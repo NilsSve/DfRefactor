@@ -1,0 +1,902 @@
+//
+
+Use Windows.pkg
+Use tWinStructs.pkg
+Use tSuggestion.pkg
+Use cTimer.pkg
+Use cRichEdit.pkg
+Use sql.pkg
+
+// defines interface for cWindowMesageHook - currently a private runtime class
+Define     U_DFWINDOWSMESSAGEHOOK  for |CI0106
+Define     GET_ENABLEWINDOWSHOOK   for |CI$0542
+Define     MSG_DISABLEWINDOWSHOOK  for |CI$0543
+Define     GET_ONWINDOWSHOOK       for |CI$0544
+Define     WH_MOUSE for 7
+Define     WH_KEYBOARD for 2
+
+// suggestion lists use a global timer and a global suggestion list
+Global_Variable Handle ghoSuggestionList
+Move 0 to ghoSuggestionList
+
+Global_Variable Handle ghoSuggestionTimer
+Move 0 to ghoSuggestionTimer
+
+// this will get created the first time it is needed.
+{ Visibility=Private }
+Class cSuggestionTimer is a cTimer
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Property Handle phoTimerOwner 0
+        Set piTimeout to 50
+    End_Procedure
+
+    Procedure OnTimer
+        Handle hoOwner
+        Get phoTimerOwner to hoOwner
+        // do this in case progam close destroys owner before timer
+        Get Object_Id of hoOwner to hoOwner
+        If hoOwner Begin
+            Send OnSuggestionTimer to hoOwner
+        End
+        Else Begin
+            // something wrong, shut off timer
+            Set pbEnabled to False
+        End
+    End_Procedure
+
+End_Class
+
+{ Visibility=Private }
+Class cSuggestionHookMouse is a DFWindowsMessageHook
+
+    // If mouse not in suggestion list or form, close suggestionlist
+    Function OnWindowsHook Integer i1 Integer i2 Integer i3 Returns Integer
+        tWinMouseHookStruct MouseHook
+        Integer ivoid hObj
+        Handle hoOwner hoParent
+        If (i1=0 and (i2=WM_LBUTTONDOWN or i2=WM_RBUTTONDOWN or i2=WM_MBUTTONDOWN or ;
+            i2=WM_NCLBUTTONDOWN or i2=WM_NCRBUTTONDOWN or i2=WM_NCMBUTTONDOWN)) Begin
+            Move (CopyMemory(AddressOf(MouseHook), i3, SizeOfType(tWinMouseHookStruct))) to iVoid
+            GET_OBJECT_FROM_WINDOW MouseHook.hwnd to hObj
+            Get Parent to hoParent
+            Get phoOwner of hoParent to hoOwner
+            If (not(hObj) or (hObj<>hoParent and hObj<>hoOwner)) Begin
+                Send DisableWindowsHook
+                Send DeActivateSuggestionList of hoOwner
+            End
+        End
+    End_Function
+
+    Procedure End_Construct_Object
+        Boolean bOk
+        Forward Send End_Construct_Object
+        Get EnableWindowsHook WH_MOUSE to bOk
+    End_Procedure
+
+End_Class
+
+{ Visibility=Private }
+Class cSuggestionHookKbd is a DFWindowsMessageHook
+
+    // If menu key, close suggestionlist
+    Function OnWindowsHook Integer i1 Integer i2 Integer i3 Returns Integer
+        Handle hoOwner
+        If (i1=0 and i2=VK_MENU) Begin
+            Delegate Get phoOwner to hoOwner
+            Send DisableWindowsHook
+            Send DeActivateSuggestionList of hoOwner
+        End
+    End_Function
+
+    Procedure End_Construct_Object
+        Boolean bOk
+        Forward Send End_Construct_Object
+        Get EnableWindowsHook WH_KEYBOARD  to bOk
+    End_Procedure
+
+End_Class
+
+{ Visibility=Private }
+Class cSuggestionList is a cRichEdit
+
+    Procedure Construct_Object
+        Handle hoObj
+        Forward Send Construct_Object
+        Property Handle phoOwner
+        Set Focus_Mode to NonFocusable
+        Set Attach_Parent_State to True
+        Set pbWrap to False
+        If (ghoSuggestionList) Begin
+            Send Destroy of ghoSuggestionList
+        End
+        Get CreateNamed (RefClass(cSuggestionHookMouse)) "oMouseHook" to hoObj
+        Get CreateNamed (RefClass(cSuggestionHookKbd))"oKbdHook" to hoObj
+        Move ghoSuggestionList to Self
+    End_Procedure
+
+    Procedure Destroy_Object
+        Forward Send Destroy_Object
+        Move 0 to ghoSuggestionList
+    End_Procedure
+
+    Procedure DeactivateList
+        Set pbEnabled of ghoSuggestionTimer to False
+        Send Deactivate
+        Send Destroy
+    End_Procedure
+
+    Procedure InitList Handle hoForm
+        Integer iSize iLoc iLoc2
+        Get GuiSize of hoForm to iSize
+        Set GuiSize to (Hi(iSize)) (1000)
+        Get Absolute_GUIOrigin of hoForm to iLoc
+        Delegate Get Absolute_GUIOrigin to iLoc2
+        Set GuiLocation to (Hi(iLoc)-Hi(iLoc2)+Hi(iSize)+2) (Low(iLoc)+2-Low(iLoc2))
+        Set Visible_State to False
+    End_Procedure
+
+    // scroll up one line
+    Procedure ScrollUp
+        Integer iLine
+        Get SelectedRow to iLine
+        If (iLine) Begin
+            Send SelectRow (iLine-1)
+        End
+    End_Procedure
+
+    // scroll down one line
+    Procedure ScrollDown
+        Integer iLine iLines
+        Get Line_Count to iLines
+        Get SelectedRow to iLine
+        // there can be an extra line at the end
+        If (iLine<iLines-1) Begin
+            Send SelectRow (iLine+1)
+        End
+    End_Procedure
+
+    // sets the current line to iLine and highlights it
+    Procedure SelectRow Integer iLine
+        Integer iPos iLen
+        Get FirstCharInLinePos iLine to iPos
+        Get LineLength iLine to iLen
+        Send SetSel iPos (iPos+iLen)
+    End_Procedure
+
+    // get the current selected Line
+    Function SelectedRow Returns Integer
+        Integer iLine
+        Get LineFromChar -1 to iLine
+        Function_Return iLine
+    End_Function
+
+    // Select the current row
+    Procedure Mouse_Up Integer hCell Integer iPos
+        Handle hoObj
+        Get phoOwner to hoObj
+        // Not necessary; SelectSuggestion will close the list.
+        //        Send Activate of hoObj // move focus to owner, which will close the list
+        Send SelectSuggestion of hoObj
+    End_Procedure
+
+End_Class
+
+// This contains mixin support for suggestion logic and contains the interface that
+// is accessed publicly. This should be mixed into the form or column DEO object
+Class cSuggestion_mixin is a Mixin
+
+    Procedure Define_cSuggestion_mixin
+
+        { EnumList="smFind, smValidationTable, smCustom" }
+        Property Integer peSuggestionMode smFind
+        Property Boolean pbFullText False
+        Property Boolean pbCaseSensitive False
+        Property Integer piMaxResults 15
+        Property Integer piStartAtChar 2
+        Property Boolean pbFullWidth True
+        Property Integer piFindIndex 0
+        Property Boolean pbFindOnSelect True
+        Property Integer piPopupTimeout 50
+
+        { Visibility=Private }
+        Property tSuggestion[] pSearchResults
+
+        { Visibility=Private }
+        Property Handle phcSuggestionListClass (RefClass(cSuggestionList))
+
+    End_Procedure
+
+    // Display one Suggestion Line in Suggestion List. Good for augmentation although
+    // this must be done carefully as you must know the suggestionlist interface, which
+    // if private
+    Procedure ShowSuggestion tSuggestion SuggestionData String sSearch
+        Integer i iCols iPos
+        String sValue
+        Integer eSuggestionMode
+        Boolean bFullText
+
+        Get peSuggestionMode to eSuggestionMode
+        Get pbFullText to bFullText
+
+        Move SuggestionData.aValues[0] to sValue
+        If (not(bFullText)) Begin
+            Set pbBold of ghoSuggestionList to True
+            Send AppendText of ghoSuggestionList (Left(sValue,Length(sSearch)))
+            Set pbBold of ghoSuggestionList to False
+            Send AppendText of ghoSuggestionList (Mid(sValue,255,Length(sSearch)+1))
+        End
+        Else Begin
+            Set pbBold of ghoSuggestionList to False
+            Move (Pos(Uppercase(sSearch),Uppercase(sValue))) to iPos
+            If (iPos) Begin
+                Send AppendText of ghoSuggestionList (Left(sValue,iPos-1))
+                Set pbBold of ghoSuggestionList to True
+                Send AppendText of ghoSuggestionList (Mid(sValue,Length(sSearch),iPos))
+                Set pbBold of ghoSuggestionList to False
+            End
+            Send AppendText of ghoSuggestionList (Mid(sValue,255,iPos+Length(sSearch)))
+        End
+
+        // if addiitonal columns (usually validation) we assume the first value is the one that is
+        // matched and we display all other values (usually just one) to the
+        // right of it.
+        Move (SizeOfArray(SuggestionData.aValues)) to iCols
+        If (iCols>1) Begin
+            Move "" to sValue
+            For i from 1 to (iCols-1)
+                Move (sValue + If(i=1," - ","  ") + SuggestionData.aValues[i]) to sValue
+            Loop
+            Send AppendText of ghoSuggestionList sValue
+        End
+    End_Procedure
+
+    // used to catch a set_field_value_Error
+    { NoDoc=True }
+    Procedure Error_Report Integer iError Integer iLine String sErr
+    End_Procedure
+
+    // does a Set_Field_Value with error testing around it.
+    { Visibility=Private }
+    Function SafeSetFieldValue Integer iFile Integer iField String sValue Returns Boolean
+        Handle hoOldError
+        Boolean bErr
+        Move Error_Object_Id to hoOldError
+        Move Self to Error_Object_Id
+        Move False to Err
+        Set_Field_Value iFile iField to sValue
+        Move Err to bErr
+        Move hoOldError to Error_Object_Id
+        Function_Return bErr
+    End_Function
+
+    // New message to add a suggestion from another data field:
+    // Augment this message in your object:
+    Procedure Add_Suggestion tSuggestion ByRef aSuggestion String sSerializeRowId String sValue1 String sValue2
+        Move sSerializeRowId To aSuggestion.sRowId
+        Move sValue1 To aSuggestion.aValues[0]
+        If (NUM_ARGUMENTS = 4) Begin
+            Move sValue2 To aSuggestion.aValues[1]
+        End
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure SuggestionsFindIncremental String sSearch tSuggestion[] ByRef aSuggestions
+        Integer iFile iField iIndex iLen iRow iMax eType iLength iDec
+        Handle hoServer
+        Boolean bContinue bCase bOldRelate bNeedsRelate bInvalid
+        String sVal sLowSearch
+        RowID riTest
+
+        Get Server to hoServer
+        Get Data_File  to iFile
+        Get Data_Field to iField
+
+        If ((hoServer <> 0) and (iFile <> 0)) Begin
+            Get piFindIndex to iIndex
+            Get piMaxResults to iMax
+            Get pbCaseSensitive to bCase
+
+            Get_Attribute DF_FIELD_TYPE of iFile iField to eType
+            Get_Attribute DF_FIELD_LENGTH of iFile iField to iLength
+            Get_Attribute DF_FIELD_PRECISION of iFile iField to iDec
+
+            Move (iLength - iDec) to iLength
+
+            If (iIndex <= 0) Begin
+                Get_Attribute DF_FIELD_INDEX of iFile iField to iIndex
+            End
+
+            If (iIndex > 0) Begin
+                Get No_Relate_State of hoServer to bOldRelate
+                Get DDOConstraintNeedsRelate of hoServer iIndex to bNeedsRelate
+                Set No_Relate_State of hoServer to (not(bNeedsRelate))
+
+                Move True to bContinue
+                Move (Length(sSearch)) to iLen
+                Move (Lowercase(sSearch)) to sLowSearch
+                Move 0 to iRow
+
+                //  Find first record
+                Send Request_Read of hoServer FIRST_RECORD iFile iIndex
+                Get SafeSetFieldValue iFile iField sSearch to bInvalid
+                If bInvalid Begin
+                    Move False to bContinue
+                End
+
+                If (bContinue) Begin
+                    Send Request_Read of hoServer GE iFile iIndex
+                End
+
+                While (Found and bContinue)
+                    Get_Field_Value iFile iField to sVal
+
+                    If ((NOT(bCase) AND Lowercase(Left(sVal, iLen)) = sLowSearch) OR (bCase AND Left(sVal, iLen) = sSearch)) Begin
+                        //ToDo: apc:
+                        Send Add_Suggestion (&aSuggestions[iRow]) (SerializeRowID(GetRowID(iFile))) (Trim(sVal))
+                        //                        Move (SerializeRowID(GetRowID(iFile)))  To aSuggestions[iRow].sRowId
+                        //                        Move (Trim(sVal))                       To aSuggestions[iRow].aValues[0]
+                        Increment iRow
+
+                        Move (iRow < iMax) to bContinue
+
+                        Send Request_Read of hoServer GT iFile iIndex
+                    End
+                    Else Begin
+                        If (eType = DF_BCD and Length(sSearch) < iLength) Begin
+                            //  For numeric fields we'll jump in the index to the next possible value (for example from 40 to 400)
+
+                            Move (GetRowID(iFile)) to riTest
+
+                            Move (sSearch * 10) to sSearch
+
+                            Get SafeSetFieldValue iFile iField sSearch to bInvalid
+                            If bInvalid Begin
+                                Move False to bContinue
+                            End
+                            Else Begin
+                                Send Request_Read of hoServer GE iFile iIndex
+                                Move (not(IsSameRowID(riTest, GetRowID(iFile)))) to bContinue
+                            End
+                        End
+                        Else Begin
+                            Move False to bContinue
+                        End
+                    End
+
+                Loop
+                Set No_Relate_State of hoServer to bOldRelate
+            End
+        End
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure SuggestionsFindFullText String sSearch tSuggestion[] ByRef aSuggestions
+        Integer iFile iField iIndex iRow iMax
+        Handle hoServer
+        Boolean bContinue bCase  bOldRelate bNeedsRelate
+        String sVal sLowSearch
+
+        Get Server to hoServer
+        Get Data_File  to iFile
+        Get Data_Field to iField
+
+        If ((hoServer <> 0) and (iFile <> 0)) Begin
+            Get piMaxResults to iMax
+            Get pbCaseSensitive to bCase
+
+            Get piFindIndex to iIndex
+            If (iIndex <= 0) Begin
+                Get_Attribute DF_FIELD_INDEX of iFile iField to iIndex
+            End
+
+            Get No_Relate_State of hoServer to bOldRelate
+            Get DDOConstraintNeedsRelate of hoServer iIndex to bNeedsRelate
+            Set No_Relate_State of hoServer to (not(bNeedsRelate))
+
+            Move (Lowercase(sSearch)) to sLowSearch
+            Move True to bContinue
+            Move 0 to iRow
+
+            //  Find first record
+            Send Request_Read of hoServer FIRST_RECORD iFile iIndex
+
+            While (Found and (iRow < iMax))
+                Get_Field_Value iFile iField to sVal
+
+                If ((bCase and sVal contains sSearch) or (not(bCase) and Lowercase(sVal) contains sLowSearch)) Begin
+                    //ToDo: apc:
+                    Send Add_Suggestion (&aSuggestions[iRow]) (SerializeRowID(GetRowID(iFile))) (Trim(sVal))
+                    //                    Move (SerializeRowID(GetRowID(iFile)))  To aSuggestions[iRow].sRowId
+                    //                    Move (Trim(sVal))                       To aSuggestions[iRow].aValues[0]
+                    Increment iRow
+                End
+
+                Send Request_Read of hoServer GT iFile iIndex
+            Loop
+            Set No_Relate_State of hoServer to bOldRelate
+        End
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure SuggestionsSQLFullText String sSearch tSuggestion[] ByRef aSuggestions
+        Integer iFile iField iIndex iRow iMax
+        Handle hoServer
+        Boolean bContinue bOrigActive  bOldRelate bNeedsRelate
+        String sVal sOrigFilter sFilter
+
+        Get Server to hoServer
+        Get Data_File  to iFile
+        Get Data_Field to iField
+
+        If ((hoServer <> 0) and (iFile <> 0)) Begin
+
+            // make sure we send DD messages to owner DDO
+            Get Which_Data_Set of hoServer iFile to hoServer
+            If (hoServer=0) Begin
+                Procedure_Return
+            End
+
+            Get piMaxResults to iMax
+            Get piFindIndex to iIndex
+            If (iIndex <= 0) Begin
+                Get_Attribute DF_FIELD_INDEX of iFile iField to iIndex
+            End
+
+            //  Determine current filter settings
+            Get psSQLFilter of hoServer to sOrigFilter
+            Get pbUseDDSqlFilters of hoServer to bOrigActive
+
+            // generate the Like filter string
+            Get SQLStrLike of hoServer iField sSearch to sFilter
+            // If filtering was active append this to what's there
+            If (bOrigActive) Begin
+                Get SQLStrAppend of hoServer sOrigFilter sFilter to sFilter
+            End
+
+            //  Set filter
+            Set psSQLFilter of hoServer to sFilter
+            Set pbUseDDSqlFilters of hoServer to True
+
+            // this will optimize No_relate. If your DF constraint does not
+            // need a post-relate test, we will disabled relates for this
+            Get No_Relate_State of hoServer to bOldRelate
+            Get DDOConstraintNeedsRelate of hoServer iIndex to bNeedsRelate
+            Set No_Relate_State of hoServer to (not(bNeedsRelate))
+
+            //  Find records
+            Move True to bContinue
+            Move 0 to iRow
+
+            Send Request_Read of hoServer FIRST_RECORD iFile iIndex
+
+            While (bContinue)
+                Get_Field_Value iFile iField to sVal
+
+                If (Found) Begin // and ((bCase and sVal contains sSearch) or (not(bCase) and Lowercase(sVal) contains sLowSearch))) Begin
+                    //ToDo: apc:
+                    Send Add_Suggestion (&aSuggestions[iRow]) (SerializeRowID(GetRowID(iFile))) (Trim(sVal))
+                    //                    Move (SerializeRowID(GetRowID(iFile)))  To aSuggestions[iRow].sRowId
+                    //                    Move (Trim(sVal))                       To aSuggestions[iRow].aValues[0]
+                    Increment iRow
+
+                    Move (iRow < iMax) to bContinue
+
+                    Send Request_Read of hoServer GT iFile iIndex
+                End
+                Else Begin
+                    Move False to bContinue
+                End
+
+            Loop
+
+            //  Restore filters
+            Set psSQLFilter of hoServer to sOrigFilter
+            Set pbUseDDSqlFilters of hoServer to bOrigActive
+            Set No_Relate_State of hoServer to bOldRelate
+        End
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure SuggestionsValidation String sSearch tSuggestion[] ByRef aSuggestions Boolean bFullText
+        Handle hoServer hoTable
+        Integer iFile iField iRow iCount iFound iMax iLen
+        Variant[][] aData
+        Boolean bCaseSensitive bContinue
+        String sDescr sVal
+
+        Get Server to hoServer
+        Get Data_File  to iFile
+        Get Data_Field to iField
+
+        If ((hoServer <> 0) and (iFile <> 0)) Begin
+            Get File_Field_Table_Object of hoServer iFile iField to hoTable
+            If (hoTable <> 0) Begin
+                Get tabledata of hoTable to aData
+
+                Get piMaxResults to iMax
+                Get pbCaseSensitive to bCaseSensitive
+
+                If (not(bCaseSensitive)) Begin
+                    Move (Lowercase(sSearch)) to sSearch
+                End
+
+                Move (SizeOfArray(aData)) to iCount
+                Move 0 to iRow
+                Move (Length(sSearch)) to iLen
+                Move True to bContinue
+
+                While (iFound < iMax and iRow < iCount and bContinue)
+                    If (not(bCaseSensitive)) Begin
+                        Move (Lowercase(aData[iRow][0])) to sVal
+                        Move (Lowercase(aData[iRow][1])) to sDescr
+                    End
+                    Else Begin
+                        Move aData[iRow][0] to sVal
+                        Move aData[iRow][1] to sDescr
+                    End
+
+                    If ((bFullText and (sVal contains sSearch)) or (not(bFullText) and (Left(sVal, iLen) = sSearch))) Begin
+                        //ToDo: apc:
+                        Send Add_Suggestion (&aSuggestions[iFound]) aData[iRow][0] aData[iRow][0] aData[iRow][1]
+                        //                        Move aData[iRow][0] to aSuggestions[iFound].sRowId
+                        //                        Move aData[iRow][0] to aSuggestions[iFound].aValues[0]
+                        //                        Move aData[iRow][1] To aSuggestions[iFound].aValues[1]
+                        Increment iFound
+                    End
+                    Else Begin
+                        Move (bFullText or iFound = 0) to bContinue
+                    End
+
+                    Increment iRow
+                Loop
+            End
+        End
+
+    End_Procedure
+
+    { MethodType=Event }
+    Procedure OnFindSuggestions String sSearch tSuggestion[] ByRef aSuggestions
+        Integer iMode iFile
+        Boolean bFullText bSupportsSQL
+        Handle hoServer
+
+        Get Server to hoServer
+        Get Data_File  to iFile
+
+        If ((hoServer <> 0) and (iFile <> 0)) Begin
+
+            Get peSuggestionMode to iMode
+            Get pbFullText to bFullText
+
+            If (iMode = smFind) Begin
+                If (not(bFullText)) Begin
+                    Send SuggestionsFindIncremental sSearch (&aSuggestions)
+                End
+                Else Begin
+                    Get SupportsSQLFilters of hoServer to bSupportsSQL
+                    If (bSupportsSQL) Begin
+                        Send SuggestionsSQLFullText sSearch (&aSuggestions)
+                    End
+                    Else Begin
+                        Send SuggestionsFindFullText sSearch (&aSuggestions)
+                    End
+                End
+            End
+            Else If (iMode = smValidationTable) Begin
+                Send SuggestionsValidation sSearch (&aSuggestions) bFullText
+            End
+        End
+    End_Procedure
+
+    { MethodType=Event }
+    Procedure OnSelectSuggestion String sSearch tSuggestion Suggestion
+        Handle hoServer
+        Integer iFile iField iMode
+        Boolean bFind
+        RowID rRowId
+
+        Get Server to hoServer
+        Get Data_File  to iFile
+        Get Data_Field to iField
+
+        If ((hoServer <> 0) and (iFile <> 0)) Begin
+            Get peSuggestionMode to iMode
+
+            If (iMode = smFind) Begin
+                Get pbFindOnSelect to bFind
+                If (bFind) Begin
+                    Move (DeserializeRowID(Suggestion.sRowId)) to rRowId
+
+                    If (not(IsNullRowID(rRowId))) Begin
+                        Send FindByRowId of hoServer iFile rRowId
+                    End
+                End
+                Else Begin
+                    Set Value to Suggestion.aValues[0]
+                    Set Item_Changed_State to True
+                End
+            End
+            Else If (imode = smValidationTable) Begin
+                Set Value to Suggestion.sRowId
+                Set Item_Changed_State to True
+            End
+
+        End
+    End_Procedure
+
+    // Return true if Suggestion should be invoked. Can be augmented
+    Function ShouldSuggestion String sValue Boolean bChanged Returns Boolean
+        Integer iStartAtChar
+        Get piStartAtChar to iStartAtChar
+        Function_Return (bChanged and Length(sValue)>=iStartAtChar)
+    End_Function
+
+End_Class
+
+// This contains logic that deals with the Windows object. It relies on the interface in
+// sSuggestion_mixin, which means it must be mixed in as a sibling of this object (as is done
+// in dbSuggestionForm or as a child of this object (as is done in cDbCJGridColumnSuggestion), which
+// means messages are resolved via delegation. sSuggestion_mixin does not send messages to this class.
+// Note that cSuggestion_mixin and cSuggestionControl_mixin are designed so they can be mixed in at
+// the same level or mixed in such that cSuggestionControl_mixin is in the child object and cSuggestion_mixin
+// is in the parent
+
+Class cSuggestionControl_mixin is a Mixin
+
+    { Visibility=Private }
+    Procedure Define_cSuggestionControl_mixin
+
+        { Visibility=Private }
+        Property Integer piTimeOutTicks 0
+
+        On_Key kEnter Send SelectSuggestion
+        On_Key Key_Escape Send DeActivateSuggestionList
+        On_Key Key_Up_Arrow Send Up
+        On_Key Key_Down_Arrow Send Down
+
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure AdjustSuggestionListSize Integer iLines
+        Integer i  iX iMax iY
+        String sTxt
+        Boolean bFullWidth
+        For i From 0 To (iLines-1)
+            Get Line of ghoSuggestionList i to sTxt
+            Get Text_Extent of ghoSuggestionList sTxt to iX
+            Move (Low(iX) max iMax) to iMax
+            Move (Hi(iX)) to iY
+        Loop
+        //ToDo: apc: this value seems a little tight when multi-columns are used
+        //ToDo: apc: would be better if the value was held in a property
+        //        Move (iMax + 20) To imax
+        Move (iMax + 40) To imax
+        Get pbFullWidth to bFullWidth
+        If bFullWidth Begin
+            Move (iMax max (Low(GuiSize(Self)))) to iMax
+        End
+        If (iLines) Begin
+            Set GuiSize of ghoSuggestionList to (iY*(iLines)+8) iMax
+            Send SelectRow of ghoSuggestionList 0 // go to first line
+        End
+        Else Begin
+            Set GuiSize of ghoSuggestionList to (Hi(GuiSize(Self))) (low(GuiSize(Self)))
+        End
+    End_Procedure
+
+    // show all suggestions
+    { Visibility=Private }
+    Procedure ShowSuggestions
+        tSuggestion[] aResults
+        Integer i iLines
+        String sSearch
+        Get pSearchResults to aResults
+        Get Value to sSearch
+        Send Delete_Data of ghoSuggestionList
+        Move (SizeOfArray(aResults)) to iLines
+        For i from 0 to (iLines-1)
+            Send ShowSuggestion aResults[i] sSearch
+            If ((iLines-1)<>i) Begin
+                Send AppendTextLn of ghoSuggestionList ""
+            End
+        Loop
+        Send AdjustSuggestionListSize iLines
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure FindSuggestions
+        String sSearch
+        tSuggestion[] aResults
+        Get Value to sSearch
+        Send OnFindSuggestions sSearch (&aResults)
+        Set pSearchResults to aResults
+        // if an error was raised, the suggestion list will be gone
+        If (ghoSuggestionList) Begin
+            Send ShowSuggestions
+        End
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure SelectSuggestion
+        String sSearch
+        tSuggestion[] aData
+        Integer iSelRow
+        If ghoSuggestionList Begin
+            Get SelectedRow of ghoSuggestionList to iSelRow
+            Get Value to sSearch
+            Get pSearchResults to aData
+            Send DeActivateSuggestionList
+            Send CancelEditIfGrid
+            If (iSelRow>=0 and SizeOfArray(aData)>iSelRow) Begin
+                Send OnSelectSuggestion sSearch aData[iSelRow]
+            End
+        End
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure CancelEditIfGrid
+        // do nothing with forms, remember
+        // to replace or augment with grid to
+        // cancel the edit control
+    End_Procedure
+
+    { Visibility=Private }
+    Function ParentForSuggestion Returns Handle
+        Handle hoMain hoMainPanel
+
+        // we must have an application object and a main panel object
+        If ghoApplication Begin
+            Get phoMainPanel of ghoApplication to hoMainPanel
+        End
+        If (hoMainPanel = 0 or Self <= Desktop) Begin
+            Function_Return 0
+        End
+
+        Move Self to hoMain
+        Repeat
+            Get Parent of hoMain to hoMain
+        Until (hoMain=Desktop or Block_Mouse_State(hoMain) or hoMainPanel=hoMain)
+
+        Function_Return (If(hoMain>Desktop,hoMain,0))
+
+    End_Function
+
+    { Visibility=Private }
+    Procedure ActivateSuggestionList
+        Handle hoView hcSuggest
+        Get ParentForSuggestion to hoView
+        If hoView Begin
+            Get phcSuggestionListClass to hcSuggest
+            Get CreateNamed of hoView hcSuggest "oSuggestList" to ghoSuggestionList
+            Send InitList of ghoSuggestionList Self
+            Set Focus_Mode of ghoSuggestionList to Focusable
+            Set phoOwner of ghoSuggestionList to Self
+            Send Add_Focus of ghoSuggestionList hoView
+        End
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure DeActivateSuggestionList
+        If ghoSuggestionList Begin
+            Send DeactivateList of ghoSuggestionList
+        End
+    End_Procedure
+
+    // augment to kill suggest list if focus is not moving to it
+    // customized for grid
+    { NoDoc=True }
+    { Visibility=Private }
+    Procedure OnKillFocus
+        // note focus has already changed here
+        If (ghoSuggestionList) Begin
+            If (Focus(Self) <> ghoSuggestionList) Begin
+                Send DeActivateSuggestionList
+                Forward Send OnKillFocus
+            End
+            Else Begin
+                // giving focus to the suggestion list here
+            End
+        End
+        Else Begin
+            Forward Send OnKillFocus
+        End
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure Up
+        If (Focus(Desktop) = Self and ghoSuggestionList) Begin
+            Send ScrollUp of ghoSuggestionList
+        End
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure Down
+        If (Focus(Desktop) = Self and ghoSuggestionList) Begin
+            Send ScrollDown of ghoSuggestionList
+        End
+    End_Procedure
+
+    { NoDoc=True }
+    { Visibility=Private }
+    Procedure Key Integer iKey
+        Integer iEndTicks
+
+        If (Focus(Desktop) <> Self) Begin
+            Forward Send Key iKey
+            Procedure_Return
+        End
+
+        Send DeActivateSuggestionList
+        Move (GetTickCount()) to iEndTicks
+        // record the time of key press
+        If (piTimeOutTicks(Self) = 0) Begin
+
+            If (ghoSuggestionTimer=0) Begin
+                Send CreateSuggestionTimer
+            End
+
+            Set pbEnabled of ghoSuggestionTimer to True
+            Set phoTimerOwner of ghoSuggestionTimer to Self
+        End
+        Set piTimeOutTicks to iEndTicks
+
+        Forward Send Key iKey
+    End_Procedure
+
+    { Visibility=Private }
+    Procedure CreateSuggestionTimer
+        Handle hoMainPanel
+        // we must have an application object and a main panel object
+        If ghoApplication Begin
+            Get phoMainPanel of ghoApplication to hoMainPanel
+        End
+        If (hoMainPanel=0) Begin
+            Error DFERR_PROGRAM "Auto-suggest requires an application object and a main panel object"
+            Procedure_Return
+        End
+        Get CreateNamed of hoMainPanel (RefClass(cSuggestionTimer)) "oSuggestionTimer" to ghoSuggestionTimer
+    End_Procedure
+
+    // sent by Auto Suggest Timer. Invoke suggestion list as needed
+    { Visibility=Private }
+    Procedure OnSuggestionTimer
+        Boolean bDoIt
+        Integer iEndTicks iStartTicks iTicks iTimeOut iChanged
+        String sValue
+
+        If (Focus(Desktop) <> Self) Begin
+            // focus out of whack. Stop the timer
+            Set pbEnabled of ghoSuggestionTimer to False
+            Send DeActivateSuggestionList
+            Procedure_Return
+        End
+
+        Get piTimeOutTicks to iStartTicks
+        If (iStartTicks <> 0) Begin
+            Move (GetTickCount()) to iEndTicks
+            Move (iEndTicks - iStartTicks) to iTicks
+            // If tick count rolled over
+            If (iTicks < 0) Begin
+                Move (-iTicks) to iTicks
+            End
+        End
+        Get piPopupTimeout to iTimeOut
+        If (iTicks >= iTimeOut) Begin
+            // If time delay has been met, launch autocomplete
+            Set pbEnabled  of ghoSuggestionTimer to False
+            Get Value to sValue
+            Get Item_Changed_State 0 to iChanged
+            Get ShouldSuggestion sValue iChanged to bDoIt
+            If bDoIt Begin
+                Send ActivateSuggestionList
+                Send FindSuggestions
+                Set Visible_State of ghoSuggestionList to True
+            End
+            Set piTimeOutTicks to 0
+        End
+    End_Procedure
+
+End_Class
+

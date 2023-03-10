@@ -1,0 +1,799 @@
+//TH-Header
+//*****************************************************************************************
+// Copyright (c)  2014  KURANT Project
+// All rights reserved.
+//
+// $FileName    : .\Hammer\AppSrc\DDOReStyler.src
+// $ProjectName : The Hammer 2.0
+// $Authors     : wil
+// $Created     : 11.14.2014  14:21
+// $Type        : LGPL
+//
+// Contents:
+//  Unfortunately the naming style of datadictionaries over time has not been constant.
+//  The new style is
+//    Object o<tablename>_DD is a c<TableName>Datadictionary
+//  They also have a switch so you can keep on using the legacy style name which is
+//    Object o<tablename>_DD is a <tablename>_Datadictionary
+//
+//  However before VDF12, the
+//    Object <tableName>_DD is a <tablename>_Datadictionary
+//
+//  This caused tremendous headaches as due to the extra "o" we ended up with name clashes
+//  all over the place. Copying old code into new views/dialogs simply breaks and if your
+//  codebase has mixed styles then the compiler will not catch that.
+//  A code nightmare.
+//
+//  This program allows you to switch between the following code styles:
+//
+//  <TableName>_DD              == eDDOldStyle
+//  o<TableName>_DD             == eDDLegacyStyle
+//
+//
+// How this code works:
+// 1. It scans your source file and for each file it will locate the datadictionary objects
+//    These datadictionary objects are then stored in an array
+// 2. We read the whole filelist into another array so that we know what table names can be
+//    used.
+// 3. The DDOs found in step 1) are classified against the filelist items and we determine
+//    the DDO style used for the declared DDOs. DDOs that could be verified are labeled
+//    on style used and marked as being verified.
+// 4. We scan the source again and replace the verified DDOs with the style wanted.
+// 5. Write the source out to disk (overwriting the original)
+//
+//
+// Please note that if your source already contains unknown DD objects (eg. You copied old
+// style code from another version of your appinto new style code) that this parser will
+// not try to correct that. The starting point should be correct working code.
+//
+// Note if a detected DDO is in commented out source code then we will still replace it,
+// this is to make sure uncommenting code doesn't break the source.
+// Commented out DDO declarations are -not- detected.
+//
+// The following use cases are not supported by the DDRestyler:
+//   - include files,
+//   - source files with incorrect DDOs already in there
+//       (eg. declare o<table>_DD but later on use <table>_DD)
+//   - references to DDO's not declared in the source file (non autonomous usage)
+//
+// How to use:
+//  1. Compile the .src into your local workspace so that it can find your filelist.
+//
+//  Restyle a single file:
+//
+//  Object oDDRestyler is a cDDStylingParser
+//  End_Object
+//
+//  Send doRestyleDDObjects of oDDRestyler "C:\Projects\OrderEntry\AppSrc\Customer.vw" eDDLegacyStyle
+//
+//  Restyle a whole folder with a filemask:
+//
+//  Send doRestyleFolder of oDDRestyler "C:\Projects\OrderEntry\AppSrc" "*.dg;*.sl;*.rv;*.bp;*.vw" eDDLegacyStyle
+//
+//*****************************************************************************************
+//TH-RevisionStart
+//TH-RevisionEnd
+
+
+Use Windows.pkg
+Use cApplication.pkg
+Use seq_chnl.pkg
+Use vwin32fh.pkg
+//Use Akefs.pkg
+Use cFilesystem.pkg
+
+Object oApplication is a cApplication
+    Set psAutoOpenWorkspace to "Config.ws"
+    Set pbPreserveEnvironment to False
+End_Object
+
+
+Define CS_CRLF For (Character(13)+character(10))
+
+
+Struct tFileList
+  Integer iFileNum
+  String  sRootName     // actual filename
+  String  sDisplayName  // description
+  String  sTable        // datadictionary name is based on sTable (see aliases)
+End_Struct
+
+Enum_List
+  Define eDDUnknown       for 0 // style unknown or not yet classified
+  Define eDDOldStyle      for 1 // <tablename>_DD
+  Define eDDLegacyStyle   for 2 // o<tablename>_DD
+  Define eDDNewStyle      for 3 // o<tablename>_dd
+End_Enum_List
+
+Struct tDDO
+  String  sDDO          // sDDO name
+  Boolean bVerified     // sDDO name has been verified against filelist
+  Integer eDDOStyle     // DDO naming style
+  Integer iLine         // source line where the DDO is declared
+  Integer iFileNum      // Not needed at this stage, but we got the data, so stick it in
+  String  sTableName    // Just as easy to have
+End_Struct
+
+
+Class cDataFiles is a cObject
+
+  Procedure Construct_Object
+    Forward Send Construct_Object
+    Property tFileList[] pFileList
+  End_Procedure // Construct_Object
+
+  //
+  // Loops through the file list and enumerates all of the files in there.
+  //
+  Procedure EnumerateAllFiles
+    Integer iFile
+    Integer iIndex
+    String  sRoot
+    String  sDisplay
+    String  sTable
+    tFileList[] filelist
+  
+    Move (ResizeArray(filelist,0)) To filelist
+    Move 0 To iFile
+    Move 0 To iIndex
+    Repeat
+      Get_Attribute DF_FILE_NEXT_USED Of iFile To iFile
+      If (iFile > 0) Begin
+        Get_Attribute DF_FILE_ROOT_NAME    Of iFile To sRoot
+        Get_Attribute DF_FILE_DISPLAY_NAME Of iFile To sDisplay
+        Get_Attribute DF_FILE_LOGICAL_NAME Of iFile To sTable
+        //Showln "   " iFile ": " sTable " (" sRoot ", " sDisplay ")"
+        Move iFile    To filelist[iIndex].iFileNum
+        Move sRoot    to filelist[iIndex].sRootName
+        Move sDisplay to filelist[iIndex].sDisplayName
+        Move sTable   to filelist[iIndex].sTable
+        Increment iIndex
+      End
+      Set pFileList to filelist
+    Until (iFile = 0)
+  End_Procedure // EnumerateAllFiles
+
+End_Class // cDataFiles
+
+Class cStylerFolder is a cObject // from Cleanmarkers project, could use a BPO here, but no GUI for the moment
+    Procedure Construct_Object
+        Forward Send Construct_Object
+      
+        Property Boolean pbOk
+        Property String  psFolderName  ""
+        Property String  psFileMask    ""
+        Property Integer peNewStyle    0
+
+        Property String[] pasFolderNames
+        Property String psFileFilter
+
+        Object oFilesystem is a cFilesystem
+            
+        End_Object
+    End_Procedure
+
+
+    Procedure OnProcess
+        String sDirName
+        Boolean bOk
+
+        Get psFolderName to sDirName
+        Get RecursiveSearchDirectoryFiles sDirName to bOK
+        Set pbOk to bOk
+    End_Procedure
+
+
+    Function RecursiveSearchDirectoryFiles String sSourceDirname Returns Boolean
+        Boolean bOk bStop bFound
+        Integer iCnt iMax iTmp
+        String  sFile sLine sEval sExt
+        Handle  hoDir
+        String[] asFolderNames
+        String sFileFilter
+        tsSearchResult[] asSearchResult
+
+        Get pasFolderNames to asFolderNames
+        Get psFileFilter   to sFileFilter
+        Get AllSourceFiles of ghoApplication asFolderNames sFileFilter to asSearchResult
+        
+//        Move 0 to iCnt
+//        //Get value of oSourceFile to sSourceFile
+//        Get Create U_cDirectory to hoDir
+//        Move (sSourceDirname+"\*.*") to sFile
+//        Get SearchSingleDirectory of hoDir sFile DIRMODE_DIRECTORIES_ONLY to iMax
+//        Decrement iMax
+//        For iCnt from 0 to iMax
+//            Get Searchresult of hoDir item iCnt LIST_FILENAME to sLine
+//            If (sLine <> "." and sLine <> "..") Begin
+//                Get RecursiveSearchDirectoryFiles (sSourceDirname + "\" + sLine) to bOk
+//                If (not(bOk)) Begin
+//                    Send destroy of hoDir
+//                    Function_Return False
+//                End
+//            End
+//        Loop
+//        Get SearchSingleDirectory of hoDir sFile DIRMODE_FILES_ONLY to iMax
+        Decrement iMax
+        For iCnt from 0 to iMax
+            Get Searchresult of hoDir item iCnt LIST_FILENAME to sLine
+            Move (right(sLine,3)) to sExt
+            Move (Lowercase(sExt)) to sExt
+            If (Pos(".", sExt)) Move (Remove(sExt, 1, 1)) to sExt
+            Get psFileMask to sEval
+            If (Pos(sExt, sEval)) Begin
+                Send DoRestyleDDObjects (sSourceDirname + "\" + sLine) (peNewStyle(Self))
+                If (not(bOk)) Begin
+                    Send destroy of hoDir
+                    Function_Return False
+                End
+            End
+        Loop
+        Send destroy of hoDir
+        Move True to bOk
+        Function_Return bOk
+    End_Function
+    
+    Procedure doRestyleDDObjects String sFileName Integer eDDStyle
+      Showln "Restyling " sFileName
+      Delegate Send doRestyleDDObjects sFileName eDDStyle
+    End_Procedure 
+
+
+    Function AllSourceFolders String[] asUserSelectedFolders Returns String[]
+        String sHomePath
+        String[] asNoFolderSearch asSourceFolders asAllSourceFolders
+        Integer iSize iCount
+
+        Get psHomePath to sHomePath
+        Get vFolderFormat sHomePath to sHomePath
+
+        Get NoFolderListAsArray False to asNoFolderSearch
+        Move (SizeOfArray(asUserSelectedFolders)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            Get RecursiveSearchFolders asUserSelectedFolders[iCount] asNoFolderSearch to asSourceFolders
+            Move (AppendArray(asAllSourceFolders, asSourceFolders)) to asAllSourceFolders
+        Loop
+
+        Function_Return asAllSourceFolders
+    End_Function
+
+    Function AllSourceFiles String[] asUserSelectedFolders String sFileFilter Returns tsSearchResult[]
+        Boolean bIsFileInFilter
+        String sSourceFolder sFileMask sFileName
+        String[] asAllSourceFolders
+        tsSearchResult[] asSourceFilesEmpty asSourceFiles asSourceFilesTotal
+        Integer iFolder iFolders iFile iFiles
+
+        Move asUserSelectedFolders to asAllSourceFolders
+        Move (SizeOfArray(asAllSourceFolders)) to iFolders
+        Decrement iFolders
+
+        // Folder loop:
+        For iFolder from 0 to iFolders
+            Move asAllSourceFolders[iFolder] to sSourceFolder
+            Get vFolderFormat sSourceFolder to sSourceFolder
+            Move (sSourceFolder + "*.*") to sFileMask
+
+            Get FileSearch of ghoFileSystem sFileMask DIRMODE_FILES_ONLY False to asSourceFiles
+            Move (SizeOfArray(asSourceFiles)) to iFiles
+            Decrement iFiles
+
+            // File loop:
+            For iFile from 0 to iFiles
+                Move asSourceFiles[iFile].sFilename to sFileName
+                Get IsFileInFilter sFileName sFileFilter to bIsFileInFilter
+                If (bIsFileInFilter = True) Begin
+                    // Store the path in the sAlternateFileName struct item
+                    Move sSourceFolder to asSourceFiles[iFile].sAlternateFileName
+                End
+                Else Begin
+                    Move (RemoveFromArray(asSourceFiles, iFile)) to asSourceFiles
+                    Decrement iFile
+                    Decrement iFiles
+                End
+            Loop
+            Move (AppendArray(asSourceFilesTotal, asSourceFiles)) to asSourceFilesTotal
+        Loop
+
+        Function_Return asSourceFilesTotal
+    End_Function
+
+    Function IsFileInFilter String sFileName String sFileFilter Returns Boolean
+        Integer iSearchIndex
+        String sExtension sChar
+        String[] asFileFilter
+
+        Move (Lowercase(sFileName))      to sFileName
+        Get ParseFileExtension sFileName to sExtension
+        Move (Left(sExtension, 1))       to sChar
+        If (sChar <> ".") Begin
+            Move ("." + String(sExtension)) to sExtension
+        End
+        Move (Lowercase(sFileFilter))         to sFileFilter
+        Move (Replaces("*", sFileFilter, "")) to sFileFilter
+        Move (StrSplitToArray(sFileFilter, ";")) to asFileFilter
+        Move (SearchArray(sExtension, asFileFilter)) to iSearchIndex
+        Function_Return (iSearchIndex <> -1)
+    End_Function
+
+    Function RecursiveSearchFolders String sSourceFolder String[] asNoFolderList Returns String[]
+        Boolean bFound
+        Integer iCount iSize iItem
+        String sMask sFileName sPrevFolderName sHomePath
+        tsSearchResult[] asSearchResult
+        String[] saSearchFolders
+
+        If (not(sSourceFolder contains ":")) Begin
+            Get psHomePath to sHomePath
+            Get vFolderFormat sHomePath to sHomePath
+            Move (sHomePath + sSourceFolder) to sSourceFolder
+        End
+        Get vFolderFormat sSourceFolder to sSourceFolder
+        Move (sSourceFolder + "*") to sMask
+
+        Move 0 to iItem
+
+        // Recursive folder search
+        Get FileSearchRecursive of ghoFileSystem sMask DIRMODE_DIRECTORIES_ONLY False to asSearchResult
+        Move (SizeOfArray(asSearchResult)) to iSize
+        Decrement iSize
+
+        // Remove folder names from array where we should not search for source files
+        Move "" to sPrevFolderName
+        For iCount from 0 to iSize
+            Get IsFolderInNoFolderList of ghoApplication asNoFolderList asSearchResult[iCount].sFilename to bFound
+            If (bFound = False) Begin
+                If (asSearchResult[iCount].sFilename <> sPrevFolderName) Begin
+                    Move asSearchResult[iCount].sFilename to saSearchFolders[iItem]
+                    Increment iItem
+                End
+            End
+            Move asSearchResult[iCount].sFilename to sPrevFolderName
+        Loop
+
+        Move sSourceFolder to saSearchFolders[SizeOfArray(saSearchFolders)]
+        // Sort the folder array to get the top one first.
+        Move (SortArray(saSearchFolders)) to saSearchFolders
+
+        Function_Return saSearchFolders
+    End_Function
+
+End_Class 
+
+
+
+Class cDDStylingParser is a cObject
+  Procedure Construct_Object
+    Forward Send Construct_Object
+    Property String   psFileName  ""
+    Property String[] psSource
+    Property tDDO[]   pDDObjects
+    Property Boolean  pbCreateBackup false  // NOT implemented as I depend on source code control
+    Property Boolean  pbStrict       True   // Only replace verified DDOs, non strict not supported atm (Search code if need)
+    Property Integer  peNewStyle     eDDUnknown
+    Property Boolean  pbCamelCaseTableName True // For new tablename Camel Case the TableName in the object
+        
+    Object oDataFiles is a cDataFiles
+    End_Object
+  End_Procedure // Construct_Object
+  
+  Procedure Read String sFileName
+    Integer  iChan
+    Integer  iLine
+    String   sLine
+    String[] sSource
+    
+    Move 0 To iLine
+    Move (ResizeArray(sSource,0)) To sSource
+    Get OpenInput sFileName To iChan
+    If (iChan>0) Begin
+      Set psFileName to sFileName
+      Repeat
+        Readln Channel iChan sLine
+        If (not(SeqEof)) Begin
+          Move (Rtrim(sLine)) To sSource[iLine]
+          Increment iLine
+        End
+      Until (Seqeof)
+      Send CloseInput iChan
+    End
+    Set psSource To sSource
+  End_Procedure // Read
+  
+  Procedure CreateBackup
+  End_Procedure // CreateBackup
+  
+  Procedure Write
+    Boolean  bBackup
+    Integer  iChan
+    Integer  iLine
+    Integer  iCount
+    String   sFileName
+    String   sLine
+    String[] sSource
+    
+    Get pbCreateBackup To bBackup
+    If (bBackup) Begin
+      Send Createbackup
+    End
+    Get psSource To sSource
+    Get psFileName To sFileName
+    If (sFileName<>"") Begin
+      Get OpenOutput sFileName To iChan
+      If (iChan>0) Begin
+        Move (SizeOfArray(sSource)-1) To iCount
+        If (iCount>=0) Begin
+          For iLine From 0 To iCount
+            Move sSource[iLine] To sLine
+            Writeln Channel iChan sLine
+          Loop
+        End
+        Send CloseOutput iChan
+      End
+    End
+  End_Procedure // Write
+  
+  //
+  // Scans the whole file and locates the declared datadictionary objects based on that
+  // the line will start with "Object" and ends with "_DataDictionary".
+  //
+  // The search is case insensitive, commented out source will be ignored.
+  //
+  // Example line that will be detected:
+  //  Object oCustomer_DD is a Customer_DataDictionary
+  //
+  Procedure FindCurrentDDObjects
+    Integer  iCount
+    Integer  iLine
+    Integer  iPos
+    Integer  iSpaceChars
+    Integer  iDDO
+    String   sLine
+    String   sNline   // normalized line, lowercase and trimmed
+    String   sDDObject
+    String[] sSource
+    tDDO[]   DDObjects
+    
+    Move 0 To iDDO
+    Move (ResizeArray(DDObjects,0)) To DDObjects
+    Get psSource To sSource
+    Move (SizeOfArray(sSource)-1) To iCount
+    If (iCount>=0) begin
+      For iLine From 0 To iCount
+        Move sSource[iLine] To sLine
+        Move (lowercase(trim(sLine))) To sNline
+        If (Pos("object ",sNline)=1) Begin
+          Move (Pos("_datadictionary",sNline)) To iPos
+          If (iPos>0) Begin
+            Move (Replace("object ",sNline,"")) To sNline
+            // space characters on the left? count them
+            Move (length(sNline) - (length(ltrim(sNline)))) To iSpaceChars
+            Move (ltrim(sNline)) To sNline // remove them
+            Move (Pos(" ",sNline)) To iPos
+            If (iPos<>0) Begin
+              Move (Mid(ltrim(sLine),iPos-1,8+iSpaceChars)) To sDDObject
+              Move sDDObject  To DDObjects[iDDO].sDDO
+              Move iLine      To DDObjects[iDDO].iLine
+              Move false      To DDObjects[iDDO].bVerified
+              Move eDDUnknown To DDObjects[iDDO].eDDOStyle
+              Increment iDDO
+            End
+          End
+        End
+      Loop
+    End
+    Set pDDObjects To DDObjects
+  End_Procedure // FindCurrentDDObjects
+  
+  //
+  // Helper function for comparing tablenames in the filelist
+  //
+  // Custom comparison function:
+  //   Returns (GT) if struct value in first parameter > struct value in second parameter.
+  //   Returns (LT) if struct value in first parameter < struct value in second parameter.
+  //   Otherwise returns (EQ).
+  Function CompareTableNames tFileList  List1 tFileList List2 Returns Integer
+    Move (lowercase(List1.sTable)) To List1.sTable
+    Move (lowercase(List2.sTable)) To List2.sTable
+    If (List1.sTable > List2.sTable) Begin
+      Function_Return (GT)
+    End
+    Else If (List1.sTable < List2.sTable) Begin
+      Function_Return (LT)
+    End
+    Function_Return (EQ)
+  End_Function //
+  
+  //
+  // Looks at the DD Objects found in the source and
+  // tests them against the filelist plus determines the type
+  //
+  Procedure ClassifyDDObjects
+    Boolean    bHasObjectPrefix
+    Boolean    bHasDDPostfix
+    Boolean    bHasDataDictionaryPostfix
+    Integer    iListSize
+    Integer    iCount
+    Integer    iDDO
+    Integer    iFile
+    String     sDDO
+    String     sTableName
+    String     sTableNameO // exception if tablename actually starts with letter O
+    tDDO[]     DDObjects
+    tFileList  SearchFile
+    tFileList[]  FileList
+    
+    Send EnumerateAllFiles of oDataFiles // not entirely optimal to run this in each source file but meh
+    Get pFileList of oDataFiles    To FileList
+    Move (SizeOfArray(FileList)-1) To iListSize
+    Get pDDObjects To DDObjects
+    Move (SizeOfArray(DDObjects)-1) to iCount
+    If (iListSize>=0 and iCount>=0) Begin
+      For iDDO from 0 To iCount
+        Move False To bHasObjectPrefix
+        Move False To bHasDDPostfix
+        Move False To bHasDataDictionaryPostfix
+        Move ""    To sTableNameO
+        Move DDObjects[iDDO].sDDO To sDDO
+        Move (trim(sDDO)) To sTableName
+        If (sTableName<>"") Begin
+          If (Lowercase(Left(sTableName,1))="o") Begin
+            Move True To bHasObjectPrefix
+            Move (Replace(Mid(sTableName,1,1),sTableName,"")) To sTableName
+            Move (trim(sDDO)) To sTableNameO // What if tablename actually starts with a letter "o" ?
+          End
+          If (Lowercase(Right(sTableName,3))="_dd") Begin
+            Move True To bHasDDPostFix
+            Move (Left(sTableName,Length(sTableName)-3)) To sTableName
+            If (sTableNameO<>"") Begin
+              Move (Left(sTableNameO,Length(sTableNameO)-3)) To sTableNameO
+            End
+          End
+          Else If (Lowercase(Right(sTableName,15))="_datadictionary") Begin
+            Move True To bHasDataDictionaryPostFix
+            Move (Left(sTableName,Length(sTableName)-15)) To sTableName
+            If (sTableNameO<>"") Begin
+              Move (Left(sTableNameO,Length(sTableNameO)-15)) To sTableNameO
+            End
+          End
+          Move sTableName To SearchFile.sTable
+          Move (SearchArray(SearchFile,FileList, Self, (RefFunc(CompareTableNames)) )) to iFile
+          If (iFile>-1) Begin
+            Move True  To DDObjects[iDDO].bVerified
+            Move FileList[iFile].iFileNum To DDObjects[iDDO].iFileNum
+            Move FileList[iFile].sTable   To DDObjects[iDDO].sTableName
+          End
+          Else If (sTableNameO<>"") Begin
+            Move sTableNameO To SearchFile.sTable
+            Move (SearchArray(SearchFile,FileList, Self, (RefFunc(CompareTableNames)) )) to iFile
+            If (iFile>-1) Begin
+              Move False To bHasObjectPrefix
+              Move True  To DDObjects[iDDO].bVerified
+              Move FileList[iFile].iFileNum To DDObjects[iDDO].iFileNum
+              Move FileList[iFile].sTable   To DDObjects[iDDO].sTableName
+            End
+          End
+          If (bHasObjectPrefix=false and bHasDDPostfix) Begin
+            Move eDDOldStyle To DDObjects[iDDO].eDDOStyle
+          End
+          Else If (bHasObjectPrefix) Begin
+            If (bHasDDPostfix) Begin
+              Move eDDLegacyStyle To DDObjects[iDDO].eDDOStyle
+            End
+            //Else If (bHasDataDictionaryPostfix) Begin
+            //  Move eDDNewStyle To DDObjects[iDDO].eDDOStyle
+            //End
+          End
+        End
+      Loop
+      Set pDDObjects To DDObjects
+    End
+  End_Procedure // ClassifyDDObjects
+  
+  Function NewStyleName String sTableName Integer eNewStyle Returns String
+    String  sDDStyle
+    Boolean bCamelCase
+    
+    Get pbCamelCaseTableName To bCamelCase
+    If (bCamelCase) Begin
+      // Camel Case makes the whole tablename lowercase except for the first Letter
+      Move (lowercase(sTableName)) To sTableName
+      Move (overstrike(Uppercase(Left(sTableName,1)),sTableName,1)) To sTableName
+    End
+    
+    Case Begin
+      Case (eNewStyle=eDDOldStyle)
+        Move (sTableName+"_DD") To sDDStyle
+        Case Break
+      Case (eNewStyle=eDDLegacyStyle)
+        Move ("o"+sTableName+"_DD") To sDDStyle
+        Case Break
+      Case (eNewStyle=eDDNewStyle)
+        Move ("o"+sTableName+"_DD") To sDDStyle
+        Case Break
+      Case Else
+        Showln ("Unexpected error new style"*trim(eNewStyle)*"is undefined.")
+    Case End
+    Function_Return sDDStyle
+  End_Function // NewStyleName
+  
+  Procedure ApplyNewStyleForTable tDDO DDObject
+    Boolean bUpdated
+    Integer eNewStyle
+    Integer eOldStyle
+    Integer iCount
+    Integer iLine
+    Integer iPos
+    Integer iLen
+    String  sLine
+    String  sNline
+    String  sNOldDDName
+    String  sNewDDName
+    String[] sSource
+
+    Get peNewStyle To eNewStyle
+    Move DDObject.eDDOStyle To eOldStyle
+    If (eNewStyle<>eOldStyle) Begin
+      Get psSource To sSource
+      Move (lowercase(DDObject.sDDO)) To sNOldDDName
+      Move (Length(sNOldDDName))      To iLen
+      Get NewStyleName DDObject.sTableName eNewStyle To sNewDDName
+      Move (SizeOfArray(sSource)-1)   To iCount
+      If (iCount>=0) begin
+        For iLine From 0 To iCount
+          Move False To bUpdated
+          Move sSource[iLine] To sLine
+          //
+          // end of line happens, see Set DDO_Server To <table>_DD
+          //
+          Move (sLine +" ") to sLine
+          Move (lowercase(sLine)) To sNline
+          // Valid separate characters are: " ",",","(",")", EOL
+          // The DDO objects are _never_ at the start of the line
+          Move (Replaces(",",sNline," ")) To sNline
+          Move (Replaces("(",sNline," ")) To sNline
+          Move (Replaces(")",sNline," ")) To sNline
+
+          // Only one type of replacement left, easy testing :)
+          Move (Pos(" "+sNOldDDName+" ",sNline)) To iPos
+          While (iPos<>0)
+            Move True To bUpdated
+            Move (Replace(" "+sNOldDDName+" ",sNline," "+sNewDDName+" ")) To sNline
+            // Don't know correct case in the actual line, use remove+insert
+            // Can't use replace on the real line as it will end up replacing replaced
+            Move (Remove(sLine,iPos+1,iLen))       To sLine
+            Move (Insert(sNewDDName,sLine,iPos+1)) To sLine
+            
+            Move (Pos(" "+sNOldDDName+" ",sNline)) To iPos
+          Loop
+          If (bUpdated) Begin
+            Move (RTrim(sLine)) To sSource[iLine]
+          End
+        Loop
+        Set psSource To sSource
+      End
+    End
+  End_Procedure // ApplyNewStyleForTable
+  
+  Procedure ApplyNewStyle
+    Boolean bStrict
+    Boolean bReplace
+    Integer iFile
+    Integer iCount
+    Integer eStyle
+    String  sFileName
+    tDDO[]  DDObjects
+    
+    Get peNewStyle To eStyle
+    If (eStyle<>eDDUnknown) Begin
+      Get pbStrict To bStrict   // default is to only rename DDO's that exist in filelist
+      Get ParseFileName (psFileName(Self)) To sFileName
+      Get pDDObjects To DDObjects
+      Move (SizeOfArray(DDObjects)-1) To iCount
+      If (iCount>=0) Begin
+        For iFile from 0 To iCount
+          Move False To bReplace
+          If (bStrict) Begin
+            If (DDObjects[iFile].bVerified=True) Begin
+              Move True To bReplace
+            End
+            Else Begin
+              Showln ("DDO"*DDObjects[iFile].sDDO*"was not found in the filelist. File"*sFileName)
+            End
+          End
+          Else Begin
+            // if you want to do non strict, you need to fill in ddobject.sTableName still!
+            Move True To bReplace
+          End
+          If (DDObjects[iFile].eDDOStyle=eDDUnknown) Begin
+            Move False To bReplace
+            Showln ("DDO"*DDObjects[iFile].sDDO*"style is not recognized. File"*sFileName)
+          End
+          If (DDObjects[iFile].eDDOStyle=eStyle) Begin
+            Move False To bReplace
+            Showln ("DDO"*DDObjects[iFile].sDDO*"style already correct. File"*sFileName)
+          End
+          If (bReplace) Begin
+            Send ApplyNewStyleForTable DDObjects[iFile]
+          End
+        Loop
+      End
+    End // eStyle<>eDDUnknown
+  End_Procedure // ApplyNewStyle
+
+
+
+  Function OpenOutput String sFileName Returns Integer
+    Integer iChan
+
+    Get Seq_New_Channel to iChan
+    If (iChan <> DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
+      Direct_Output channel iChan sFileName
+    End
+    Function_Return iChan
+  End_Function
+  
+  Procedure CloseOutput Integer iChan
+    Close_Output Channel iChan
+    send Seq_Release_Channel iChan
+  End_Procedure
+
+  Function OpenInput String sFileName Returns Integer
+    Integer iChan
+
+    Get Seq_New_Channel to iChan
+    If (iChan<>DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
+      Direct_Input channel iChan ("binary:"+sFileName)
+    End
+    Function_Return iChan
+  End_Function
+  
+  Procedure CloseInput Integer iChan
+    Close_Input Channel iChan
+    send Seq_Release_Channel iChan
+  End_Procedure
+  
+  //
+  // Code that handles the restyle on the DD Object in the source filename supplied
+  // and changes it to the new style eDDStyle
+  //
+  Procedure doRestyleDDObjects String sFileName Integer eDDStyle
+    Send Read sFilename
+    Send FindCurrentDDObjects
+    Send ClassifyDDObjects
+    Set peNewStyle            To eDDStyle
+    Send ApplyNewStyle
+    Send Write
+  End_Procedure
+  
+  Procedure doRestyleFolder String sFolderName String sFileMask Integer eDDStyle
+    Handle hoStyler
+    
+    Get Create (RefClass(cStylerFolder)) To hoStyler
+    If (hoStyler) Begin
+      Set psFolderName of hoStyler To sFolderName
+      Set psFileMask   of hoStyler To sFileMask
+      Set peNewStyle   of hoStyler To eDDStyle
+      Send OnProcess Of hoStyler
+      
+      Send Destroy of hoStyler
+    End
+  End_Procedure // doRestyleFolder
+
+End_Class // cDDStylingParser
+
+         
+         
+
+Object oDDRestyler is a cDDStylingParser
+End_Object
+
+//Send doRestyleDDObjects of oDDRestyler "D:\Projects\Clients\NHS\NH\BeforeDDRestyler\ADALookup.sl" eDDLegacyStyle
+//Send doRestyleFolder of oDDRestyler "D:\Projects\Clients\NHS\NH\BeforeDDRestyler" "*.dg;*.sl;*.rv;*.bp;*.vw" eDDLegacyStyle
+//Send doRestyleFolder of oDDRestyler "D:\Projects\Clients\NHS\Orthobanc18\ORTHOBANC" "*.dg;*.sl;*.rv;*.bp;*.vw" eDDLegacyStyle
+
+
+Use VdfBase.pkg
+String sDummy  
+Winput "Click OK" sDummy

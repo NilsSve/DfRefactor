@@ -1,0 +1,232 @@
+//TH-Header
+//*****************************************************************************************
+// Copyright (c)  2017 The Hammer 3.0
+// All rights reserved.
+//
+// $FileName    : cRefactorMethodExtract.pkg
+// $ProjectName : TheHammer3
+// $Authors     : Wil van Antwerpen
+// $Created     : 12.10.2017  09:54
+//
+// Contents:
+//  Partially sponsored and suggested to implement by 28it, thanks Marco!
+//
+//*****************************************************************************************
+//TH-RevisionStart
+//TH-RevisionEnd
+Use cFDFileReader.pkg
+Define CS_ValidLeftCharacters       For ("()[];,&+-*<>= "+Character(9)) // Character 9=tab char
+
+Struct tRefactorVar
+    String  sName
+    Integer iType
+    Boolean bRead     // within selected text, variable is used to read from
+    Boolean bWrite    //                                           write to
+    Boolean bUsed     // variable is used in the selected text
+    Boolean bBefore   // variable is used in the current method before the selected text
+    Boolean bAfter    // variable is used in the current method after the selected text
+    Boolean bParam    // was passed to the outer method as a parameter
+    Boolean bLocalParam // Are used as parameters in the extracted method
+    Boolean bIsDB     // It's a database field
+End_Struct
+
+Class cRefactorMethodExtract is a cObject
+  Procedure Construct_Object
+    Forward Send Construct_Object
+    Property tRefactorVar[] pVariables
+
+        // Used to show the fields of a DataFile, by reading the *.FD file.
+    Object oFDFileReader Is a cFDFileReader
+        Set  piSortMode         To ascending    // Sort for searching during type.
+        //Set  piNormalizeEntries To True         // Normalize entry instead of all Uppercase.
+    End_Object
+  End_Procedure
+
+  Procedure VariablesToIsolate tRefactorVar[] Variables
+    Set pVariables to Variables
+  End_Procedure
+
+  //
+  // Tests to see if the line starts with a declaration line, because we can then skip it.
+  //
+  Function IsVarDeclarationLine String sLine Returns Boolean
+    Boolean bVarLine
+    Integer iType
+    Integer iLength
+    String  sType
+
+    Move False To bVarLine
+    Move (LTrim(sLine)) To sLine
+    For iType From MK_INTEGER To MK_ULONGPTR // see cParser for min/max values
+      Get fVarTypToString iType   To sType
+      Move (lowercase(sType+" ")) To sType
+      Move (Length(sType)) To iLength
+      If (Left(sLine,iLength)=sType) Begin
+        Move True To bVarLine
+        Move (MK_ULONGPTR+1) To iType
+      End
+    Loop
+    Function_Return bVarLine
+  End_Function
+
+  //
+  // Codifies how our commands act on the variables, which is variables that's only being read ($in$)
+  // or a variable that is being written to ($out$)
+  // If the command isn't defined then our template returns as an empty string.
+  // $fun$ is function
+  //
+  Function KeywordParamTemplate String sKeyword Returns String
+    String sTemplate
+    Move "" To sTemplate
+    Move (trim(lowercase(sKeyword))) To sKeyword
+    Case Begin
+      Case (sKeyword="if")
+        Move "if $in$" To sTemplate
+        Case Break
+      Case (sKeyword="move")
+        Move "move $in$ to $out$" To sTemplate
+        Case Break
+      Case (sKeyword="get")
+        Move "get $fun$ to $out$" To sTemplate  // $fun$ was $in$
+        Case Break
+      Case (sKeyword="set")
+        Move "set $fun$ to $in$" To sTemplate   // $fun$ was $out$
+        Case Break
+    Case End
+    Function_Return sTemplate
+  End_Function
+
+  // On a preparsed line all the strings have been replaced by underscores
+  // and plus symbols so that the line becomes much easier to parse.
+  // So this string "ab" is ____ and 'ac' becomes ++++ and '"ac' is +_+++
+  //
+  Function IsPreparsedStringLiteral String sParam Returns Boolean
+    Boolean bIsString
+    Integer iPos iLength
+    String  sChar
+
+    Move True to bIsString
+    Move (Trim(sParam)) To sParam
+    Move (Length(sParam)) To iLength
+    For iPos From 1 To iLength
+      Move (Mid(sParam,1,iPos)) To sChar
+      If (sChar<>"_" and sChar<>"+") Begin
+        Move iLength To iPos
+        Move False To bIsString
+      End
+    Loop
+    Function_Return bIsString
+  End_Function
+
+  Function LoadFDReader String sFile Returns Boolean
+    Boolean bResult
+    String  sPath
+
+    Move False to bResult
+    If (sFile <> "") Begin
+      Get FindFileInSearchPath (CurrentDDSrcPath(ghoWorkSpaceHandlerEx)) sFile To sPath
+      If (sPath="")  Get FindFileInSearchPath (CurrentAppSrcPath(ghoWorkSpaceHandlerEx)) sFile To sPath
+      If (sPath="")  Get FindFileInSearchPath (CurrentDataPath(ghoWorkSpaceHandlerEx))   sFile To sPath
+      If (sPath<>"") Begin
+        Send Fill To oFDFileReader sPath
+        Move True to bResult
+      End
+    End
+    Function_Return bResult
+  End_Function
+
+
+  Procedure CheckVariableUsage String sLine
+    Boolean bHasFD
+    Boolean bHasField
+    Integer iCount
+    Integer iItem
+    Integer iPos
+    String  sVar
+    String  sChar
+    String  sFile
+    String  sField
+    tRefactorVar[] Variables
+
+    Get pVariables to Variables
+    Move (SizeOfArray(Variables)) To iCount
+    For iItem From 0 To (iCount-1)
+      Move (lowercase(Variables[iItem].sName)) To sVar
+      Move (Pos(sVar,sLine)) To iPos
+      If (iPos>0) Begin
+        Move (Mid(sLine, 1, (iPos - 1))) to sChar
+        If (CS_ValidLeftCharacters contains sChar) Begin
+            Move True To Variables[iItem].bUsed
+        End
+        If (Variables[iItem].bUsed) Begin
+          Move (Pos(".",sVar)) To iPos
+          If (iPos>0) Begin
+            Move (Left(sVar,iPos-1)) To sFile
+            Get LoadFDReader (sFile+".fd") to bHasFD
+            If (bHasFD) Begin
+              Move (Replace(sFile+".",sVar,"")) To sField
+              Get HasField of oFDFileReader sField to bHasField
+              If (bHasField) Begin
+                Move True To Variables[iItem].bIsDB
+              End
+            End
+          End
+        End
+      End
+    Loop
+    Set pVariables To Variables
+  End_Procedure
+
+
+  Procedure CheckVariableBefore String sLine
+    Boolean bDeclareVar
+    Integer iCount
+    Integer iItem
+    Integer iToken
+    Integer iPos
+    String  sVar sElem
+    tRefactorVar[] Variables
+
+    Move (LTrim(sLine)) To sLine
+    Get IsVarDeclarationLine sLine To bDeclareVar
+    If (bDeclareVar=false) Begin
+      Get pVariables to Variables
+      Move (SizeOfArray(Variables)) To iCount
+      For iItem From 0 To (iCount-1)
+        Move (lowercase(Variables[iItem].sName)) To sVar
+        Move (Pos(sVar,sLine)) To iPos
+        If (iPos<>0) Begin
+          Move True To Variables[iItem].bBefore
+        End
+      Loop
+      Set pVariables To Variables
+    End
+  End_Procedure
+
+
+  Procedure CheckVariableAfter String sLine
+    Boolean bDeclareVar
+    Integer iCount
+    Integer iItem
+    Integer iToken
+    Integer iPos
+    String  sVar sElem
+    tRefactorVar[] Variables
+
+    Move (LTrim(sLine)) To sLine
+    Get IsVarDeclarationLine sLine To bDeclareVar
+    If (bDeclareVar=false) Begin
+      Get pVariables to Variables
+      Move (SizeOfArray(Variables)) To iCount
+      For iItem From 0 To (iCount-1)
+        Move (lowercase(Variables[iItem].sName)) To sVar
+        Move (Pos(sVar,sLine)) To iPos
+        If (iPos<>0) Begin
+          Move True To Variables[iItem].bAfter
+        End
+      Loop
+      Set pVariables To Variables
+    End
+  End_Procedure
+
+End_Class

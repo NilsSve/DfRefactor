@@ -1,0 +1,1752 @@
+//****************************************************************************
+// $Module type: Program
+// $Module name: SourceCodeTools
+// $Author     : Nils G. Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2018-08-05 @ 09:50 (Military date format: YY-MM-DD)
+//
+// Description : Code Refactor functions.
+//
+// The code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//
+//****************************************************************************
+Use DFAllEnt.pkg
+Use cCJStandardCommandBarSystem.pkg
+Use cCJCommandBarSystem.pkg
+Use File_dlg.pkg
+Use gFormatNumbers.pkg
+Use cWorkspaceMenuItem.pkg
+Use vWin32fh.pkg
+Use SourceCode.inc
+
+Object oHtmlHelp is a cHtmlHelp
+    Set pbAlwaysOnTop to False
+End_Object
+
+// Dummy messages that are called from the toolbars; in case they
+// doesn't exist in a view. This avoids runtime errors.
+Function pbShouldSave Desktop Returns Boolean
+    Function_Return False
+End_Function
+
+Function BackupFile Desktop Returns String
+    Function_Return ""
+End_Function
+
+Procedure OpenSourceFile Desktop
+End_Procedure
+
+Procedure Compare Desktop String sCompareApp
+End_Procedure
+
+Procedure OnWorkspaceLoaded Desktop
+End_Procedure
+
+Procedure LoadFile Desktop String sFileName
+End_Procedure
+
+External_Function GetACP "GetACP" kernel32.dll Returns Integer
+
+Enum_List
+    Define CI_CleanupSource
+    Define CI_CodeIndenter
+End_Enum_List
+
+// Needs to be _before_ the cApplication object as we refer to it there.
+// However, the package itself must be Used _after_ the ghoApplication object,
+// as it contains references to the phoWorkspace property. (Kind of catch 22).
+#IFNDEF ghoEditorProperties
+Global_Variable Integer ghoEditorProperties
+#ENDIF
+
+Use cRefactorApplication.pkg
+
+Object oApplication is a cRefactorApplication
+    Set psProduct to "DFRefactor - Refactoring for DataFlex"
+    Set peHelpType to htHtmlHelp
+    Set psHelpFile to "DFRefactor.chm"
+
+    Object oSwsOpenDialog is an OpenDialog
+        Set Dialog_Caption to CS_SelectWorkspaceFile
+        Set Filter_String  to CS_WorkspaceFilterString
+    End_Object
+
+    Function SelectWorkspaceFile Returns String
+        Boolean bOpen
+        String sFileName
+
+        Move "" to sFileName
+        Get Show_Dialog of oSwsOpenDialog to bOpen
+        If (bOpen = True) Begin
+            Get File_Name of oSwsOpenDialog to sFileName
+            Send AddWorkSpaceFileToRegistry sFileName
+        End
+        Function_Return sFileName
+    End_Function
+
+    { MethodType=Property }
+    Procedure Set psSWSFile String sSWSFile
+        String sPath sListItem   
+        Handle hoCombo 
+        Integer iItem iCount
+        
+        Get ParseFoldername sSWSFile to sPath
+        If (sPath <> "") Begin
+            Get vFolderFormat sPath to sPath
+        End
+        Set psHomePath to sPath
+        Set private.psSWSFile to sSWSFile 
+
+        If (ghoCommandBars > 0) Begin         
+            Send DisplayWorkspaceItem of (oWorkspaceSelector_Menuitem(ghoCommandBars)) sSWSFile
+            If (hoCombo > 0) Begin
+                Get ComListCount of hoCombo to iCount
+                For iItem from 0 to iCount
+                    Get ComList of hoCombo iItem to sListItem
+                    If (sListItem = "Select Workspace:") Begin
+                        Set ComListIndex of hoCombo to iItem
+                    End
+                Loop
+                Send Destroy of hoCombo
+            End
+        End
+    End_Procedure
+
+    { MethodType=Property }
+    Function psSWSFile Returns String
+        Function_Return (private.psSWSFile(Self))
+    End_Function
+
+    { MethodType=Property }
+    Function psWorkspaceHomePath Returns String
+        String sPath sSWSFile
+        Get psSWSFile to sSWSFile
+        Get ParseFolderName sSWSFile to sPath
+        Function_Return sPath
+    End_Function
+
+    Procedure UpdateWorkspaceSelectorDisplay String sFileName
+        String sText sVersion sWorkspaceText
+        Handle hoIniFile
+        Integer iPos
+        Boolean bExists
+
+        If (sFileName <> "") Begin
+            Move (RightPos(". ", sFileName)) to iPos
+            If (iPos <> 0) Begin
+                Move (Mid(sFileName, CI_EOL, 4)) to sFileName
+                Get FileExists of ghoFileSystem sFileName DIRMODE_FILES_ONLY to bExists
+                If (bExists = False) Begin
+                    Send Info_Box "The .sws file doesn't exist! Please select another."
+                    Procedure_Return
+                End
+            End
+            Move CS_CurrentWorkspace to sWorkspaceText
+            Get Create (RefClass(cIniFile)) to hoIniFile
+            Set psFilename of hoIniFile to sFileName
+            Get ReadString of hoIniFile CS_PropertiesKeyWord CS_VersionKeyWord "" to sVersion
+            Send Destroy of hoIniFile
+
+            // Remove any number pre-facing the .sws file path & name
+            Move (Pos(":", sFileName)) to iPos
+            If (iPos <> 2) Begin
+                Move (Mid(sFileName, CI_EOL, 4)) to sFileName
+            End
+            Get ParseFileName sFileName to sText
+        End
+        Else Begin
+            Move CS_OpenWorkspace to sWorkspaceText
+            Move CS_NoActiveWorkspaceText to sText            
+            If ((oWorkspaceSelector_Menuitem(ghoCommandBars))) Begin
+                If (IsComObjectCreated(oWorkspaceSelector_Menuitem(ghoCommandBars))) Begin
+                    Send ResetComboForm of (oWorkspaceSelector_Menuitem(ghoCommandBars))
+                End
+            End
+        End
+        
+        // It is probably safest to clear all views when switching workspace.
+        If (phoMainPanel(Self) <> 0) Begin
+            Broadcast Send Request_Clear_All of (Client_Id(phoMainPanel(ghoApplication)))
+            Set psCaption of (oWorkspaceSelector_Menuitem(ghoCommandBars)) to sWorkspaceText
+        End
+        Set psSWSFile to sFileName
+        If (phoMainPanel(Self) <> 0) Begin  
+            // Send to all views
+            Broadcast Send OnWorkspaceLoaded of (Client_Id(phoMainPanel(ghoApplication)))
+        End
+        Send UpdateSourceFileNameDisplay ""
+    End_Procedure
+
+    Procedure UpdateSourceFileNameDisplay String sFileName
+        String sText sFileBrowseText sFileNameOnly
+
+        If (sFileName <> "") Begin
+            Move sFileName to sText
+            Get ParseFileName sFileName to sFileNameOnly
+            Move CS_CurrentSourceFileTxt to sFileBrowseText
+        End
+        Else Begin
+            Move CS_BrowseSourceFileTxt to sFileBrowseText
+            Move CS_NoActiveSourceFileText to sText
+        End
+
+        Set psCurrentSourceFileName to sFileName
+        If (phoMainPanel(Self) <> 0) Begin
+            Set psCaption of (oOpenFolderMenuItem(ghoCommandBars))      to sFileBrowseText
+            Set psCaption of (oSourceFileText_MenuItem(ghoCommandBars)) to sFileNameOnly
+            Set psToolTip of (oSourceFileText_MenuItem(ghoCommandBars)) to sText
+            Set pbChecked of (oSourceFileText_MenuItem(ghoCommandBars)) to (sText <> "")
+        End
+    End_Procedure
+
+    Procedure ToggleWorkspaceAndFileMode
+        Boolean bState
+        Get pbWorkspaceMode to bState
+        If (oWorkspaceRadio_MenuItem(ghoCommandBars) <> 0) Begin
+            Set pbChecked of (oWorkspaceRadio_MenuItem(ghoCommandBars)) to bState
+        End
+        If (oFileRadioMenuItem(ghoCommandBars) <> 0) Begin
+            Set pbChecked of (oFileRadioMenuItem(ghoCommandBars)) to (not(bState))
+        End
+    End_Procedure
+
+    Object oOpenSourceFileDialog is a OpenDialog
+        Set Dialog_Caption to "Select a source file"
+
+        // Nils: I find these filters to restricted and cumbersome to work with.
+        // Wil: Me too
+        //Set Filter_String to CS_SourceFileFilters
+        Set Filter_String to (CS_SourceCodeFilters+"|All Files (*.*)|*.*")
+    End_Object
+
+    Procedure SelectSourceFile
+        Boolean bOpen bReadOnly bExists
+        String  sFileName sHomePath sAppSrcPath sInitialFolder
+        Handle ho
+
+        Move (oOpenSourceFileDialog(Self)) to ho
+        Get Initial_Folder of ho to sInitialFolder
+        If (sInitialFolder = "") Begin
+            Get psHomePath to sHomePath
+            // If an "AppSrc" folder exists we want to display those source files.
+            Get vFolderFormat sHomePath to sAppSrcPath
+            Move (sAppSrcPath + "AppSrc") to sAppSrcPath
+            Get vFolderExists sAppSrcPath to bExists
+            If (bExists = True) Begin
+                Move sAppSrcPath to sHomePath
+            End
+
+            Set Initial_Folder of ho to sHomePath
+        End
+        Get Show_Dialog of ho to bOpen
+        If (bOpen = True) Begin
+            Get File_Name of ho to sFileName
+            // Check if user is opening file as read_only
+            Get TickReadOnly_State of ho to bReadOnly
+            If (bReadOnly = True) Begin
+                Send Info_Box ("Files should not be opened as ReadOnly.") "Warning!"
+            End
+            Else Begin
+                Set pbWorkspaceMode to False
+                Send UpdateSourceFileNameDisplay sFileName
+                Send LoadFile of (phoEditor(Self)) sFileName
+                Send Activate_oEditorView_vw of (Client_Id(phoMainPanel(Self)))
+            End
+        End
+    End_Procedure
+
+    Procedure OpenContainingFolder String sFName
+        String sPath sFileName
+
+        If (num_arguments = 0 or sFName = "") Begin
+            Get psHomePath to sPath
+        End
+
+        Else Begin
+            Move sFName to sFileName
+            Get ParseFolderName sFileName to sPath
+        End
+
+        RunProgram Shell Background sPath
+    End_Procedure
+
+    Function ScintillaEditorSettings String sKey Returns String
+        String sRetval sFontSize sFont
+
+        Get psFontFace of ghoEditorProperties to sFont
+        Move (Left(sFont, Pos(';', sFont))) to sFontSize
+        Move (Trim(Replace(sFontSize, sFont, ""))) to sFont
+        Move (Replace("PT;", Uppercase(sFontSize), "")) to sFontSize
+        Move (Trim(Right(sFont, Length(sFont)-Pos(';', sFont)))) to sFont
+        If (sKey = CS_StudioFontName) Begin
+            Move sFont to sRetval
+        End
+        If (sKey = CS_StudioFontSize) Begin
+            Move sFontSize to sRetval
+        End
+        Function_Return sRetval
+    End_Function
+
+    // Command Line Interface:
+    //
+    // Enable to pass a path to an folder or filename on the command line,
+    // and add something like this to the Studio's Tools menu:
+    // Label:                Command:                                                 Parameters:
+    // "DFRefactor" "C:\Projects\DFRefactor\Programs\DFRefactor.exe" "<project>"
+    // Note: This Studio setup can be done from the ProgramSetup.dg dialog.
+    Procedure OnCreate
+        Handle hoCommandLine
+        String sSourceFile sSWSFile
+        Boolean bChecked   
+        Integer iWin10BetaSetting
+
+        Forward Send OnCreate
+
+        // Test for serious Windows 10 "bug": "https://support.dataaccess.com/Forums/showthread.php?64797-Recent-Microsoft-Changes-to-Windows-10-May-Impact-Functionality-and-or-Data-Integrity"
+        Move (GetACP()) to iWin10BetaSetting
+        If (iWin10BetaSetting = 65001) Begin
+            Send Info_Box ("Windows 10 ouch! This workstation has its BETA option set to TRUE. This means that the normal codepage that DataFlex relies on does not work. This also means that some refactoring functions will fail. Program will now exit!")
+            Send vShellExecute "Open" "https://support.dataaccess.com/Forums/showthread.php?64797-Recent-Microsoft-Changes-to-Windows-10-May-Impact-Functionality-and-or-Data-Integrity" "" ""
+            Send Exit_Application
+        End
+        
+        Set psStartupProgramPath to (psProgramPath(phoWorkspace(Self)))
+        Set psStartupBitmapPath  to (psBitmapPath(phoWorkspace(Self)))
+
+        Get phoCommandLine to hoCommandLine
+        If (hoCommandLine > 0) Begin
+            Get Argument of hoCommandLine 1 to sSWSFile
+            Get Argument of hoCommandLine 2 to sSourceFile
+            //            Showln sSWSFile
+            //            Showln sSourceFile
+            Move (Trim(sSourceFile)) to sSourceFile
+            If (Right(sSourceFile, 1) = CS_DirSeparator) Begin
+                Move (Left(sSourceFile, (Length(sSourceFile) -1))) to sSourceFile
+            End
+            // We need to send these messages in this order: 
+            //Showln sSWSFile
+            //Showln sSourceFile            
+            Send UpdateWorkspaceSelectorDisplay sSWSFile
+            Send UpdateSourceFileNameDisplay sSourceFile
+        End
+
+        Get ReadDword CS_Settings CS_CreateBackupFiles True to bChecked
+        Set private.pbShouldBackupFile to bChecked
+    End_Procedure
+
+End_Object
+
+Use cToolTipController.pkg
+Object oToolTipController is a cToolTipController
+    Move Self to ghoToolTipController
+    Set piIcon to TTI_INFO
+    Set psTitle to "Info"
+    Set piMaxWidth to 250
+    Set piDurationPopup to 14000    // 14 seconds, needed for long tooltips.
+    Set pbUsePrefix to True
+End_Object
+
+Open SysFile
+// Need this here for the menu system.
+Use cUnusedSourceFiles.pkg
+
+Use oEditorProperties.pkg
+Use oEditContextMenu.pkg
+Use oDEOEditContextMenu.pkg
+Use cSCTabWorkspace.pkg
+//Use CaptureWindow.pkg
+
+Register_Object oSysfile_DD
+
+Object oMain is a Panel
+    Set Label to (psProduct(ghoApplication))
+    Set Size to 257 550
+    Set piMinSize to 257 550
+
+    Object oCJCommandBarSystem is a cCJCommandBarSystem
+        Set pbTimerUpdate to True
+        Set piLayoutBuild to 8
+        Set pbToolBarAccelTips to True
+        Set pbAutoResizeIcons  to True
+        Set pbTabbedWorkspaces to True
+
+        Property Handle phoTabWorkspace
+        Property Handle phoTabPaintManager
+
+        Procedure OnCreateCommandBars
+            Integer eTheme
+            Forward Send OnCreateCommandBars
+
+            Send DoChangeToolTipFormat
+
+            Get ReadDword of ghoApplication CS_Settings CS_ThemeKeyWord xtpThemeOffice2013Publisher to eTheme
+            Send SetTheTheme eTheme
+        End_Procedure
+
+        Procedure OnCreateTabbedWorkspace Handle hoTabWorkspace Handle hoTabPaintManager
+            Set phoTabWorkspace     to hoTabWorkspace
+            Set phoTabPaintManager  to hoTabPaintManager
+            Send DisplayTabWorkspace
+        End_Procedure
+
+        Procedure DisplayTabWorkspace
+            Variant vTab vPaintManager
+            Handle hoTab hoPaintManager hoOptions
+            Integer iSize
+
+            If (not(IsComObjectCreated(Self))) Begin
+                Procedure_Return
+            End
+
+            Get OptionsObject to hoOptions
+
+            // Create the tab workspace object. It will get created for the Client_Area so
+            // each view will be displayd on a separate tab-page (instead of the standard DF MDI-interface)
+            Get phoTabWorkspace    to hoTab
+            Get phoTabPaintManager to hoPaintManager
+
+            // Don't show the tab-pages "close" and next/prev buttons.
+            Set ComFlags of hoTab to xtpWorkspaceHideAll
+
+            Move 16 to iSize
+            Send ComSetIconSize of hoPaintManager iSize iSize   // Set icon size for Tab-workspace.
+            // To show or not to show tab-page icons...
+            Set ComShowIcons    of hoPaintManager to True
+
+            // Sets the tab-pages to display on the left side, instead of at the top:
+            Set ComPosition     of hoPaintManager to xtpTabPositionLeft
+
+            // This will truncate the middle part of long items
+            //Set ComDrawTextPathEllipsis of hoPaintManager to True
+
+            Get piToolbarIconSize of ghoApplication to iSize
+            Set piToolbarIconSize to iSize
+            Set ComToolTipBehaviour of hoPaintManager to xtpTabToolTipAlways // We _must_ have this for tooltips to show on tab-pages (views)
+
+            // Send Destroy of hoTab // Nope, we can't destroy this - else the tab-page settings won't work.
+            //#IF (!@ < 190)
+            //            Send Destroy of hoPaintManager
+            //#ENDIF
+        End_Procedure
+
+        Procedure DoChangeToolTipFormat
+            Variant vToolTip
+            Handle  hoObject
+            Integer eTheme iToolTipStyle
+            Boolean bIsBalloonStyleSupported
+
+            Get ComToolTipContext to vTooltip
+            Get Create (RefClass(cCJToolTipContext)) to hoObject
+            Set pvComObject of hoObject to vTooltip
+            Move xtpToolTipStandard to iToolTipStyle
+            
+            // Baloon tooltip style requires IE 5.0 or later, so check if installed.
+            // The ComShowTitleAndDescription also requires IE 5.0.
+            Get ComIsBalloonStyleSupported of hoObject to bIsBalloonStyleSupported
+            If (bIsBalloonStyleSupported = False) Begin
+                // If not supported we cannot show baloon tooltip; use standard style instead.
+                If (iToolTipStyle = xtpToolTipBalloon) Begin
+                    Move xtpToolTipStandard to iToolTipStyle
+                End
+            End
+            If (bIsBalloonStyleSupported = True) Begin
+                Send ComShowTitleAndDescription of hoObject True xtpToolTipIconInfo
+            End
+            
+            Set ComStyle            of hoObject to iToolTipStyle
+            Set ComShowOfficeBorder of hoObject to True
+            Set ComShowShadow       of hoObject to True
+            // Set the max width for a tooltip. 250 just seems to be a good
+            // compromise. After 250 pixels the text will wrap to the next line automatically.
+            Set  ComMaxTipWidth     of hoObject to 250 // In pixels
+            Send Destroy            of hoObject
+            
+            If (phoStatusBar(ghoCommandBars)) Begin
+                Send DoChangeToolTipFormat of (phoStatusBar(Self))
+            End
+        End_Procedure
+
+        Procedure Set piToolbarIconSize Integer iSize
+            Handle hoOptions
+
+            If (not(IsComObjectCreated(Self))) Begin
+                Procedure_Return
+            End
+
+            Get OptionsObject to hoOptions
+            Send ComSetIconSize of hoOptions False iSize iSize  // Set icon size for Toolbar buttons.
+            Send ComRecalcLayout
+        End_Procedure
+
+        Procedure SetTheTheme Integer eTheme
+            Integer iColor
+            Set peVisualTheme to eTheme
+            // If the color is changed it messes with the grid alternate background color.
+//            Get ComGetSpecialColor XPCOLOR_TOOLBAR_FACE to iColor    
+//            Broadcast Recursive Set Color of (Client_Id(phoMainPanel(ghoApplication))) to iColor
+//            Send ComRecalcLayout of ghoCommandBars
+        End_Procedure
+
+        Object oWorkspace_Toolbar is a cCJToolbar
+            Set pbDockNextTo to False
+            Set peStretched to stStretchShared
+            Set pbCloseable to False
+            Set pbCustomizable to False
+
+            Object oWorkspaceSelectorText_Menuitem is a cCJMenuItem
+                Set psCaption to CS_SelectWorkspaceText
+                Set psToolTip to "Select Workspace"
+                Set psDescription to "Select a Workspace .sws File"
+                Set psImage to "ActionOpenWorkspace.ico"
+                Set peControlType to xtpControlCustom
+                Set peControlStyle to xtpButtonIconAndCaption
+                Procedure OnExecute Variant vCommandBarControl
+                    Send Execute of (oWorkspaceOpen_Menuitem(ghoCommandBars))
+                End_Procedure
+            End_Object
+                           
+            Object oWorkspaceSelector_Menuitem is a cCJMenuItem
+                Set psToolTip to "Select Workspace"
+                Set psImage to "ActionOpenWorkspace.ico"
+                Set peControlType to xtpControlComboBox 
+                
+                Property Handle[] phoMenuItems
+                Property tWorkspace[] pWorkspaces
+
+                // Event for when an item is selected from the comboform
+                Procedure OnExecute Variant vCommandBarControl
+                    Handle hoCombo
+                    Integer iSelection iSize
+                    tWorkspace[] Workspaces  
+                    String sWorkspace sWorkspaceShort
+            
+                    // Create and bind proxy control
+                    Get CreateProxyControl vCommandBarControl to hoCombo  
+                    // Get the current selection
+                    Get ComListIndex of hoCombo to iSelection
+                    Decrement iSelection 
+                    If (iSelection = 0) Begin
+                        Send Execute of (oResetWorkspace_MenuItem(ghoCommandBars))
+                        Procedure_Return
+                    End
+                    
+                    Get pWorkspaces to Workspaces
+                    Move Workspaces[iSelection].sWorkspaceFull to sWorkspace
+                    If (sWorkspace <> CS_NoWorkspaceSelected) Begin
+                        Send UpdateWorkspaceSelectorDisplay of ghoApplication sWorkspace
+                        Set psToolTip     to CS_CurrentWorkspaceText
+                        Set psDescription to sWorkspace   
+                        Set psCaption     of (oWorkspaceSelectorText_Menuitem(ghoCommandBars)) to CS_CurrentWorkspaceText
+                        Set psDescription of (oWorkspaceSelectorText_Menuitem(ghoCommandBars)) to sWorkspace
+                        Move Workspaces[iSelection].sWorkspace to sWorkspaceShort  
+                        Get ComListCount of hoCombo to iSelection 
+                        Increment iSelection
+                        Send ComAddItem  of hoCombo sWorkspaceShort iSelection
+                        Set ComListIndex of hoCombo to iSelection
+                    End                             
+
+                    // Dispose of the proxy control
+                    Send Destroy of hoCombo
+                End_Procedure
+
+                Procedure OnCreateControl Handle hoCombo
+                    Forward Send OnCreateControl hoCombo
+            
+                    Send ComAddItem of hoCombo CS_NoWorkspaceSelected 1
+                    Set ComListIndex of hoCombo to 1
+                End_Procedure   
+                
+                Procedure FillComboList Handle hoCombo
+                    Integer iCount iSize iLength iCurrent iTxtEntentSize iLengthShort iTxtEntentSizeShort
+                    String[] asWorkspaces
+                    tWorkspace[] Workspaces
+                    String sWorkspace
+
+                    Get ReadWorkspaceKeysFromRegistry of ghoApplication to asWorkspaces  
+                    Move (InsertInArray(asWorkspaces, 0, CS_NoWorkspaceSelected)) to asWorkspaces
+                    Move (SizeOfArray(asWorkspaces)) to iSize
+                    Decrement iSize
+                    Send ComClear of hoCombo
+            
+                    for iCount from 0 to iSize
+                        Move asWorkspaces[iCount] to sWorkspace  
+                        Move sWorkspace to Workspaces[iCount].sWorkspaceFull
+                        Get ParseFileName sWorkspace to sWorkspace
+                        Move sWorkspace to Workspaces[iCount].sWorkspace
+                        Send ComAddItem of hoCombo Workspaces[iCount].sWorkspaceFull (iCount + 1)
+                        Get Text_Extent Workspaces[iCount].sWorkspaceFull to iLength
+                        If (iLength > iTxtEntentSize) Begin
+                            Move iLength to iTxtEntentSize
+                        End
+                        Get Text_Extent Workspaces[iCount].sWorkspace to iLengthShort
+                        If (iLengthShort > iTxtEntentSizeShort) Begin
+                            Move iLengthShort to iTxtEntentSizeShort
+                        End
+                    Loop
+                    
+                    Set pWorkspaces to Workspaces
+                    Move (Low(iTxtEntentSize) + 40) to iSize
+                    Set ComDropDownWidth of hoCombo to iSize  
+                    Set ComWidth         of hoCombo to (Low(iTxtEntentSizeShort) + 40)  
+                    Set ComListIndex     of hoCombo to 1
+                End_Procedure
+
+                Procedure DisplayWorkspaceItem String sWorkspace
+                    Handle hoCombo
+                    tWorkspace[] Workspaces   
+                    String sWorkspaceShort
+                    Integer iCount iSize iSelection
+                    Boolean bFound
+
+                    // Create and bind proxy control 
+                    If (IsComObjectCreated(Self)) Begin
+                        Get CreateFirstProxyControl to hoCombo   
+                        // Start by filling the combo with previously saved workspaces (if any),
+                        // in case the combo hasn't been activated before and a new workspace
+                        // is opened.    
+                        If (hoCombo > 0) Begin
+                            Send FillComboList hoCombo
+                            
+                            Get pWorkspaces to Workspaces  
+                            Move (SizeOfArray(Workspaces)) to iSize
+                            Decrement iSize    
+                            Move 0 to iSelection  
+                            Move "" to sWorkspaceShort
+                            
+                            for iCount from 0 to iSize
+                                Move (Lowercase(sWorkspace) = Lowercase(Workspaces[iCount].sWorkspace)   or ;
+                                Lowercase(sWorkspace) = Lowercase(Workspaces[iCount].sWorkspaceFull)) ;
+                                to bFound
+                                If (bFound = True) Begin
+                                    Move Workspaces[iCount].sWorkspace to sWorkspaceShort
+                                    Move iCount to iSelection 
+                                    Move iSize to iCount // We're done
+                                End
+                            Loop               
+                            
+                            // If found; add a new combo item at the end with the short version of the workspace (no path),
+                            // and point the combo to that item.
+                            If (iSelection <> 0) Begin
+                                Set psToolTip     to CS_CurrentWorkspaceText
+                                Set psDescription to sWorkspaceShort   
+                                Set psCaption     of (oWorkspaceSelectorText_Menuitem(ghoCommandBars)) to CS_CurrentWorkspaceText
+                                Set psDescription of (oWorkspaceSelectorText_Menuitem(ghoCommandBars)) to sWorkspace
+                                Set psDescription to sWorkspace
+                                Get ComListCount of hoCombo to iSelection 
+                                Increment iSelection
+                                Send ComAddItem  of hoCombo sWorkspaceShort iSelection
+                                Set ComListIndex of hoCombo to iSelection
+                            End
+                            Send Destroy of hoCombo    
+                        End
+                    End
+                
+                End_Procedure
+                
+                Procedure ResetComboForm
+                    Handle hoCombo
+                    // Create and bind proxy control 
+                    If (IsComObjectCreated(Self)) Begin
+                        Get CreateFirstProxyControl to hoCombo
+                        If (hoCombo <> 0) Begin
+                            Send ComClear of hoCombo
+                            Send ComAddItem of hoCombo CS_NoWorkspaceSelected 1
+                            Set ComListIndex of hoCombo to 1
+                            Set psCaption of (oWorkspaceSelectorText_Menuitem(ghoCommandBars)) to CS_SelectWorkspaceText
+                            Send Destroy of hoCombo
+                        End
+                    End
+                End_Procedure
+
+                Procedure OnCreateAction
+                    String sSWSFile sSourceFile
+
+                    Forward Send OnCreateAction
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Get psCurrentSourceFileName         of ghoApplication to sSourceFile
+                    Send UpdateWorkspaceSelectorDisplay of ghoApplication sSWSFile
+                    Send UpdateSourceFileNameDisplay    of ghoApplication sSourceFile
+                End_Procedure
+
+                // Note: We re-fill the combo each time it gets "clicked".
+                Procedure OnPopupInit Variant vCommandBarControl Handle hoCommandBarControls
+                    Handle hoCombo
+                    Forward Send OnPopupInit vCommandBarControl hoCommandBarControls
+                    Get CreateProxyControl vCommandBarControl to hoCombo
+                    Send FillComboList hoCombo
+                    Send Destroy of hoCombo
+                End_Procedure
+
+            End_Object
+
+            Object oWorkspaceOpen_Menuitem is a cCJMenuItem
+                Set psToolTip to "Open Workspace File"
+                Set psDescription to "Open a Workspace .sws File (Alt+W)"
+                Set psShortcut to "Alt+W"
+                Set pbControlCloseSubMenu to False
+                Set pbControlFlagNoMovable to True
+                Set psImage to "ActionOpen.ico"
+                Set peControlStyle to xtpButtonIcon
+
+                Procedure OnExecute Variant vCommandBarControl
+                    String sFileName
+                    Get SelectWorkspaceFile of ghoApplication to sFileName
+                    If (sFileName <> "") Begin
+                        Send UpdateWorkspaceSelectorDisplay of ghoApplication sFileName
+                        Send DisplayWorkspaceItem of (oWorkspaceSelector_Menuitem(ghoCommandBars)) sFileName
+                    End
+                End_Procedure
+                
+            End_Object
+            
+            Object oResetWorkspace_MenuItem is a cCJMenuItem
+                Set pbControlBeginGroup to True
+                Set pbActiveUpdate to True
+                Set psCaption to "Clear Workspace"
+                Set psToolTip to "Clear Workspace"
+                Set psDescription to "Clears the currently selected workspace, and everything else (Ctrl+F5)"
+                Set psImage to "ActionClear.ico"
+                Set peControlStyle to xtpButtonIconAndCaption
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Boolean bChanged
+                    Integer iRetval
+
+                    Broadcast Recursive Get pbShouldSave of (Client_Id(phoMainPanel(ghoApplication))) to bChanged
+                    If (bChanged = True) Begin
+                        Get YesNo_Box ("Changes exists! If you answer 'Yes' your changes will be lost. Are you sure?") "" MB_DEFBUTTON2 to iRetval
+                        If (iRetval <> MBR_Yes) Begin
+                            Procedure_Return
+                        End
+                    End
+                    Send UpdateWorkspaceSelectorDisplay of ghoApplication ""
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sSWSFile
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Function_Return (sSWSFile <> "")
+                End_Function
+
+            End_Object
+
+            Object oRemoveWorkspaceHistory_Menuitem is a cCJMenuItem
+                Set psCaption to "Remove History "
+                Set psToolTip to "Remove History"
+                Set psDescription to "Dialog for removing Workspace history items from the registry (Alt+H)"
+                Set peControlStyle to xtpButtonIcon
+                Set psImage to "RemoveWorkspaceHistory.ico"
+                Set pbControlBeginGroup to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Forward Send OnExecute vCommandBarControl
+                    Send DeleteWorkSpaceHistoryFromRegistry of ghoApplication
+                End_Procedure
+            End_Object
+
+        End_Object
+
+        Object oSourceFile_Toolbar is a cCJToolbar
+            Set pbEnableDocking to False
+            Set pbCloseable to False
+            Set pbCustomizable to False
+            Set pbShowExpandButton to False
+            Set peStretched to stStretchShared
+
+            Object oOpenFolderMenuItem is a cCJMenuItem
+                Set psCaption to CS_BrowseSourceFileTxt
+                Set psToolTip to "Select File"
+                Set psDescription to "Displays an Open File dialog to select a source file from (Alt+O)"
+                Set psImage to "ActionOpen.ico"
+                Set peControlStyle to xtpButtonIconAndCaption
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Forward Send OnExecute vCommandBarControl
+                    Send SelectSourceFile of ghoApplication
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    Boolean bState
+                    String sSWSFile
+
+                    Move False to bState
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Move (sSWSFile <> "") to bState
+
+                    Function_Return bState
+                End_Function
+
+            End_Object
+
+            Object oSourceFileText_MenuItem is a cCJMenuItem
+                Set peControlType to xtpControlCustom   
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Forward Send OnExecute vCommandBarControl
+                    Send Execute of oOpenFolderMenuItem
+                End_Procedure
+            End_Object
+
+            Object oResetSourceFile_MenuItem is a cCJMenuItem
+                Set psCaption to "Clear File"
+                Set pbControlBeginGroup to True
+                Set psToolTip to "Clear source"
+                Set psDescription to "Clears (closes) the currently opened source file without saving changes. (F5)"
+                Set pbActiveUpdate to True
+                Set psImage to "ActionClear.ico"
+                Set peControlStyle to xtpButtonIconAndCaption
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Boolean bChanged
+                    Integer iRetval
+                    Handle hoEditor
+
+                    Broadcast Recursive Get pbShouldSave of (Client_Id(phoMainPanel(ghoApplication))) to bChanged
+                    If (bChanged = True) Begin
+                        Get YesNo_Box "Changes exists! If you answer 'Yes' your changes will be lost. Are you sure?" to iRetval
+                        If (iRetval <> MBR_Yes) Begin
+                            Procedure_Return
+                        End
+                    End
+                    Send UpdateSourceFileNameDisplay of ghoApplication ""
+                    Get phoEditor of ghoApplication to hoEditor
+                    Send Request_Clear of hoEditor
+                    Set pbWorkspaceMode of ghoApplication to True                            
+                    Send Activate_oRefactorView of (Client_Id(phoMainPanel(ghoApplication))) 
+                    Send Activate of (phoRefactorView(ghoApplication))
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sFileName
+                    Get psCurrentSourceFileName of ghoApplication to sFileName
+                    Function_Return (sFileName <> "")
+                End_Function
+
+            End_Object
+
+            Object oOpenContainingFolder_MenuItem is a cCJMenuItem
+                Set psImage to "ActionOpenContainingFolder.ico"
+                Set psCaption to "Containing Folder"
+                Set psToolTip to "Open Folder"
+                Set psDescription to "Open Containing Folder"
+                Set pbActiveUpdate to True
+                Set pbControlBeginGroup to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    String sPath sFile
+                    Get psWorkspaceHomePath of ghoApplication to sPath
+                    Get psCurrentSourceFileName of ghoApplication to sFile
+                    
+                    // We want to have that file to be selected in Windows Explorer
+                    If (sFile <> "") Begin
+                        Move ("/select," * String(sFile)) to sPath
+                    End 
+                    Send vShellExecute "open" "explorer.exe" sPath ""
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sPath
+                    Get psWorkspaceHomePath of ghoApplication to sPath
+                    Function_Return (sPath <> "")
+                End_Function
+
+            End_Object
+
+        End_Object
+
+        Object oFileToolBar is a cCJToolbar
+            Set psTitle to "Process Toolbar"
+            Set peStretched to stStretchShared
+            Set pbCloseable to False
+            Set pbDockNextTo to False
+            Set pbCustomizable to False
+
+            Object oRadioSelectorText_Menuitem is a cCJMenuItem
+                Set psCaption to "Refactoring Mode:"
+                Set psToolTip to "Refactoring Mode"
+                Set psDescription to "Select if the Process should run on all source files that matches the 'File extensions' combo for selected workspace, or only on one selected file. (Toggle with Alt+F)"
+                Set pbControlBeginGroup to True
+                Set pbActiveUpdate to True
+                Set psImage to "Mode.ico"
+                Set peControlStyle to xtpButtonIconAndCaption
+
+                Procedure OnExecute Variant vCommandBarControl
+
+                    Forward Send OnExecute vCommandBarControl
+                    Send Execute of oWorkspaceRadio_MenuItem
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sSWSFile
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Function_Return (sSWSFile <> "")
+                End_Function
+
+            End_Object
+
+            Object oWorkspaceRadio_MenuItem is a cCJMenuItem
+                Set peControlType to xtpControlRadioButton
+                Set psCaption to "Full Workspace"
+                Set psToolTip to "Mode"
+                Set psDescription to "Select if the Process should run on all source files that matches the 'File extensions' combo for selected workspace. (Toggle with Alt+F)"
+                Set pbChecked to True
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Boolean bState
+
+                    Forward Send OnExecute vCommandBarControl
+                    Get pbChecked to bState
+                    Set pbChecked to (not(bState))
+                    Set pbWorkspaceMode of ghoApplication to (not(bState))
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sSWSFile
+
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Function_Return (sSWSFile <> "")
+                End_Function
+
+                Procedure OnCreateControl Handle hoObj
+                    String sSWSFile
+                    Forward Send OnCreateControl hoObj
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Set pbChecked to (sSWSFile <> "")
+                End_Procedure
+
+            End_Object
+
+            Object oFileRadioMenuItem is a cCJMenuItem
+                Set peControlType to xtpControlRadioButton
+                Set psCaption to "One &File"
+                Set psToolTip to "Mode"
+                Set psDescription to "Select if the Process should be run on one selected source file only (use the 'Open Source File:' to select) Toggles with Alt+F"
+                Set psShortcut to "Alt+F"
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Boolean bState
+
+                    Forward Send OnExecute vCommandBarControl
+                    Get pbChecked to bState
+                    Set pbChecked to (not(bState))
+                    Set pbWorkspaceMode of ghoApplication to bState
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sSWSFile
+
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Function_Return (sSWSFile <> "")
+                End_Function
+
+                Procedure OnCreateControl Handle hoObj
+                    String sSWSFile sSourceFile
+                    Forward Send OnCreateControl hoObj
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Get psCurrentSourceFileName of ghoApplication to sSourceFile
+                    Set pbChecked to (sSWSFile <> "")
+                    Set pbWorkspaceMode of ghoApplication to (sSourceFile = "")
+                End_Procedure
+
+            End_Object
+
+            Object oSave_ToolItem is a cCJSaveMenuItem
+                Set peControlStyle to xtpButtonIcon
+                Set pbControlBeginGroup to True
+                Set psCaption to "&Save"
+                Set psToolTip to "Save"
+                Set psDescription to "Save editor changes (Alt+S)"
+                Set psShortcut to "Alt+S"
+
+                Function IsEnabled Returns Boolean
+                    Boolean bChanged
+
+                    Move False to bChanged   
+                    Get Should_Save of (oSysfile_DD(phoRefactorView(ghoApplication))) to bChanged
+                    If (bChanged = False) Begin
+                        Get pbShouldSave of (phoEditorView(ghoApplication)) to bChanged
+                    End     
+                    Function_Return bChanged
+                End_Function
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send Request_Save of (Focus(Self))
+                End_Procedure
+
+            End_Object
+
+            Object oEditorUndo_MenuItem is a cCJMenuItem
+                Set psToolTip to "Undo"
+                Set psDescription to "Undo last editor action (Ctrl+Z)"
+                Set psImage to "ActionUndo.ico"
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Handle hoEditor
+                    Forward Send OnExecute vCommandBarControl
+
+                    Get phoEditor of ghoApplication to hoEditor
+                    Send CME_UndoAction of hoEditor
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    Boolean bOK bCanUndo
+                    Handle hoEditor
+
+                    Get phoEditor of ghoApplication to hoEditor
+                    Get Can_UndoAction of hoEditor  to bCanUndo
+
+                    Function_Return bCanUndo
+                End_Function
+
+            End_Object
+
+        End_Object
+
+        Object oTools_toolbar is a cCJToolbar
+            Set peStretched to stStretchShared
+            Set pbCloseable to False
+            Set pbCustomizable to False
+
+            Object oOpenLogFile_MenuItem is a cCJMenuItem
+                Set psToolTip to "View logfile"
+                Set psDescription to "View the logfile that is added to for each run (Alt+L)"
+                Set psImage to "OpenLogFile.ico"
+                Set peControlStyle to xtpButtonIcon
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    String sPath sLogFile
+                    Boolean bLogFileExists
+
+                    Forward Send OnExecute vCommandBarControl
+
+                    Get psHomePath of ghoApplication to sPath
+                    Get vFolderFormat sPath to sPath
+                    Move (sPath + CS_BackupFolder + CS_DirSeparator + CS_SummaryLogfileName) to sLogFile
+                    Get vFilePathExists sLogFile to bLogFileExists
+                    If (bLogFileExists = False) Begin
+                        Send Info_Box "Can't find the log file"
+                        Procedure_Return
+                    End
+
+                    Send ActivateLogFileDialog of (Client_Id(ghoCommandBars)) sLogFile
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sPath sLogFile
+                    Boolean bLogFileExists
+
+                    Get psHomePath of ghoApplication to sPath
+                    Get vFolderFormat sPath to sPath
+                    Move (sPath + CS_BackupFolder + CS_DirSeparator + CS_SummaryLogfileName) to sLogFile
+                    Get vFilePathExists sLogFile to bLogFileExists
+
+                    Function_Return (bLogFileExists = True)
+                End_Function
+
+            End_Object
+
+            Object oShowErrorLog_MenuItem is a cCJMenuItem
+                Set psToolTip to "View Error Log"
+                Set psDescription to "View the error log"
+                Set psImage to "ErrorLog.ico"
+                Set peControlStyle to xtpButtonIcon
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send Popup of (oStatusLog_dg(Client_Id(ghoCommandBars)))
+                End_Procedure
+
+            End_Object
+
+            Object oUnusedSourceFiles_MenuItem is a cCJMenuItem
+                Set psCaption to "Unused Source"
+                Set psDescription to "Show Unused Source Files dialog (Alt+I)"
+                Set psToolTip to "Unused Source Files"
+                Set psImage to "UnusedSourceFiles.ico"
+                Set peControlStyle to xtpButtonIcon
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    String sPath sFileName sLine sHomePath
+                    tUnusedSourceFiles[] asUnusedSource
+                    Boolean bLogFileExists bExists
+                    Integer iCh iCount
+
+                    Forward Send OnExecute vCommandBarControl
+
+                    Get psHomePath of ghoApplication to sHomePath
+                    Get vFolderFormat sHomePath to sHomePath
+                    Move (sHomePath + CS_BackupFolder + CS_DirSeparator + CS_UnusedSourceLogFile) to sFileName
+                    Get vFilePathExists sFileName to bLogFileExists
+                    If (bLogFileExists = False) Begin
+                        Send Info_Box "Can't find the log file"
+                        Procedure_Return
+                    End
+
+                    Send Cursor_Wait of Cursor_Control
+                    Direct_Input channel iCh sFileName
+                    While (SeqEof = False)
+                        Readln channel iCh sLine
+                        Get vFilePathExists sLine to bExists
+                        If (bExists = True) Begin
+                            Get ParseFolderName sLine to asUnusedSource[iCount].sPath
+                            Get ParseFileName   sLine to asUnusedSource[iCount].sFileName
+                            Increment iCount
+                        End
+                    Loop
+
+                    Send FillUnusedSourceFilesDialog of (Client_Id(ghoCommandBars)) asUnusedSource
+                    Send Cursor_Ready of Cursor_Control
+                    Send DisplayUnusedSourceFilesDialog of (Client_Id(ghoCommandBars))
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sPath sLogFile
+                    Boolean bLogFileExists
+
+                    Get psHomePath of ghoApplication to sPath
+                    Get vFolderFormat sPath to sPath
+                    Move (sPath + CS_BackupFolder + CS_DirSeparator + CS_UnusedSourceLogFile) to sLogFile
+                    Get vFilePathExists sLogFile to bLogFileExists
+
+                    Function_Return (bLogFileExists = True)
+                End_Function
+
+            End_Object
+
+            Object oUndoRefactoring_MenuItem is a cCJMenuItem
+                Set psToolTip to "Undo Backup Files"
+                Set psDescription to "Undo process of refactoring actions. Dialog that moves files from the 'DFRefactor Backup' subfolder structure to their original folders. (Alt+U)"
+                Set psImage to "UndoRefactoring.ico"
+                Set pbActiveUpdate to True
+                Set pbControlBeginGroup to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    tsSearchResult[] BackpupFileArray
+                    Forward Send OnExecute vCommandBarControl
+                    Send Cursor_Wait of Cursor_Control
+                    Get AllBackupFolderFiles of ghoApplication to BackpupFileArray
+                    Send Cursor_Ready of Cursor_Control
+                    Send FillBackupFilesDialog of (Client_Id(ghoCommandBars)) BackpupFileArray
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sSourcePath sBackupPath
+                    String sBackupName sSourceFilename
+                    Boolean bWorkspaceMode bOK
+
+                    Move False to bOK
+                    Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
+                    Get psCurrentSourceFileName of ghoApplication to sSourceFilename
+                    Get IsBackupFile of ghoApplication sSourceFilename to sBackupName
+                    If (bWorkspaceMode = True) Begin
+                        Get SourceFilePath of ghoApplication to sSourcePath
+                        Get HomeBackupFilePath of ghoApplication to sBackupPath
+                        Move (sSourcePath <> "" and sBackupPath <> "") to bOK
+                    End
+                    Else Begin
+                        Move (sSourceFilename <> "" and sBackupName <> "") to bOK
+                    End
+
+                    Function_Return bOK
+                End_Function
+
+            End_Object
+
+            Object oCompare_MenuItem is a cCJMenuItem
+                Set psCaption to "Co&mpare"
+                Set psToolTip to "Compare"
+                Set psDescription to "Compare file changes after running refactoring function(s) (Alt+M)"
+                Set psImage to "Compare.ico"
+                Set peControlStyle to xtpButtonIcon
+                Set pbActiveUpdate to True
+                Set pbControlBeginGroup to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    String sCompareApp
+                    Boolean bWorkspaceMode
+
+                    Forward Send OnExecute vCommandBarControl
+
+                    Get psFileCompareApp of ghoApplication to sCompareApp
+                    Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
+                    If (bWorkspaceMode = True) Begin
+                        Send ComparePaths of ghoApplication sCompareApp
+                    End
+                    Else Begin
+                        Send CompareFiles of ghoApplication sCompareApp
+                    End
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sSourcePath sBackupPath
+                    String sBackupName sSourceFilename sCompareApp
+                    Boolean bWorkspaceMode bOK
+
+                    Move False to bOK
+                    Get psFileCompareApp of ghoApplication to sCompareApp
+                    If (sCompareApp <> "") Begin
+                        Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
+                        Get psCurrentSourceFileName of ghoApplication to sSourceFilename
+                        Get IsBackupFile of ghoApplication sSourceFilename to sBackupName
+                        If (bWorkspaceMode = True) Begin
+                            Get SourceFilePath of ghoApplication to sSourcePath
+                            Get HomeBackupFilePath of ghoApplication to sBackupPath
+                            Move (sSourcePath <> "" and sBackupPath <> "") to bOK
+                        End
+                        Else Begin
+                            Move (sSourceFilename <> "" and sBackupName <> "") to bOK
+                        End
+                    End
+
+                    Function_Return bOK
+                End_Function
+
+            End_Object
+
+            Object oCodeExplorer_ToolbarButton is a cCJMenuItem
+                Set psCaption to "DataFlex Source &Explorer"
+                Set psToolTip to "DataFlex Source Explorer"
+                Set psDescription to "Run Starzen's DataFlex Source Explorer (Alt+E)"
+                Set psImage to "DataFlexSourceExplorer.ico"
+                Set psShortcut to "Alt+E"
+                Set peControlStyle to xtpButtonIcon
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    String sProgram sSWSPath
+                    Forward Send OnExecute vCommandBarControl
+
+                    Get ReadString of ghoApplication "Settings" "StarZenSourceExplorer" "" to sProgram
+                    If (sProgram = "") Begin
+                        Send Info_Box "You first need to setup the path to StarZen's Source Code Explorer program with 'Program Settings'"
+                        Procedure_Return
+                    End
+                    Get psSWSFile of ghoApplication to sSWSPath
+                    If (sSWSPath <> "") Begin
+                        Move ("-ws" * '"' + sSWSPath + '"') to sSWSPath
+                    End
+                    RunProgram Background sProgram sSWSPath
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sProgram
+                    Get psStarZenSourceExplorer of ghoApplication to sProgram
+                    Function_Return (sProgram <> "")
+                End_Function
+
+            End_Object
+
+        End_Object
+
+        Object oSettings_toolbar is a cCJToolbar
+            Set peStretched to stStretchShared
+            Set pbCloseable to False
+            Set pbCustomizable to False
+
+            Object oSettings_Toolbarbutton is a cCJMenuItem
+                Set psToolTip to "Program Settings"
+                Set psCaption to "Se&ttings"
+                Set psDescription to "Program Settings (Alt+T)"
+                Set psImage to "Settings.ico"
+                Set peControlStyle to xtpButtonIcon
+                Set pbControlBeginGroup to True
+                Set psShortcut to "Alt+T"
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Forward Send OnExecute vCommandBarControl
+                    Send Popup of (oProgramSetup_dg(Client_Id(ghoCommandBars)))
+                    Broadcast Recursive Send DoChangeFontSize of (Client_Id(ghoCommandBars))
+                End_Procedure
+
+            End_Object
+
+            Object oScintillaEditorSettings_Mentuitem is a cCJMenuItem
+                Set psToolTip to "Editor Settings"
+                Set psCaption to "E&ditor Settings"
+                Set psDescription to "Configure the editor (Alt+D)"
+                Set psImage to "EditorSettings.ico"
+                Set peControlStyle to xtpButtonIcon
+                Set psShortcut to "Alt+D"
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Forward Send OnExecute vCommandBarControl
+                    Send Popup of (oScintillaParameters_dg(Client_Id(ghoCommandBars)))
+                End_Procedure
+
+            End_Object
+
+            Object oThemeItem is a cCJMenuItem
+                Set peControlType to xtpControlComboBox
+                Set psCaption to "Theme:"
+                Set pbControlBeginGroup to True
+                Set psToolTip to "Theme"
+                Set psDescription to "Select a theme from the drop down list"
+                Set peControlStyle to xtpButtonIconAndCaption
+//                Set pbVisible to False
+
+                Property tCJComboBoxContent[] pCJComboBoxContentArray
+
+                Procedure OnCreateControl Handle hoObj
+                    Integer iItem eTheme
+                    Set ComWidth of hoObj to 235
+                    Send FillComboList hoObj
+                    Get peVisualTheme to eTheme
+                    Get FindDataItem hoObj eTheme to iItem
+                    Set ComListIndex of hoObj to (If(iItem, iItem, 1))
+                    Set ComAutoComplete of hoObj to True
+                End_Procedure
+
+                Function FindDataItem Handle hoCombo Integer eVal Returns Integer
+                    Integer iCount i eTheme
+                    Get ComListCount of hoCombo to iCount
+                    For i From 1 to iCount
+                        Get ComItemData  of hoCombo i to eTheme
+                        If (eTheme = eVal) Begin
+                            Function_Return i
+                        End
+                    Loop
+                    Function_Return 0
+                End_Function
+
+                Procedure AddTheme Handle hoCombo String sText Integer eTheme
+                    tCJComboBoxContent[] CJComboBoxContentArray
+                    Integer iCount    
+                    Get pCJComboBoxContentArray to CJComboBoxContentArray
+                    Move (SizeOfArray(CJComboBoxContentArray)) to iCount
+                    Move (" " + String(sText)) to CJComboBoxContentArray[iCount].sText
+                    Move eTheme to CJComboBoxContentArray[iCount].eTheme
+                    Set pCJComboBoxContentArray to CJComboBoxContentArray
+                End_Procedure
+
+                // First sorts the array alphabetically, then adds items
+                // to the CodeJock combo.
+                Procedure AddAllThemesToControl Handle hoCombo
+                    tCJComboBoxContent[] CJComboBoxContentArray
+                    Integer iSize iCount iItems
+
+                    Get pCJComboBoxContentArray to CJComboBoxContentArray
+                    Move (SortArray(CJComboBoxContentArray)) to CJComboBoxContentArray
+                    Move (SizeOfArray(CJComboBoxContentArray)) to iSize
+                    Decrement iSize
+                    For iCount from 0 to iSize
+                        Get ComListCount of hoCombo to iItems
+                        Increment iItems
+                        Send ComAddItem of hoCombo CJComboBoxContentArray[iCount].sText iItems
+                        Set ComItemData of hoCombo iItems to CJComboBoxContentArray[iCount].eTheme
+                    Loop
+
+                    Set pCJComboBoxContentArray to CJComboBoxContentArray
+                End_Procedure
+
+                Procedure FillComboList Handle hoCombo
+                    Send ComClear     of hoCombo
+
+                    Send AddTheme hoCombo "xtpThemeOffice2016Access"        xtpThemeOffice2016Access
+                    Send AddTheme hoCombo "xtpThemeOffice2016Excel"         xtpThemeOffice2016Excel
+                    Send AddTheme hoCombo "xtpThemeOffice2016OneNote"       xtpThemeOffice2016OneNote
+                    Send AddTheme hoCombo "xtpThemeOffice2016Outlook"       xtpThemeOffice2016Outlook
+                    Send AddTheme hoCombo "xtpThemeOffice2016PowerPoint"    xtpThemeOffice2016PowerPoint
+                    Send AddTheme hoCombo "xtpThemeOffice2016Publisher"     xtpThemeOffice2016Publisher
+                    Send AddTheme hoCombo "xtpThemeOffice2016Word"          xtpThemeOffice2016Word
+
+                    Send AddTheme hoCombo "xtpThemeVisualStudio2015Light"   xtpThemeVisualStudio2015Light
+                    Send AddTheme hoCombo "xtpThemeOffice2007Aqua"          xtpThemeOffice2007Aqua
+                    Send AddTheme hoCombo "xtpThemeOffice2007Blue"          xtpThemeOffice2007Blue
+                    Send AddTheme hoCombo "xtpThemeOffice2007Black"         xtpThemeOffice2007Black
+                    Send AddTheme hoCombo "xtpThemeOffice2007Silver"        xtpThemeOffice2007Silver
+
+                    Send AddTheme hoCombo "xtpThemeOffice2010"              xtpThemeOffice2010
+                    Send AddTheme hoCombo "xtpThemeOffice2010Blue"          xtpThemeOffice2010Blue
+                    Send AddTheme hoCombo "xtpThemeOffice2010Black"         xtpThemeOffice2010Black
+                    Send AddTheme hoCombo "xtpThemeOffice2010Silver"        xtpThemeOffice2010Silver
+
+                    Send AddTheme hoCombo "xtpThemeOffice2013Word"          xtpThemeOffice2013Word
+                    Send AddTheme hoCombo "xtpThemeOffice2013Outlook"       xtpThemeOffice2013Outlook
+                    Send AddTheme hoCombo "xtpThemeOffice2013Excel"         xtpThemeOffice2013Excel
+                    Send AddTheme hoCombo "xtpThemeOffice2013PowerPoint"    xtpThemeOffice2013PowerPoint
+                    Send AddTheme hoCombo "xtpThemeOffice2013Access"        xtpThemeOffice2013Access
+                    Send AddTheme hoCombo "xtpThemeOffice2013Publisher"     xtpThemeOffice2013Publisher
+                    Send AddTheme hoCombo "xtpThemeOffice2013OneNote"       xtpThemeOffice2013OneNote
+
+                    Send AddTheme hoCombo "xtpThemeWindows7"                xtpThemeWindows7
+                    Send AddTheme hoCombo "xtpThemeVisualStudio2015Blue"    xtpThemeVisualStudio2015Blue
+
+                    Send AddTheme hoCombo "xtpThemeOffice2003"              xtpThemeOffice2003
+                    Send AddTheme hoCombo "xtpThemeWhidbey"                 xtpThemeWhidbey
+                    Send AddTheme hoCombo "xtpThemeResource"                xtpThemeResource
+                    Send AddTheme hoCombo "xtpThemeVisualStudio2008"        xtpThemeVisualStudio2008
+                    Send AddTheme hoCombo "xtpThemeVisualStudio6"           xtpThemeVisualStudio6
+                    Send AddTheme hoCombo "xtpThemeVisualStudio2010"        xtpThemeVisualStudio2010
+                    Send AddTheme hoCombo "xtpThemeOffice2013"              xtpThemeOffice2013
+                    Send AddTheme hoCombo "xtpThemeVisualStudio2012"        xtpThemeVisualStudio2012
+                    Send AddTheme hoCombo "xtpThemeVisualStudio2012Light"   xtpThemeVisualStudio2012Light
+                    Send AddTheme hoCombo "xtpThemeVisualStudio2012Dark"    xtpThemeVisualStudio2012Dark
+
+                    Send AddAllThemesToControl hoCombo
+                End_Procedure
+
+                Function CurrentTheme Handle vCommandBarControl Returns Integer
+                    Handle hMessage hoCombo
+                    Integer iIndex
+
+                    Move 0 to hMessage
+                    Get CreateProxyControl vCommandBarControl to hoCombo
+                    Get ComListIndex of hoCombo to iIndex
+                    If (iIndex > 0) Begin
+                        // Get the ItemData for the selected item and send that message
+                        Get ComItemData of hoCombo iIndex to hMessage
+                    End
+                    Send Destroy of hoCombo
+                    Function_Return hMessage
+                End_Function
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Integer eTheme
+                    Integer iColor
+
+                    Get CurrentTheme vCommandBarControl to eTheme
+                    Set peVisualTheme of ghoCommandBars to eTheme
+                    Send WriteDword of ghoApplication CS_Settings CS_ThemeKeyWord eTheme
+                    Send ComRecalcLayout of ghoCommandBars
+
+                    // Sets the background color for all application objects to the selected theme color:
+//                    Get ComGetSpecialColor of ghoCommandBars XPCOLOR_TOOLBAR_FACE to iColor
+//                    Broadcast Recursive Set Color of (Client_Id(phoMainPanel(ghoApplication))) to iColor
+                End_Procedure 
+                
+            End_Object
+
+        End_Object
+
+        Object oExit_toolbar is a cCJToolbar
+            Set peStretched to stStretchShared
+            Set pbCloseable to False
+            Set pbCustomizable to False
+
+            //            Object oCaptureViewMenuItem is a cCJMenuItem
+            //                Set psCaption to "Take shapshot"
+            //                Set psToolTip to "Take shapshot"
+            //                Set psDescription to "Take a snapshot image of the current view/panel. (F10)"
+            //                Set psImage to "Camera.ico"
+            //
+            //                Procedure OnExecute Variant vCommandBarControl
+            //                    Send TakeSnapshot False
+            //                End_Procedure
+            //
+            ////                Function IsEnabled Returns Boolean
+            ////                    Function_Return
+            ////                End_Function
+            //            End_Object
+            //
+            Object oAbout_MenuItem is a cCJMenuItem
+                Set psCaption to "About"
+                Set psToolTip to "About"
+                Set psDescription to "About the program"
+                Set psImage to "ActionAbout.ico"
+                Set pbControlBeginGroup to True
+                Procedure OnExecute Variant vCommandBarControl
+                    Forward Send OnExecute vCommandBarControl
+                    Send Activate_About of (Client_Id(ghoCommandBars))
+                End_Procedure
+            End_Object
+
+            Object oHelpMenuItem is a cCJHelpMenuItem
+                Set peControlType to xtpControlSplitButtonPopup
+                Set psToolTip to "Help"
+                Set psDescription to "Help about the program (F1)"
+
+                Object oHelpMenuItemLocal is a cCJHelpMenuItem
+                    Set psCaption to "Local HTML Help"
+                End_Object
+
+                Object oHelpMenuItemInternetBrowser is a cCJMenuItem
+                    Set psCaption to "Online HTML Help"
+                    Set psImage to "ActionHelpInternet.ico"
+                    Procedure OnExecute Variant vCommandBarControl
+                        Runprogram Shell Background "https://www.rdctools.com/HTMLHelpDFRefactor/DFRefactor - Automated Code Refactoring for DataFlex.html"
+                    End_Procedure
+
+                End_Object
+
+                Object oCheckforUpdatesMenuItem is a cCJMenuItem
+                    Set psCaption to "Check for Updates"
+                    Set psDescription to "Check for Updates..."
+                    Set psImage to "InternetUpdate.ico"
+                    Set pbControlBeginGroup to True
+                    
+                    Procedure OnExecute Variant vCommandBarControl
+                        String sPath sUpdateProgram sParam sFolder
+                        
+                        // The updater.exe program is located in the home folder:
+                        Get psHome of (phoWorkspace(ghoApplication)) to sPath
+                        Get vFolderFormat sPath to sPath
+                        Move "updater.exe" to sUpdateProgram
+                        Move "/checknow"   to sParam
+                        Runprogram Shell Wait ('"' + sPath + sUpdateProgram + '"') sParam
+                    End_Procedure
+
+                    Function RemoveFolderDelimiter String sPath Returns String
+                        String sDirSep
+                        Move (SysConf(SYSCONF_DIR_SEPARATOR)) to sDirSep
+                        Move (Trim(sPath)) to sPath
+                        If (Right(sPath, 1) = sDirSep) Begin
+                            Move (Left(sPath, (Length(sPath) -1))) to sPath
+                        End
+                        Function_Return sPath
+                    End_Function
+
+                End_Object
+                
+            End_Object
+
+            Object oExitMenuItem is a cCJExitMenuItem
+                Set psImage to "ActionExit.ico"
+                Set psToolTip to "Exit"
+                Set psDescription to "Exit the program (Alt+F4)"
+                Set pbControlBeginGroup to True
+            End_Object
+
+        End_Object
+
+        Object oStatusBar is a cCJStatusBar
+            Set StatusBar_Id to Self
+
+            Object oStatusPane1 is a cCJStatusBarPane
+                Set piID to sbpIDIdlePane
+                Set pbStyleStretch to True
+            End_Object
+
+            Object oStatusPane2 is a cCJStatusBarPane
+                Set phoViewPane to Self
+                Set pbStyleStretch to True
+            End_Object
+
+            Object oStatusPane3 is a cCJStatusBarPane
+                Set psText to "Current Action:"
+            End_Object
+
+            Object oNumberOfLines_StatusbarPane is a cCJStatusBarPane
+                Set psText to "No of Lines:"
+            End_Object
+
+            Object oNumberOfCharacters_StatusbarPane is a cCJStatusBarPane
+                Set psText to "Characters:"
+            End_Object
+
+            Procedure Set NumberOfEditorLines String sText
+                Move (FormatValue(sText, ",###")) to sText
+                Set psText of oNumberOfLines_StatusbarPane to ("No of Lines:" * String(sText))
+            End_Procedure
+
+            Procedure Set NumberOfEditorCharacters String sText
+                Move (FormatValue(sText, ",###")) to sText
+                Set psText of oNumberOfCharacters_StatusbarPane to ("Characters:" * String(sText))
+            End_Procedure
+
+            Procedure Set ActionText String sText
+                Handle hoViewPane
+                Get phoViewPane to hoViewPane
+                Set psText of hoViewPane to sText
+            End_Procedure
+
+        End_Object
+
+    End_Object
+
+    Object oClientArea is a ClientArea
+
+        Use RefactorView.vw
+        Use EditorView.vw
+
+        Use oEditorProperties.pkg
+        Use ProgramSetup.dg
+        Use ScintillaParameters.dg
+        Use DeleteWorkspaceHistory.dg
+        Use BackupFiles.dg
+        Use UnusedSourceFiles.dg
+        Use LogFileDialog.dg   
+        Use StatusLog.dg
+        Use StdAbout.pkg
+
+        Procedure Activate_About
+            Send DoAbout "" "" "" ;
+            "Authors: Nils Svedmyr, Wil van Antwerpen, Sean Bamforth, Allan Kim Eriksen, Chris Spencer, Bob Worsley and Marcia Booth" ;
+            "DFRefactor72x72.bmp" "http://www.rdctools.com" "http://vdf-guidance.com"
+        End_Procedure
+
+        // We doesn't  allow closing of a view - it just doesn't make
+        // sense with a tabbed interface.
+        Function Exit_Loss_Confirmation For cUIObject Returns Integer
+            Function_Return 1
+        End_Function
+
+        Function Verify_Exit_Application Returns Integer
+            Integer iFail
+            Boolean bChanged
+
+            Broadcast Recursive Get pbShouldSave to bChanged
+            If (bChanged = True) Begin
+                Get YesNoCancel_Box "Changes exists! Do you want to save changes?" "" MB_DEFBUTTON3 to iFail
+                If (iFail = MBR_Yes) Begin
+                    Send Execute of (oSave_ToolItem(ghoCommandBars))
+                    Move 0 to iFail
+                End
+                If (iFail = MBR_No) Begin
+                    Move 0 to iFail
+                End
+                If (iFail = MBR_Cancel) Begin
+                    Move 1 to iFail
+                End
+            End
+            Function_Return iFail
+        End_Function
+
+    End_Object
+
+    Procedure ActivateWorkspaceDialog
+        Send Execute of (oWorkspaceOpen_Menuitem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateFileRadioButton
+        Send Execute of (oFileRadioMenuItem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateCompare
+        Send Execute of (oCompare_MenuItem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateBrowseDialog
+        Send Execute of (oOpenFolderMenuItem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateProcess
+        Send KeyAction of (oExecute_btn(oRefactorView(client_id(phoMainPanel(ghoApplication)))))
+    End_Procedure
+
+    Procedure ActivateSave
+        Send Execute of (oSave_ToolItem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateClear
+        Send Execute of (oResetSourceFile_MenuItem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateClearAll
+        Send Execute of (oResetWorkspace_MenuItem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateSourceExplorer
+        Send Execute of (oCodeExplorer_ToolbarButton(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateSettings
+        Send Execute of (oSettings_Toolbarbutton(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateEditorSettings
+        Send Execute of (oScintillaEditorSettings_Mentuitem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateHistoryDialog
+        Send Execute of (oRemoveWorkspaceHistory_Menuitem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateLogFile
+        Send Execute of (oOpenLogFile_MenuItem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateUnusedSourceFiles
+        Send Execute of (oUnusedSourceFiles_MenuItem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateUndoRefactoringDialog
+        Send Execute of (oUndoRefactoring_MenuItem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateShapshot
+        //        Send TakeSnapshot False
+    End_Procedure
+
+    Procedure Switch_Prior_View
+        Send Switch_Prior_View of (ClientAreaObject (ghoCommandBars))
+    End_Procedure
+
+    Procedure Switch_Next_View
+        Send Switch_Next_View of (ClientAreaObject (ghoCommandBars))
+    End_Procedure
+
+    Procedure ToggleActionButton
+        Integer iActiveView
+        Handle  hoView
+        Get piActiveView of ghoApplication to iActiveView
+        If (iActiveView = CI_CleanupSource) Begin
+            Get phoActiveView of ghoApplication to hoView
+            Send ToggleActionButton of hoView
+        End
+    End_Procedure 
+    
+    On_Key Key_Alt+Key_D   Send ActivateEditorSettings
+    On_Key Key_Ctrl+Key_D  Send ActivateEditorSettings
+    On_Key Key_Ctrl+Key_E  Send ActivateSourceExplorer
+    On_Key Key_Alt+Key_E   Send ActivateSourceExplorer
+    On_Key Key_Ctrl+Key_F  Send ActivateFileRadioButton
+    On_Key Key_Alt+Key_F   Send ActivateFileRadioButton
+    On_Key Key_Alt+Key_G   Send ToggleActionButton
+    On_Key Key_Ctrl+Key_G  Send ToggleActionButton
+    On_Key Key_Alt+Key_H   Send ActivateHistoryDialog
+    On_Key Key_Alt+Key_I   Send ActivateUnusedSourceFiles
+    On_Key Key_Alt+Key_L   Send ActivateLogFile
+    On_Key Key_Ctrl+Key_M  Send ActivateCompare
+    On_Key Key_Alt+Key_M   Send ActivateCompare
+    On_Key Key_Ctrl+Key_N  Send ActivateClear
+    On_Key Key_Alt+Key_N   Send ActivateClear
+    On_Key Key_Ctrl+Key_O  Send ActivateBrowseDialog
+    On_Key Key_Alt+Key_O   Send ActivateBrowseDialog
+    On_Key Key_Ctrl+Key_P  Send ActivateProcess
+    On_Key Key_Alt+Key_P   Send ActivateProcess
+    On_Key Key_Ctrl+Key_R  Send ActivateProcess
+    On_Key Key_Alt+Key_R   Send ActivateProcess
+    On_Key Key_Ctrl+Key_S  Send ActivateSave
+    On_Key Key_Alt+Key_S   Send ActivateSave
+    On_Key Key_Ctrl+Key_T  Send ActivateSettings
+    On_Key Key_Alt+Key_T   Send ActivateSettings
+    On_Key Key_Alt+Key_U   Send ActivateUndoRefactoringDialog
+    On_Key Key_Ctrl+Key_W  Send ActivateWorkspaceDialog
+    On_Key Key_Alt+Key_W   Send ActivateWorkspaceDialog
+    On_Key Key_Alt+Key_X   Send Exit_Application
+    On_Key Key_F2          Send ActivateSave
+    On_Key Key_Ctrl+Key_F4 Send ActivateBrowseDialog
+    On_Key Key_F5          Send ActivateClear
+    On_Key Key_F10         Send ActivateShapshot
+    On_Key Key_Ctrl+Key_F5 Send ActivateClearAll
+
+    // On_Key constant for Ctrl+Shift+Tab
+    #IFNDEF C_CtrlShiftTab
+    Define C_CtrlShiftTab for 7170
+    #ENDIF    
+
+    On_Key C_CtrlShiftTab   Send Switch_Prior_View
+    On_Key Key_Ctrl+Key_Tab Send Switch_Next_View  
+End_Object
+
+Procedure OnStartup
+    String sSWSFile
+    Get psSWSFile of ghoApplication to sSWSFile
+    If (sSWSFile <> "") Begin
+        Send DisplayWorkspaceItem of (oWorkspaceSelector_Menuitem(ghoCommandBars)) sSWSFile
+    End
+    Send Activate_oRefactorView of (ClientAreaObject(ghoCommandBars))
+End_Procedure      
+Send OnStartup
+
+Start_UI

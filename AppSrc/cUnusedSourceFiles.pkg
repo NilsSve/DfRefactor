@@ -1,0 +1,375 @@
+// Original work by Sean Bamforth, APG.
+// Adapted to this project by Nils Svedmyr, RDC Tools International
+//
+Use Batchdd.pkg
+Use cApplication.pkg
+Use vWin32fh.pkg
+
+Struct tUnusedSourceFiles
+    String sUsedPackageName
+    String sFileName
+    String sPath
+    Integer iRow
+End_Struct
+
+Use RefactorFunctionConstants.inc
+//Use UnusedSourceFiles.dg
+
+#IFNDEF ghoFileSystem
+Global_Variable Integer ghoFileSystem
+#ENDIF
+
+Class cUnusedSourceFiles is a BusinessProcess
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        
+        // The path and psFileFilter needs to be set to the current workspace before using this class
+        Property String psHomePath (psHome(phoWorkspace(ghoApplication)))
+        Property String psFileFilter "*.src;*.vw;*.sl;*.dg;*.rv;*.bp;*.pkg;*.wo;*.dd;*.inc"
+        
+        Property String[] pasAllFolders
+        Property Integer piNoOfUnusedSourceFiles 0
+        Property Boolean pbOK True
+        //
+        // Return array:
+        Property String[] pasUnusedSource
+    End_Procedure
+
+    Function AllSourceFiles String[] asFolders String sFileFilter Returns tUnusedSourceFiles[]
+        String[] asFileFilters
+        String[] asSearch
+        tUnusedSourceFiles[] asAllSource asSource asEmpty
+        Integer iFilterCount iFilterSize iFolderCount iFolderSize iSize iCount iSearchCount iSearchSize iItem
+        String sFolder sFilename
+        tsSearchResult[] SearchResult
+
+        Move (StrSplitToArray(sFileFilter, ";")) to asFileFilters
+
+        Move (SizeOfArray(asFolders)) to iFolderSize
+        Decrement iFolderSize
+        Move (SizeOfArray(asFileFilters)) to iFilterSize
+        Decrement iFilterSize
+
+        For iFolderCount From 0 to iFolderSize
+            For iFilterCount From 0 to iFilterSize
+                Move asFolders[iFolderCount] to sFolder
+                Get vFolderFormat sFolder to sFolder
+                Move (Lowercase(sFolder) + asFileFilters[iFilterCount]) to asSearch[SizeOfArray(asSearch)]
+            Loop
+        Loop
+
+        Move (SizeOfArray(asSearch)) to iSize
+        Decrement iSize
+        For iCount From 0 to iSize
+            Move asSearch[iCount]  to sFolder
+            Get ParseFolderName sFolder to sFolder
+            Get vFolderFormat   sFolder to sFolder
+
+            Move 0 to iItem
+            Move asEmpty to asSource
+            Get FileSearch of ghoFileSystem asSearch[iCount] DIRMODE_FILES_ONLY False to SearchResult
+            Move (SizeOfArray(SearchResult)) to iSearchSize
+            Decrement iSearchSize
+            For iSearchCount from 0 to iSearchSize
+                Move sFolder                                to asSource[iItem].sPath
+                Move (SearchResult[iSearchCount].sFilename) to asSource[iItem].sFileName
+                Increment iItem
+            Loop
+
+            Move (AppendArray(asSource, asAllSource)) to asAllSource
+        Loop
+
+        Function_Return asAllSource
+    End_Function
+
+    Function IsUseOrIncludeLine String sInp Returns Boolean
+        Boolean bOK
+
+        Move False to bOK
+        Move (Lowercase(sInp)) to sInp
+        Get StripComment sInp  to sInp
+        Move (Trim(sInp)) to sInp
+
+        If ((Pos("use ", sInp)) = 1) Begin
+            Move True to bOK
+        End
+        If ((Pos("#include ", sInp)) = 1) Begin
+            Move True to bOK
+        End                   
+        // Hardcoded exception for the LoginEncryption.pkg file(!). It should never be removed.
+        If (lowercase(sInp) contains "loginencryption.pkg") Begin
+            Move False to bOK
+        End
+        Function_Return bOK
+    End_Function
+
+    Function StripComment String sLine Returns String
+        Integer iPos
+
+        Move (Pos(CS_CommentSymbol, sLine)) to iPos
+        If (iPos > 0) Begin
+            Move (Left(sLine, iPos - 1)) to sLine
+        End
+        Function_Return sLine
+    End_Function
+
+    // Note: The function adds a ".pkg" to the package name if no extension has been specifieds in the source code.
+    Function ExtractPackageName String sLine Returns String
+        Integer iPos
+
+        Move (Trim(Lowercase(sLine))) to sLine
+        Get StripComment sLine to sLine
+        Move (Pos("#include ", sLine)) to iPos
+        If (iPos = 1) Begin
+            Move (Mid(sLine, CI_EOL, (iPos + 8))) to sLine
+        End
+        Move (Pos("use ", sLine)) to iPos
+        If (iPos = 1) Begin
+            Move (Mid(sLine, CI_EOL, (iPos + 3))) to sLine
+        End
+        Move (Trim(sLine)) to sLine
+        If (not(sLine contains ".")) Begin
+            Move (sLine + ".pkg") to sLine
+        End
+
+        Move (Pos(CS_DirSeparator, sLine)) to iPos
+        If (iPos <> 0) Begin
+            Get ParseFileName sLine to sLine
+        End
+
+        Function_Return sLine
+    End_Function
+
+    Function ReadSourceFile String sFilename Returns String[]
+        Integer iCh iFileSize iCount
+        String[] asFile
+
+        Get Seq_New_Channel to iCh
+        If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin 
+            Error "No Channel Available for Process: Procedure 'ReadSourceFile (cUnusedSourceFiles)'"            
+            Function_Return asFile
+        End
+
+        Move 0 to iCount
+        Get vWin32_APIFileSize sFilename to iFileSize
+        Move (ResizeArray(asFile, iFileSize)) to asFile
+
+        Direct_Input channel iCh ("binary:" + sFilename)
+        While (SeqEof = False)
+            Readln channel iCh asFile[iCount]
+            Increment iCount
+        Loop
+        Close_Input channel iCh
+        Send Seq_Release_Channel iCh
+        Move (ResizeArray(asFile, iCount)) to asFile
+
+        Function_Return asFile
+    End_Function
+
+    Function SingleFileUsedPackages String sFullFilename Returns tUnusedSourceFiles[]
+        tUnusedSourceFiles[] asRetVal
+        String[] asFile
+        String sLine sPath sFilename sPackageName sSourceLine
+        Integer iItem iCount iSize
+        Boolean bOK
+
+        Move 0 to iItem
+        Get ReadSourceFile sFullFilename to asFile
+        Move (SizeOfArray(asFile)) to iSize
+        If (iSize = 0) Begin
+            Function_Return asRetVal
+        End
+
+        Get ParseFolderName sFullFilename  to sPath
+        Get ParseFileName   sFullFilename  to sFilename
+        Set Title_Text of ghoStatusPanel   to ("Scanning for 'Use':" * String(sPath))
+        Set Message_Text of ghoStatusPanel to ("in file:" * String(sFilename))
+        Decrement iSize
+        For iCount from 0 to iSize
+            Move asFile[iCount] to sLine
+            Move (Lowercase(sLine)) to sLine
+            Move (Trim(sLine)) to sSourceLine
+            If (sSourceLine <> "") Begin
+                Get IsUseOrIncludeLine sLine to bOK
+                If (bOK = True) Begin
+                    Get ExtractPackageName sLine to sPackageName
+                    Move sPackageName to asRetVal[iItem].sUsedPackageName
+                    Move sPath        to asRetVal[iItem].sPath
+                    Move sFilename    to asRetVal[iItem].sFileName
+                    Move iCount       to asRetVal[iItem].iRow
+                    Increment iItem
+                End
+            End
+        Loop
+
+        Set Title_Text   of ghoStatusPanel to ""
+        Set Message_Text of ghoStatusPanel to ""
+
+        Function_Return asRetVal
+    End_Function
+
+    Function IncludeOrUseFile String sLine Returns String
+        Integer iPos
+
+        Move (lowercase(sLine)) to sLine
+        Move (Replace("#include ", sLine, "use ")) to sLine
+
+        Move (Pos("use ",sLine)) to iPos
+        If (iPos = 0) Begin
+            Function_Return ""
+        End
+
+        Move (Mid(sLine, CI_EOL, (iPos + 4))) to sLine
+        Move (Trim(sLine)) to sLine
+        If ((Pos(".", sLine)) = 0) Begin
+            Append sLine ".pkg"
+        End
+
+        Function_Return sLine
+    End_Function
+
+    //    Function RemoveStructArrayDuplicates tUnusedSourceFiles[] asUsedSourceFiles Returns tUnusedSourceFiles[]
+    //        tUnusedSourceFiles[] asNoDuplicates
+    //        Integer iSize iCount iItem
+    //        String sUsedPackageName sUsedPackageNameCompare
+    //
+    //        Move 0 to iItem
+    //        Move (SortArray(asUsedSourceFiles))   to asUsedSourceFiles
+    //        Move (SizeOfArray(asUsedSourceFiles)) to iSize
+    //        Decrement iSize
+    //        For iCount from 0 to iSize
+    //            Move asUsedSourceFiles[iCount].sUsedPackageName to sUsedPackageName
+    //            Move asNoDuplicates[iItem].sUsedPackageName     to sUsedPackageNameCompare
+    //            If (Lowercase(sUsedPackageName) <> Lowercase(sUsedPackageNameCompare)) Begin
+    //                Move asUsedSourceFiles[iCount].iRow         to asNoDuplicates[iItem].iRow
+    //                Move asUsedSourceFiles[iCount].sFileName    to asNoDuplicates[iItem].sFileName
+    //                Move asUsedSourceFiles[iCount].sPath        to asNoDuplicates[iItem].sPath
+    //                Move sUsedPackageName                       to asNoDuplicates[iItem].sUsedPackageName
+    //                Increment iItem
+    //            End
+    //        Loop
+    //
+    //        Function_Return asNoDuplicates
+    //    End_Function
+
+    // Note: Only uniqely identifed package files are returned in the struct array.
+    // All duplicates have been removed.
+    Function UsedPackageFiles tUnusedSourceFiles[] asSourceAllFiles Returns tUnusedSourceFiles[]
+        tUnusedSourceFiles[] asSingleFile asUsedSourceFiles
+        Integer iCount iSize
+
+        Move (SizeOfArray(asSourceAllFiles)) to iSize
+        Decrement iSize
+        For iCount From 0 to iSize
+            Get SingleFileUsedPackages (asSourceAllFiles[iCount].sPath + String(asSourceAllFiles[iCount].sFileName)) to asSingleFile
+            If (SizeOfArray(asSingleFile) <> 0) Begin
+                Move (AppendArray(asUsedSourceFiles, asSingleFile)) to asUsedSourceFiles
+            End
+        Loop
+
+        // It doesn't make any time difference if duplicates are removed or not.
+        //        Get RemoveStructArrayDuplicates asUsedSourceFiles to asUsedSourceFiles
+
+        Function_Return asUsedSourceFiles
+    End_Function
+
+    Function UnusedPackages tUnusedSourceFiles[] asUsedFiles tUnusedSourceFiles[] asAllFiles Returns tUnusedSourceFiles[]
+        Integer iCount iSize iIndex iItem
+        String sFilename sExt
+        tUnusedSourceFiles[] aUnusedSource
+        tUnusedSourceFiles UsedFile
+
+        Move 0 to iItem
+        Move (SortArray(asUsedFiles))  to asUsedFiles
+        Move (SizeOfArray(asAllFiles)) to iSize
+        Decrement iSize
+
+        For iCount From 0 to iSize
+            Move asAllFiles[iCount].sFileName to sFilename
+            Move (Lowercase(sFilename))       to sFilename
+            Move sFilename                    to UsedFile.sUsedPackageName
+            Get ParseFileExtension sFilename  to sExt
+
+            If (sExt <> "src") Begin
+                Move (SearchArray(UsedFile, asUsedFiles)) to iIndex
+                If (iIndex = -1) Begin                                      
+                    // Fix for Bug #182 "LoginEncryptionKey.inc" should never be listed as an unused source file.
+                    If (Lowercase(asAllFiles[iCount].sFileName) <> "loginencryptionkey.inc") Begin
+                        Move asAllFiles[iCount].sFileName to aUnusedSource[iItem].sFileName
+                        Move asAllFiles[iCount].sPath     to aUnusedSource[iItem].sPath
+                        Increment iItem
+                    End
+                End
+            End
+        Loop
+
+        Function_Return aUnusedSource
+    End_Function
+
+    Procedure OnProcess
+        String sFileFilter sHomePath
+        String[] asAllFolders
+        tUnusedSourceFiles[] asAllSourceFiles asUsedSourceFiles asUsedFiles asUnusedSource
+        Integer iCh iSize iCount
+
+        Get psFileFilter                                      to sFileFilter
+        Get pasAllFolders                                     to asAllFolders
+        Get AllSourceFiles asAllFolders sFileFilter           to asAllSourceFiles
+        Get UsedPackageFiles asAllSourceFiles                 to asUsedSourceFiles
+        Get UnusedPackages asUsedSourceFiles asAllSourceFiles to asUnusedSource
+        Set piNoOfUnusedSourceFiles to (SizeOfArray(asUnusedSource))
+
+        Get Seq_New_Channel to iCh
+        If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
+            Set pbOK to False
+            Error "No channel available for writing Unused Source Code. Procedure: 'OnProcess' (cUnusedSourceFiles)"
+            Procedure_Return
+        End
+
+        Move (SizeOfArray(asUnusedSource)) to iSize
+        If (iSize <> 0) Begin
+            Decrement iSize
+            Get psHomePath to sHomePath
+            Get vFolderFormat sHomePath to sHomePath
+
+            Direct_Output channel iCh (sHomePath + CS_BackupFolder + CS_DirSeparator + CS_UnusedSourceLogFile)
+            For iCount from 0 to iSize
+                Writeln channel iCh (asUnusedSource[iCount].sPath + String(asUnusedSource[iCount].sFileName))
+            Loop
+
+            // For testing purposes:
+            //            Writeln channel iCh ""
+            //            Writeln channel iCh "asUsedFiles"
+            //            Move (SizeOfArray(asUsedFiles)) to iSize
+            //            Decrement iSize
+            //            For iCount from 0 to iSize
+            //                Writeln channel iCh asUsedFiles[iCount]
+            //            Loop
+            //
+            //            Writeln channel iCh ""
+            //            Writeln channel iCh "asAllSourceFiles"
+            //            Move (SizeOfArray(asAllSourceFiles)) to iSize
+            //            Decrement iSize
+            //            For iCount from 0 to iSize
+            //                Writeln channel iCh asAllSourceFiles[iCount]
+            //            Loop
+            //
+            //            Writeln channel iCh ""
+            //            Writeln channel iCh "asUsedSourceFiles"
+            //            Move (SizeOfArray(asUsedSourceFiles)) to iSize
+            //            Decrement iSize
+            //            For iCount from 0 to iSize
+            //                Writeln channel iCh asUsedSourceFiles[iCount]
+            //            Loop
+
+            Close_Output channel iCh
+            Send Seq_Release_Channel iCh
+        End
+        Set pbOK to True   
+        
+        Set pasUnusedSource to asUnusedSource
+
+    End_Procedure
+    
+End_Class

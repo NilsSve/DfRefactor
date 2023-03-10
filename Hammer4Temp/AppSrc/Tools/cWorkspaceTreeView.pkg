@@ -1,0 +1,424 @@
+// cDatabaseTreeView.pkg
+// Created by Sergey V Natarov (senatc@postman.ru) on 09/03/2017 @ 11:40
+//
+
+Use dfTreeVw.pkg
+Use DrgNDrop.pkg
+Use cImageList32.pkg
+Use Tools\TH3Workspace.pkg
+Use Menu\TH3FileTabContextMenu.mn
+
+Struct tTHWSItem
+    String  sName
+    Integer bFolder
+    String  sFullPath
+    tTHWSItem[] ltSubItems
+End_Struct
+
+Define WSTV_SORT_BYNUMBER for 0
+Define WSTV_SORT_BYNAME   for 1
+
+Class cWorkspaceImageList is a cImageList32
+    Procedure OnCreate // add the images
+        Integer iImage
+        Get AddImage 'Workspace16.ico' clFuchsia to iImage
+        Get AddImage 'Folder16.ico' clFuchsia to iImage
+        Get AddImage 'Utility16.ico' clFuchsia to iImage
+        Get AddImage 'THSource16.ico' clFuchsia to iImage
+    End_Procedure
+End_Class
+
+Class cWorkspaceTreeView is a TreeView
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // Cache of the storage
+        Property tTHWSItem[] ptWSItem
+        Property String[]    psFileName
+        Property Integer     piCollapsed False
+        Object oWorkspaceImageList   is a cWorkspaceImageList
+            Set piMaxImages         to 8
+        End_Object
+        Set ImageListObject         to (oWorkspaceImageList(Self))
+        Set peAnchors               to anAll
+        Set pbEnableInfoTips        to True
+        Set piBackColor             to gtColorer[EC_TEXT].iBackC
+        Set piTextColor             to gtColorer[EC_TEXT].iForeC
+        Set piLineColor             to gtColorer[EC_TEXT].iForeC
+        On_Key kEnter  Send OnItemClicked
+        On_Key kCancel Send Request_Cancel
+    End_Procedure
+
+    Import_Class_Protocol cDragAndDrop_mx
+
+    Procedure Mouse_Down2 Integer iT
+        Handle hItem
+        String[] saFileName
+        String sFile
+        Integer iData
+        Get CurrentTreeItem to hItem
+        If (hItem) Begin
+            Get psFileName to saFileName
+            Get ItemData hItem to iData
+            If (iData) Move saFileName[iData] to sFile
+            If (sFile<>"") Begin
+                Set psFileName of (oFileContextMenu(Self)) to sFile
+                Send Popup to (oFileContextMenu(Self))
+            End
+        End
+    End_Procedure
+    Procedure Mouse_Up Integer iP1
+        Send OnItemClicked
+    End_Procedure
+
+    Procedure Request_Cancel
+      If (ghoOutputPane<>0) Begin
+        Send CloseOutputPane of ghoOutputPane
+        Set Windows_Override_State To True // don't pass the message to Windows.
+      End                                  // as otherwise it will still send the keycodes to the queue
+    End_Procedure
+
+    Register_Object oEdit
+    Procedure OnItemClicked
+        Handle      hItem       hParent
+        Integer     iData       iType
+        String      sPathFile
+        String[]    saFileName
+        //
+        Get CurrentTreeItem to hItem
+        Get ParentItem hItem to hParent
+        If (hParent<>0) Begin
+            Get ItemData hItem to iData
+            Get psFileName to saFileName
+            Get CheckType saFileName[iData] to iType
+            If (iType=KPH_FILE_FOLDER) Procedure_Return
+            If (iType=KPH_FILE_EDITABLE) Begin
+                If (saFileName[iData] <> "") Begin
+                    // Case sensitivity correction if needed, might not fix path case, but
+                    // does take care of file's case, which is "good enough" as it doesn't
+                    // bite code maintainance tools or mess up preferred file case
+                    Get FileNameOnDisk saFileName[iData] to sPathFile
+                    Send CAOpenFile of (oClientArea(oMain(Self))) sPathFile
+                End
+            End
+            Else Send Info_Box saFileName[iData] "Can't open the file"
+        End
+    End_Procedure
+
+    Function DragAndDrop_DataType Returns String
+        Function_Return "DD_CLASS"
+    End_Function
+
+    Function Table_Drop_Data Handle hItem Returns String
+        String  sData
+        Integer iData
+        String  sFile
+        String[] sFileName
+        Get ItemData hItem to iData
+        If iData Begin
+            Get ItemLabel hItem to sFile
+            Get psFileName to sFileName
+            // User selected either Filename or Folder.
+            // Returns Filename as a "USE" and Folder as a string.
+            If (sFile contains ".") ;
+                Move (Character(10)+"Use"*sFile) to sData
+            Else Move (Character(10)+'"'+sFileName[iData]+'"') to sData
+        End
+        Function_Return sData
+    End_Function
+
+    Procedure ClearAll
+        String[] sFileName
+        Forward Send ClearAll
+        Set psFileName to sFileName
+    End_Procedure
+
+    Function DragAndDrop_GetData Returns String
+        Function_Return (Table_Drop_Data(Self, CurrentTreeItem(Self)))
+    End_Function
+
+    Function CanRemoveElement Returns Integer
+        Handle  hItem
+        Integer iData
+        Get CurrentTreeItem to hItem
+        //Get ItemData hItem to iData
+        Get ItemImage hItem to iData
+        Function_Return (iData=2)
+    End_Function
+
+    Procedure mRemoveFolder String sFolder
+        Integer iFolder iFolders iCount
+        String[] saFileName saFolders
+        tTHWorkspace THWorkspace
+        Get pTHWorkspace of ghoApplication To THWorkspace
+        Get psFileName to saFileName
+        Move (SizeOfArray(THWorkspace.saFolders)) to iFolders
+        For iFolder from 0 to (iFolders-1)
+            If (sFolder<>THWorkspace.saFolders[iFolder]) Begin
+                Move THWorkspace.saFolders[iFolder] to saFolders[iCount]
+                Increment iCount
+            End
+        Loop
+        Move saFolders To THWorkspace.saFolders
+        Set pTHWorkspace of ghoApplication To THWorkspace
+    End_Procedure
+
+    Function SortWSElements tTHWSItem ltWSItem1 tTHWSItem ltWSItem2 Returns Integer
+        If (ltWSItem1.bFolder > ltWSItem2.bFolder) Function_Return (LT)
+        If (ltWSItem1.bFolder < ltWSItem2.bFolder) Function_Return (GT)
+        If (ltWSItem1.sName > ltWSItem2.sName) Function_Return (GT)
+        If (ltWSItem1.sName < ltWSItem2.sName) Function_Return (LT)
+        Function_Return (EQ)
+    End_Function
+
+    Function mTHWSReadFolder String sFolder String sMask tTHWSItem[] ltWSItem String sPatterns Returns tTHWSItem[]
+        Integer bFolder bFolders iCount iFolder
+        String sEle sExt
+        Direct_Input ("DIR:"+sFolder)
+        While (not(SeqEof))
+            Readln sEle
+            Move 0 to bFolder
+            If (Left(sEle, 1)="[") Begin
+                If ((sEle="[.]")or(sEle="[..]")) Move "" to sEle
+                Else Begin
+                    Move (Left(sEle, Length(sEle)-1)) to sEle
+                    Move (Right(sEle, Length(sEle)-1)) to sEle
+                    Move 1 to bFolder
+                    Move 1 to bFolders
+                End
+            End
+            If ( (sEle<>"") and (not(sPatterns contains ('|'+Uppercase(sEle)+'|') )) ) Begin
+                If (Pos('.', sEle)) Begin
+                    Move sEle to sExt
+                    While (Pos('.', sExt)>0)
+                        Move (Right(sExt, Length(sExt)-Pos('.', sExt))) to sExt
+                    Loop
+                End
+                If ((bFolder=1) or (sMask contains ('|'+Uppercase(sExt)+'|'))) Begin
+                    Move sEle    to ltWSItem[iCount].sName
+                    Move bFolder to ltWSItem[iCount].bFolder
+                    Move sFolder to ltWSItem[iCount].sFullPath
+                    Increment iCount
+                End
+            End
+        Loop
+        Move (SortArray(ltWSItem, Self, RefFunc(SortWSElements))) to ltWSItem
+        Close_Input
+        If (bFolders) Begin
+            For iFolder from 0 to (iCount-1)
+                If (ltWSItem[iFolder].bFolder) Begin
+                    If (Right(sFolder, 1)<>'\') Move (sFolder+'\') to sFolder
+                    If (sFolder<>"\") Begin // don't enumerate a complete disk!
+                      Get mTHWSReadFolder (sFolder - ltWSItem[iFolder].sName) sMask ltWSItem[iFolder].ltSubItems sPatterns to ltWSItem[iFolder].ltSubItems
+                    End
+                End
+            Loop
+        End
+        //
+        Function_Return ltWSItem
+    End_Function
+
+    Function IncludeFiles Returns String
+        Integer iFile iFiles
+        String sFiles
+        tTHWorkspace THWorkspace
+        Get pTHWorkspace of ghoApplication To THWorkspace
+        Move (SizeOfArray(THWorkspace.saFiles)) to iFiles
+        Move '|' to sFiles
+        For iFile from 0 to (iFiles-1)
+            Move (sFiles+THWorkspace.saFiles[iFile]+'|') to sFiles
+        Loop
+        Function_Return (Uppercase(sFiles))
+    End_Function
+
+    Function ExcludePatterns Returns String
+        Integer iPattern iPatterns
+        String  sPatterns
+        tTHWorkspace THWorkspace
+        Get pTHWorkspace of ghoApplication To THWorkspace
+        Move (SizeOfArray(THWorkspace.saExclude)) to iPatterns
+        Move '|' to sPatterns
+        For iPattern from 0 to (iPatterns-1)
+            Move (sPatterns+THWorkspace.saExclude[iPattern]+'|') to sPatterns
+        Loop
+        Function_Return (Uppercase(sPatterns))
+    End_Function
+
+    Procedure BuildWorkspaceTree Handle hRoot tTHWSItem[] ltWSItem String[] ByRef sFileName String sFilter
+        Handle   hElement
+        String   sName sPath sSchema
+        Integer  iFolder iFolders iFile
+        tTHWorkspace THWorkspace
+        Get pTHWorkspace of ghoApplication To THWorkspace
+        If (hRoot=0) Begin
+            Send ClearAll
+            Move THWorkspace.sName to sName
+            Move THWorkspace.sSchema to sSchema
+            If (sName="") Move "Project" to sName
+            If (sSchema<>"") Move (sName * '('+sSchema+')') to sName
+            Get AddTreeItem sName 0 0 0 0 to hRoot
+            Get ptWSItem to ltWSItem
+            If (SizeOfArray(ltWSItem)=0) Procedure_Return
+        End
+        Move (Uppercase(Trim(sFilter))) to sFilter
+        Move (SizeOfArray(ltWSItem)) to iFolders
+        For iFolder from 0 to (iFolders-1)
+            Move ltWSItem[iFolder].sName to sName
+#IF (!@ < 200)
+            Move (ToOEM(sName)) To sName
+#ENDIF
+            If (ltWSItem[iFolder].bFolder) Begin
+                 If (SizeOfArray(ltWSItem[iFolder].ltSubItems)) Begin
+                    If (sFilter="") Begin
+                        If (ltWSItem[iFolder].bFolder=1) Get AddTreeItem sName hRoot 0 1 1 to hElement
+                        Else Get AddTreeItem sName hRoot 0 2 2 to hElement
+                        Move (SizeOfArray(sFileName)) to iFile
+                        Move ltWSItem[iFolder].sFullPath to sPath
+                        If ((sPath<>"") and (Right(sPath, 1)<>'\')) Move (sPath+'\') to sPath
+                        Move (sPath - sName) to sFileName[iFile]
+                        Set ItemData hElement to iFile
+                    End
+                    Else Move hRoot  to hElement
+                    Send BuildWorkspaceTree hElement ltWSItem[iFolder].ltSubItems (&sFileName) sFilter
+                 End
+            End
+            Else If ((sFilter="") or (Uppercase(sName) contains sFilter)) Begin
+                Get AddTreeItem sName hRoot 0 3 3 to hElement
+                Move (SizeOfArray(sFileName)) to iFile
+                Move ltWSItem[iFolder].sFullPath to sPath
+                If (Right(sPath, 1)<>'\') Move (sPath+'\') to sPath
+                Move (sPath - ltWSItem[iFolder].sName) to sFileName[iFile]
+                Set ItemData hElement to iFile
+            End
+        Loop
+    End_Procedure
+
+    Procedure SearchFiles String sFilter
+        tTHWSItem[] ltWSItem
+        String[]    sFileName
+        Handle      hItem
+        Move "<Reserved>" to sFileName[0]
+        Send BuildWorkspaceTree 0 ltWSItem (&sFileName) sFilter
+        Get RootItem to hItem
+        If (sFilter="") Begin
+            If (piCollapsed(Self)) Begin
+                Send DoCollapseAll hItem
+            End
+            Send DoExpandItem hItem
+        End
+        Else Send DoExpandAll
+        Send DoMakeItemFirstVisible hItem
+        Set psFileName to sFileName
+    End_Procedure
+    
+    Function LibIsChildFolder String sLib String sFolder Returns Boolean
+      Boolean bIsChildPath
+      
+      Move False to bIsChildPath
+      Move (lowercase(sLib))    to sLib
+      Move (lowercase(sFolder)) to sFolder
+      While (sLib <> "")
+        Get vParentPath sLib to sLib
+        If (sFolder=sLib) Begin
+          Move True to bIsChildPath
+        End
+      Loop
+      Function_Return bIsChildPath
+    End_Function
+
+    // When adding a library to the folder collection we have to conditionally add the path.
+    // This means we can't just use appendarray.
+    // 1. If the path is already in the list we do not want to add it again (if already added manually then don't add again)
+    // 2. If the library is a child path of the workspace, we do not want to add it.
+    Function AddUniqueLibraries String[] saFolders String[] saLibraries Returns String[]
+        Boolean  bExists
+        Boolean  bIsChildPath
+        Integer  iLib
+        Integer  iLibSize
+        Integer  iFolder
+        Integer  iFolderSize
+        String   sLib
+        String   sFolder
+        String[] saResult
+        
+        Move saFolders To saResult
+        Move (SizeOfArray(saLibraries)) To iLibSize
+        Move (SizeOfArray(saFolders))   To iFolderSize
+        For iLib From 0 To (iLibSize-1)
+          Move False To bExists
+          Move False To bIsChildPath
+          Move saLibraries[iLib] To sLib
+          Get vFolderFormat sLib To sLib
+          For iFolder From 0 To (iFolderSize-1)
+            Move saFolders[iFolder] To sFolder
+            Get vFolderFormat sFolder To sFolder
+            If (lowercase(sLib)=lowercase(sFolder)) Begin
+              Move True To bExists
+              Move iFolderSize To iFolder // exit inner loop
+            End
+            If (bExists=false) Begin
+              Get LibIsChildFolder sLib sFolder To bIsChildPath
+              If bIsChildPath ;
+                Move iFolderSize To iFolder // exit inner loop
+            End
+          Loop
+          If (bExists=false and bIsChildPath=false) Begin
+            Move sLib To saResult[SizeOfArray(saResult)]
+          End
+        Loop
+        Function_Return saResult
+    End_Function
+
+    Procedure LoadWorkspaceStructure
+        tTHWSItem[] ltWSItem
+        Integer iCount
+        Handle hoWorkspace hRoot
+        String sPath sFiles sPatterns
+        String[] sFileName
+        String[] LibraryFolders
+        Integer iFolder
+        tTHWorkspace THWorkspace
+        //
+        Get pTHWorkspace Of ghoApplication To THWorkspace
+        Get LibraryHomeFolders of (oLibraries(ghoWorkspaceHandlerEx)) to LibraryFolders
+        If (SizeOfArray(LibraryFolders)) Begin
+          Get AddUniqueLibraries THWorkspace.saFolders LibraryFolders To THWorkspace.saFolders
+        End
+        If (SizeOfArray(THWorkspace.saFolders)) Begin
+            Get IncludeFiles    to sFiles
+            Get ExcludePatterns to sPatterns
+            Get mTHWSReadFolder THWorkspace.saFolders[0] sFiles ltWSItem sPatterns to ltWSItem
+            // External folders
+            For iFolder from 1 to (SizeOfArray(THWorkspace.saFolders)-1)
+                Move (SizeOfArray(ltWSItem))            to iCount
+                Move THWorkspace.saFolders[iFolder]     to ltWSItem[iCount].sName
+                Move 2                                  to ltWSItem[iCount].bFolder
+                Get mTHWSReadFolder THWorkspace.saFolders[iFolder] sFiles ltWSItem[iCount].ltSubItems sPatterns to ltWSItem[iCount].ltSubItems
+            Loop
+        End
+        //
+        Set ptWSItem        to ltWSItem
+        Move "<Reserved>" to sFileName[0]
+        Send BuildWorkspaceTree 0 ltWSItem (&sFileName) ""
+        Set psFileName      to sFileName
+        Get RootItem to hRoot
+        If (piCollapsed(Self)) Begin
+            Set CurrentTreeItem to hRoot
+            Send DoExpandItem hRoot
+        End
+        Else Send DoExpandAll
+        Send DoMakeItemFirstVisible hRoot
+    End_Procedure
+
+    Procedure OnGetInfoTip Handle hItem String ByRef sInfoTip
+        String[] saFileName
+        Integer  iData
+        If (pbEnableInfoTips(Self)) Begin
+            Get psFileName to saFileName
+            Get ItemData hItem to iData
+            If (iData) Move saFileName[iData] to sInfoTip
+        End
+    End_Procedure
+
+End_Class
+
