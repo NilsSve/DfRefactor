@@ -194,8 +194,11 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
                         String sFunctionName sLine sPath sSourceFile sParameter
                         Boolean bChanged
                         String[] asSource asSourceFiles
-
-                        Move False to Err
+                        
+                        // Suspend all timers while we are working:
+                        Send SuspendGUI of Desktop True
+                        Move False to Err  
+                        Move False to bChanged
                         Move "    [Found] Reread // End comment" to sLine
                         Move sLine to asSource[0]                   
                         Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
@@ -210,12 +213,13 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
                             Move (Trim(FunctionsA.Function_Name)) to sFunctionName
                             If (Lowercase(sFunctionName) <> Lowercase(CS_EditorDropSelf)) Begin
                                 Move (Eval("get_" - (sFunctionName))) to iFunctionID   
-                                If (FunctionsA.Type = eAll_Functions or FunctionsA.Type = eRemove_Function) Begin
+                                If (FunctionsA.Type = eAll_Functions or FunctionsA.Type = eStandard_Function or FunctionsA.Type = eRemove_Function) Begin
                                     Get iFunctionID of ghoRefactorFunctionLibrary (&sLine) sParameter to bChanged
-                                End 
-                                If (FunctionsA.Type = eEditor_Function or FunctionsA.Type = eReport_Function or FunctionsA.Type = eOther_Function) Begin                                    
-                                    Get iFunctionID of ghoRefactorFunctionLibrary (&asSource) sParameter to bChanged
                                 End
+                                // ToDo: We need a visible pho<Editor object (scintilla) for this to work:
+//                                If (FunctionsA.Type = eEditor_Function or FunctionsA.Type = eReport_Function or FunctionsA.Type = eOther_Function) Begin                                    
+//                                    Get iFunctionID of ghoRefactorFunctionLibrary (&asSource) sParameter to bChanged
+//                                End
                                 If (FunctionsA.Type = eOther_FunctionAll or FunctionsA.Type = eReport_FunctionAll) Begin                                    
                                     Get iFunctionID of ghoRefactorFunctionLibrary (&asSourceFiles) sParameter to bChanged
                                 End
@@ -224,6 +228,7 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
                                 If (Err = True) Begin
                                     Get YesNo_Box "An error occured. Do you want to quite?" to iRetval
                                     If (iRetval = MBR_Yes) Begin
+                                        Send SuspendGUI of Desktop False
                                         Procedure_Return
                                     End
                                     Else Begin
@@ -234,6 +239,7 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
                             Constrained_Find Next  
                         Loop
                         Send Info_Box "Done! All functions were run. Check the Output Window (DataFlex Console Window)"
+                        Send SuspendGUI of Desktop False
                     End_Procedure
                 
                 End_Object

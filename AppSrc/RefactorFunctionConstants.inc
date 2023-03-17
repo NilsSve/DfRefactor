@@ -73,6 +73,7 @@ Struct tCodeComponents
     String sLineEndIndicator
     Boolean bHasIndicateCommand
     String sLeftCommand
+    String sLeftCommand2
     String sCode   
     String sOfStatement   
     String sToStatement

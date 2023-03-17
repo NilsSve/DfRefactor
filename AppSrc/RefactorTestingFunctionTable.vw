@@ -372,7 +372,7 @@ Object oFunctionTableTesting is a cRefactorDbView
     
             Object oCompareProgram_btn is a cRDCButton
                 Set Size to 14 100
-                Set Location to 250 225
+                Set Location to 242 225
                 Set Label to "Co&mpare Before && After"
                 Set peAnchors to anBottomRight
                 Set psImage to "Compare.ico"
@@ -397,7 +397,7 @@ Object oFunctionTableTesting is a cRefactorDbView
                 Entry_Item SysFile.PathSourceCompareTool
                 Set Server to oSysFile_DD
                 Set Size to 12 140
-                Set Location to 251 7
+                Set Location to 249 7
                 Set Label_Col_Offset to 0
                 Set Label_Row_Offset to 1
                 Set Label_Justification_Mode to JMode_Top
@@ -422,7 +422,7 @@ Object oFunctionTableTesting is a cRefactorDbView
 
             Object oSelectCompareProgram_btn is a cRDCButton
                 Set Size to 14 41
-                Set Location to 250 151
+                Set Location to 248 151
                 Set Label to "Select"
                 Set peAnchors to anBottomRight
                 Set psImage to "ActionOpen.ico"
@@ -431,11 +431,52 @@ Object oFunctionTableTesting is a cRefactorDbView
                 Procedure OnClick
                     Send Prompt of oCompareprogram_fm
                 End_Procedure
+            End_Object    
+            
+            Object oSourceExplorerProgram_fm is a dbForm
+                Entry_Item SysFile.PathStarZen
+                Set Server to oSysFile_DD
+                Set Size to 12 140
+                Set Location to 273 7
+                Set Prompt_Button_Mode to pb_PromptOn
+                Set Label_Row_Offset to 1
+                Set Label_Col_Offset to 0
+                Set Label_Justification_Mode to JMode_Top
+                Set Label to "StarZen's Source Code Explorer:"
+                Set peAnchors to anBottomLeftRight                                                                              
+    
+                Procedure Prompt
+                    Integer bOpen
+                    String sFileName
+    
+                    Get Show_Dialog of oOpenDialog to bOpen
+                    If (bOpen) Begin
+                        Get File_Name of oOpenDialog to sFileName
+                        Set Changed_Value Item 0 to sFileName
+                        Set private.psStarZenSourceExplorer of ghoApplication to sFileName
+                    End
+                End_Procedure
+    
             End_Object
+
+            Object oSelectSourceExplorerProgram_btn is a cRDCButton
+                Set Size to 14 41
+                Set Location to 272 151
+                Set Label to "Select"
+                Set peAnchors to anBottomRight
+                Set psImage to "ActionOpen.ico"
+                Set psToolTip to "Select a file comparison tool, such as 'Beyond Compare', 'WinMerge', 'Araxis Merge' etc.. (Press F4)"
+            
+                Procedure OnClick
+                    Send Prompt of oSourceExplorerProgram_fm
+                End_Procedure
+            End_Object    
+
+            
 
             Object oTestCompileRefactoredCode_btn is a cRDCButton
                 Set Size to 14 100
-                Set Location to 267 225
+                Set Location to 257 225
                 Set Label to "Compile Refactored Code"
                 Set peAnchors to anBottomRight
                 Set psImage to "CompileProject.ico"
@@ -449,6 +490,40 @@ Object oFunctionTableTesting is a cRefactorDbView
                     Integer iLines
                     Get SC_LineCount of (phoEditor(Self)) to iLines
                     Function_Return (iLines > 1)
+                End_Function
+        
+            End_Object
+
+            Object oShowErrorLog_btn is a cRDCButton
+                Set Size to 14 100
+                Set Location to 272 225
+                Set Label to "Show &Error Log"
+                Set peAnchors to anBottomRight
+                Set psImage to "CompileProjectErrors.ico"
+                Set psToolTip to "Show Error log from compilation (Ctrl+E)"
+            
+                Procedure OnClick
+                    String sAppSrcPath
+                    Boolean bExists
+
+                    Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrcPath
+                    Get vFolderFormat sAppSrcPath to sAppSrcPath
+                    Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
+                    If (bExists = True) Begin
+                        Send ActivateErrorDialog of (Client_Id(phoMainPanel(ghoApplication))) (sAppSrcPath + CS_TestErrFile)
+                    End
+                End_Procedure  
+                
+                Function IsEnabled Returns Boolean
+                    Boolean bExists
+                    String sAppSrcPath
+                    Integer iLines
+
+                    Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrcPath
+                    Get vFolderFormat sAppSrcPath to sAppSrcPath
+                    Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
+                    Get SC_LineCount of (phoEditorRefactored(ghoApplication)) to iLines
+                    Function_Return (bExists = True and iLines > 1)
                 End_Function
         
             End_Object
@@ -531,9 +606,11 @@ Object oFunctionTableTesting is a cRefactorDbView
             Send Info_Box "No Legacy code found."
             Procedure_Return
         End
-
+        
+        // Suspend all timers while we work.
+        Send SuspendGUI of Desktop True
         Set pbIsRefactoring of ghoApplication to True   
-        Send Cursor_Wait of (Cursor_Control(Self)) 
+        Send Cursor_Wait of Cursor_Control
         Decrement iSize  
         
         For iCount from 0 to iSize
@@ -713,7 +790,9 @@ Object oFunctionTableTesting is a cRefactorDbView
         Set Value of (oRefactoredCode_Time_fm(Self)) to (dtEnd - dtStart)
         Set pbIsRefactoring of ghoApplication to False
         Send UpdateStatusBar of hoEditor "Ready!" True
-        Send Cursor_Ready of (Cursor_Control(Self))        
+        Send Cursor_Ready of Cursor_Control
+        // Re-enable timers:
+        Send SuspendGUI of Desktop False
     End_Procedure
     
 End_Object

@@ -704,6 +704,8 @@ Object oRefactorTesting is a cRefactorDbView
         End
         Decrement iSize  
         Set pbIsRefactoring of ghoApplication to True 
+        // Temporary disable all timers while we work:
+        Send SuspendGUI of Desktop True
             
         For iCount from 0 to iSize
             // Need this to show "Number of lines:" changes
@@ -795,6 +797,7 @@ Object oRefactorTesting is a cRefactorDbView
         Move (CurrentDateTime()) to dtEnd
         Set Value of (oRefactoredCode_Time_fm(Self)) to (dtEnd - dtStart)
         Set pbIsRefactoring of ghoApplication to False
+        Send SuspendGUI of Desktop False
     End_Procedure
 
 End_Object

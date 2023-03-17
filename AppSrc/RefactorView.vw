@@ -869,7 +869,7 @@ Register_Procedure RefreshSelectionUpdate
     End_Function
     
     //
-    // ToDo: *** START_MAIN_PROCESSS ***
+    // ToDo: *** MAIN REFACTORING ROUTINE ***
     //
     Procedure START_MAIN_PROCESS
         String[] asFolderNames
