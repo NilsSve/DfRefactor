@@ -1,9 +1,13 @@
 DFRefactor - The Automated Refactoring Tool for DataFlex
 
-This will install the full DFRefactor workspace, including source code. It does NOT create any Windows menu items or make changes to the registry - it just copies all the source files to the directory of choice.
+DFRefactor is a tool written in DataFlex that helps with refactoring of old DataFlex code. It consists of a series of functions to help in the refactoring process. Each refactoring function that can be used to refactor code must be entered to the main function repository; the RefavtorFunctionLibrary.pkg class.
+That same function must also be registered with the FuntionMaintenance view.
 
-DFRefactor is a tool written in DataFlex that helps with refactoring of old DataFlex code. It consists of a series of functions to help in the refactoring process. Each refactoring function is represented by a checkbox. 
+There are several types of refactoring functions, but in general source is passed to functions one source line at a time. Each function must have an interace of a "String ByRef sSourceLine" and a second optional "String sParameter". All functions must return a Boolean True if the passed source line was changed, else return a False.
 
-There are two types of refactoring functions; Refactoring Functions and Reporting Functions. The first category makes actual changes to the selected source code, while the second category only creates a report what may need to handled later manually.
+It consists of three important programs;
+- TestBenchRefactorFunctions.src - A test bench used when developing & testing your own refactoring functions.
+- DFUnit_Testrunner.src - A series of unit tests. You need to add several unit tests for each function that you add to the function repository.
+- DFRefactor.src - The main refactoring program that is used as soon as all functions has been proven to work as intended.
 
-You need a DataFlex Studio 18.2 or later to compile the source file DFRefactor.src to an executable.
+You need a DataFlex Studio 19.1 or later to compile the source file DFRefactor.src to an executable.
