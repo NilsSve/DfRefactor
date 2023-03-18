@@ -595,6 +595,7 @@ Object oFunctionTableTesting is a cRefactorDbView
         Send UpdateStatusBar of hoEditor "" True
         Get EditorDataAsStringArray of hoEditor to asLegacyCode
         Move (SizeOfArray(asLegacyCode)) to iSize
+        Decrement iSize  
 
         Get phoEditorRefactored to hoEditor
         Get psCodeFile of hoEditor to sRefactoredFileName
@@ -611,7 +612,6 @@ Object oFunctionTableTesting is a cRefactorDbView
         Send SuspendGUI of Desktop True
         Set pbIsRefactoring of ghoApplication to True   
         Send Cursor_Wait of Cursor_Control
-        Decrement iSize  
         
         For iCount from 0 to iSize
             // Need this to show "Number of lines:" changes

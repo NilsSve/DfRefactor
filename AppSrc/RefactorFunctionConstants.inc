@@ -15,6 +15,12 @@ Enum_List
     Define CI_CommandExpression
     Define CI_OfExpression
     Define CI_ToTexpression
+End_Enum_List 
+
+Enum_List
+    Define CI_SplitWithSpaceAndSemicolon for 1
+    Define CI_SplitWithSemicolon         for 2
+    Define CI_SplitAddBeginEndBlock      for 3
 End_Enum_List
 
 Struct tWorkspace
