@@ -1,4 +1,0 @@
-Date
-Time
-Description
-FunctionName
