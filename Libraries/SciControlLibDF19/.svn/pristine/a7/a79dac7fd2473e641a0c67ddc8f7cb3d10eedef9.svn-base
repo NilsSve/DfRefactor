@@ -1,3 +1,0 @@
-Type
-Code
-Description

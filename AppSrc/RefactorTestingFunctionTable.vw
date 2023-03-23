@@ -27,8 +27,8 @@ Object oFunctionTableTesting is a cRefactorDbView
     Set pbAutoActivate to True
     Set Maximize_Icon to True 
     Set pbAcceptDropFiles to True
-
     Set phoTestView of ghoApplication to Self
+
     Property Handle phoEditorLegacy
     Property Handle phoEditorRefactored   
         
@@ -50,8 +50,31 @@ Object oFunctionTableTesting is a cRefactorDbView
     Set Main_DD to oFunctions_DD
     Set Server to oFunctions_DD
 
+Define CS_Splitters              for "Splitters"
+Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
+
     Object oSplitterContainer is a cDbSplitterContainer
-        Set piSplitterLocation to 498
+        Set piSplitterLocation to 498 
+        
+        // ToDo: This messes up the dynamic sizing of objects at startup.
+        // So this is probably to early to make this kind of manipulation.
+        // Research is needed where & when it should be made.
+//        Procedure Page_Delete 
+//            Integer iLocation
+//            Get piGuiSplitterLocation to iLocation
+//            Send WriteDword of ghoApplication CS_Splitters CS_TestingViewSplitterPos iLocation
+//            Forward Send Page_Delete
+//        End_Procedure 
+//        
+//        Procedure Page Integer iPageObject
+//            Integer iLocation
+//            
+//            Get ReadDword of ghoApplication CS_Splitters CS_TestingViewSplitterPos 0 to iLocation
+//            If (iLocation <> 0) Begin
+//                Set piGuiSplitterLocation to iLocation
+//            End
+//            Forward Send Page iPageObject
+//        End_Procedure
 
         Object oSplitterContainerChild1 is a cDbSplitterContainerChild
 
