@@ -9,6 +9,7 @@ Use File_dlg.pkg
 
 Use cFunctionsDataDictionary.dd
 Use Windows.pkg
+Use cRDCCJSelectionGrid.pkg
 
 ACTIVATE_VIEW Activate_oFunctionsExportImport FOR oFunctionsExportImport
 Object oFunctionsExportImport is a dbView
@@ -19,6 +20,7 @@ Object oFunctionsExportImport is a dbView
     Set pbAutoActivate to True   
     
     Property Handle phoSelection_lst
+    Property Handle phoSelection_grd
 
     Object oFunctions_DD is a cFunctionsDataDictionary
     End_Object 
@@ -98,14 +100,14 @@ Object oFunctionsExportImport is a dbView
             Set Label to "Copy to Right >>"
         
             Procedure OnClick
-                Handle hoList  
+                Handle hoGrid  
                 Integer iID
                 
-                Delegate Get phoSelection_lst to hoList    
+                Delegate Get phoSelection_grd to hoGrid
                 Get Field_Current_Value of oFunctions_DD Field FunctionsA.ID to iID
                 If (iID <> 0) Begin
-                    Send Add_Item of hoList msg_None iID
-                    Send OnChange of hoList
+                    Send AddItem of hoGrid iID
+                    Send DoSetCheckboxFooterText of hoGrid
                 End
             End_Procedure
         
@@ -121,16 +123,16 @@ Object oFunctionsExportImport is a dbView
             End_Procedure
             
             Procedure DeleteSelectedItem    
-                Handle hoList  
+                Handle hoGrid 
                 Integer iItem iCount
                 
-                Delegate Get phoSelection_lst to hoList    
-                Get Item_Count of hoList to iCount
+                Delegate Get phoSelection_grd to hoGrid
+                Get ItemCount of hoGrid to iCount
                 If (iCount = 0) Begin
                     Procedure_Return
                 End
-                Get Current_Item of hoList to iItem
-                Send Delete_Item of hoList iItem 
+                Send Request_Delete of hoGrid
+                Send DoSetCheckboxFooterText of hoGrid
             End_Procedure
             
         End_Object
@@ -141,19 +143,19 @@ Object oFunctionsExportImport is a dbView
             Set Label to "Add All >>"
         
             Procedure OnClick
-                Handle hoList  
+                Handle hoGrid 
                 Integer iID
                 
-                Delegate Get phoSelection_lst to hoList    
-                Send Delete_Data of hoList
+                Delegate Get phoSelection_grd to hoGrid
+                Send Request_Clear_All of hoGrid
                 Clear FunctionsA
                 Repeat
                     Find gt FunctionsA.ID 
                     If (Found = True) Begin
-                        Send Add_Item of hoList msg_None FunctionsA.ID
+                        Send AddItem of hoGrid FunctionsA.ID
                     End
                 Until (Found = False)
-                Send OnChange of hoList
+                Send DoSetCheckboxFooterText of hoGrid
             End_Procedure
         
         End_Object
@@ -164,85 +166,105 @@ Object oFunctionsExportImport is a dbView
             Set Label to "<< Remove All"
         
             Procedure OnClick
-                Handle hoList  
-                Delegate Get phoSelection_lst to hoList    
-                Send Delete_Data of hoList
-                Send OnChange of hoList
+                Handle hoGrid 
+                Delegate Get phoSelection_grd to hoGrid
+                Send Request_Clear_All of hoGrid
+                Send DoSetCheckboxFooterText of hoGrid
             End_Procedure
                 
         End_Object 
         
-        Object oSelection_lst is a List
-            Set Size to 94 75
-            Set Location to 31 405
-            Set peAnchors to anNone
-            Set Label to "Selected Function ID's"
-            Set Label_Justification_Mode to JMode_Top
-            Set Label_Col_Offset to 0
-            Set Label_Row_Offset to 1 
-            Delegate Set phoSelection_lst to Self  
+        Object oSelection_grd is a cRDCCJSelectionGrid
+            Set Size to 106 75
+            Set Location to 21 405
+            Set pbShowInvertSelectionsMenuItem to False
+            Delegate Set phoSelection_grd to Self  
+
+            Object oCJGridColumnRowIndicator is a cCJGridColumnRowIndicator
+            End_Object
+
+            Object oFunctionID_Col is a cCJGridColumn
+                Set piWidth to 105
+                Set psCaption to "Selected ID's"    
+                Set phoData_Col to Self
+            End_Object
             
-            Procedure DeleteID
-                Send DeleteSelectedItem of oRemoveFromList_btn 
-            End_Procedure   
-            
-            Procedure OnChange
-                Integer iCount
-                Get Item_Count to iCount
-                Set Value of oCountSelection_fm to iCount
+            Procedure ToggleCurrentItem
             End_Procedure 
             
-            Procedure Delete_Item Integer iItem
-                Forward Send Delete_Item iItem 
-                Send OnChange       
-                If (iItem > 0) Begin
-                    Set Current_Item to iItem
-                End
+            Procedure LoadData
+                Set pbVisible of (phoCheckbox_Col(Self)) to False 
+                Set piWidth of (phoCheckbox_Col(Self)) to 0
             End_Procedure
             
-            On_Key kDelete_Character Send DeleteID
-        End_Object
+            Procedure AddItem String sDataValue
+                Handle hoDataSource
+                tDataSourceRow[] TheData
+                tsSearchResult[] asFolderArray
+                Integer iSize iData_Col iCheckbox_Col
+        
+                If (not(IsComObjectCreated(Self))) Begin
+                    Procedure_Return
+                End
+        
+                Get piColumnId of (phoData_Col(Self)) to iData_Col
+                Get piColumnId of (phoCheckbox_Col(Self)) to iCheckbox_Col
+                Get phoDataSource to hoDataSource
+                Get DataSource of hoDataSource to TheData
+                Move (SizeOfArray(TheData)) to iSize
+                Move sDataValue to TheData[iSize].sValue[iData_Col]
+                Move False      to TheData[iSize].sValue[iCheckbox_Col]
 
-        Object oCountSelection_fm is a Form
-            Set Size to 12 18
-            Set Location to 121 405
-            Set Label to "Selections:"
-            Set Label_Justification_Mode to JMode_Right
-            Set Label_Col_Offset to 0
-            Set Enabled_State to False
+                Send DoSetCheckboxFooterText
+                Send ReInitializeData TheData False
+                Send MoveToLastRow
+            End_Procedure
+
+            Procedure DoSetCheckboxFooterText
+                Integer iCol iItems
+                Handle hoCol hoCheckbox_Col
+        
+                If ((phoData_Col(Self) = 0)) Begin
+                    Move 1 to iCol
+                End
+                Else Begin
+                    Get piColumnId of (phoData_Col(Self)) to iCol
+                End
+                Get ItemCount to iItems
+                Get ColumnObject iCol to hoCol
+                Set psFooterText of hoCol  to ("Count:" * String(iItems))
+            End_Procedure
+
         End_Object
         
         Object oExport_btn is a Button
             Set Size to 14 75
-            Set Location to 32 486
+            Set Location to 32 491
             Set Label to "Export Function Data"
             Set psToolTip to "Export selected function ID's data records *and* the corresponding function text(s) from the cRefactorFunctionLibrary repository class."
             Set peAnchors to anNone
         
             Procedure OnClick
-                Handle hoList  
+                Handle hoGrid 
                 Integer iItem iSize iCount iID iRetval
-                Integer[] aiFunctions 
+                String[] asFunctions 
                 Boolean bOK  
                 String sFileName
                 
-                Delegate Get phoSelection_lst to hoList    
-                Get Item_Count of hoList to iSize
+                Delegate Get phoSelection_grd to hoGrid
+                Get ItemCount of hoGrid to iSize
                 If (iSize = 0) Begin
                     Send Info_Box "No items to process!" 
                     Procedure_Return
                 End
-                Decrement iSize
-                For iCount from 0 to iSize
-                    Get Value of hoList Item iCount to iID
-                    Move iID to aiFunctions[SizeOfArray(aiFunctions)]    
-                Loop  
+                Send SelectAll of hoGrid   
+                Get SelectedItems of hoGrid to asFunctions
                 
                 // Main Export function:
-                Get ExportFile of ghoImportExportFunctions aiFunctions (&sFileName) to bOK
+                Get ExportFile of ghoImportExportFunctions asFunctions (&sFileName) to bOK
 
                 If (bOK = True) Begin
-                    Send Info_Box (String(iSize + 1) * "selected function(s) was successfully exported to the DFRefactor Export/Import file:\n" + sFileName)
+                    Send Info_Box (String(iSize) * "selected function(s) was successfully exported to the DFRefactor Export/Import file:\n" + sFileName)
                 End 
                 Else Begin
                     Send Info_Box "The export of the selected functions failed."
@@ -251,11 +273,10 @@ Object oFunctionsExportImport is a dbView
     
             Object oExportIdleHandler is a cIdleHandler
                 Procedure OnIdle
-                    Handle hoList            
+                    Handle hoGrid           
                     Integer iSize
-                    
-                    Delegate Get phoSelection_lst to hoList
-                    Get Item_Count of hoList to iSize
+                    Delegate Get phoSelection_grd to hoGrid
+                    Get ItemCount of hoGrid to iSize
                     Delegate Set Enabled_State to (iSize <> 0)
                 End_Procedure
             End_Object
@@ -274,7 +295,7 @@ Object oFunctionsExportImport is a dbView
 
         Object oViewExportFile_btn is a Button
             Set Size to 14 75
-            Set Location to 48 486
+            Set Location to 48 491
             Set Label to "View Export File"
             Set psToolTip to "View the file with the associtated program."
             Set peAnchors to anNone
@@ -319,7 +340,7 @@ Object oFunctionsExportImport is a dbView
             End_Procedure    
         
         End_Object 
-        
+
     End_Object
 
     Object oImport_grp is a dbGroup
