@@ -13,7 +13,7 @@ Use Windows.pkg
 ACTIVATE_VIEW Activate_oFunctionsExportImport FOR oFunctionsExportImport
 Object oFunctionsExportImport is a dbView
     Set Location to 5 5
-    Set Size to 299 589
+    Set Size to 292 589
     Set Label to "Export/Import"
     Set Border_Style to Border_Thick
     Set pbAutoActivate to True   
@@ -105,6 +105,7 @@ Object oFunctionsExportImport is a dbView
                 Get Field_Current_Value of oFunctions_DD Field FunctionsA.ID to iID
                 If (iID <> 0) Begin
                     Send Add_Item of hoList msg_None iID
+                    Send OnChange of hoList
                 End
             End_Procedure
         
@@ -131,6 +132,7 @@ Object oFunctionsExportImport is a dbView
                 Get Current_Item of hoList to iItem
                 Send Delete_Item of hoList iItem 
             End_Procedure
+            
         End_Object
 
         Object oAddAll_btn is a Button
@@ -151,6 +153,7 @@ Object oFunctionsExportImport is a dbView
                         Send Add_Item of hoList msg_None FunctionsA.ID
                     End
                 Until (Found = False)
+                Send OnChange of hoList
             End_Procedure
         
         End_Object
@@ -164,12 +167,13 @@ Object oFunctionsExportImport is a dbView
                 Handle hoList  
                 Delegate Get phoSelection_lst to hoList    
                 Send Delete_Data of hoList
+                Send OnChange of hoList
             End_Procedure
                 
         End_Object 
         
         Object oSelection_lst is a List
-            Set Size to 96 75
+            Set Size to 94 75
             Set Location to 31 405
             Set peAnchors to anNone
             Set Label to "Selected Function ID's"
@@ -180,9 +184,32 @@ Object oFunctionsExportImport is a dbView
             
             Procedure DeleteID
                 Send DeleteSelectedItem of oRemoveFromList_btn 
+            End_Procedure   
+            
+            Procedure OnChange
+                Integer iCount
+                Get Item_Count to iCount
+                Set Value of oCountSelection_fm to iCount
+            End_Procedure 
+            
+            Procedure Delete_Item Integer iItem
+                Forward Send Delete_Item iItem 
+                Send OnChange       
+                If (iItem > 0) Begin
+                    Set Current_Item to iItem
+                End
             End_Procedure
             
             On_Key kDelete_Character Send DeleteID
+        End_Object
+
+        Object oCountSelection_fm is a Form
+            Set Size to 12 18
+            Set Location to 121 405
+            Set Label to "Selections:"
+            Set Label_Justification_Mode to JMode_Right
+            Set Label_Col_Offset to 0
+            Set Enabled_State to False
         End_Object
         
         Object oExport_btn is a Button
@@ -215,7 +242,7 @@ Object oFunctionsExportImport is a dbView
                 Get ExportFile of ghoImportExportFunctions aiFunctions (&sFileName) to bOK
     
                 If (bOK = True) Begin
-                    Get YesNo_Box (String(iSize + 1) * "selected function(s) was successfully exported to the ini-file:\n" + sFileName + "\n\nDo you want to locate it in Windows Explorer?") to iRetval
+                    Get YesNo_Box (String(iSize + 1) * "selected function(s) was successfully exported to the ini-file:\n" + sFileName + "\n\nDo you want to locate the file in Windows Explorer?") to iRetval
                     If (iRetval = MBR_Yes) Begin
                         // We want to have that file to be selected in Windows Explorer
                         Move ("/select, " + sFileName) to sFileName
@@ -255,7 +282,7 @@ Object oFunctionsExportImport is a dbView
 
     Object oImport_grp is a dbGroup
         Set Size to 54 572
-        Set Location to 235 8
+        Set Location to 230 8
         Set Label to "Import"
 
         Object oImportFileName_fm is a Form
