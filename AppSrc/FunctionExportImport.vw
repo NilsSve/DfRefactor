@@ -240,19 +240,13 @@ Object oFunctionsExportImport is a dbView
                 
                 // Main Export function:
                 Get ExportFile of ghoImportExportFunctions aiFunctions (&sFileName) to bOK
-    
+
                 If (bOK = True) Begin
-                    Get YesNo_Box (String(iSize + 1) * "selected function(s) was successfully exported to the ini-file:\n" + sFileName + "\n\nDo you want to locate the file in Windows Explorer?") to iRetval
-                    If (iRetval = MBR_Yes) Begin
-                        // We want to have that file to be selected in Windows Explorer
-                        Move ("/select, " + sFileName) to sFileName
-                        Send vShellExecute "open" "explorer.exe" sFileName ""
-                    End
+                    Send Info_Box (String(iSize + 1) * "selected function(s) was successfully exported to the DFRefactor Export/Import file:\n" + sFileName)
                 End 
                 Else Begin
                     Send Info_Box "The export of the selected functions failed."
                 End
-    
             End_Procedure
     
             Object oExportIdleHandler is a cIdleHandler
@@ -277,6 +271,54 @@ Object oFunctionsExportImport is a dbView
             End_Procedure    
         
         End_Object   
+
+        Object oViewExportFile_btn is a Button
+            Set Size to 14 75
+            Set Location to 48 486
+            Set Label to "View Export File"
+            Set psToolTip to "View the file with the associtated program."
+            Set peAnchors to anNone
+        
+            Procedure OnClick
+                Boolean bExists
+                String sFileName sPath
+
+                Get psHome of (phoWorkspace(ghoApplication)) to sPath
+                Get vFolderFormat sPath to sPath
+                Move CS_ImpExpFileJson to sFileName
+                File_Exist (sPath + sFileName) bExists
+                If (bExists = True) Begin
+                    Send vShellExecute "open" sFileName sPath ""
+                End 
+                Else Begin
+                    Send Info_Box ("Export file not found:" * (sPath + sFileName))
+                End                   
+            End_Procedure
+    
+            Object oExportIdleHandler is a cIdleHandler
+                Procedure OnIdle
+                    String sPath sFileName 
+                    Boolean bExists
+                    Get psHome of (phoWorkspace(ghoApplication)) to sPath
+                    Get vFolderFormat sPath to sPath
+                    Move (sPath + CS_ImpExpFileJson) to sFileName
+                    File_Exist sFileName bExists
+                    Delegate Set Enabled_State to (bExists = True)
+                End_Procedure                                    
+                
+            End_Object
+        
+            Procedure Page Integer iPageObject
+               Forward Send Page iPageObject
+               Set pbEnabled of oExportIdleHandler to True
+            End_Procedure
+        
+            Procedure Deactivating
+               Set pbEnabled of oExportIdleHandler to False
+               Forward Send DeActivating 
+            End_Procedure    
+        
+        End_Object 
         
     End_Object
 
@@ -329,7 +371,7 @@ Object oFunctionsExportImport is a dbView
             Set Size to 14 75
             Set Location to 19 486
             Set Label to "Import Function Data"
-            Set psToolTip to "Import from a selected import-file."
+            Set psToolTip to "Imports data from the selected DFRefactor import-file."
             Set peAnchors to anNone
         
             Procedure OnClick
