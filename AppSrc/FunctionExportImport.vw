@@ -4,17 +4,20 @@
 
 Use DFClient.pkg
 Use DFEntry.pkg
+Use cRDCDbHeaderGroup.pkg
 Use oExportImportFunctions.pkg
 Use File_dlg.pkg
 
 Use cFunctionsDataDictionary.dd
 Use Windows.pkg
 Use cRDCCJSelectionGrid.pkg
+Use cDbTextEdit.pkg
+Use cCJGridColumn.pkg
 
 ACTIVATE_VIEW Activate_oFunctionsExportImport FOR oFunctionsExportImport
 Object oFunctionsExportImport is a dbView
     Set Location to 5 5
-    Set Size to 292 589
+    Set Size to 320 651
     Set Label to "Export/Import"
     Set Border_Style to Border_Thick
     Set pbAutoActivate to True   
@@ -30,33 +33,37 @@ Object oFunctionsExportImport is a dbView
 
     Object oInfo_tb is a TextBox
         Set Auto_Size_State to False
-        Set Size to 67 420
+        Set Size to 67 419
         Set Location to 16 66
         Set Justification_Mode to JMode_Left
         Set Label to "Info text"
         
         Procedure Page Integer iPageObject  
             String sVal
-            Move "This view is designed so that you can Export/Import refactoring data and source code from one machine to another." to sval
+            Move "This view is designed to enable you to Export/Import refactoring data and source code from one machine to another." to sVal
             Append sVal "\n\nSelect the functions to be exported. The data from the Functions table together with the corresponding function code text "
-            Append sVal "from the cRefactorFunctionLibrary class will be written to a file that can be copied/send to another machine for import." 
-            Append sVal "\n\nNote that each function that has code in the cRefactorFunctionLibrary class *must* also be registrered under the 'Function Maintenance' tab-page."
-            Move (Replaces("\n", sVal, (Character(13)))) to sVal
+            Append sVal "from the cRefactorFunctionLibrary class will be exported to a Json file that can be copied/send to another machine for import." 
+            Append sVal "\n\nNote that each function that has code in the cRefactorFunctionLibrary class *must* also have been registrered under the 'Function Maintenance' tab-page."
+            Move (Replaces("\n", sVal, (CS_CR))) to sVal
             Set Label to sVal
             Forward Send Page iPageObject
         End_Procedure
         
     End_Object
 
-    Object oExport_grp is a dbGroup
-        Set Size to 137 572
-        Set Location to 85 8
+    Object oExport_grp is a cRDCDbHeaderGroup
+        Set Size to 137 637
+        Set Location to 75 8
         Set Label to "Export"
+        Set psImage to "Export.ico"
+        Set psNote to "Export Functions to Json."
+        Set psToolTip to "Export function data to Json file."
+        Set peAnchors to anNone
 
         Object oFunctionsID is a dbForm
             Entry_Item Functions.ID
             Set Size to 12 34
-            Set Location to 16 59
+            Set Location to 33 59
             Set Label to "ID"
             Set Label_Justification_mode to jMode_right
             Set Label_Col_Offset to 2
@@ -67,7 +74,7 @@ Object oFunctionsExportImport is a dbView
         Object oFunctionsFunction_Name is a dbForm
             Entry_Item Functions.Function_Name
             Set Size to 12 250
-            Set Location to 30 59
+            Set Location to 46 59
             Set Label to "Name"
             Set Label_Justification_mode to jMode_right
             Set Label_Col_Offset to 2
@@ -77,36 +84,42 @@ Object oFunctionsExportImport is a dbView
         Object oFunctionsFunction_Description is a dbForm
             Entry_Item Functions.Function_Description
             Set Size to 12 250
-            Set Location to 44 59
+            Set Location to 61 59
             Set Label to "Description"
             Set Label_Justification_mode to jMode_right
             Set Label_Col_Offset to 2
             Set Label_row_Offset to 0
+            Set Enabled_State to False
         End_Object 
         
-        Object oFunctionsFunction_Help is a dbForm
+        Object oFunctionsFunction_Help is a cDbTextEdit
             Entry_Item Functions.Function_Help
-            Set Size to 12 250
-            Set Location to 58 59
+            Set Size to 37 250
+            Set Location to 75 59
             Set Label to "Help Text"
-            Set Label_Justification_mode to jMode_right
+            Set Label_Justification_Mode to JMode_Right
             Set Label_Col_Offset to 2
-            Set Label_row_Offset to 0
+            Set Label_Row_Offset to 0
+            Set Read_Only_State to True
+            Set Border_Style to Border_WindowEdge
         End_Object 
         
         Object oCopyToRight_btn is a Button
-            Set Size to 14 75
-            Set Location to 32 320
-            Set Label to "Copy to Right >>"
+            Set Size to 12 55
+            Set Location to 46 317
+            Set Label to "Copy >>"
+            Set Default_State to True
         
             Procedure OnClick
                 Handle hoGrid  
                 Integer iID
+                String sFunctionName
                 
                 Delegate Get phoSelection_grd to hoGrid
                 Get Field_Current_Value of oFunctions_DD Field FunctionsA.ID to iID
+                Get Field_Current_Value of oFunctions_DD Field FunctionsA.Function_Name to sFunctionName
                 If (iID <> 0) Begin
-                    Send AddItem of hoGrid iID
+                    Send AddItem of hoGrid iID sFunctionName
                     Send DoSetCheckboxFooterText of hoGrid
                 End
             End_Procedure
@@ -114,10 +127,10 @@ Object oFunctionsExportImport is a dbView
         End_Object
         
         Object oRemoveFromList_btn is a Button
-            Set Size to 14 75
-            Set Location to 48 319
-            Set Label to "<< Remove from list"
-        
+            Set Size to 12 55
+            Set Location to 61 316
+            Set Label to "<< Remove"
+            
             Procedure OnClick
                 Send DeleteSelectedItem
             End_Procedure
@@ -138,10 +151,10 @@ Object oFunctionsExportImport is a dbView
         End_Object
 
         Object oAddAll_btn is a Button
-            Set Size to 14 75
-            Set Location to 75 320
+            Set Size to 14 55
+            Set Location to 83 317
             Set Label to "Add All >>"
-        
+            
             Procedure OnClick
                 Handle hoGrid 
                 Integer iID
@@ -161,8 +174,8 @@ Object oFunctionsExportImport is a dbView
         End_Object
 
         Object oRemoveAll_btn is a Button
-            Set Size to 14 75
-            Set Location to 92 319
+            Set Size to 14 55
+            Set Location to 98 316
             Set Label to "<< Remove All"
         
             Procedure OnClick
@@ -175,18 +188,25 @@ Object oFunctionsExportImport is a dbView
         End_Object 
         
         Object oSelection_grd is a cRDCCJSelectionGrid
-            Set Size to 106 75
-            Set Location to 21 405
+            Set Size to 106 178
+            Set Location to 21 379
             Set pbShowInvertSelectionsMenuItem to False
+            Set psNoItemsText to "No data yet..."
             Delegate Set phoSelection_grd to Self  
 
             Object oCJGridColumnRowIndicator is a cCJGridColumnRowIndicator
+                Set piWidth to 25
             End_Object
 
             Object oFunctionID_Col is a cCJGridColumn
-                Set piWidth to 105
-                Set psCaption to "Selected ID's"    
+                Set piWidth to 30
+                Set psCaption to "ID"    
                 Set phoData_Col to Self
+            End_Object
+
+            Object oFunctionName_Col is a cCJGridColumn
+                Set piWidth to 241
+                Set psCaption to "Function Name"
             End_Object
             
             Procedure ToggleCurrentItem
@@ -197,11 +217,11 @@ Object oFunctionsExportImport is a dbView
                 Set piWidth of (phoCheckbox_Col(Self)) to 0
             End_Procedure
             
-            Procedure AddItem String sDataValue
+            Procedure AddItem String sDataValue String sFunctionName
                 Handle hoDataSource
                 tDataSourceRow[] TheData
                 tsSearchResult[] asFolderArray
-                Integer iSize iData_Col iCheckbox_Col
+                Integer iSize iData_Col iCheckbox_Col iFunctionName_Col
         
                 If (not(IsComObjectCreated(Self))) Begin
                     Procedure_Return
@@ -209,11 +229,13 @@ Object oFunctionsExportImport is a dbView
         
                 Get piColumnId of (phoData_Col(Self)) to iData_Col
                 Get piColumnId of (phoCheckbox_Col(Self)) to iCheckbox_Col
+                Get piColumnId of (oFunctionName_Col(Self)) to iFunctionName_Col
                 Get phoDataSource to hoDataSource
                 Get DataSource of hoDataSource to TheData
                 Move (SizeOfArray(TheData)) to iSize
-                Move sDataValue to TheData[iSize].sValue[iData_Col]
-                Move False      to TheData[iSize].sValue[iCheckbox_Col]
+                Move sDataValue    to TheData[iSize].sValue[iData_Col]             
+                Move sFunctionName to TheData[iSize].sValue[iFunctionName_Col]
+                Move False         to TheData[iSize].sValue[iCheckbox_Col]
 
                 Send DoSetCheckboxFooterText
                 Send ReInitializeData TheData False
@@ -223,26 +245,26 @@ Object oFunctionsExportImport is a dbView
             Procedure DoSetCheckboxFooterText
                 Integer iCol iItems
                 Handle hoCol hoCheckbox_Col
-        
-                If ((phoData_Col(Self) = 0)) Begin
-                    Move 1 to iCol
-                End
-                Else Begin
-                    Get piColumnId of (phoData_Col(Self)) to iCol
-                End
+                Get piColumnId of (oFunctionName_Col(Self)) to iCol
                 Get ItemCount to iItems
                 Get ColumnObject iCol to hoCol
                 Set psFooterText of hoCol  to ("Count:" * String(iItems))
             End_Procedure
 
+            Procedure DoChangeFontSize
+            End_Procedure
+            
         End_Object
         
         Object oExport_btn is a Button
-            Set Size to 14 75
-            Set Location to 32 491
-            Set Label to "Export Function Data"
+            Set Size to 22 66
+            Set Location to 33 564
+            Set Label to "Export Data to Json"
             Set psToolTip to "Export selected function ID's data records *and* the corresponding function text(s) from the cRefactorFunctionLibrary repository class."
-            Set peAnchors to anNone
+            Set peAnchors to anNone 
+            Set psImage to "Json.ico"
+            Set piImageSize to 32
+            Set MultiLineState to True
         
             Procedure OnClick
                 Handle hoGrid 
@@ -294,11 +316,13 @@ Object oFunctionsExportImport is a dbView
         End_Object   
 
         Object oViewExportFile_btn is a Button
-            Set Size to 14 75
-            Set Location to 48 491
-            Set Label to "View Export File"
-            Set psToolTip to "View the file with the associtated program."
-            Set peAnchors to anNone
+            Set Size to 22 66
+            Set Location to 58 564
+            Set Label to "View Json File"
+            Set psToolTip to "View the Json file with the associated program."
+            Set psImage to "View.ico"
+            Set piImageSize to 32
+            Set MultiLineState to True
         
             Procedure OnClick
                 Boolean bExists
@@ -341,17 +365,55 @@ Object oFunctionsExportImport is a dbView
         
         End_Object 
 
+        Object oOpenContainingFolder_btn is a Button
+            Set Size to 22 66
+            Set Location to 83 564
+            Set Label to "Containing Folder"
+            Set psToolTip to "Open Containing Folder"
+            Set psImage to "ActionOpenContainingFolder.ico"
+            Set piImageSize to 32
+            Set MultiLineState to True
+
+            Procedure OnClick
+                String sPath sFile
+
+                Get psHome of (phoWorkspace(ghoApplication)) to sPath
+                Move CS_ImpExpFileJson to sFile
+
+                // We want to have that file to be selected in Windows Explorer
+                If (sFile <> "") Begin
+                    Move ("/select, " + sFile) to sPath
+                End
+                Send vShellExecute "open" "explorer.exe" sPath ""
+            End_Procedure
+
+            Function IsEnabled Returns Boolean
+                String sPath sFile
+                Boolean bExists
+                Get psHome of (phoWorkspace(ghoApplication)) to sPath
+                Get vFolderFormat sPath to sPath
+                Move CS_ImpExpFileJson to sFile
+                Get vFilePathExists (sPath + sFile) to bExists
+                Function_Return (bExists = True)
+            End_Function
+
+        End_Object
+
     End_Object
 
-    Object oImport_grp is a dbGroup
-        Set Size to 54 572
-        Set Location to 230 8
-        Set Label to "Import"
+    Object oImport_grp is a cRDCDbHeaderGroup
+        Set Size to 96 637
+        Set Location to 220 8
+        Set Label to "Import" 
+        Set psNote to "Import Functions from Json."
+        Set psToolTip to "Import function data from Json file."
+        Set psImage to "Import.ico"
+        Set peAnchors to anNone
 
         Object oImportFileName_fm is a Form
-            Set Size to 12 393
-            Set Location to 19 90
-            Set Label to "Select import file name"
+            Set Size to 13 398
+            Set Location to 37 93
+            Set Label to "Select Json import file"
             Set Label_Col_Offset to 2
             Set Label_Justification_Mode to JMode_Right
             Set Prompt_Button_Mode to PB_PromptOn  
@@ -388,18 +450,35 @@ Object oFunctionsExportImport is a dbView
             On_Key kPrompt Send Prompt
         End_Object
 
+        Object oSelectFile_btn is a Button
+            Set Size to 22 64
+            Set Location to 33 494
+            Set Label to "Select File"  
+            Set psToolTip to "Select Json file to import"
+            Set psImage to "ActionOpen.ico"
+            Set piImageSize to 32
+            Set MultiLineState to True
+        
+            Procedure OnClick
+                Send Prompt of oImportFileName_fm    
+            End_Procedure
+        
+        End_Object
+
         Object oImport_btn is a Button
-            Set Size to 14 75
-            Set Location to 19 486
-            Set Label to "Import Function Data"
-            Set psToolTip to "Imports data from the selected DFRefactor import-file."
-            Set peAnchors to anNone
+            Set Size to 22 66
+            Set Location to 33 564
+            Set Label to "Import Json Data"
+            Set psToolTip to "Imports data from the selected DFRefactor Json import-file."
+            Set psImage to "Json.ico"
+            Set piImageSize to 32
+            Set MultiLineState to True
         
             Procedure OnClick
                 String sFileName
                 Integer iSize iErrors iRetval
                 
-                Get YesNo_Box "The Json import will make changes to your cRefactorFunctionLibrary.pkg file. Be sure to save any changes before you commence! Continue?" to iRetval
+                Get YesNo_Box ("The Json import will make changes to your" * CS_FunctionLibraryFile * "and" * CS_UnitTestsFile * "files.\n\nBe sure to Save any changes before you commence!\nContinue?") to iRetval
                 If (iRetval <> MBR_Yes) Begin
                     Procedure_Return
                 End
@@ -408,7 +487,7 @@ Object oFunctionsExportImport is a dbView
                 Get ImportFile of ghoImportExportFunctions sFileName (&iSize) to iErrors
     
                 If (iErrors = 0) Begin
-                    Send Info_Box (String(iSize + 1) * "Function(s) was successfully updated/added to the Functions data table and code was updated/added for the cRefactorFunctionLibrary.pkg file!")
+                    Send Info_Box (String(iSize + 1) * "Function(s) was successfully updated/added to the Functions data table and code was updated/added for the" * CS_FunctionLibraryFile * "and" * CS_UnitTestsFile * "files!")
                 End 
                 Else Begin
                     Send Info_Box ("The import failed with:" * String(iErrors) * "errors")
@@ -442,11 +521,13 @@ Object oFunctionsExportImport is a dbView
         End_Object 
 
         Object oViewImportFile_btn is a Button
-            Set Size to 14 75
-            Set Location to 36 486
-            Set Label to "View Import File"
-            Set psToolTip to "View the file with the associtated program."
-            Set peAnchors to anNone
+            Set Size to 22 66
+            Set Location to 58 564
+            Set Label to "View Json File"
+            Set psToolTip to "View the Json file with the associated program."
+            Set psImage to "View.ico"
+            Set piImageSize to 32
+            Set MultiLineState to True
         
             Procedure OnClick
                 String sPath sFileName
