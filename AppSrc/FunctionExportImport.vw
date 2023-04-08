@@ -165,7 +165,7 @@ Object oFunctionsExportImport is a dbView
                 Repeat
                     Find gt FunctionsA.ID 
                     If (Found = True) Begin
-                        Send AddItem of hoGrid FunctionsA.ID
+                        Send AddItem of hoGrid FunctionsA.ID FunctionsA.Function_Name
                     End
                 Until (Found = False)
                 Send DoSetCheckboxFooterText of hoGrid
@@ -226,6 +226,8 @@ Object oFunctionsExportImport is a dbView
                 If (not(IsComObjectCreated(Self))) Begin
                     Procedure_Return
                 End
+                Move (Trim(sDataValue)) to sDataValue
+                Move (Trim(sFunctionName)) to sFunctionName
         
                 Get piColumnId of (phoData_Col(Self)) to iData_Col
                 Get piColumnId of (phoCheckbox_Col(Self)) to iCheckbox_Col
