@@ -17,7 +17,7 @@ Use cCJGridColumn.pkg
 ACTIVATE_VIEW Activate_oFunctionsExportImport FOR oFunctionsExportImport
 Object oFunctionsExportImport is a dbView
     Set Location to 5 5
-    Set Size to 320 651
+    Set Size to 354 651
     Set Label to "Export/Import"
     Set Border_Style to Border_Thick
     Set pbAutoActivate to True   
@@ -31,29 +31,40 @@ Object oFunctionsExportImport is a dbView
     Set Main_DD to oFunctions_DD
     Set Server  to oFunctions_DD
 
-    Object oInfo_tb is a TextBox
-        Set Auto_Size_State to False
-        Set Size to 67 419
-        Set Location to 16 66
-        Set Justification_Mode to JMode_Left
-        Set Label to "Info text"
-        
-        Procedure Page Integer iPageObject  
-            String sVal
-            Move "This view is designed to enable you to Export/Import refactoring data and source code from one machine to another." to sVal
-            Append sVal "\n\nSelect the functions to be exported. The data from the Functions table together with the corresponding function code text "
-            Append sVal "from the cRefactorFunctionLibrary class will be exported to a Json file that can be copied/send to another machine for import." 
-            Append sVal "\n\nNote that each function that has code in the cRefactorFunctionLibrary class *must* also have been registrered under the 'Function Maintenance' tab-page."
-            Move (Replaces("\n", sVal, (CS_CR))) to sVal
-            Set Label to sVal
-            Forward Send Page iPageObject
-        End_Procedure
-        
+    Object oInfo_grp is a cRDCDbHeaderGroup
+        Set Size to 103 637
+        Set Location to 10 8
+        Set Label to "Info"
+        Set psImage to "ActionAbout.ico"
+        Set psNote to "Info about Export/Import"
+        Set psToolTip to "How to Export/Import function data to/from Json file."
+        Set peAnchors to anNone
+
+        Object oInfo_tb is a TextBox
+            Set Auto_Size_State to False
+            Set Size to 67 419
+            Set Location to 25 59
+            Set Justification_Mode to JMode_Left
+            Set Label to "Info text"
+            
+            Procedure Page Integer iPageObject  
+                String sVal
+                Move "This view is designed to enable you to Export/Import refactoring data and source code from one machine to another." to sVal
+                Append sVal "\n\nSelect the functions to be exported. The data from the Functions table together with the corresponding function code text "
+                Append sVal "from the cRefactorFunctionLibrary class will be exported to a Json file that can be copied/send to another machine for import, in alphabetical order (Function names)." 
+                Append sVal "\n\nNote that each function that has code in the cRefactorFunctionLibrary class *must* also have been registrered under the 'Function Maintenance' tab-page."
+                Move (Replaces("\n", sVal, (CS_CR))) to sVal
+                Set Label to sVal
+                Forward Send Page iPageObject
+            End_Procedure
+            
+        End_Object
+
     End_Object
 
     Object oExport_grp is a cRDCDbHeaderGroup
-        Set Size to 137 637
-        Set Location to 75 8
+        Set Size to 122 637
+        Set Location to 123 8
         Set Label to "Export"
         Set psImage to "Export.ico"
         Set psNote to "Export Functions to Json."
@@ -188,7 +199,7 @@ Object oFunctionsExportImport is a dbView
         End_Object 
         
         Object oSelection_grd is a cRDCCJSelectionGrid
-            Set Size to 106 178
+            Set Size to 91 178
             Set Location to 21 379
             Set pbShowInvertSelectionsMenuItem to False
             Set psNoItemsText to "No data yet..."
@@ -201,12 +212,12 @@ Object oFunctionsExportImport is a dbView
             Object oFunctionID_Col is a cCJGridColumn
                 Set piWidth to 30
                 Set psCaption to "ID"    
-                Set phoData_Col to Self
             End_Object
 
             Object oFunctionName_Col is a cCJGridColumn
                 Set piWidth to 241
                 Set psCaption to "Function Name"
+                Set phoData_Col to Self
             End_Object
             
             Procedure ToggleCurrentItem
@@ -221,7 +232,7 @@ Object oFunctionsExportImport is a dbView
                 Handle hoDataSource
                 tDataSourceRow[] TheData
                 tsSearchResult[] asFolderArray
-                Integer iSize iData_Col iCheckbox_Col iFunctionName_Col
+                Integer iSize iData_Col iCheckbox_Col iID_Col
         
                 If (not(IsComObjectCreated(Self))) Begin
                     Procedure_Return
@@ -229,14 +240,14 @@ Object oFunctionsExportImport is a dbView
                 Move (Trim(sDataValue)) to sDataValue
                 Move (Trim(sFunctionName)) to sFunctionName
         
-                Get piColumnId of (phoData_Col(Self)) to iData_Col
+                Get piColumnId of (oFunctionID_Col(Self)) to iID_Col
+                Get piColumnId of (phoData_Col(Self))     to iData_Col
                 Get piColumnId of (phoCheckbox_Col(Self)) to iCheckbox_Col
-                Get piColumnId of (oFunctionName_Col(Self)) to iFunctionName_Col
                 Get phoDataSource to hoDataSource
                 Get DataSource of hoDataSource to TheData
                 Move (SizeOfArray(TheData)) to iSize
-                Move sDataValue    to TheData[iSize].sValue[iData_Col]             
-                Move sFunctionName to TheData[iSize].sValue[iFunctionName_Col]
+                Move sDataValue    to TheData[iSize].sValue[iID_Col]
+                Move sFunctionName to TheData[iSize].sValue[iData_Col]
                 Move False         to TheData[iSize].sValue[iCheckbox_Col]
 
                 Send DoSetCheckboxFooterText
@@ -283,12 +294,13 @@ Object oFunctionsExportImport is a dbView
                 End
                 Send SelectAll of hoGrid   
                 Get SelectedItems of hoGrid to asFunctions
+                Move (SortArray(asFunctions)) to asFunctions
                 
                 // Main Export function:
                 Get ExportFile of ghoImportExportFunctions asFunctions (&sFileName) to bOK
 
                 If (bOK = True) Begin
-                    Send Info_Box (String(iSize) * "selected function(s) was successfully exported to the DFRefactor Export/Import file:\n" + sFileName)
+                    Send Info_Box (String(iSize) * "selected function(s) was successfully exported to the Export/Import file:\n" + sFileName)
                 End 
                 Else Begin
                     Send Info_Box "The export of the selected functions failed."
@@ -369,7 +381,7 @@ Object oFunctionsExportImport is a dbView
 
         Object oOpenContainingFolder_btn is a Button
             Set Size to 22 66
-            Set Location to 83 564
+            Set Location to 90 564
             Set Label to "Containing Folder"
             Set psToolTip to "Open Containing Folder"
             Set psImage to "ActionOpenContainingFolder.ico"
@@ -404,8 +416,8 @@ Object oFunctionsExportImport is a dbView
     End_Object
 
     Object oImport_grp is a cRDCDbHeaderGroup
-        Set Size to 96 637
-        Set Location to 220 8
+        Set Size to 89 637
+        Set Location to 255 8
         Set Label to "Import" 
         Set psNote to "Import Functions from Json."
         Set psToolTip to "Import function data from Json file."
@@ -418,7 +430,6 @@ Object oFunctionsExportImport is a dbView
             Set Label to "Select Json import file"
             Set Label_Col_Offset to 2
             Set Label_Justification_Mode to JMode_Right
-            Set Prompt_Button_Mode to PB_PromptOn  
             Set psToolTip to "Press [F4] to display the Open dialog and select an import file."
             
             Procedure Prompt
@@ -500,7 +511,7 @@ Object oFunctionsExportImport is a dbView
                 Get ImportFile of ghoImportExportFunctions sFileName (&iSize) to iErrors
     
                 If (iErrors = 0) Begin
-                    Send Info_Box (String(iSize + 1) * "Function(s) was successfully updated/added to the Functions data table and code was updated/added for the" * CS_FunctionLibraryFile * "and" * CS_UnitTestsFile * "files!")
+                    Send Info_Box (String(iSize + 1) * "Successfully updated/added the Functions data table and code was updated/added for the" * CS_FunctionLibraryFile * "and" * CS_UnitTestsFile * "files!")
                 End 
                 Else Begin
                     Send Info_Box ("The import failed with:" * String(iErrors) * "errors")
