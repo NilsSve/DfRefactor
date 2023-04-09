@@ -447,7 +447,18 @@ Object oFunctionsExportImport is a dbView
                     Function_Return False
                 End                      
                 Set Value to asSelectedFiles[0]
-            End_Procedure             
+            End_Procedure
+            
+            Procedure Activating
+                String sPath 
+                Boolean bExists
+                Get psHome of (phoWorkspace(ghoApplication)) to sPath
+                Get vFolderFormat sPath to sPath
+                File_Exist (sPath + CS_ImpExpFileJson) bExists
+                If (bExists = True) Begin
+                    Set Value to (sPath + CS_ImpExpFileJson)
+                End
+            End_Procedure
             
             On_Key kPrompt Send Prompt
         End_Object
