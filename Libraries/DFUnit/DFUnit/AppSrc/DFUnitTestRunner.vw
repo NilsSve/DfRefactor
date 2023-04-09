@@ -50,16 +50,17 @@ Object DFUnitTestRunner_vw is a View
     End_Object
 
     Object oRunTestsButton is a Button
-        Set Size to 30 169
+        Set Size to 30 87
         Set Location to 9 12
         Set Label to "Run again"
-        Set peAnchors to anTopLeftRight
+        Set peAnchors to anNone
         Set psImage to "RunProgram.ico"
         Set piImageSize to 42
 //        Set FontPointHeight to 18  
         // We use this instead so we can align in the Studio.
-        Set Form_FontWeight to FW_BOLD
-        Set piImageMarginLeft to 20
+        Set Form_FontWeight to FW_BOLD 
+        Set piImageMarginLeft to 15
+        Set MultiLineState to True
     
         Procedure OnClick
             Send Execute to (Parent(Self))
@@ -68,12 +69,12 @@ Object DFUnitTestRunner_vw is a View
     End_Object
 
     Object oClose_btn is a Button
-        Set Size to 30 70
-        Set Location to 9 186
+        Set Size to 30 61
+        Set Location to 9 105
         Set Label to "Exit"
         Set psImage to "ActionExit.ico"
         Set piImageSize to 36
-        Set peAnchors to anTopRight
+        Set peAnchors to anNone
         Set piImageMarginLeft to 20
     
         Procedure OnClick
