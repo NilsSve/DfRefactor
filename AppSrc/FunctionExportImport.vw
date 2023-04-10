@@ -118,7 +118,7 @@ Object oFunctionsExportImport is a dbView
         Object oCopyToRight_btn is a Button
             Set Size to 12 55
             Set Location to 46 317
-            Set Label to "Copy >>"
+            Set Label to "Add >>"
             Set Default_State to True
         
             Procedure OnClick
