@@ -53,6 +53,7 @@ Struct tRefactorSettings
     //
     String  sFileFilter                 // File selection filter.
     String[] asFolderNames              // String array with full path to all selected folders.
+    Integer eDDOStyle
 End_Struct                   
 
 Struct tParseObject
