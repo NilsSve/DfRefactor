@@ -17,7 +17,7 @@ Use cCJGridColumn.pkg
 ACTIVATE_VIEW Activate_oFunctionsExportImport FOR oFunctionsExportImport
 Object oFunctionsExportImport is a dbView
     Set Location to 5 5
-    Set Size to 354 651
+    Set Size to 327 651
     Set Label to "Export/Import"
     Set Border_Style to Border_Thick
     Set pbAutoActivate to True   
@@ -68,7 +68,7 @@ Object oFunctionsExportImport is a dbView
         Set Label to "Export"
         Set psImage to "Export.ico"
         Set psNote to "Export Functions to Json."
-        Set psToolTip to "Export function data to Json file."
+        Set psToolTip to ("Export function data from the Functions table, function code from:" * String(CS_FunctionLibraryFile) * "and Unit testing from:" * String(CS_UnitTestsFile) + ", to Json file:" * String(CS_ImpExpFileJson))
         Set peAnchors to anNone
 
         Object oFunctionsID is a dbForm
@@ -416,21 +416,22 @@ Object oFunctionsExportImport is a dbView
     End_Object
 
     Object oImport_grp is a cRDCDbHeaderGroup
-        Set Size to 89 637
+        Set Size to 65 637
         Set Location to 255 8
         Set Label to "Import" 
         Set psNote to "Import Functions from Json."
-        Set psToolTip to "Import function data from Json file."
+        Set psToolTip to ("Import function data to the Functions table, function code to:" * String(CS_FunctionLibraryFile) * "and Unit testing to:" * String(CS_UnitTestsFile) + ", from Json file:" * String(CS_ImpExpFileJson))
         Set psImage to "Import.ico"
         Set peAnchors to anNone
 
         Object oImportFileName_fm is a Form
-            Set Size to 13 398
-            Set Location to 37 93
-            Set Label to "Select Json import file"
-            Set Label_Col_Offset to 2
-            Set Label_Justification_Mode to JMode_Right
+            Set Size to 14 360
+            Set Location to 37 59
+            Set Label to "Json import file:"
+            Set Label_Col_Offset to 0
+            Set Label_Justification_Mode to JMode_Top
             Set psToolTip to "Press [F4] to display the Open dialog and select an import file."
+            Set Label_Row_Offset to 1
             
             Procedure Prompt
                 String sPath
@@ -476,7 +477,7 @@ Object oFunctionsExportImport is a dbView
 
         Object oSelectFile_btn is a Button
             Set Size to 22 64
-            Set Location to 33 494
+            Set Location to 33 425
             Set Label to "Select File"  
             Set psToolTip to "Select Json file to import"
             Set psImage to "ActionOpen.ico"
@@ -546,7 +547,7 @@ Object oFunctionsExportImport is a dbView
 
         Object oViewImportFile_btn is a Button
             Set Size to 22 66
-            Set Location to 58 564
+            Set Location to 33 493
             Set Label to "View Json File"
             Set psToolTip to "View the Json file with the associated program."
             Set psImage to "View.ico"

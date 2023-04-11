@@ -807,8 +807,8 @@ Register_Procedure RefreshSelectionUpdate
         Move (SysFile.SelectedReportAllFunctions + SysFile.SelectedOtherAllFunctions) ;
             to RefactorSettings.iSelectedAllFilesFunctions
 
-        Move SysFile.bCountSourceLines              to RefactorSettings.bCountSourceLines
-        Move SysFile.bEditorDropSelf                to RefactorSettings.bEditorDropSelf
+        Move SysFile.bCountSourceLines            to RefactorSettings.bCountSourceLines
+        Move SysFile.bEditorDropSelf              to RefactorSettings.bEditorDropSelf
 
         Set pRefactorSettings of ghoRefactorFunctionLibrary to RefactorSettings
     End_Procedure
