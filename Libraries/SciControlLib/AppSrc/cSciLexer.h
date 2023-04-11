@@ -26,7 +26,9 @@ Define WM_RBUTTONUP             For |CI$0205 // 0x0205
 #IFNDEF GET_CREATEWINDOWEX
   External_Function CreateWindowEx     'CreateWindowExA'      User32.dll  DWord e Pointer c Pointer v DWord w DWord x DWord y DWord wi DWord he Handle hP Handle hm Handle hi Pointer cs Returns Handle
 #ENDIF
-External_Function GetObject          'GetObjectA'           Gdi32.dll   Handle hGdi Integer iSize Pointer pBuff Returns Integer
+#IFNDEF Get_GetObject
+  External_Function GetObject          'GetObjectA'           Gdi32.dll   Handle hGdi Integer iSize Pointer pBuff Returns Integer
+#ENDIF
 #IFNDEF GET_CREATEFONTINDIRECT
   External_Function CreateFontIndirect 'CreateFontIndirectA'  Gdi32.dll   Pointer pLogfont Returns Integer
 #ENDIF
