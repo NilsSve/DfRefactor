@@ -17,8 +17,8 @@ Use StatusLog.dg
 
 Use cFunctionsDataDictionary.dd
 Use cSysFileDataDictionary.dd
-Use cdbCJGridColumn.pkg
-Use Windows.pkg
+Use cFolderSelHeaDataDictionary.dd
+Use cFolderSelDtlDataDictionary.dd
 
 Enum_List
     Integer Ico_Folders
@@ -44,10 +44,17 @@ Object oRefactorView is a cRefactorDbView
     Set pbAcceptDropFiles to True
     Set Auto_Clear_DEO_State to False  
     Set Auto_Top_Panel_State to False
-
-    Set phoRefactorView of ghoApplication to Self
-
+    Set phoRefactorView of ghoApplication to Self   
+    
     Object oSysFile_DD is a cSysFileDataDictionary
+    End_Object
+
+    Object oFolderSelHea_DD is a cFolderSelHeaDataDictionary
+        Set private.phoFolderSelHeaDD of ghoApplication to Self
+    End_Object
+
+    Object oFolderSelDtl_DD is a cFolderSelDtlDataDictionary
+        Set DDO_Server to oFolderSelHea_DD
     End_Object
 
     Object oFunctions_DD is a cFunctionsDataDictionary  
@@ -120,7 +127,7 @@ Object oRefactorView is a cRefactorDbView
                     End_Object
 
                     Object oFoldername_Col is a cCJGridColumn
-                        // NOTE: This must be set here!
+                        // NOTE: This must be set here for selections to work!
                         Set phoData_Col to Self
                         Set piWidth to 797
                         Set psCaption to "Folder Name"
@@ -153,17 +160,17 @@ Object oRefactorView is a cRefactorDbView
 
                     End_Object
 
-                    // This column is created automatically by the cRDCCJGrid class.
+                    // A "oCheckbox_Col" column is created automatically by the cRDCCJGrid class.
                     // Object oCheckbox_Col is a cCJGridColumn
                     // End_Object
 
                     Procedure LoadData
                         String sHomePath sFolderName sDefaultFolders
-                        String[] asNoFolderList asStartFolder asFolderArray asDefaultFolders
-                        Handle hoDataSource
+                        String[] asNoFolderList asStartFolder asFolderArray asDefaultFolders asSavedFolders
+                        Handle hoDataSource hoFolderSelHeaDD
                         tDataSourceRow[] TheData TheDataEmpty
-                        Integer iSize iRow iCount iFolderCol iCheckBoxCol iDefaultFolders iFolder
-                        Boolean bChecked
+                        Integer iSize iRow iCount iSavedSize iFolderCol iCheckBoxCol iDefaultFolders iFolder
+                        Boolean bChecked bUseDDO bExists
 
                         If (not(IsComObjectCreated(Self))) Begin
                             Procedure_Return
@@ -183,7 +190,24 @@ Object oRefactorView is a cRefactorDbView
                             Send Cursor_Ready of Cursor_Control
                             Procedure_Return
                         End
-                        Decrement iSize
+                        Decrement iSize   
+                        
+                        // If saved folders exists, they have previously been selected and
+                        // will take precedense over other "standard" selections
+                        // in the loop below.
+                        Move 0 to iSavedSize
+                        Get private.phoFolderSelHeaDD of ghoApplication to hoFolderSelHeaDD
+                        Move (hoFolderSelHeaDD <> 0) to bUseDDO
+                        If (bUseDDO = True) Begin
+                            Get psHomePath of ghoApplication to sHomePath 
+                            Get IsSavedFolders of hoFolderSelHeaDD sHomePath to bExists
+                            If (bExists = True) Begin
+                                Get FindSavedFolders of hoFolderSelHeaDD sHomePath to asSavedFolders
+                            End
+                            Move (SizeOfArray(asSavedFolders)) to iSavedSize
+                            Decrement iSavedSize
+                            Move (iSavedSize >= 0) to bUseDDO
+                        End
 
                         Move 0 to iCount
                         Get phoDataSource to hoDataSource
@@ -204,6 +228,9 @@ Object oRefactorView is a cRefactorDbView
                             Move asFolderArray[iCount] to sFolderName
                             Move sFolderName to TheData[iRow].sValue[iFolderCol]
                             Get IsFolderInDefaultsFolderList of ghoApplication sFolderName to bChecked
+                            If (bUseDDO = True) Begin
+                                Get FindFolderName sFolderName asSavedFolders to bChecked
+                            End
                             Move bChecked to TheData[iRow].sValue[iCheckBoxCol]
                             Increment iRow
                         Loop
@@ -219,131 +246,36 @@ Object oRefactorView is a cRefactorDbView
                         Set psFooterText of oFoldername_Col  to ("Selected Items:" * String(iCount) * "of" * String(iSize + 1))
                         Send Cursor_Ready of Cursor_Control
                     End_Procedure
-
-                    On_Key kClear Send ActivateProcess
-                End_Object
-
-                Object oFileNameFilters_cf is a cRDCDbComboForm 
-                    Entry_Item SysFile.FileExtensionFilter
-                    Set Server to oSysFile_DD
-                    Set Size to 12 256
-                    Set Location to 6 310
-                    Set Label to "Select File Extensions Filter"
-                    Set psToolTip to "Each extension must start with a wildcard character and a dot (*.) and file extensions must be separated with a semicolon (;)"
-                    Set Status_Help to (psToolTip(Self))
-                    Set Combo_Sort_State to False
-                    Set pbAutoEnable to True
-                    Set peAnchors to anTopRight
-
-                    Property Integer piMaxUserFilters 8
-
-                    Procedure Combo_Fill_List
-                        String sDFExtensions sDFVersion
-                        Integer iMajorVersion iMinorVersion iCount iSize
-                        String[] asUserExtensions
-
-                        Forward Send Combo_Fill_List
-                        Move FMAC_VERSION  to iMajorVersion
-                        Move FMAC_REVISION to iMinorVersion
-                        Move (String(iMajorVersion) + "." + String(iMinorVersion)) to sDFVersion
-                        Get StudioFileExtensions of ghoApplication sDFVersion to sDFExtensions
-
-                        Send Combo_Add_Item CS_StdExtensions
-                        Send Combo_Add_Item CS_DFAndTemplExt
-                        Send Combo_Add_Item CS_PkgIncExt
-                        Send Combo_Add_Item CS_SrcPkgExt
-
-                        If (sDFExtensions <> String(cx_RegKeyDFKeyDoesNotExist)) Begin
-                            Send Combo_Add_Item sDFExtensions
-                        End
-
-                        Get UserSavedExtensions to asUserExtensions
-                        Move (SizeOfArray(asUserExtensions)) to iSize
-                        Decrement iSize
-                        For iCount from 0 to iSize
-                            Send Combo_Add_Item (Trim(asUserExtensions[iCount]))
-                        Loop
-
-                        Set Value to CS_StdExtensions
-                    End_Procedure
-
-                    Function UserSavedExtensions Returns String[]
-                        String[] asUserExtensions
-                        String sExt
-                        Integer iCount iSize
-
-                        Get piMaxUserFilters to iSize
-                        For iCount from 0 to iSize
-                            Get ReadString  of ghoApplication CS_Settings (CS_DFExtensionsKey + String(iCount)) "" to sExt
-                            If (sExt <> "") Begin
-                                Move sExt to asUserExtensions[SizeOfArray(asUserExtensions)]
-                            End
-                        Loop
-
-                        Function_Return asUserExtensions
-                    End_Function
-
-                    // Note: Can't save new extensions entered by user with the
-                    // OnChange event, as it would save character per character.
-                    Procedure OnExitObject
-                        String sDFExtensions sDFVersion sNewExt
-                        Integer iMajorVersion iMinorVersion iCount iSize iMaxUserFilters iItem
-                        String[] asUserExtensions
-                        Boolean bExists
-
-                        Move FMAC_VERSION  to iMajorVersion
-                        Move FMAC_REVISION to iMinorVersion
-                        Move (String(iMajorVersion) + "." + String(iMinorVersion)) to sDFVersion
-                        Get StudioFileExtensions of ghoApplication sDFVersion to sDFExtensions
-
-                        Get piMaxUserFilters to iSize
-                        Get Value to sNewExt
-                        If (sNewExt <> CS_StdExtensions and ;
-                            sNewExt <> CS_DFAndTemplExt and ;
-                            sNewExt <> CS_PkgIncExt and ;
-                            sNewExt <> CS_SrcPkgExt and ;
-                            sNewExt <> sDFExtensions) Begin
-
-                            Get IsExtensionInRegistry sNewExt to bExists
-
-                            If (bExists = False) Begin
-                                Get UserSavedExtensions to asUserExtensions
-                                // Push the new item on top of the list
-                                Send WriteString of ghoApplication CS_Settings (CS_DFExtensionsKey + String("0")) sNewExt
-                                Get piMaxUserFilters to iMaxUserFilters
-                                Move (SizeOfArray(asUserExtensions)) to iSize
-                                Move (iMaxUserFilters min iSize) to iSize
-                                Decrement iSize
-                                Move 0 to iItem
-                                For iCount from 0 to iSize
-                                    Send WriteString of ghoApplication CS_Settings (CS_DFExtensionsKey + String(iCount + 1)) asUserExtensions[iItem]
-                                    Increment iItem
-                                Loop
-                                Get piMaxUserFilters to iSize
-                                Move iSize to iCount // Get out of loop
+                    
+                    Function FindFolderName String sFolderName String[] asSavedFolders Returns Boolean
+                        Integer iRow
+                        Move (SearchArray(sFolderName, asSavedFolders)) to iRow
+                        Function_Return (iRow <> -1)
+                    End_Function 
+                    
+                    Procedure SaveSelectedFolders
+                        Boolean bSave bOK
+                        Handle hoDD        
+                        String sHomeFolder
+                        String[] asSelectedFolders asSavedFolders
+                        
+                        Move False to bSave
+                        Get SelectedItems to asSelectedFolders
+                        Get psHomePath of ghoApplication to sHomeFolder
+                        Get private.phoFolderSelHeaDD of ghoApplication to hoDD
+                        Get FindSavedFolders of hoDD sHomeFolder to asSavedFolders
+                        Move (not(IsSameArray(asSelectedFolders, asSavedFolders))) to bSave
+                        If (bSave = True) Begin
+                            Get SaveSelectedFolders of hoDD sHomeFolder asSelectedFolders to bOK
+                            If (bOK = False) Begin
+                                Send Info_Box "Could not save selected folders." 
                             End
                         End
-
                     End_Procedure
 
-                    Function IsExtensionInRegistry String sExt Returns Boolean
-                        Boolean bExists
-                        String[] asUserExtensions
-                        Integer iCount iSize
-
-                        Move False to bExists
-                        Get UserSavedExtensions to asUserExtensions
-                        Move (SizeOfArray(asUserExtensions)) to iSize
-                        Decrement iSize
-                        For iCount from 0 to iSize
-                            If (Lowercase(asUserExtensions[iCount]) = Lowercase(sExt)) Begin
-                                Move True to bExists
-                                Move iSize to iCount // We're done.
-                            End
-                        Loop
-                        Function_Return bExists
-                    End_Function
-
+                    On_Key kClear         Send ActivateProcess  
+                    On_Key Key_F2         Send SaveSelectedFolders
+                    On_Key Key_Ctrl+Key_S Send SaveSelectedFolders
                 End_Object
 
                 Procedure UpdateEnabledState
@@ -356,6 +288,11 @@ Object oRefactorView is a cRefactorDbView
 
             End_Object
 
+            Procedure OnExitArea Handle hoFrom
+                Send SaveSelectedFolders of oFolders_grd
+                Forward Send OnExitArea hoFrom
+            End_Procedure
+                     
         End_Object
 
         Object oSelectFunctions_tp is a dbTabPage
@@ -755,6 +692,130 @@ Register_Procedure RefreshSelectionUpdate
                 Set Value of oNoOfSelectedFunctions2_fm to iSelectedFunctions
                 Set Changed_State of oSysFile_DD to False
             End_Procedure
+
+        End_Object
+
+        Object oFileNameFilters_cf is a cRDCDbComboForm 
+            Entry_Item SysFile.FileExtensionFilter
+            Set Server to oSysFile_DD
+            Set Size to 12 229
+            Set Location to 30 73
+            Set Label to "File Extensions Filter"
+            Set psToolTip to "Select file extensions filter. Each extension must start with a wildcard character and a dot (*.) and file extensions must be separated with a semicolon (;)"
+            Set Status_Help to (psToolTip(Self))
+            Set Combo_Sort_State to False
+            Set pbAutoEnable to True
+            Set peAnchors to anTopLeftRight
+
+            Property Integer piMaxUserFilters 8
+            Set Label_Row_Offset to 00
+
+            Procedure Combo_Fill_List
+                String sDFExtensions sDFVersion
+                Integer iMajorVersion iMinorVersion iCount iSize
+                String[] asUserExtensions
+
+                Forward Send Combo_Fill_List
+                Move FMAC_VERSION  to iMajorVersion
+                Move FMAC_REVISION to iMinorVersion
+                Move (String(iMajorVersion) + "." + String(iMinorVersion)) to sDFVersion
+                Get StudioFileExtensions of ghoApplication sDFVersion to sDFExtensions
+
+                Send Combo_Add_Item CS_StdExtensions
+                Send Combo_Add_Item CS_DFAndTemplExt
+                Send Combo_Add_Item CS_PkgIncExt
+                Send Combo_Add_Item CS_SrcPkgExt
+
+                If (sDFExtensions <> String(cx_RegKeyDFKeyDoesNotExist)) Begin
+                    Send Combo_Add_Item sDFExtensions
+                End
+
+                Get UserSavedExtensions to asUserExtensions
+                Move (SizeOfArray(asUserExtensions)) to iSize
+                Decrement iSize
+                For iCount from 0 to iSize
+                    Send Combo_Add_Item (Trim(asUserExtensions[iCount]))
+                Loop
+
+                Set Value to CS_StdExtensions
+            End_Procedure
+
+            Function UserSavedExtensions Returns String[]
+                String[] asUserExtensions
+                String sExt
+                Integer iCount iSize
+
+                Get piMaxUserFilters to iSize
+                For iCount from 0 to iSize
+                    Get ReadString  of ghoApplication CS_Settings (CS_DFExtensionsKey + String(iCount)) "" to sExt
+                    If (sExt <> "") Begin
+                        Move sExt to asUserExtensions[SizeOfArray(asUserExtensions)]
+                    End
+                Loop
+
+                Function_Return asUserExtensions
+            End_Function
+
+            // Note: Can't save new extensions entered by user with the
+            // OnChange event, as it would save character per character.
+            Procedure OnExitObject
+                String sDFExtensions sDFVersion sNewExt
+                Integer iMajorVersion iMinorVersion iCount iSize iMaxUserFilters iItem
+                String[] asUserExtensions
+                Boolean bExists
+
+                Move FMAC_VERSION  to iMajorVersion
+                Move FMAC_REVISION to iMinorVersion
+                Move (String(iMajorVersion) + "." + String(iMinorVersion)) to sDFVersion
+                Get StudioFileExtensions of ghoApplication sDFVersion to sDFExtensions
+
+                Get piMaxUserFilters to iSize
+                Get Value to sNewExt
+                If (sNewExt <> CS_StdExtensions and ;
+                    sNewExt <> CS_DFAndTemplExt and ;
+                    sNewExt <> CS_PkgIncExt and ;
+                    sNewExt <> CS_SrcPkgExt and ;
+                    sNewExt <> sDFExtensions) Begin
+
+                    Get IsExtensionInRegistry sNewExt to bExists
+
+                    If (bExists = False) Begin
+                        Get UserSavedExtensions to asUserExtensions
+                        // Push the new item on top of the list
+                        Send WriteString of ghoApplication CS_Settings (CS_DFExtensionsKey + String("0")) sNewExt
+                        Get piMaxUserFilters to iMaxUserFilters
+                        Move (SizeOfArray(asUserExtensions)) to iSize
+                        Move (iMaxUserFilters min iSize) to iSize
+                        Decrement iSize
+                        Move 0 to iItem
+                        For iCount from 0 to iSize
+                            Send WriteString of ghoApplication CS_Settings (CS_DFExtensionsKey + String(iCount + 1)) asUserExtensions[iItem]
+                            Increment iItem
+                        Loop
+                        Get piMaxUserFilters to iSize
+                        Move iSize to iCount // Get out of loop
+                    End
+                End
+
+            End_Procedure
+
+            Function IsExtensionInRegistry String sExt Returns Boolean
+                Boolean bExists
+                String[] asUserExtensions
+                Integer iCount iSize
+
+                Move False to bExists
+                Get UserSavedExtensions to asUserExtensions
+                Move (SizeOfArray(asUserExtensions)) to iSize
+                Decrement iSize
+                For iCount from 0 to iSize
+                    If (Lowercase(asUserExtensions[iCount]) = Lowercase(sExt)) Begin
+                        Move True to bExists
+                        Move iSize to iCount // We're done.
+                    End
+                Loop
+                Function_Return bExists
+            End_Function
 
         End_Object
 
