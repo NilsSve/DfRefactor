@@ -229,7 +229,7 @@ Object oRefactorView is a cRefactorDbView
                             Move sFolderName to TheData[iRow].sValue[iFolderCol]
                             Get IsFolderInDefaultsFolderList of ghoApplication sFolderName to bChecked
                             If (bUseDDO = True) Begin
-                                Get FindFolderName sFolderName asSavedFolders to bChecked
+                                Get IsFolderName sFolderName asSavedFolders to bChecked
                             End
                             Move bChecked to TheData[iRow].sValue[iCheckBoxCol]
                             Increment iRow
@@ -247,7 +247,7 @@ Object oRefactorView is a cRefactorDbView
                         Send Cursor_Ready of Cursor_Control
                     End_Procedure
                     
-                    Function FindFolderName String sFolderName String[] asSavedFolders Returns Boolean
+                    Function IsFolderName String sFolderName String[] asSavedFolders Returns Boolean
                         Integer iRow
                         Move (SearchArray(sFolderName, asSavedFolders)) to iRow
                         Function_Return (iRow <> -1)
