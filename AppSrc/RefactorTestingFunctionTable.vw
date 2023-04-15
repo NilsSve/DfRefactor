@@ -23,7 +23,7 @@ Object oFunctionTableTesting is a cRefactorDbView
     Set Border_Style to Border_Thick
     Set Size to 289 831
     Set Location to 2 7
-    Set Label to "Test Bench for Functions"
+    Set Label to "Test Bench"
     Set pbAutoActivate to True
     Set Maximize_Icon to True 
     Set pbAcceptDropFiles to True
