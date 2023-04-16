@@ -34,6 +34,14 @@ Object oFunctionTableTesting is a cRefactorDbView
     Property Handle phoEditorRefactored   
         
     Object oSysFile_DD is a cSysFileDataDictionary
+        // We don't care about data-loss in this view.
+        // Note that it won't help to try to set the Data_Loss & Exit_Loss
+        // messages because the change_state is embedded into almost
+        // every db-class, so one change affects in lots of places.
+        Function Should_Save Returns Integer
+            Function_Return 0
+        End_Function
+
     End_Object
 
     Object oFunctions_DD is a cFunctionsDataDictionary
@@ -46,7 +54,7 @@ Object oFunctionTableTesting is a cRefactorDbView
     Procedure Request_Save
         Send Request_Save of (Main_DD(Self))
         Forward Send Request_Save
-    End_Procedure
+    End_Procedure 
     
     Set Main_DD to oFunctions_DD
     Set Server to oFunctions_DD
@@ -159,16 +167,17 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
 
             Object oLegacyCode_NoOfLines_fm is a Form
-                Set Size to 10 33
-                Set Location to 197 454
+                Set Size to 10 16
+                Set Location to 197 470
                 Set Enabled_State to False
                 Set Label to "No of Lines:"
                 Set Value to "0"
+                Set Label_Col_Offset to 2 
+                Set Label_Row_Offset to 1
                 Set Label_Justification_Mode to JMode_Right
-                Set peAnchors to anBottomRight
                 Set Form_Datatype to 0 
-                Set Label_Col_Offset to 2
-                Set Label_Row_Offset to 2
+                Set Label_FontWeight to fw_Bold
+                Set peAnchors to anBottomRight
                 
                     Procedure Set Value Integer iItem String sValue
                     Integer iValue
@@ -181,7 +190,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
         
             Object oSaveFiles_grp is a cRDCDbHeaderGroup
-                Set Size to 74 483
+                Set Size to 74 487
                 Set Location to 211 5
                 Set Label to "Input/Output Files:"
                 Set psImage to "InputOutput.ico"
@@ -190,12 +199,13 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set peAnchors to anBottomLeftRight
 
                 Object oLegacyCodeFilename_fm is a cFileNameForm
-                    Set Size to 14 347
+                    Set Size to 14 352
                     Set Location to 28 129
                     Set Label to "Legacy Code File"
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
                     Set peAnchors to anBottomLeftRight 
+                    Set Label_FontWeight to fw_Bold
 
                     Procedure Set Value Integer iItem String sFileName
                         Forward Set Value to sFileName
@@ -204,12 +214,13 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
 
                 Object oRefactoredCodeFilename_fm is a cFileNameForm
-                    Set Size to 14 346
-                    Set Location to 47 129
+                    Set Size to 14 352
+                    Set Location to 44 129
                     Set Label to "Refactored Code File"
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
                     Set peAnchors to anBottomLeftRight
+                    Set Label_FontWeight to fw_Bold
 
                     Procedure Set Value Integer iItem String sFileName
                         Forward Set Value to sFileName
@@ -251,16 +262,16 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
 
             Object oRefactoredCode_NoOfLines_fm is a Form
-                Set Size to 10 28
-                Set Location to 197 48
+                Set Size to 10 16
+                Set Location to 197 21
                 Set Enabled_State to False
-                Set Label to "No of Lines:"
                 Set Value to "0"
-                Set Label_Col_Offset to 2
-                Set Label_Justification_Mode to JMode_Right
-                Set peAnchors to anBottomLeft
+//                Set Label to "No of Lines"
+//                Set Label_Col_Offset to -60
+//                Set Label_Justification_Mode to JMode_Right
                 Set Form_Datatype to 0 
-                Set Label_Row_Offset to 2
+                Set peAnchors to anBottomLeft
+                
                 Procedure Set Value Integer iItem String sValue
                     Integer iValue
                     String sFormatString 
@@ -269,18 +280,19 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Move (FormatValue(iValue, sFormatString)) to sValue
                     Forward Set Value to sValue
                 End_Procedure
+          
             End_Object
 
             Object oRefactoredCode_Time_fm is a Form
                 Set Size to 10 33
-                Set Location to 197 113
+                Set Location to 197 72
                 Set Enabled_State to False
                 Set Label to "Elapsed:"
-                Set Label_Col_Offset to 2
+                Set Label_Col_Offset to 2    
+                Set Label_Row_Offset to 1
                 Set Label_Justification_Mode to JMode_Right
-                Set peAnchors to anBottomLeft
                 Set Form_Datatype to Mask_Clock_Window
-                Set Label_Row_Offset to 2
+                Set peAnchors to anBottomLeft
             End_Object
 
             Object oAction_grp is a cRDCDbHeaderGroup
@@ -304,8 +316,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set peAnchors to anBottomLeft
                     Set Label_Col_Offset to 1
                     Set Label_FontWeight to fw_Bold
-                    Set FontWeight to fw_Bold
-    //                Set Visible_State to False
+                    Set FontWeight to fw_Bold 
                 End_Object
     
                 Object oUseConstraints_cb is a CheckBox
@@ -317,10 +328,18 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set phoUseConstraints_cb of ghoApplication to Self
                     
                     Procedure OnChange
-                        Boolean bState
+                        Boolean bState  
+                        Integer iFunctions
                         Get Checked_State to bState
-    //                    Set Visible_State of oNoOfSelectedFunctions2_fm to (bState = True)
-                    End_Procedure
+                        If (bState = False) Begin                                
+                            Get_Attribute DF_FILE_RECORDS_USED of Functions.File_Number to iFunctions
+                        End
+                        Else Begin
+                            Move SysFile.SelectedFunctionTotal to iFunctions
+                        End
+                        Set Value of oNoOfSelectedFunctions2_fm to iFunctions 
+                    End_Procedure 
+                    
                 End_Object
     
                 Object oRefactor_btn is a Button
@@ -509,7 +528,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     Procedure OnSetFocus
         Set Value of (oLegacyCodeFilename_fm(Self))     to (psCodeFile(phoEditorLegacy(ghoApplication)))
         Set Value of (oRefactoredCodeFilename_fm(Self)) to (psCodeFile(phoEditorRefactored(ghoApplication)))
-        Set Value of oNoOfSelectedFunctions2_fm to SysFile.SelectedFunctionTotal
+        Send OnChange of oUseConstraints_cb 
     End_Procedure
 
     // *** MAIN REFACTORING ROUTINE ***
@@ -737,7 +756,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         // Re-enable timers:
         Send SuspendGUI of Desktop False
     End_Procedure
-    
+
 End_Object
 
 Procedure JumpToSourceLine Integer iLine
