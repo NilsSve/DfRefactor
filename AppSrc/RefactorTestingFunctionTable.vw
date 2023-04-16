@@ -7,6 +7,7 @@ Use seq_chnl.pkg
 Use cRefactorDbView.pkg
 Use cRDCDbSpinForm.pkg
 Use cRDCDbForm.pkg
+Use cRDCDbHeaderGroup.pkg
 Use cFileNameForm.pkg
 Use cScintillaRefactorEditor.pkg
 Use oEditorProperties.pkg
@@ -21,7 +22,7 @@ Use cFunctionsADataDictionary.dd
 Activate_View Activate_oFunctionTableTesting for oFunctionTableTesting
 Object oFunctionTableTesting is a cRefactorDbView
     Set Border_Style to Border_Thick
-    Set Size to 289 831
+    Set Size to 289 822
     Set Location to 2 7
     Set Label to "Test Bench"
     Set pbAutoActivate to True
@@ -54,7 +55,7 @@ Define CS_Splitters              for "Splitters"
 Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
     Object oSplitterContainer is a cDbSplitterContainer
-        Set piSplitterLocation to 498 
+        Set piSplitterLocation to 498
         
         // ToDo: This messes up the dynamic sizing of objects at startup.
         // So this is probably to early to make this kind of manipulation.
@@ -83,18 +84,18 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Filter_String to "Programs|*.exe|Any file|*.*"
             End_Object
 
-            Object oInfo_tb is a TextBox
-                Set Size to 10 251
-                Set Location to 5 126
-                Set Label to "- You can drag && drop a source file from Windows Explorer to this editor object"
-            End_Object
-
             Object oLegacyEditor_tb is a TextBox
                 Set Size to 10 74
                 Set Location to 4 8
                 Set Label to "Legacy Code: (Before)"
                 Set FontWeight to fw_Bold
                 Set FontPointHeight to 10
+            End_Object
+
+            Object oInfo_tb is a TextBox
+                Set Size to 10 251
+                Set Location to 5 126
+                Set Label to "- You can drag && drop a source file from Windows Explorer to this editor object"
             End_Object
         
             Object oLegacyCode_edt is a cScintillaRefactorEditor
@@ -178,19 +179,22 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Forward Set Value to sValue
                 End_Procedure
             End_Object
-
-            Object oSaveFiles_grp is a dbGroup
-                Set Size to 71 383
-                Set Location to 205 5
-                Set Label to "Refactoring Code Sample Files:"
+        
+            Object oSaveFiles_grp is a cRDCDbHeaderGroup
+                Set Size to 74 483
+                Set Location to 211 5
+                Set Label to "Input/Output Files:"
+                Set psImage to "InputOutput.ico"
+                Set psNote to "Fixed names for input/output files"
+                Set psToolTip to "These two file names are used by the TEST-BENCH. The names are fixed and cannot be changed."
                 Set peAnchors to anBottomLeftRight
 
                 Object oLegacyCodeFilename_fm is a cFileNameForm
-                    Set Size to 14 368
-                    Set Location to 19 7
+                    Set Size to 14 347
+                    Set Location to 28 129
                     Set Label to "Legacy Code File"
-                    Set Label_Col_Offset to 0
-                    Set Label_Justification_Mode to JMode_Top
+                    Set Label_Col_Offset to 2
+                    Set Label_Justification_Mode to JMode_Right
                     Set peAnchors to anBottomLeftRight 
 
                     Procedure Set Value Integer iItem String sFileName
@@ -200,11 +204,11 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
 
                 Object oRefactoredCodeFilename_fm is a cFileNameForm
-                    Set Size to 14 368
-                    Set Location to 45 6
+                    Set Size to 14 346
+                    Set Location to 47 129
                     Set Label to "Refactored Code File"
-                    Set Label_Col_Offset to 0
-                    Set Label_Justification_Mode to JMode_Top
+                    Set Label_Col_Offset to 2
+                    Set Label_Justification_Mode to JMode_Right
                     Set peAnchors to anBottomLeftRight
 
                     Procedure Set Value Integer iItem String sFileName
@@ -214,99 +218,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
 
             End_Object
-
-//            Object oSplitBy_rgp is a dbRadioGroup
-//                Entry_Item SysFile.eSplitBy
-//                Set Server to oSysFile_DD
-//                Set Location to 205 308
-//                Set Size to 51 117
-//                Set Label to "Split 'If' line to:"
-//                Set peAnchors to anBottomRight
-//
-//                Object oRadio0 is a Radio
-//                    Set Label to CS_SplitBySpaceSemiColumn
-//                    Set psToolTip to "Break the if/else line with a space followed by a semicolon"
-//                    Set Size to 10 119
-//                    Set Location to 13 5
-//                End_Object
-//
-//                Object oRadio1 is a Radio
-//                    Set Size to 10 119
-//                    Set Location to 24 5
-//                    Set Label to CS_SplitBySemiColumn
-//                    Set psToolTip to "Break the if/else line with a semicolon"
-//                End_Object
-//
-//                Object oRadio2 is a Radio
-//                    Set Size to 10 119
-//                    Set Location to 36 5
-//                    Set Label to CS_SplitByBeginEnd
-//                    Set psToolTip to "Break the if/else line by adding a begin / end block"
-//                End_Object
-//
-//                Procedure Notify_Select_State Integer NewId Integer OldId
-//                    Forward Send Notify_Select_State NewId OldId
-//                End_Procedure
-//        
-//            End_Object
-
-//            Object oDDOStyle_rgp is a dbRadioGroup
-//                Entry_Item SysFile.eDDOStyle
-//                Set Server to oSysFile_DD
-//                Set Location to 205 183
-//                Set Size to 51 120
-//                Set Label to "DDO Style:"
-//                Set peAnchors to anBottomRight
-//
-//                Object oRadio0 is a Radio
-//                    Set Label to CS_DDOldStyle
-//                    Set Size to 10 119
-//                    Set Location to 12 5
-//                End_Object
-//
-//                Object oRadio1 is a Radio
-//                    Set Size to 10 119
-//                    Set Location to 23 5
-//                    Set Label to CS_DDLegacyStyle
-//                End_Object
-//
-//                Object oRadio2 is a Radio
-//                    Set Size to 10 119
-//                    Set Location to 35 5
-//                    Set Label to CS_DDNewStyle
-//                End_Object
-//
-//                Procedure Notify_Select_State Integer NewId Integer OldId
-//                    Forward Send Notify_Select_State NewId OldId
-//                End_Procedure
-//        
-//            End_Object
-            
-//            Object oTabSize_sf is a cRDCDbSpinForm
-//                Entry_Item SysFile.TabSize
-//                Set Server to oSysFile_DD
-//                Set Size to 13 27
-//                Set Location to 240 460
-//                Set Label to "Tab Size"
-//                Set Label_Col_Offset to 2
-//                Set Label_Justification_Mode to JMode_Right
-//                Set psToolTip to "Select the indent size you want to use when indenting code and when breaking a line on rewriting a single line to multiple lines. It is the same value that can be set on the Editor Settings dialog tab size."
-//                Set peAnchors to anBottomRight
-//            End_Object
-
-//            Object oMaxBlankLines_sf is a cRDCDbSpinForm
-//                Entry_Item SysFile.MaxBlankLines
-//                Set Server to oSysFile_DD
-//                Set Size to 13 27
-//                Set Location to 261 460
-//                Set Label to "Max blank lines"
-//                Set Label_Col_Offset to 2
-//                Set Label_Justification_Mode to JMode_Right
-//                Set psToolTip to "Select the maximum number of consecutive blank lines that is allowed in a source file. If more empty lines are encountered, they will be removed."
-//                Set Maximum_Position to 6
-//                Set Minimum_Position to 1
-//                Set peAnchors to anBottomRight
-//            End_Object
 
         End_Object
 
@@ -321,7 +232,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
     
             Object oRefactoredCode_edt is a cScintillaRefactorEditor
-                Set Size to 176 476
+                Set Size to 176 469
                 Set Location to 17 6
                 Delegate Set phoEditorRefactored to (Self)  
                 Delegate Set phoEditor to (Self)
@@ -372,215 +283,224 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Label_Row_Offset to 2
             End_Object
 
-            Object oRefactor_btn is a Button
-                Set Size to 26 100
-                Set Location to 213 225
-                Set Label to "&Refactor Legacy Code"
-                Set peAnchors to anBottomRight
-                Set Default_State to True
-                // Note: We use Form_FontWeight instead of FontWeight to _not_ make the object larger
-                // because of the bold font.
-                Set Form_FontWeight to FW_BOLD
-                Set psImage to "Start.ico"
-                Set psToolTip to "Refactors the legacy code from the left editor, then saves it to disk. (Ctrl+R)"
-                Set piImageSize to 24
-                
-                Procedure OnClick                          
-                    Boolean bUseConstraints
-                    Get Checked_State of (phoUseConstraints_cb(ghoApplication)) to bUseConstraints
-                    Delegate Send RefactoreCode bUseConstraints
-                End_Procedure
-            
-            End_Object
+            Object oAction_grp is a cRDCDbHeaderGroup
+                Set Size to 74 315
+                Set Location to 211 5
+                Set Label to "Refactor Actions:"
+                Set psImage to "DFRefactor.ico"
+                Set psNote to "Select actions"
+                Set psToolTip to "These buttons to perform various refactoring actions."
+                Set peAnchors to anBottomLeftRight
+
+                Object oNoOfSelectedFunctions2_fm is a cRDCDbForm
+                    Entry_Item SysFile.SelectedFunctionTotal
+                    Set Server to oSysFile_DD
+                    Set Size to 13 13
+                    Set Location to 28 163
+                    Set Label_Justification_Mode to JMode_Right
+                    Set Label to "Number of Selected Functions:"
+                    Set psToolTip to "Total number of functions selected."
+                    Set Enabled_State to False
+                    Set peAnchors to anBottomLeft
+                    Set Label_Col_Offset to 1
+                    Set Label_FontWeight to fw_Bold
+                    Set FontWeight to fw_Bold
+    //                Set Visible_State to False
+                End_Object
     
-            Object oCompareProgram_btn is a cRDCButton
-                Set Size to 14 100
-                Set Location to 242 225
-                Set Label to "Co&mpare Before && After"
-                Set peAnchors to anBottomRight
-                Set psImage to "Compare.ico"
-                Set psToolTip to "Starts the selected compare program and passes the two source files (Ctrl+M). It automatically saves the source files first."
-            
-                Procedure OnClick
-                    String sCompareApp
-                    Send Execute of (oSave_ToolItem(ghoCommandBars))
-                    Get psFileCompareApp of ghoApplication to sCompareApp
-                    Send CompareFiles of ghoApplication sCompareApp
-                End_Procedure
-        
-                Function IsEnabled Returns Boolean
-                    Integer iLines
-                    Get SC_LineCount of (phoEditor(Self)) to iLines
-                    Function_Return (iLines > 1)
-                End_Function
-        
-            End_Object
-
-            Object oCompareprogram_fm is a dbForm
-                Entry_Item SysFile.PathSourceCompareTool
-                Set Server to oSysFile_DD
-                Set Size to 12 140
-                Set Location to 249 7
-                Set Label_Col_Offset to 0
-                Set Label_Row_Offset to 1
-                Set Label_Justification_Mode to JMode_Top
-                Set Label to "Select Compare Program:"
-                Set psToolTip to "Select a file comparison tool, such as 'Beyond Compare', 'WinMerge', 'Araxis Merge' etc.. (Press F4)"
-                Set peAnchors to anBottomLeftRight                                                                              
-        
-                Procedure Prompt
-                    Integer bOpen
-                    String sFileName
-        
-                    Get Show_Dialog of oOpenDialog to bOpen
-                    If (bOpen) Begin
-                        Get File_Name of oOpenDialog to sFileName
-                        Set Value to sFileName
-                        Set Changed_State to True
-                        Set psFileCompareApp of ghoApplication to sFileName
-                    End
-                End_Procedure  
-                
-            End_Object
-
-            Object oSelectCompareProgram_btn is a cRDCButton
-                Set Size to 14 41
-                Set Location to 248 151
-                Set Label to "Select"
-                Set peAnchors to anBottomRight
-                Set psImage to "ActionOpen.ico"
-                Set psToolTip to "Select a file comparison tool, such as 'Beyond Compare', 'WinMerge', 'Araxis Merge' etc.. (Press F4)"
-            
-                Procedure OnClick
-                    Send Prompt of oCompareprogram_fm
-                End_Procedure
-            End_Object    
-            
-            Object oSourceExplorerProgram_fm is a dbForm
-                Entry_Item SysFile.PathStarZen
-                Set Server to oSysFile_DD
-                Set Size to 12 140
-                Set Location to 273 7
-                Set Prompt_Button_Mode to pb_PromptOn
-                Set Label_Row_Offset to 1
-                Set Label_Col_Offset to 0
-                Set Label_Justification_Mode to JMode_Top
-                Set Label to "StarZen's Source Code Explorer:"
-                Set peAnchors to anBottomLeftRight                                                                              
+                Object oUseConstraints_cb is a CheckBox
+                    Set Location to 42 62
+                    Set Size to 8 109
+                    Set Label to "Constrain Function Calls"
+                    Set peAnchors to anBottomLeft
+                    Set psToolTip to "If checked only Functions selected on the 'Function List' tab-page will be called."
+                    Set phoUseConstraints_cb of ghoApplication to Self
+                    
+                    Procedure OnChange
+                        Boolean bState
+                        Get Checked_State to bState
+    //                    Set Visible_State of oNoOfSelectedFunctions2_fm to (bState = True)
+                    End_Procedure
+                End_Object
     
-                Procedure Prompt
-                    Integer bOpen
-                    String sFileName
-    
-                    Get Show_Dialog of oOpenDialog to bOpen
-                    If (bOpen) Begin
-                        Get File_Name of oOpenDialog to sFileName
-                        Set Changed_Value Item 0 to sFileName
-                        Set private.psStarZenSourceExplorer of ghoApplication to sFileName
-                    End
-                End_Procedure
-    
-            End_Object
-
-            Object oSelectSourceExplorerProgram_btn is a cRDCButton
-                Set Size to 14 41
-                Set Location to 272 151
-                Set Label to "Select"
-                Set peAnchors to anBottomRight
-                Set psImage to "ActionOpen.ico"
-                Set psToolTip to "Select a file comparison tool, such as 'Beyond Compare', 'WinMerge', 'Araxis Merge' etc.. (Press F4)"
-            
-                Procedure OnClick
-                    Send Prompt of oSourceExplorerProgram_fm
-                End_Procedure
-            End_Object    
-
-            
-
-            Object oTestCompileRefactoredCode_btn is a cRDCButton
-                Set Size to 14 100
-                Set Location to 257 225
-                Set Label to "Compile Refactored Code"
-                Set peAnchors to anBottomRight
-                Set psImage to "CompileProject.ico"
-                Set psToolTip to "Compiles a test program (CompiledRefactoredCode.src) where the refactored code file is Use'd. (F5)"
-            
-                Procedure OnClick
-                    Send CompileRefactoredCode of ghoApplication
-                End_Procedure  
+                Object oRefactor_btn is a Button
+                    Set Size to 30 74
+                    Set Location to 25 178
+                    Set Label to "&Refactor Code"
+                    Set peAnchors to anBottomLeft
+                    Set Default_State to True
+                    // Note: We use Form_FontWeight instead of FontWeight to _not_ make the object larger
+                    // because of the bold font.
+                    Set Form_FontWeight to FW_BOLD
+                    Set psImage to "Start.ico"
+                    Set psToolTip to "Refactors the legacy code from the left editor, then saves it to disk. (Ctrl+R)"
+                    Set piImageSize to 24
+                    
+                    Procedure OnClick                          
+                        Boolean bUseConstraints
+                        Get Checked_State of (phoUseConstraints_cb(ghoApplication)) to bUseConstraints
+                        Delegate Send RefactoreCode bUseConstraints
+                    End_Procedure
                 
-                Function IsEnabled Returns Boolean
-                    Integer iLines
-                    Get SC_LineCount of (phoEditor(Self)) to iLines
-                    Function_Return (iLines > 1)
-                End_Function
+                End_Object
         
-            End_Object
-
-            Object oShowErrorLog_btn is a cRDCButton
-                Set Size to 14 100
-                Set Location to 272 225
-                Set Label to "Show &Error Log"
-                Set peAnchors to anBottomRight
-                Set psImage to "CompileProjectErrors.ico"
-                Set psToolTip to "Show Error log from compilation (Ctrl+E)"
+                Object oCompareProgram_btn is a cRDCButton
+                    Set Size to 14 53
+                    Set Location to 25 255
+                    Set Label to "Co&mpare"
+                    Set peAnchors to anBottomLeft
+                    Set psImage to "Compare.ico"
+                    Set psToolTip to "Starts the selected compare program and passes the two source files (Ctrl+M). It automatically saves the source files first."
+                
+                    Procedure OnClick
+                        String sCompareApp
+                        Send Execute of (oSave_ToolItem(ghoCommandBars))
+                        Get psFileCompareApp of ghoApplication to sCompareApp
+                        Send CompareFiles of ghoApplication sCompareApp
+                    End_Procedure
             
-                Procedure OnClick
-                    String sAppSrcPath
-                    Boolean bExists
-
-                    Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrcPath
-                    Get vFolderFormat sAppSrcPath to sAppSrcPath
-                    Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
-                    If (bExists = True) Begin
-                        Send ActivateErrorDialog of (Client_Id(phoMainPanel(ghoApplication))) (sAppSrcPath + CS_TestErrFile)
-                    End
-                End_Procedure  
+                    Function IsEnabled Returns Boolean
+                        Integer iLines
+                        Get SC_LineCount of (phoEditor(Self)) to iLines
+                        Function_Return (iLines > 1)
+                    End_Function
+            
+                End_Object
+    
+                Object oTestCompileRefactoredCode_btn is a cRDCButton
+                    Set Size to 14 53
+                    Set Location to 40 255
+                    Set Label to "Compile"
+                    Set peAnchors to anBottomLeft
+                    Set psImage to "CompileProject.ico"
+                    Set psToolTip to "Compiles a test program (CompiledRefactoredCode.src) where the refactored code file is Use'd. (F5)"
                 
-                Function IsEnabled Returns Boolean
-                    Boolean bExists
-                    String sAppSrcPath
-                    Integer iLines
-
-                    Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrcPath
-                    Get vFolderFormat sAppSrcPath to sAppSrcPath
-                    Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
-                    Get SC_LineCount of (phoEditorRefactored(ghoApplication)) to iLines
-                    Function_Return (bExists = True and iLines > 1)
-                End_Function
-        
-            End_Object
-
-            Object oUseConstraints_cb is a CheckBox
-                Set Location to 222 128
-                Set Size to 8 109
-                Set Label to "Constrain Function Calls"
-                Set peAnchors to anBottomRight
-                Set psToolTip to "If checked only Functions selected on the 'Function List' tab-page will be called."
-                Set phoUseConstraints_cb of ghoApplication to Self
+                    Procedure OnClick
+                        Send CompileRefactoredCode of ghoApplication
+                    End_Procedure  
+                    
+                    Function IsEnabled Returns Boolean
+                        Integer iLines
+                        Get SC_LineCount of (phoEditor(Self)) to iLines
+                        Function_Return (iLines > 1)
+                    End_Function
+            
+                End_Object
+    
+                Object oShowErrorLog_btn is a cRDCButton
+                    Set Size to 14 53
+                    Set Location to 55 255
+                    Set Label to "&Error Log"
+                    Set peAnchors to anBottomLeft
+                    Set psImage to "CompileProjectErrors.ico"
+                    Set psToolTip to "Show Error log from compilation (Ctrl+E)"
                 
-                Procedure OnChange
-                    Boolean bState
-                    Get Checked_State to bState
-                    Set Visible_State of oNoOfSelectedFunctions2_fm to (bState = True)
-                End_Procedure
-            End_Object
+                    Procedure OnClick
+                        String sAppSrcPath
+                        Boolean bExists
+    
+                        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrcPath
+                        Get vFolderFormat sAppSrcPath to sAppSrcPath
+                        Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
+                        If (bExists = True) Begin
+                            Send ActivateErrorDialog of (Client_Id(phoMainPanel(ghoApplication))) (sAppSrcPath + CS_TestErrFile)
+                        End
+                    End_Procedure  
+                    
+                    Function IsEnabled Returns Boolean
+                        Boolean bExists
+                        String sAppSrcPath
+                        Integer iLines
+    
+                        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrcPath
+                        Get vFolderFormat sAppSrcPath to sAppSrcPath
+                        Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
+                        Get SC_LineCount of (phoEditorRefactored(ghoApplication)) to iLines
+                        Function_Return (bExists = True and iLines > 1)
+                    End_Function
+            
+                End_Object
 
-            Object oNoOfSelectedFunctions2_fm is a cRDCDbForm
-                Entry_Item SysFile.SelectedFunctionTotal
-                Set Server to oSysFile_DD
-                Set Size to 13 15
-                Set Location to 221 106
-                Set Label_Justification_Mode to JMode_Right
-                Set Label to "Tot No of Selected Functions"
-                Set psToolTip to "Total number of functions selected."
-                Set Enabled_State to False
-                Set peAnchors to anBottomRight
-                Set Label_Col_Offset to 3
-                Set Label_FontWeight to fw_Bold
-                Set FontWeight to fw_Bold
-                Set Visible_State to False
             End_Object
+            
+//            Object oCompareprogram_fm is a dbForm
+//                Entry_Item SysFile.PathSourceCompareTool
+//                Set Server to oSysFile_DD
+//                Set Size to 12 140
+//                Set Location to 249 7
+//                Set Label_Col_Offset to 0
+//                Set Label_Row_Offset to 1
+//                Set Label_Justification_Mode to JMode_Top
+//                Set Label to "Select Compare Program:"
+//                Set psToolTip to "Select a file comparison tool, such as 'Beyond Compare', 'WinMerge', 'Araxis Merge' etc.. (Press F4)"
+//                Set peAnchors to anBottomLeftRight                                                                              
+//        
+//                Procedure Prompt
+//                    Integer bOpen
+//                    String sFileName
+//        
+//                    Get Show_Dialog of oOpenDialog to bOpen
+//                    If (bOpen) Begin
+//                        Get File_Name of oOpenDialog to sFileName
+//                        Set Value to sFileName
+//                        Set Changed_State to True
+//                        Set psFileCompareApp of ghoApplication to sFileName
+//                    End
+//                End_Procedure  
+//                
+//            End_Object
+//
+//            Object oSelectCompareProgram_btn is a cRDCButton
+//                Set Size to 14 41
+//                Set Location to 248 151
+//                Set Label to "Select"
+//                Set peAnchors to anBottomRight
+//                Set psImage to "ActionOpen.ico"
+//                Set psToolTip to "Select a file comparison tool, such as 'Beyond Compare', 'WinMerge', 'Araxis Merge' etc.. (Press F4)"
+//            
+//                Procedure OnClick
+//                    Send Prompt of oCompareprogram_fm
+//                End_Procedure
+//            End_Object    
+//            
+//            Object oSourceExplorerProgram_fm is a dbForm
+//                Entry_Item SysFile.PathStarZen
+//                Set Server to oSysFile_DD
+//                Set Size to 12 140
+//                Set Location to 273 7
+//                Set Prompt_Button_Mode to pb_PromptOn
+//                Set Label_Row_Offset to 1
+//                Set Label_Col_Offset to 0
+//                Set Label_Justification_Mode to JMode_Top
+//                Set Label to "StarZen's Source Code Explorer:"
+//                Set peAnchors to anBottomLeftRight                                                                              
+//    
+//                Procedure Prompt
+//                    Integer bOpen
+//                    String sFileName
+//    
+//                    Get Show_Dialog of oOpenDialog to bOpen
+//                    If (bOpen) Begin
+//                        Get File_Name of oOpenDialog to sFileName
+//                        Set Changed_Value Item 0 to sFileName
+//                        Set private.psStarZenSourceExplorer of ghoApplication to sFileName
+//                    End
+//                End_Procedure
+//    
+//            End_Object
+//
+//            Object oSelectSourceExplorerProgram_btn is a cRDCButton
+//                Set Size to 14 41
+//                Set Location to 272 151
+//                Set Label to "Select"
+//                Set peAnchors to anBottomRight
+//                Set psImage to "ActionOpen.ico"
+//                Set psToolTip to "Select a file comparison tool, such as 'Beyond Compare', 'WinMerge', 'Araxis Merge' etc.. (Press F4)"
+//            
+//                Procedure OnClick
+//                    Send Prompt of oSourceExplorerProgram_fm
+//                End_Procedure
+//            End_Object    
 
         End_Object
 
