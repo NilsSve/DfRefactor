@@ -22,7 +22,7 @@ Use cFunctionsADataDictionary.dd
 Activate_View Activate_oFunctionTableTesting for oFunctionTableTesting
 Object oFunctionTableTesting is a cRefactorDbView
     Set Border_Style to Border_Thick
-    Set Size to 289 822
+    Set Size to 282 886
     Set Location to 2 7
     Set Label to "Test Bench"
     Set pbAutoActivate to True
@@ -107,7 +107,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
         
             Object oLegacyCode_edt is a cScintillaRefactorEditor
-                Set Size to 176 481
+                Set Size to 176 484
                 Set Location to 17 6
                 Delegate Set phoEditorLegacy to (Self)
                 Set phoEditorLegacy of ghoApplication to (Self)
@@ -168,7 +168,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
             Object oLegacyCode_NoOfLines_fm is a Form
                 Set Size to 10 16
-                Set Location to 197 470
+                Set Location to 197 474
                 Set Enabled_State to False
                 Set Label to "No of Lines:"
                 Set Value to "0"
@@ -190,8 +190,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
         
             Object oSaveFiles_grp is a cRDCDbHeaderGroup
-                Set Size to 74 487
-                Set Location to 211 5
+                Set Size to 66 483
+                Set Location to 210 7
                 Set Label to "Input/Output Files:"
                 Set psImage to "InputOutput.ico"
                 Set psNote to "Fixed names for input/output files"
@@ -199,7 +199,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set peAnchors to anBottomLeftRight
 
                 Object oLegacyCodeFilename_fm is a cFileNameForm
-                    Set Size to 14 352
+                    Set Size to 13 344
                     Set Location to 28 129
                     Set Label to "Legacy Code File"
                     Set Label_Col_Offset to 2
@@ -214,8 +214,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
 
                 Object oRefactoredCodeFilename_fm is a cFileNameForm
-                    Set Size to 14 352
-                    Set Location to 44 129
+                    Set Size to 13 343
+                    Set Location to 43 129
                     Set Label to "Refactored Code File"
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
@@ -243,7 +243,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
     
             Object oRefactoredCode_edt is a cScintillaRefactorEditor
-                Set Size to 176 469
+                Set Size to 176 377
                 Set Location to 17 6
                 Delegate Set phoEditorRefactored to (Self)  
                 Delegate Set phoEditor to (Self)
@@ -296,8 +296,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
 
             Object oAction_grp is a cRDCDbHeaderGroup
-                Set Size to 74 313
-                Set Location to 211 5
+                Set Size to 66 374
+                Set Location to 210 6
                 Set Label to "Refactor Actions:"
                 Set psImage to "DFRefactor.ico"
                 Set psNote to "Select actions"
@@ -308,7 +308,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Entry_Item SysFile.SelectedFunctionTotal
                     Set Server to oSysFile_DD
                     Set Size to 13 13
-                    Set Location to 28 161
+                    Set Location to 30 161
                     Set Label_Justification_Mode to JMode_Right
                     Set Label to "Number of Selected Functions:"
                     Set psToolTip to "Total number of functions selected."
@@ -320,7 +320,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
     
                 Object oUseConstraints_cb is a CheckBox
-                    Set Location to 42 60
+                    Set Location to 44 60
                     Set Size to 8 109
                     Set Label to "Constrain Function Calls"
                     Set peAnchors to anBottomLeft
@@ -343,8 +343,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
     
                 Object oRefactor_btn is a Button
-                    Set Size to 30 74
-                    Set Location to 25 176
+                    Set Size to 30 78
+                    Set Location to 27 176
                     Set Label to "&Refactor Code"
                     Set peAnchors to anBottomLeft
                     Set Default_State to True
@@ -365,7 +365,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
                 Object oCompareProgram_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 25 253
+                    Set Location to 27 259
                     Set Label to "Co&mpare"
                     Set peAnchors to anBottomLeft
                     Set psImage to "Compare.ico"
@@ -388,7 +388,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     
                 Object oTestCompileRefactoredCode_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 40 253
+                    Set Location to 43 259
                     Set Label to "Compile"
                     Set peAnchors to anBottomLeft
                     Set psImage to "CompileProject.ico"
@@ -408,7 +408,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     
                 Object oShowErrorLog_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 55 253
+                    Set Location to 43 316
                     Set Label to "&Error Log"
                     Set peAnchors to anBottomLeft
                     Set psImage to "CompileProjectErrors.ico"
