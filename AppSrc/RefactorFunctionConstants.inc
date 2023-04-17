@@ -108,6 +108,15 @@ End_Struct
 #ENDIF
 Define clDarkGreen                  for (RGB(49, 60, 83))
 
+Define CS_StudioTools               for "\Studio\Tools"
+Define CS_RegWorkspace              for "<workspace>"
+Define CS_RegFileName               for "<file>"
+Define CS_SaveAll                   for "<saveall>"
+Define CS_CommandLine               for "CommandLine"
+Define CS_Command                   for "Command"
+Define CS_Name                      for "Name"
+Define CS_Separator                 for "Separator"
+
 Define CPC_OpenFile                 for 1 // perfcounter on open file
 Define CS_Settings                  for "Settings"
 Define CS_GridFontSize              for "GridFontSize"
