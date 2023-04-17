@@ -296,7 +296,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
 
             Object oAction_grp is a cRDCDbHeaderGroup
-                Set Size to 74 315
+                Set Size to 74 313
                 Set Location to 211 5
                 Set Label to "Refactor Actions:"
                 Set psImage to "DFRefactor.ico"
@@ -308,7 +308,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Entry_Item SysFile.SelectedFunctionTotal
                     Set Server to oSysFile_DD
                     Set Size to 13 13
-                    Set Location to 28 163
+                    Set Location to 28 161
                     Set Label_Justification_Mode to JMode_Right
                     Set Label to "Number of Selected Functions:"
                     Set psToolTip to "Total number of functions selected."
@@ -320,7 +320,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
     
                 Object oUseConstraints_cb is a CheckBox
-                    Set Location to 42 62
+                    Set Location to 42 60
                     Set Size to 8 109
                     Set Label to "Constrain Function Calls"
                     Set peAnchors to anBottomLeft
@@ -344,7 +344,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     
                 Object oRefactor_btn is a Button
                     Set Size to 30 74
-                    Set Location to 25 178
+                    Set Location to 25 176
                     Set Label to "&Refactor Code"
                     Set peAnchors to anBottomLeft
                     Set Default_State to True
@@ -365,7 +365,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
                 Object oCompareProgram_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 25 255
+                    Set Location to 25 253
                     Set Label to "Co&mpare"
                     Set peAnchors to anBottomLeft
                     Set psImage to "Compare.ico"
@@ -388,7 +388,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     
                 Object oTestCompileRefactoredCode_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 40 255
+                    Set Location to 40 253
                     Set Label to "Compile"
                     Set peAnchors to anBottomLeft
                     Set psImage to "CompileProject.ico"
@@ -408,7 +408,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     
                 Object oShowErrorLog_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 55 255
+                    Set Location to 55 253
                     Set Label to "&Error Log"
                     Set peAnchors to anBottomLeft
                     Set psImage to "CompileProjectErrors.ico"

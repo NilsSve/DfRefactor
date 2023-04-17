@@ -111,6 +111,7 @@ Define clDarkGreen                  for (RGB(49, 60, 83))
 Define CPC_OpenFile                 for 1 // perfcounter on open file
 Define CS_Settings                  for "Settings"
 Define CS_GridFontSize              for "GridFontSize"
+Define CS_TabPosition               for "TabPosition"
 Define CS_StarZenSourceExplorer     for "StarZenSourceExplorer"
 Define CS_FileCompareProgram        for "FileCompareProgram"
 Define CS_ToolbarIconSize           for "ToolbarIconSize"
