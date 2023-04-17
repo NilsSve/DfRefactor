@@ -31,9 +31,9 @@ Object oMaintainFunctions is a dbView
     Set Server  To oFunctions_DD
 
     Object oInfo_tb is a TextBox
-        Set Size to 10 91
-        Set Location to 6 230
-        Set Label to "List of all Functions in the database. Double-Click a row to Edit, Right-Click for options"
+        Set Size to 10 275
+        Set Location to 8 34
+        Set Label to "List of Functions in the database. Double-Click a row to Edit, Right-Click for options"
         Set FontWeight to fw_Bold
     End_Object
 
@@ -168,16 +168,17 @@ Object oMaintainFunctions is a dbView
     Object oSysFile_TotFunctionsSelected is a cRDCDbForm
         Entry_Item SysFile.SelectedFunctionTotal
         Set Server to oSysFile_DD
-        Set Location to 5 198
-        Set Size to 12 20
-        Set Label to "Total Functions Selected:"
+        Set Location to 7 486
+        Set Size to 12 15
+        Set Label to "Selected Functions:"
         Set Enabled_State to False
         Set peAnchors to anNone
+        Set Label_Col_Offset to 0
     End_Object
 
     Object oGridFontSize_cf is a cRDCComboForm
-        Set Size to 13 54
-        Set Location to 4 54
+        Set Size to 13 32
+        Set Location to 7 370
         Set Label to "Grid font size"
         Set psToolTip to "Sets the font size for grids"
         Set Label_Col_Offset to 2

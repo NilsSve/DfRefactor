@@ -270,7 +270,7 @@ Object oFunctionsExportImport is a dbView
         End_Object
         
         Object oExport_btn is a Button
-            Set Size to 22 66
+            Set Size to 24 66
             Set Location to 33 564
             Set Label to "Export Data to Json"
             Set psToolTip to "Export selected function ID's data records *and* the corresponding function text(s) from the cRefactorFunctionLibrary repository class."
@@ -330,7 +330,7 @@ Object oFunctionsExportImport is a dbView
         End_Object   
 
         Object oViewExportFile_btn is a Button
-            Set Size to 22 66
+            Set Size to 24 66
             Set Location to 58 564
             Set Label to "View Json File"
             Set psToolTip to "View the Json file with the associated program."
@@ -380,8 +380,8 @@ Object oFunctionsExportImport is a dbView
         End_Object 
 
         Object oOpenContainingFolder_btn is a Button
-            Set Size to 22 66
-            Set Location to 90 564
+            Set Size to 24 66
+            Set Location to 88 564
             Set Label to "Containing Folder"
             Set psToolTip to "Open Containing Folder"
             Set psImage to "ActionOpenContainingFolder.ico"
@@ -476,8 +476,8 @@ Object oFunctionsExportImport is a dbView
         End_Object
 
         Object oSelectFile_btn is a Button
-            Set Size to 22 64
-            Set Location to 33 425
+            Set Size to 24 66
+            Set Location to 32 425
             Set Label to "Select File"  
             Set psToolTip to "Select Json file to import"
             Set psImage to "ActionOpen.ico"
@@ -491,8 +491,8 @@ Object oFunctionsExportImport is a dbView
         End_Object
 
         Object oImport_btn is a Button
-            Set Size to 22 66
-            Set Location to 33 564
+            Set Size to 24 66
+            Set Location to 32 564
             Set Label to "Import Json Data"
             Set psToolTip to "Imports data from the selected DFRefactor Json import-file."
             Set psImage to "Json.ico"
@@ -546,8 +546,8 @@ Object oFunctionsExportImport is a dbView
         End_Object 
 
         Object oViewImportFile_btn is a Button
-            Set Size to 22 66
-            Set Location to 33 493
+            Set Size to 24 66
+            Set Location to 32 493
             Set Label to "View Json File"
             Set psToolTip to "View the Json file with the associated program."
             Set psImage to "View.ico"
