@@ -86,15 +86,18 @@ Define vSE_ERR_SHARE           For |CI0026
 //declare C structure struct_browseinfo
 //as documented in MSDN under Windows Shell API
 Struct tvBrowseInfo
-  Handle    hWndOwner
-  Pointer   pIDLRoot
-  Pointer   pszDisplayName
-  Pointer   lpszTitle
-  dWord     ulFlags
-  Pointer   lpfnCallback
-  dWord     lParam
-  DWord     iImage
-End_Struct // tvBrowseInfo
+    Handle hWndOwner
+    Pointer pIDLRoot
+    Pointer pszDisplayName
+    Pointer lpszTitle
+    DWord ulFlags
+#IFDEF IS$WIN64
+    Integer iMissingAlignment1
+#ENDIF
+    Pointer lpfnCallback
+    DWord lParam
+    DWord iImage
+End_Struct
 
 // Browsing for directory.
 Define vBIF_RETURNONLYFSDIRS   For |CI$0001  // For finding a folder to start document searching
@@ -125,14 +128,17 @@ External_function vWin32_SHGetPathFromIDList "SHGetPathFromIDList" shell32.dll ;
 
 External_function vWin32_CoTaskMemFree "CoTaskMemFree" ole32.dll Pointer pV Returns Integer
 
-
-
-
 Struct tvSecurity_attributes
   DWord   nLength
+#IFDEF IS$WIN64
+    Integer iMissingAlignment1
+#ENDIF
   Pointer lpDescriptor
   Integer bInheritHandle
-End_Struct // tvSecurity_attributes
+#IFDEF IS$WIN64
+    Integer iMissingAlignment2
+#ENDIF
+End_Struct
 
 //nLength:
 // Specifies the size, in bytes, of this structure. Set this value to the size of the
@@ -254,15 +260,21 @@ Define vFOF_SIMPLEPROGRESS     For |CI$0100  // means don't show names of files
 Define vFOF_NOCONFIRMMKDIR     For |CI$0200  // don't confirm making any needed dirs
 
 Struct tvShFileOpStruct
-  Handle  hWnd
-  Integer wFunc
-  Pointer pFrom
-  Pointer pTo
-  Short   fFlags
-  Short   fAnyOperationsAborted
-  Pointer hNameMappings
-  Pointer lpszProgressTitle      // only used if FOF_SIMPLEPROGRESS
-End_Struct // tvShFileOpStruct
+    Handle  hWnd
+    Integer wFunc
+#IFDEF IS$WIN64
+    Integer iMissingAlignment1
+#ENDIF
+    Pointer pFrom
+    Pointer pTo
+    Short   fFlags
+    Short   fAnyOperationsAborted
+#IFDEF IS$WIN64
+    Integer iMissingAlignment2
+#ENDIF
+    Pointer hNameMappings
+    Pointer lpszProgressTitle      // only used if FOF_SIMPLEPROGRESS
+End_Struct
 
 // hwnd
 //   Handle of the dialog box to use to display information about the status of the operation.
@@ -411,22 +423,23 @@ External_function vWin32_SHGetFolderPath "SHGetFolderPathA" SHFolder.Dll ;
    Pointer lpszPath ;
    Returns Integer
 
-
-
 Struct tvWin32FindData
- Dword            dwFileAttributes
- Dword            ftCreationLowDateTime
- Dword            ftCreationHighDateTime
- dword            ftLastAccessLowDateTime
- Dword            ftLastAccessHighDateTime
- Dword            ftLastWriteLowDateTime
- Dword            ftLastWriteHighDateTime
- Dword            nFileSizeHigh
- Dword            nFileSizeLow
- Dword            dwReserved0
- Dword            dwReserved1
+ DWord dwFileAttributes
+ DWord ftCreationLowDateTime
+ DWord ftCreationHighDateTime
+ DWord ftLastAccessLowDateTime
+ DWord ftLastAccessHighDateTime
+ DWord ftLastWriteLowDateTime
+ DWord ftLastWriteHighDateTime
+ DWord nFileSizeHigh
+ DWord nFileSizeLow
+ DWord dwReserved0
+ DWord dwReserved1
  UChar[vMax_Path] cFileName
- UChar[14]        cAlternateFileName
+ UChar[14] cAlternateFileName
+#IFDEF IS$WIN64
+    Char iMissingAlignment1
+#ENDIF
 End_Struct
 
 // Courtesy Of Vincent Oorsprong
@@ -459,13 +472,10 @@ External_function vWin32W_FindNextFile "FindNextFileW" Kernel32.dll Handle hFind
 //  hFindFile      : file search handle
 External_function vWin32_FindClose "FindClose" Kernel32.dll Handle hFindFile Returns Integer
 
-
-
 Struct tvFileTime
   DWord dwLowDateTime
   DWord dwHighDateTime
 End_Struct
-
 
 Struct tvSystemTime
   UShort wYear
@@ -477,7 +487,6 @@ Struct tvSystemTime
   UShort wSecond
   UShort wMilliSeconds
 End_Struct
-
 
 // Courtesy Of Vincent Oorsprong
 //  lpFileTime     : pointer to file time to convert

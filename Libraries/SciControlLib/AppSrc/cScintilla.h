@@ -1181,24 +1181,23 @@ Define SCI_INDEXPOSITIONFROMLINE               For 2714
 
 // Basic signed type used throughout interface (see scintilla source Sci_Position.h)
 // typedef ptrdiff_t Sci_Position;
-Define Sci_Position For Longptr
+//Define Sci_Position For Longptr
 
 // Unsigned variant used for ILexer::Lex and ILexer::Fold
 // typedef size_t Sci_PositionU;
-Define Sci_PositionU For ULongptr
+//Define Sci_PositionU For ULongptr
 
 // For Sci_CharacterRange  which is defined as long to be compatible with Win32 CHARRANGE
 // typedef long Sci_PositionCR;
-Define Sci_PositionCR For integer
-
+//Define Sci_PositionCR For integer
 
 //struct Sci_CharacterRange {
 //    Sci_PositionCR cpMin;
 //    Sci_PositionCR cpMax;
 //};
 Struct tSci_CharacterRange
-  Sci_PositionCR cpMin
-  Sci_PositionCR cpMax
+    Integer cpMin
+    Integer cpMax
 End_Struct
 
 //struct Sci_TextRange {
@@ -1206,8 +1205,8 @@ End_Struct
 //    char *lpstrText;
 //};
 Struct tSci_TextRange
-  tSci_CharacterRange chrg
-  Pointer lpstrText
+    tSci_CharacterRange chrg
+    Pointer lpstrText
 End_Struct
 
 //struct Sci_TextToFind {
@@ -1216,9 +1215,9 @@ End_Struct
 //    struct Sci_CharacterRange chrgText; // returned as position of matching text
 //};
 Struct tSci_TextToFind
-  tSci_CharacterRange chrg
-  Pointer            pszText
-  tSci_CharacterRange chrgText
+    tSci_CharacterRange chrg
+    Pointer pszText
+    tSci_CharacterRange chrgText
 End_Struct
 
 //struct Sci_Rectangle {
@@ -1228,12 +1227,11 @@ End_Struct
 //	int bottom;
 //};
 Struct tSci_Rectangle
-  Integer left
-  Integer top
-  Integer right
-  Integer bottom
+    Integer left
+    Integer top
+    Integer right
+    Integer bottom
 End_Struct
-
 
 //
 //  Struct Sci_NotifyHeader {
@@ -1245,11 +1243,11 @@ End_Struct
 //  	unsigned int code;
 //  };
 Struct tSci_NotifyHeader
-  Handle   hwndFrom
-  ULongptr idFrom
-  UInteger uCode
+    Handle   hwndFrom
+    ULongptr idFrom
+    UInteger uCode
 #IFDEF IS$WIN64
-    Integer tSciNotifyHeaderMissingAlignment
+    Integer iMissingAlignment1
 #ENDIF
 End_Struct
 //
@@ -1292,36 +1290,36 @@ End_Struct
 //  	/* SCN_AUTOCSELECTION, SCN_AUTOCCOMPLETED, SCN_USERLISTSELECTION, */
 //  };
 Struct tSCNotification
-  tSci_NotifyHeader nmhdr
-  Sci_Position      position
-  Integer           ch
-  Integer           modifiers
-  Integer           modificationType
+    tSci_NotifyHeader nmhdr
+    Longptr position
+    Integer ch
+    Integer modifiers
+    Integer modificationType
 #IFDEF IS$WIN64
-    Integer tSCNotificationMissingAlignment1
+    Integer iMissingAlignment1
 #ENDIF
-  Address           Text
-  Sci_Position      length
-  Sci_Position      linesAdded
-  Integer           message
+    Address Text
+    Longptr length
+    Longptr linesAdded
+    Integer message
 #IFDEF IS$WIN64
-    Integer tSCNotificationMissingAlignment2
+    Integer iMissingAlignment2
 #ENDIF
-  ULongptr          wParam
-  Longptr           lParam
-  Sci_Position      line
-  Integer           foldLevelNow
-  Integer           foldLevelPrev
-  Integer           margin
-  Integer           listType
-  Integer           x
-  Integer           y
-  Integer           token
+    ULongptr wParam
+    Longptr lParam
+    Longptr line
+    Integer foldLevelNow
+    Integer foldLevelPrev
+    Integer margin
+    Integer listType
+    Integer x
+    Integer y
+    Integer token
 #IFDEF IS$WIN64
-    Integer tSCNotificationMissingAlignment3
+    Integer iMissingAlignment3
 #ENDIF
-  Sci_Position      annotationLinesAdded
-  Integer           updated
-  Integer           listCompletionMethod
-  //Integer           characterSource  // not in the current scintilla YET
+    Longptr annotationLinesAdded
+    Integer updated
+    Integer listCompletionMethod
+    //Integer           characterSource  // not in the current scintilla YET
 End_Struct

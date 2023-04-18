@@ -33,6 +33,9 @@ Struct tRefactorCheckbox
     Boolean bChecked
     Boolean bReportFunction
     Integer iRefactorFunction
+#IFDEF IS$WIN64
+    Integer iMissingAlignment1
+#ENDIF
 End_Struct
 
 Struct tRefactorSettings
@@ -54,7 +57,10 @@ Struct tRefactorSettings
     String  sFileFilter                 // File selection filter.
     String[] asFolderNames              // String array with full path to all selected folders.
     Integer eDDOStyle
-End_Struct                   
+#IFDEF IS$WIN64
+    Integer iMissingAlignment1
+#ENDIF
+End_Struct
 
 Struct tParseObject
     String sObject
@@ -66,6 +72,9 @@ End_Struct
 Struct tCJComboBoxContent
     String sText
     Integer eTheme
+#IFDEF IS$WIN64
+    Integer iMissingAlignment1
+#ENDIF
 End_Struct
 
 Struct tBackupFiles
@@ -79,6 +88,9 @@ Struct tCodeComponents
     String sLineStartIndicator
     String sLineEndIndicator
     Boolean bHasIndicateCommand
+#IFDEF IS$WIN64
+    Integer iMissingAlignment1
+#ENDIF
     String sLeftCommand
     String sLeftCommand2
     String sCode   
@@ -86,7 +98,10 @@ Struct tCodeComponents
     String sToStatement
     String sRightComment 
     Boolean bHasEndSemiColon   
-End_Struct 
+#IFDEF IS$WIN64
+    Integer iMissingAlignment2
+#ENDIF
+End_Struct
 
 Struct tBooleanIndicator
     Boolean bHasBracket  
@@ -99,6 +114,9 @@ Struct tOperatorsInfo
     Boolean bIsOperator
     Boolean bIsLegacy
     Integer iPos
+#IFDEF IS$WIN64
+    Integer iMissingAlignment1
+#ENDIF
     String  sOperator
 End_Struct
 

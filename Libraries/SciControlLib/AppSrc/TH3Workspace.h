@@ -36,26 +36,32 @@ Struct tTHSource
     Integer iBookmarkCount
     Integer iCursorLine
     Integer iCursorColumn
+#IFDEF IS$WIN64
+    Integer iMissingAlignment1
+#ENDIF
 End_Struct
 
 Struct tTHWorkspace
     String   sName
     String   sSchema
     Integer  iShowPaths
-    String   sFullName
-    String   sStudio
-    String   sCompiler
-    String   sDBEditor
-    String   sDBViewer
-    String   sFFText
-    String   sFFTypes
-    String   sFFPath
-    Integer  iFFMatchWord
-    Integer  iFFMatchCase
-    Integer  iFFSubFolders
-    Integer  iFFShowAll
-    Integer  iFFExcludeComments
-    Integer  iFFRegExp
+#IFDEF IS$WIN64
+    Integer iMissingAlignment1
+#ENDIF
+    String sFullName
+    String sStudio
+    String sCompiler
+    String sDBEditor
+    String sDBViewer
+    String sFFText
+    String sFFTypes
+    String sFFPath
+    Integer iFFMatchWord
+    Integer iFFMatchCase
+    Integer iFFSubFolders
+    Integer iFFShowAll
+    Integer iFFExcludeComments
+    Integer iFFRegExp
     String[] saFiles
     String[] saFileDesc
     String[] saFolders
@@ -71,27 +77,26 @@ Struct tTHCompiler
     Handle hoCompiler
 End_Struct
 
-
 // Language Definition
 Struct tTHLanguage
-    String      sName
-    Integer     iProcedural
-    Integer     iCaseSensitive
-    String      sLineComments
-    String      sStringDelimiter
-    String      sMultiLineCommentStart
-    String      sMultiLineCommentStop
-    String      sEscapeChar
-    String      sLineTerminationChar
-    String      sMetaStart
-    String      sMetaStop
-    String[]    saScopeStart
-    String[]    saScopeStop
-    String[]    saKeywords
-    String[]    saOperators
-    String[]    saTags
-    String[]    saEntities
-    String[]    saAttributes
+    String sName
+    Integer iProcedural
+    Integer iCaseSensitive
+    String sLineComments
+    String sStringDelimiter
+    String sMultiLineCommentStart
+    String sMultiLineCommentStop
+    String sEscapeChar
+    String sLineTerminationChar
+    String sMetaStart
+    String sMetaStop
+    String[] saScopeStart
+    String[] saScopeStop
+    String[] saKeywords
+    String[] saOperators
+    String[] saTags
+    String[] saEntities
+    String[] saAttributes
 End_Struct
 
 Struct tDFDefaultClasses
