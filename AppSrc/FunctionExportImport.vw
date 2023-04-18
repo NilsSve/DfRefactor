@@ -43,13 +43,13 @@ Object oFunctionsExportImport is a dbView
         Object oInfo_tb is a TextBox
             Set Auto_Size_State to False
             Set Size to 67 419
-            Set Location to 25 59
+            Set Location to 29 59
             Set Justification_Mode to JMode_Left
             Set Label to "Info text"
             
             Procedure Page Integer iPageObject  
                 String sVal
-                Move "This view is designed to enable you to Export/Import refactoring data and source code from one machine to another." to sVal
+                Append sVal "This view is designed to enable you to Export/Import refactoring data and source code from one machine to another."
                 Append sVal "\n\nSelect the functions to be exported. The data from the Functions table together with the corresponding function code text "
                 Append sVal "from the cRefactorFunctionLibrary class and oRefactor_Unit_Tests.pkg will be exported to a Json file that can be copied/send to another machine for import, in alphabetical order by Function names." 
                 Append sVal "\n\nNote that each function that has code in the cRefactorFunctionLibrary class *must* also have been registrered under the 'Function Maintenance' tab-page."
