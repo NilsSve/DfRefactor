@@ -38,7 +38,7 @@ End_Object
 Activate_View Activate_oRefactorView for oRefactorView
 Object oRefactorView is a cRefactorDbView
     Set Location to 1 0
-    Set Size to 311 578
+    Set Size to 315 642
     Set Label to "Refactoring Selections"
     Set Icon to "DFRefactor.ico"
     Set pbAcceptDropFiles to True
@@ -82,18 +82,275 @@ Object oRefactorView is a cRefactorDbView
     #Include oBPO.pkg
                                     
     Object oMain_TabDialog is a dbTabDialog
-        Set Size to 254 578
+        Set Size to 258 642
         Set piMinSize to 140 510
-        Set Location to 6 -2
+        Set Location to 0 -2
         Set Rotate_Mode to RM_Rotate
         Set peAnchors to anAll
         Set Auto_Clear_DEO_State to False  
         Set Auto_Top_Panel_State to False
         Set phoImageList to oImageList
         Set Default_Tab to -1
+
+        Object oSelectFunctions_tp is a dbTabPage
+            Set Label to "Select Functions"
+
+            Object oSelectFunctions_grp is a cRDCDbHeaderGroup
+                Set Size to 239 634
+                Set piMinSize to 126 490
+                Set Location to 4 0
+                Set Label to "Function List"             
+                Set psImage to "FunctionLibrary.ico"
+                Set psNote to "Select functions. Right click grid for options."
+                Set psToolTip to "Standard refactoring functions are functions that are called once for each source line."
+                Set Border_Style to Border_None
+                Set peAnchors to anAll
+                Set piImageIndex to Ico_Functions
+
+Register_Procedure RefreshSelectionUpdate
+
+                Object oFunctionSelection_grd is a cRDCDbCJGrid
+                    Set Size to 211 621
+                    Set Location to 27 10
+                    Set Ordering to 5
+                    Set pbAllowAppendRow to False
+                    Set pbAllowDeleteRow to False
+                    Set pbAllowInsertRow to False
+                    Set pbAutoAppend to False
+                    Set pbEditOnTyping to False
+                    Set piLayoutBuild to 4
+                    Set pbHeaderReorders to True
+                    Set pbHeaderTogglesDirection to True
+                        
+                    Procedure Activating
+                        Forward Send Activating  
+                        Send DoChangeFontSize
+                    End_Procedure
+            
+                    Object oFunctions_ID is a cRDCDbCJGridColumn
+                        Entry_Item Functions.ID
+                        Set piWidth to 32
+                        Set psCaption to "ID"
+                        Set pbEditable to False
+                    End_Object
+
+                    Object oFunctions_Function_Name is a cRDCDbCJGridColumn
+                        Entry_Item Functions.Function_Name
+                        Set piWidth to 291
+                        Set psCaption to "Function Name"
+                        Set pbEditable to False   
+                        Set phoData_Col to Self   
+                        Set psToolTip to "The name of the refactoring function. Hover the mouse over a function row to see more help on what it does."
+                                    
+                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                            Get RowValue of oFunctions_Function_Help iRow to sText
+                            Function_Return sText
+                        End_Function
+            
+                    End_Object
+                        
+                    Object oFunctions_Function_Description is a cRDCDbCJGridColumn
+                        Entry_Item Functions.Function_Description
+                        Set piWidth to 397
+                        Set psCaption to "Description"
+                        Set pbEditable to False
+                        Set psToolTip to "A short description of whate the refactoring function does. Hover the mouse over a function row to see more help on what it does."
+            
+                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                            Get RowValue of oFunctions_Function_Help iRow to sText
+                            Function_Return sText
+                        End_Function
+            
+                    End_Object
+
+                    Object oFunctions_Type is a cRDCDbCJGridColumn
+                        Entry_Item Functions.Type
+                        Set piWidth to 154
+                        Set psCaption to "Type"
+                        Set peHeaderAlignment to xtpAlignmentCenter  
+                        Set pbComboButton to True
+                        Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
+            
+                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                            Get RowValue of oFunctions_Function_Help iRow to sText
+                            Function_Return sText
+                        End_Function
+            
+                    End_Object                    
+
+                    Object oFunctions_Parameter is a cDbCJGridColumn
+                        Entry_Item Functions.Parameter
+                        Set piWidth to 74
+                        Set psCaption to "Option"
+                        Set psToolTip to "For some functions an extra parameter can be passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
+            
+                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                            Get RowValue of oFunctions_ParameterHelp iRow to sText
+                            Move (Replaces("\n", sText, CS_CRLF)) to sText
+                            Function_Return sText
+                        End_Function
+            
+                    End_Object
+
+                    Object oFunctions_ParameterHelp is a cDbCJGridColumn
+                        Entry_Item Functions.ParameterHelp
+                        Set piWidth to 200
+                        Set psCaption to "Parameter Help"
+                        Set pbVisible to False
+                    End_Object
+
+                    Object oFunctions_Function_Help is a cRDCDbCJGridColumn
+                        Entry_Item Functions.Function_Help
+                        Set piWidth to 221
+                        Set psCaption to "Help"
+                        Set pbVisible to False
+                    End_Object
+            
+                    Object oFunctions_Selected is a cRDCDbCJGridColumn
+                        Entry_Item Functions.Selected
+                        Set piWidth to 87
+                        Set psCaption to "Select"
+                        Set pbCheckbox to True
+                        Set peHeaderAlignment to xtpAlignmentCenter  
+                        Set phoCheckbox_Col to Self
+                        Set peFooterAlignment to  xtpAlignmentCenter
+            
+                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                            Get RowValue of oFunctions_Function_Help iRow to sText
+                            Function_Return sText
+                        End_Function
+            
+                    End_Object
+
+                    Procedure Refresh Integer eMode
+                        Integer iChecked iSelectedFolders
+                        Forward Send Refresh eMode
+                        Set Value of oNoOfSelectedFunctions2_fm to SysFile.SelectedFunctionTotal
+                        Get CheckedItems of oFolders_grd to iSelectedFolders
+                        Set Value of oNoOfSelectedFolders_fm to iSelectedFolders
+                    End_Procedure
+                                
+                End_Object
+
+                Object oSelectAll_btn is a Button
+                    Set Size to 14 62
+                    Set Location to 10 267
+                    Set Label to "Select All"
+                    Set psImage to "SelectAll.ico"
+                    Set peAnchors to anTopRight
+                    Procedure OnClick
+                        Send SelectAll of (Main_DD(Self))
+                        Send RefreshSelectionUpdate of oFunctionSelection_grd
+                    End_Procedure
+                End_Object
+
+                Object oDeselectAll_btn is a Button
+                    Set Size to 14 62
+                    Set Location to 10 333
+                    Set Label to "Select None"
+                    Set psImage to "SelectNone.ico"
+                    Set peAnchors to anTopRight
+                    Procedure OnClick
+                        Send DeSelectAll of (Main_DD(Self))
+                        Send RefreshSelectionUpdate of oFunctionSelection_grd
+                    End_Procedure
+                End_Object
+
+                Object oConstrainByType_cf is a ComboForm
+                    Set Size to 14 84
+                    Set Location to 10 461
+                    Set peAnchors to anTopRight
+                    Set Label_Col_Offset to 2
+                    Set Label_Justification_Mode to JMode_Right
+                    Set Label to "Constrain by Type"
+                    Set Entry_State to False
+                    Set Combo_Sort_State to False
+                  
+                    Procedure Combo_Fill_List
+                        Send Combo_Add_Item CS_All_Functions
+                        Send Combo_Add_Item CS_Standard_Function
+                        Send Combo_Add_Item CS_Remove_Function
+                        Send Combo_Add_Item CS_Editor_Function
+                        Send Combo_Add_Item CS_Report_Function   
+                        Send Combo_Add_Item CS_Report_FunctionAll
+                        Send Combo_Add_Item CS_Other_Function   
+                        Send Combo_Add_Item CS_Other_FunctionAll
+                    End_Procedure
+                  
+                    Procedure OnChange
+                        String sValue                      
+                        Integer iType
+                        
+                        Get Value to sValue
+                        Case Begin
+                            Case (sValue = CS_All_Functions)
+                                Move eAll_Functions to iType
+                                Case Break
+                            Case (sValue = CS_Standard_Function)
+                                Move eStandard_Function to iType
+                                Case Break
+                            Case (sValue = CS_Remove_Function)
+                                Move eRemove_Function to iType
+                                Case Break                            
+                            Case (sValue = CS_Editor_Function)
+                                Move eEditor_Function to iType
+                                Case Break
+                            Case (sValue = CS_Report_Function)
+                                Move eReport_Function to iType
+                                Case Break
+                            Case (sValue = CS_Report_FunctionAll)
+                                Move eReport_FunctionAll to iType
+                                Case Break
+                            Case (sValue = CS_Other_Function)
+                                Move eOther_Function to iType
+                                Case Break
+                            Case (sValue = CS_Other_FunctionAll)
+                                Move eOther_FunctionAll to iType
+                                Case Break
+                            Case Else
+                        Case End
+                            
+                        Set piFunctionType of (Main_DD(Self)) to iType
+                        Send Rebuild_Constraints of (Main_DD(Self)) 
+                        Send RefreshDataFromDD of oFunctionSelection_grd 0
+                    End_Procedure
+                  
+                End_Object
+    
+                Object oDisabledInfo_txt is a TextBox
+                    Set Auto_Size_State to False
+                    Set Size to 22 100
+                    Set Location to 2 153
+                    Set Justification_Mode to JMode_Left
+                    Set FontWeight to fw_Bold
+                    Set peAnchors to anTopRight
+                    
+                    Object oDisabledInfo_Idle is an cIdleHandler
+                        Set pbEnabled to True
+                        Procedure OnIdle
+                            String sText  
+                            Boolean bSelected
+                            
+                            Get Field_Current_Value of oSysFile_DD Field SysFile.bCountSourceLines to bSelected
+                            If (bSelected = True) Begin
+                                Move 'Grid Disabled! Function: "Only count Source Lines" is selected!' to sText
+                            End                 
+                            Else Begin
+                                Move "" to sText
+                            End
+                            Set Value of oDisabledInfo_txt to sText  
+                            Set Enabled_State of oFunctionSelection_grd to (bSelected = False)  
+                        End_Procedure
+                    End_Object
+            
+                End_Object
+                
+            End_Object
+                    
+        End_Object
         
         Object oFolders_tp is a dbTabPage
-            Set Label to "Select Folders and Files"
+            Set Label to "Select Folders"
             Set piImageIndex to Ico_Folders
             Set pbAcceptDropFiles to True
 
@@ -106,17 +363,18 @@ Object oRefactorView is a cRefactorDbView
     
             Object oSourceFolders_grp is a cRDCDbHeaderGroup
                 Set Location to 4 0
-                Set Size to 233 570
-                Set Label to "Select Source Code Folders"
+                Set Size to 233 634
+                Set Label to "Folders List"
+//                Set Label to "Select Source Code Folders"
                 Set psImage to "Folder.ico"
-                Set psNote to "Right click grid for options"
+                Set psNote to "Select Folders. Right click grid for options"
                 Set psToolTip to "You can add a folder with drag and drop from Windows Explorer, or by using the right-click mouse menu."
                 Set peAnchors to anAll
                 Set Border_Style to Border_None
                 Set piMinSize to 126 490
     
                 Object oFolders_grd is a cRDCCJSelectionGrid
-                    Set Size to 204 557
+                    Set Size to 204 621
                     Set Location to 27 9
                     Set psNoItemsText to "No Workspace selected yet..."
                     Set pbShowAddFolderMenuItem to True
@@ -294,260 +552,6 @@ Object oRefactorView is a cRefactorDbView
             End_Procedure
                      
         End_Object
-
-        Object oSelectFunctions_tp is a dbTabPage
-            Set Label to "Select Functions"
-
-            Object oSelectFunctions_grp is a cRDCDbHeaderGroup
-                Set Size to 233 570
-                Set piMinSize to 126 490
-                Set Location to 4 0
-                Set Label to "Select Functions"             
-                Set psImage to "FunctionLibrary.ico"
-                Set psNote to "Refactoring functions"
-                Set psToolTip to "Standard refactoring functions are functions that are called once for each source line."
-                Set Border_Style to Border_None
-                Set peAnchors to anAll
-                Set piImageIndex to Ico_Functions
-
-Register_Procedure RefreshSelectionUpdate
-
-                Object oFunctionSelection_grd is a cRDCDbCJGrid
-                    Set Size to 204 557
-                    Set Location to 27 10
-                    Set Ordering to 5
-                    Set pbAllowAppendRow to False
-                    Set pbAllowDeleteRow to False
-                    Set pbAllowInsertRow to False
-                    Set pbAutoAppend to False
-                    Set pbEditOnTyping to False
-                    Set piLayoutBuild to 4
-                    Set pbHeaderReorders to True
-                    Set pbHeaderTogglesDirection to True
-                        
-                    Procedure Activating
-                        Forward Send Activating  
-                        Send DoChangeFontSize
-                    End_Procedure
-            
-                    Object oFunctions_ID is a cRDCDbCJGridColumn
-                        Entry_Item Functions.ID
-                        Set piWidth to 29
-                        Set psCaption to "ID"
-                        Set pbEditable to False
-                    End_Object
-
-                    Object oFunctions_Function_Name is a cRDCDbCJGridColumn
-                        Entry_Item Functions.Function_Name
-                        Set piWidth to 262
-                        Set psCaption to "Function Name"
-                        Set pbEditable to False   
-                        Set phoData_Col to Self   
-                        Set psToolTip to "The name of the refactoring function. Hover the mouse over a function row to see more help on what it does."
-                                    
-                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
-                            Get RowValue of oFunctions_Function_Help iRow to sText
-                            Function_Return sText
-                        End_Function
-            
-                    End_Object
-                        
-                    Object oFunctions_Function_Description is a cRDCDbCJGridColumn
-                        Entry_Item Functions.Function_Description
-                        Set piWidth to 356
-                        Set psCaption to "Description"
-                        Set pbEditable to False
-                        Set psToolTip to "A short description of whate the refactoring function does. Hover the mouse over a function row to see more help on what it does."
-            
-                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
-                            Get RowValue of oFunctions_Function_Help iRow to sText
-                            Function_Return sText
-                        End_Function
-            
-                    End_Object
-
-                    Object oFunctions_Type is a cRDCDbCJGridColumn
-                        Entry_Item Functions.Type
-                        Set piWidth to 138
-                        Set psCaption to "Type"
-                        Set peHeaderAlignment to xtpAlignmentCenter  
-                        Set pbComboButton to True
-                        Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
-            
-                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
-                            Get RowValue of oFunctions_Function_Help iRow to sText
-                            Function_Return sText
-                        End_Function
-            
-                    End_Object                    
-
-                    Object oFunctions_Parameter is a cDbCJGridColumn
-                        Entry_Item Functions.Parameter
-                        Set piWidth to 67
-                        Set psCaption to "Option"
-                        Set psToolTip to "For some functions an extra parameter can be passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
-            
-                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
-                            Get RowValue of oFunctions_ParameterHelp iRow to sText
-                            Move (Replaces("\n", sText, CS_CRLF)) to sText
-                            Function_Return sText
-                        End_Function
-            
-                    End_Object
-
-                    Object oFunctions_ParameterHelp is a cDbCJGridColumn
-                        Entry_Item Functions.ParameterHelp
-                        Set piWidth to 200
-                        Set psCaption to "Parameter Help"
-                        Set pbVisible to False
-                    End_Object
-
-                    Object oFunctions_Function_Help is a cRDCDbCJGridColumn
-                        Entry_Item Functions.Function_Help
-                        Set piWidth to 221
-                        Set psCaption to "Help"
-                        Set pbVisible to False
-                    End_Object
-            
-                    Object oFunctions_Selected is a cRDCDbCJGridColumn
-                        Entry_Item Functions.Selected
-                        Set piWidth to 77
-                        Set psCaption to "Select"
-                        Set pbCheckbox to True
-                        Set peHeaderAlignment to xtpAlignmentCenter  
-                        Set phoCheckbox_Col to Self
-                        Set peFooterAlignment to  xtpAlignmentCenter
-            
-                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
-                            Get RowValue of oFunctions_Function_Help iRow to sText
-                            Function_Return sText
-                        End_Function
-            
-                    End_Object
-
-                    Procedure Refresh Integer eMode
-                        Integer iChecked
-                        Forward Send Refresh eMode
-                        Set Value of oNoOfSelectedFunctions2_fm to SysFile.SelectedFunctionTotal
-                    End_Procedure
-                                
-                End_Object
-
-                Object oSelectAll_btn is a Button
-                    Set Size to 14 62
-                    Set Location to 4 203
-                    Set Label to "Select All"
-                    Set psImage to "SelectAll.ico"
-                    Set peAnchors to anTopRight
-                    Procedure OnClick
-                        Send SelectAll of (Main_DD(Self))
-                        Send RefreshSelectionUpdate of oFunctionSelection_grd
-                    End_Procedure
-                End_Object
-
-                Object oDeselectAll_btn is a Button
-                    Set Size to 14 62
-                    Set Location to 4 269
-                    Set Label to "Select None"
-                    Set psImage to "SelectNone.ico"
-                    Set peAnchors to anTopRight
-                    Procedure OnClick
-                        Send DeSelectAll of (Main_DD(Self))
-                        Send RefreshSelectionUpdate of oFunctionSelection_grd
-                    End_Procedure
-                End_Object
-
-                Object oConstrainByType_cf is a ComboForm
-                    Set Size to 14 84
-                    Set Location to 4 397
-                    Set peAnchors to anTopRight
-                    Set Label_Col_Offset to 2
-                    Set Label_Justification_Mode to JMode_Right
-                    Set Label to "Constrain by Type"
-                    Set Entry_State to False
-                    Set Combo_Sort_State to False
-                  
-                    Procedure Combo_Fill_List
-                        Send Combo_Add_Item CS_All_Functions
-                        Send Combo_Add_Item CS_Standard_Function
-                        Send Combo_Add_Item CS_Remove_Function
-                        Send Combo_Add_Item CS_Editor_Function
-                        Send Combo_Add_Item CS_Report_Function   
-                        Send Combo_Add_Item CS_Report_FunctionAll
-                        Send Combo_Add_Item CS_Other_Function   
-                        Send Combo_Add_Item CS_Other_FunctionAll
-                    End_Procedure
-                  
-                    Procedure OnChange
-                        String sValue                      
-                        Integer iType
-                        
-                        Get Value to sValue
-                        Case Begin
-                            Case (sValue = CS_All_Functions)
-                                Move eAll_Functions to iType
-                                Case Break
-                            Case (sValue = CS_Standard_Function)
-                                Move eStandard_Function to iType
-                                Case Break
-                            Case (sValue = CS_Remove_Function)
-                                Move eRemove_Function to iType
-                                Case Break                            
-                            Case (sValue = CS_Editor_Function)
-                                Move eEditor_Function to iType
-                                Case Break
-                            Case (sValue = CS_Report_Function)
-                                Move eReport_Function to iType
-                                Case Break
-                            Case (sValue = CS_Report_FunctionAll)
-                                Move eReport_FunctionAll to iType
-                                Case Break
-                            Case (sValue = CS_Other_Function)
-                                Move eOther_Function to iType
-                                Case Break
-                            Case (sValue = CS_Other_FunctionAll)
-                                Move eOther_FunctionAll to iType
-                                Case Break
-                            Case Else
-                        Case End
-                            
-                        Set piFunctionType of (Main_DD(Self)) to iType
-                        Send Rebuild_Constraints of (Main_DD(Self)) 
-                        Send RefreshDataFromDD of oFunctionSelection_grd 0
-                    End_Procedure
-                  
-                End_Object
-    
-                Object oDisabledInfo_txt is a TextBox
-                    Set Auto_Size_State to False
-                    Set Size to 22 100
-                    Set Location to 2 89
-                    Set Justification_Mode to JMode_Left
-                    Set FontWeight to fw_Bold
-                    Set peAnchors to anTopRight
-                    
-                    Object oDisabledInfo_Idle is an cIdleHandler
-                        Set pbEnabled to True
-                        Procedure OnIdle
-                            String sText  
-                            Boolean bSelected
-                            
-                            Get Field_Current_Value of oSysFile_DD Field SysFile.bCountSourceLines to bSelected
-                            If (bSelected = True) Begin
-                                Move "Grid is Disabled! Function 'Only count Source Lines' selected!" to sText
-                            End                 
-                            Else Begin
-                                Move "" to sText
-                            End
-                            Set Value of oDisabledInfo_txt to sText    
-                        End_Procedure
-                    End_Object
-            
-                End_Object
-                
-            End_Object
-                    
-        End_Object
     
         Procedure UpdateEnabledState
             String sSWSFile
@@ -563,103 +567,14 @@ Register_Procedure RefreshSelectionUpdate
         Set Enabled_State to (sSWSFile <> "")
     End_Procedure
 
-    Object oRunNow_grp is a cRDCDbHeaderGroup
-        Set Size to 46 558
-        Set Location to 262 11
-        Set psLabel to "Refactor Selected Code"
-        Set psNote to "Process selected functions for the selected folders/source files" 
-        Set psToolTip to "Process selected refactoring functions for the source code matching the selected folders and file extensions."
-        Set psImage to "DFRefactor.ico"
-        Set peAnchors to anBottomLeftRight
-//        Set Border_Style to Border_None
-        Set pbUseLargeFontHeight to True
-
-        Object oNoOfSelectedFolders_fm is a Form
-            Set Size to 13 15
-            Set Location to 15 420
-            Set Label_Justification_Mode to JMode_Right
-            Set Label to "Number of Selected Folders"
-            Set psToolTip to "Total number of folders selected."
-            Set Enabled_State to False
-            Set peAnchors to anBottomRight
-            Set Label_FontWeight to fw_Bold
-            Set Label_Col_Offset to 1
-            Set FontWeight to fw_Bold  
-            Set Form_Datatype to Mask_Numeric_Window   
-            Set Form_Mask to "####"
-        End_Object
-
-        Object oNoOfSelectedFunctions2_fm is a cRDCDbForm
-            Entry_Item SysFile.SelectedFunctionTotal
-            Set Server to oSysFile_DD
-            Set Size to 13 15
-            Set Location to 29 420
-            Set Label_Justification_Mode to JMode_Right
-            Set Label to "Number of Selected Functions"
-            Set psToolTip to "Total number of functions selected."
-            Set Enabled_State to False
-            Set peAnchors to anBottomRight
-            Set Label_FontWeight to fw_Bold
-            Set Label_Col_Offset to 1
-            Set FontWeight to fw_Bold              
-        End_Object
-
-        Object oExecute_btn is a cRDCButton
-            Set Size to 25 109
-            Set Location to 17 442
-            Set Label to "Start &Refactoring!" //"&Refactor Code Now!"
-            Set psToolTip to "Start processing the selected refactoring functions. If 'Workspace' mode has been selected from the toolbar all source files that matches the 'File Extensions Filter' will be processed. Else the operations will take place on a single file only. (Alt+R or Ctrl+R)"
-//            Set MultiLineState to True
-            Set psImage to "Start.ico"
-            Set pbAutoEnable to True
-            Set peAnchors to anBottomRight
-            Set Default_State to True
-            Set piImageMarginLeft to 7
-            Set piImageSize to 32
-
-            Procedure End_Construct_Object
-                Forward Send End_Construct_Object
-                // Note: We use Form_FontWeight instead of FontWeight to _not_ make the object larger
-                // because of the bold font.
-                Set Form_FontWeight to FW_BOLD
-            End_Procedure
-
-            Procedure OnClick  
-                Send START_MAIN_PROCESS
-            End_Procedure
-
-            Function IsEnabled Returns Boolean
-                Boolean bEnabled bWorkspaceMode
-                String sFileName sSWSFile
-                Integer iSelectedFunctions iFolders
-
-                Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
-                Get psSWSFile               of ghoApplication to sSWSFile
-                Get psCurrentSourceFileName of ghoApplication to sFileName
-
-                If (bWorkspaceMode = True) Begin
-                    Move (sSWSFile <> "") to bEnabled
-                End
-                Else Begin
-                    Move (sFileName <> "") to bEnabled
-                End
-
-                If (bEnabled = True) Begin
-                    Move (SysFile.SelectedFunctionTotal > 0) to bEnabled
-                End
-
-                If (bEnabled = True) Begin
-                    Get CheckedItems of oFolders_grd to iFolders
-                    Move (iFolders <> 0) to bEnabled
-                End          
-                If (bEnabled = False) Begin
-                    Get Field_Current_Value of oSysFile_DD Field SysFile.bCountSourceLines to bEnabled
-                End
-
-                Function_Return bEnabled
-            End_Function
-
-        End_Object
+    Object oSelectFiles_grp is a cRDCDbHeaderGroup
+        Set Size to 48 260
+        Set Location to 262 6
+        Set psLabel to "File Filter"
+        Set psNote to "File Extensions Filter"
+        Set psToolTip to "Select file extensions filter. Each extension must start with a wildcard character and a dot (*.) and file extensions must be separated with a semicolon (;)"
+        Set psImage to "FileExtensions.ico"
+        Set peAnchors to anBottomLeft
 
         Procedure UpdateEnabledState
             String sSWSFile
@@ -667,40 +582,11 @@ Register_Procedure RefreshSelectionUpdate
             Set Enabled_State to (sSWSFile <> "")
         End_Procedure
 
-        Object oSysFile_CountSourceLines_cb is a dbCheckBox
-            Entry_Item SysFile.bCountSourceLines
-            Set Server to oSysFile_DD
-            Set Location to 4 444
-            Set Size to 8 109
-            Set Label to "Only count Source Lines"   
-            Set FontWeight to fw_Bold
-            Set peAnchors to anBottomRight 
-            Set psToolTip to (String("This function will tell you have big your workspace is by counting the number of real source lines for all selected folders and file extensions.") + String(CS_CR) + String("Note: It will skip blank or comments lines, and it will not count files generated by the Studio from COM components.") + String(CS_CR) + String(CS_CR) + String("This function needs be run alone, all other functions will be ignored."))
-            
-            Procedure OnChange
-                Boolean bChecked
-                Integer iSelectedFunctions
-                
-                Get Checked_State to bChecked
-                Set Enabled_State of oFunctionSelection_grd to (bChecked = False) 
-                If (bChecked = True) Begin
-                    Move 1 to iSelectedFunctions
-                End                             
-                Else Begin
-                    Move SysFile.SelectedFunctionTotal to iSelectedFunctions
-                End
-                Set Value of oNoOfSelectedFunctions2_fm to iSelectedFunctions
-                Set Changed_State of oSysFile_DD to False
-            End_Procedure
-
-        End_Object
-
         Object oFileNameFilters_cf is a cRDCDbComboForm 
             Entry_Item SysFile.FileExtensionFilter
             Set Server to oSysFile_DD
-            Set Size to 12 229
-            Set Location to 30 73
-            Set Label to "File Extensions Filter"
+            Set Size to 12 250
+            Set Location to 30 4
             Set psToolTip to "Select file extensions filter. Each extension must start with a wildcard character and a dot (*.) and file extensions must be separated with a semicolon (;)"
             Set Status_Help to (psToolTip(Self))
             Set Combo_Sort_State to False
@@ -708,7 +594,9 @@ Register_Procedure RefreshSelectionUpdate
             Set peAnchors to anTopLeftRight
 
             Property Integer piMaxUserFilters 8
-            Set Label_Row_Offset to 00
+            Set Label_Row_Offset to 1
+            Set Label_Justification_Mode to JMode_Top
+            Set Label_Col_Offset to 0
 
             Procedure Combo_Fill_List
                 String sDFExtensions sDFVersion
@@ -816,6 +704,157 @@ Register_Procedure RefreshSelectionUpdate
                 Loop
                 Function_Return bExists
             End_Function
+
+        End_Object
+
+    End_Object
+
+    Object oRunNow_grp is a cRDCDbHeaderGroup
+        Set Size to 48 367
+        Set Location to 262 270
+        Set piMinSize to 48 367
+        Set psLabel to "Refactor Code"
+        Set psNote to "Calls the selected functions for selected folders/source files" 
+        Set psToolTip to "Calls the selected functions for the matching selected folders and file extensions."
+        Set psImage to "DFRefactor.ico"
+        Set peAnchors to anBottomLeftRight
+        Set pbUseLargeFontHeight to True
+
+        Object oNoOfSelectedFolders_fm is a Form
+            Set Size to 13 15
+            Set Location to 28 105
+            Set Label_Justification_Mode to JMode_Right
+            Set Label to "Number of Selected Folders:"
+            Set psToolTip to "Total number of folders selected."
+            Set Enabled_State to False
+            Set peAnchors to anBottomRight
+            Set Label_FontWeight to fw_Bold
+            Set Label_Col_Offset to 0
+            Set FontWeight to fw_Bold  
+            Set Form_Datatype to Mask_Numeric_Window   
+            Set Form_Mask to "####"
+        End_Object
+
+        Object oNoOfSelectedFunctions2_fm is a cRDCDbForm
+            Entry_Item SysFile.SelectedFunctionTotal
+            Set Server to oSysFile_DD
+            Set Size to 13 15
+            Set Location to 28 230
+            Set Label_Justification_Mode to JMode_Right
+            Set Label to "Number of Selected Functions:"
+            Set psToolTip to "Total number of functions selected."
+            Set Enabled_State to False
+            Set peAnchors to anBottomRight
+            Set Label_FontWeight to fw_Bold
+            Set Label_Col_Offset to 0
+            Set FontWeight to fw_Bold              
+        End_Object
+
+        Object oExecute_btn is a cRDCButton
+            Set Size to 25 109
+            Set Location to 16 252
+            Set Label to "Start &Refactoring!" //"&Refactor Code Now!"
+            Set psToolTip to "Start processing the selected refactoring functions. If 'Workspace' mode has been selected from the toolbar all source files that matches the 'File Extensions Filter' will be processed. Else the operations will take place on a single file only. (Alt+R or Ctrl+R)"
+//            Set MultiLineState to True
+            Set psImage to "Start.ico"
+            Set pbAutoEnable to True
+            Set peAnchors to anBottomRight
+            Set Default_State to True
+            Set piImageMarginLeft to 7
+            Set piImageSize to 32
+
+            Procedure End_Construct_Object
+                Forward Send End_Construct_Object
+                // Note: We use Form_FontWeight instead of FontWeight to _not_ make the object larger
+                // because of the bold font.
+                Set Form_FontWeight to FW_BOLD
+            End_Procedure
+
+            Procedure OnClick  
+                Send START_MAIN_PROCESS
+            End_Procedure
+
+            Function IsEnabled Returns Boolean
+                Boolean bEnabled bWorkspaceMode
+                String sFileName sSWSFile sHomePath
+                Integer iSelectedFunctions iFolders 
+                Handle hoFolderSelHeaDD
+                Boolean bExists bUseDDO  
+                String[] asSavedFolders
+
+                Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
+                Get psSWSFile               of ghoApplication to sSWSFile
+                Get psCurrentSourceFileName of ghoApplication to sFileName
+
+                If (bWorkspaceMode = True) Begin
+                    Move (sSWSFile <> "") to bEnabled
+                End
+                Else Begin
+                    Move (sFileName <> "") to bEnabled
+                End
+
+                If (bEnabled = True) Begin
+                    Move (SysFile.SelectedFunctionTotal > 0) to bEnabled
+                End
+
+                If (bEnabled = True) Begin
+                    Get CheckedItems of oFolders_grd to iFolders
+                    If (iFolders = 0) Begin
+                        Get private.phoFolderSelHeaDD of ghoApplication to hoFolderSelHeaDD
+                        Move (hoFolderSelHeaDD <> 0) to bUseDDO
+                        If (bUseDDO = True) Begin
+                            Get psHomePath of ghoApplication to sHomePath 
+                            Get IsSavedFolders of hoFolderSelHeaDD sHomePath to bExists
+                            If (bExists = True) Begin
+                                Get FindSavedFolders of hoFolderSelHeaDD sHomePath to asSavedFolders
+                            End
+                            Move (SizeOfArray(asSavedFolders)) to iFolders
+                        End
+                    End
+                    Move (iFolders <> 0) to bEnabled
+                End          
+                If (bEnabled = False) Begin
+                    Get Field_Current_Value of oSysFile_DD Field SysFile.bCountSourceLines to bEnabled
+                End
+
+                Function_Return bEnabled
+            End_Function
+
+        End_Object
+
+        Procedure UpdateEnabledState
+            String sSWSFile
+            Get psSWSFile of ghoApplication to sSWSFile
+            Set Enabled_State to (sSWSFile <> "")
+        End_Procedure
+
+        Object oSysFile_CountSourceLines_cb is a dbCheckBox
+            Entry_Item SysFile.bCountSourceLines
+            Set Server to oSysFile_DD
+            Set Location to 4 261
+            Set Size to 8 109
+            Set Label to "Only count Source Lines"   
+            Set FontWeight to fw_Bold
+            Set peAnchors to anBottomRight 
+            Set psToolTip to (String("This function will tell you have big your workspace is by counting the number of real source lines for all selected folders and file extensions.") + String(CS_CR) + String("Note: It will skip blank or comments lines, and it will not count files generated by the Studio from COM components.") + String(CS_CR) + String(CS_CR) + String("This function needs be run alone, all other functions will be ignored."))
+            
+            Procedure OnChange
+                Boolean bChecked
+                Integer iSelectedFunctions iSelectedFolders
+                
+                Set Changed_State of oSysFile_DD to False
+                Get Checked_State to bChecked
+
+                Get CheckedItems of oFolders_grd to iSelectedFolders
+                Set Value of oNoOfSelectedFolders_fm to iSelectedFolders
+                If (bChecked = True) Begin
+                    Move 1 to iSelectedFunctions
+                End                             
+                Else Begin
+                    Move SysFile.SelectedFunctionTotal to iSelectedFunctions
+                End
+                Set Value of oNoOfSelectedFunctions2_fm to iSelectedFunctions
+            End_Procedure
 
         End_Object
 
@@ -1222,11 +1261,13 @@ Register_Procedure RefreshSelectionUpdate
     End_Procedure
 
     Procedure OnSetFocus
-        Integer iSelectedFunctions                 
-        Boolean bCountSourceLines
+        Boolean bCountSourceLines 
+        Integer iSelectedFunctions iSelectedFolders                
 
         Set piActiveView of ghoApplication to CI_CleanupSource Self
 
+        Get CheckedItems of oFolders_grd to iSelectedFolders
+        Set Value of oNoOfSelectedFolders_fm to iSelectedFolders
         Move (SysFile.bCountSourceLines = True) to bCountSourceLines
         If (bCountSourceLines = True) Begin
             Move 1 to iSelectedFunctions
@@ -1239,7 +1280,28 @@ Register_Procedure RefreshSelectionUpdate
     End_Procedure
 
     Procedure OnWorkspaceLoaded
+        Integer iSelectedFolders  
+        Handle hoFolderSelHeaDD
+        Boolean bExists bUseDDO
+        String sHomePath 
+        String[] asSavedFolders
+                      
         Send LoadData of oFolders_grd
+        Send OnChange of oSysFile_CountSourceLines_cb
+        Get CheckedItems of oFolders_grd to iSelectedFolders
+        If (iSelectedFolders = 0) Begin
+            Get private.phoFolderSelHeaDD of ghoApplication to hoFolderSelHeaDD
+            Move (hoFolderSelHeaDD <> 0) to bUseDDO
+            If (bUseDDO = True) Begin
+                Get psHomePath of ghoApplication to sHomePath 
+                Get IsSavedFolders of hoFolderSelHeaDD sHomePath to bExists
+                If (bExists = True) Begin
+                    Get FindSavedFolders of hoFolderSelHeaDD sHomePath to asSavedFolders
+                End
+                Move (SizeOfArray(asSavedFolders)) to iSelectedFolders
+            End
+        End
+        Set Value of oNoOfSelectedFolders_fm to iSelectedFolders
     End_Procedure
 
     // Allow a source file, .sws file or a folder to be dropped on the view:

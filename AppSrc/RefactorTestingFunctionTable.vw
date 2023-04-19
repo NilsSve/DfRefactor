@@ -298,10 +298,11 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Object oAction_grp is a cRDCDbHeaderGroup
                 Set Size to 66 374
                 Set Location to 210 6
-                Set Label to "Refactor Actions:"
+                Set Label to "Refactor Code"
                 Set psImage to "DFRefactor.ico"
                 Set psNote to "Select actions"
-                Set psToolTip to "These buttons to perform various refactoring actions."
+                Set psToolTip to "Click buttons to perform various refactoring actions."
+                Set pbUseLargeFontHeight to True
                 Set peAnchors to anBottomLeftRight
 
                 Object oNoOfSelectedFunctions2_fm is a cRDCDbForm

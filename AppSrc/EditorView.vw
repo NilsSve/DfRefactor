@@ -19,8 +19,8 @@ Object oEditorView_vw is a cRefactorDbView
     Set phoEditorView of ghoApplication to Self
 
     Object oEditor_edt is a cScintillaRefactorEditor
-        Set Size to 248 473
-        Set Location to 8 10
+        Set Size to 246 473
+        Set Location to 13 10
         Set peAnchors to anAll
         Set Enabled_State to False
 
@@ -163,6 +163,12 @@ Object oEditorView_vw is a cRefactorDbView
             Get psSWSFile of ghoApplication to sSWSFile
             Set Enabled_State to (sSWSFile <> "")
         End_Procedure
+    End_Object
+
+    Object oEditorInfo_tb is a TextBox
+        Set Size to 10 132
+        Set Location to 2 20
+        Set Label to "Editor object used by Scintilla Editor's build in refactoring functions"
     End_Object
 
     Procedure Activate_View Returns Integer
