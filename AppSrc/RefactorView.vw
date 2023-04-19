@@ -328,7 +328,7 @@ Register_Procedure RefreshSelectionUpdate
                     Object oDisabledInfo_Idle is an cIdleHandler
                         Set pbEnabled to True
                         Procedure OnIdle
-                            String sText  
+                            String sText sSWSFile 
                             Boolean bSelected
                             
                             Get Field_Current_Value of oSysFile_DD Field SysFile.bCountSourceLines to bSelected
@@ -339,7 +339,8 @@ Register_Procedure RefreshSelectionUpdate
                                 Move "" to sText
                             End
                             Set Value of oDisabledInfo_txt to sText  
-                            Set Enabled_State of oFunctionSelection_grd to (bSelected = False)  
+                            Get psSWSFile of ghoApplication to sSWSFile
+                            Set Enabled_State of oFunctionSelection_grd to (sSWSFile <> "" and bSelected = False)  
                         End_Procedure
                     End_Object
             
@@ -356,7 +357,7 @@ Register_Procedure RefreshSelectionUpdate
 
             Procedure OnFileDropped String sFileFolderName Boolean bLast
                 String sFileExt
-                Boolean bFile bFolder bSWSFile
+                Boolean bFile bFolder
         
                 Delegate Send OnFileDropped sFileFolderName bLast
             End_Procedure
@@ -861,7 +862,7 @@ Register_Procedure RefreshSelectionUpdate
     End_Object
 
     // Hidden object!
-    // This _must_ be here, else we will get inficite recursion and a crash because there
+    // This _must_ be here, else we will get infinite recursion and a crash because there
     // will be no object to take the focus when the view is disabled.
 //    Object oHidden_Focus_Object is a Form
 //        Set Size to 13 27
@@ -1338,7 +1339,7 @@ Register_Procedure RefreshSelectionUpdate
 
     Object oView_IdleHandler is a cIdleHandler
         Set pbEnabled to True
-        Procedure OnIdle
+        Procedure OnIdle 
             Broadcast Recursive Send UpdateEnabledState of (Parent(Self))
         End_Procedure
     End_Object
