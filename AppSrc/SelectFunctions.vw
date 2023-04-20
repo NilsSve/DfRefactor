@@ -13,7 +13,7 @@ Use Windows.pkg
 ACTIVATE_VIEW Activate_oMaintainFunctions FOR oMaintainFunctions
 Object oMaintainFunctions is a dbView
     Set Location to 2 4
-    Set Size to 143 591
+    Set Size to 145 589
     Set Label to "Functions List"
     Set Border_Style to Border_Thick
     Set pbAutoActivate to True
@@ -32,14 +32,14 @@ Object oMaintainFunctions is a dbView
 
     Object oInfo_tb is a TextBox
         Set Size to 10 275
-        Set Location to 8 34
+        Set Location to 4 126
         Set Label to "List of Functions in the database. Double-Click a row to Edit, Right-Click for options"
         Set FontWeight to fw_Bold
     End_Object
 
     Object oFunctionSelection_grd is a cRDCDbCJGrid
         Set Size to 125 578
-        Set Location to 26 7
+        Set Location to 17 6
         Set Ordering to 5
         Set piLayoutBuild to 3
         Set pbHeaderReorders to True
@@ -138,11 +138,48 @@ Object oMaintainFunctions is a dbView
             Delegate Send ActivateFunctionsView iFunctionID
         End_Procedure
 
+        Procedure ScaleFont Integer iDirection    // from control + mouse wheel in container object
+            Integer iSize jSize kSize iSup iInf iDef
+            Handle hoPaintManager hoFont
+            Boolean blimite
+            Variant vFont
+            
+            Move 3 to iInf      //max size
+            Move 18 to iSup     //min size
+            Move 8 to iDef      //default
+            Get phoReportPaintManager to hoPaintManager
+            If (IsComObjectCreated (hoPaintManager) = False) Begin
+                Procedure_Return
+            End
+            Get Create (RefClass(cComStdFont)) to hoFont
+            Get ComTextFont of hoPaintManager to vFont
+            Set pvComObject of hoFont to vFont
+            If (iDirection = 0) Begin
+                Set ComSize of hoFont to iDef
+            End
+            Else Begin
+               Get ComSize of hoFont to iSize
+               Move iSize to jSize
+               Repeat
+                    Move (If(iDirection > 0, jSize + 1, jSize - 1)) to jSize
+                    Move (If(iDirection > 0, If(jSize > iSup, True, False), If(jSize < iInf, True, False))) to blimite
+                    If (not(blimite)) Begin       
+                       Set ComSize of hoFont to jSize
+                       Get ComSize of hoFont to kSize
+                    End
+               Until (iSize <> kSize or blimite)    
+               Move kSize to iSize
+            End
+            Send Destroy to hoFont 
+            Send ComRedraw  
+            Send WriteString of ghoApplication CS_Settings CS_GridFontSize iSize
+        End_Procedure 
+    
     End_Object
 
     // To enable Ctrl+MouseWheel in the grid to change font size.
     Procedure OnWmMouseWheel Integer wParam Integer lParam
-       Integer iKeys iClicks iX iY iCONTROL
+       Integer iKeys iClicks iX iY iCONTROL iSize
        Short iDelta     // Short signed integer
        Boolean bok 
        Handle hoGrid
@@ -168,87 +205,51 @@ Object oMaintainFunctions is a dbView
     Object oSysFile_TotFunctionsSelected is a cRDCDbForm
         Entry_Item SysFile.SelectedFunctionTotal
         Set Server to oSysFile_DD
-        Set Location to 7 486
+        Set Location to 3 561
         Set Size to 12 15
-        Set Label to "Selected Functions:"
+        Set Label to "Selected:"
         Set Enabled_State to False
-        Set peAnchors to anNone
+        Set peAnchors to anTopRight
         Set Label_Col_Offset to 0
     End_Object
 
-    Object oGridFontSize_cf is a cRDCComboForm
-        Set Size to 13 32
-        Set Location to 7 370
-        Set Label to "Grid font size"
-        Set psToolTip to "Sets the font size for grids"
-        Set Label_Col_Offset to 2
-        Set Label_Justification_Mode to JMode_Right
-        Set Entry_State to False
-        Set Combo_Sort_State to False
-
-        Procedure Combo_Fill_List
-            Integer iSize
-
-            Send Combo_Add_Item "6"
-            Send Combo_Add_Item "7"
-            Send Combo_Add_Item "8"
-            Send Combo_Add_Item "9"
-            Send Combo_Add_Item "10"
-            Send Combo_Add_Item "11"
-            Send Combo_Add_Item "12"
-            Send Combo_Add_Item "13"
-            Send Combo_Add_Item "14"
-            Send Combo_Add_Item "15"
-            Send Combo_Add_Item "16"
-
-            Get ReadString of ghoApplication CS_Settings CS_GridFontSize 8 to iSize
-            Set Value to iSize
-        End_Procedure
-
-        Procedure OnChange     
-            Integer iSize
-            Get Value to iSize
-            Send WriteString of ghoApplication CS_Settings CS_GridFontSize iSize
-            Broadcast Recursive Send DoChangeFontSize of (Client_Id(ghoCommandBars))
-        End_Procedure
-
-    End_Object
-
-    Procedure ScaleFont Integer iDirection    // from control + mouse wheel in container object
-        Integer iSize jSize kSize iSup iInf iDef
-        Handle hoPaintManager hoFont
-        Variant vFont
-        
-        Move 3 to iInf      //max size
-        Move 18 to iSup     //min size
-        Move 8 to iDef      //default
-        Boolean blimite
-        Get phoReportPaintManager to hoPaintManager
-        If (IsComObjectCreated (hoPaintManager) = False) Begin
-            Procedure_Return
-        End
-        Get Create (RefClass(cComStdFont)) to hoFont
-        Get ComTextFont of hoPaintManager to vFont
-        Set pvComObject of hoFont to vFont
-        If (iDirection = 0) Begin
-            Set ComSize of hoFont to iDef
-        End
-        Else Begin
-           Get ComSize of hoFont to iSize
-           Move iSize to jSize
-           Repeat
-                Move (If(iDirection > 0, jSize + 1, jSize - 1)) to jSize
-                Move (If(iDirection > 0, If(jSize > iSup, True, False), If(jSize < iInf, True, False))) to blimite
-                If (not(blimite)) Begin       
-                   Set ComSize of hoFont to jSize
-                   Get ComSize of hoFont to kSize
-                End
-            Until (iSize <> kSize or blimite)
-        End
-        Send Destroy to hoFont 
-        Send ComRedraw  
-        Send WriteString of ghoApplication CS_Settings CS_GridFontSize iSize
-    End_Procedure 
+//    Object oGridFontSize_cf is a cRDCComboForm
+//        Set Size to 13 32
+//        Set Location to 7 457
+//        Set Label to "Grid font size"
+//        Set psToolTip to "Sets the font size for grids"
+//        Set Label_Col_Offset to 2
+//        Set Label_Justification_Mode to JMode_Right
+//        Set Entry_State to False
+//        Set Combo_Sort_State to False
+//
+//        Procedure Combo_Fill_List
+//            Integer iSize
+//
+//            Send Combo_Add_Item "6"
+//            Send Combo_Add_Item "7"
+//            Send Combo_Add_Item "8"
+//            Send Combo_Add_Item "9"
+//            Send Combo_Add_Item "10"
+//            Send Combo_Add_Item "11"
+//            Send Combo_Add_Item "12"
+//            Send Combo_Add_Item "13"
+//            Send Combo_Add_Item "14"
+//            Send Combo_Add_Item "15"
+//            Send Combo_Add_Item "16"
+//
+//            Get ReadString of ghoApplication CS_Settings CS_GridFontSize 8 to iSize
+//            Set Value to iSize
+//        End_Procedure
+//
+//        Procedure OnChange     
+//            Integer iSize
+//            Get Value to iSize
+//            Send WriteString of ghoApplication CS_Settings CS_GridFontSize iSize
+//            Broadcast Recursive Send DoChangeFontSize of (Client_Id(ghoCommandBars))
+//        End_Procedure
+//
+//    End_Object
 
     Procedure Close_Panel
     End_Procedure

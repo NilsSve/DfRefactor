@@ -16,8 +16,8 @@ Use dfEnRad.pkg
 ACTIVATE_VIEW Activate_oFunctionMaintenance_vw FOR oFunctionMaintenance_vw
 Object oFunctionMaintenance_vw is a cRefactorDbView
     Set Location to 5 5
-    Set Size to 251 482
-    Set piMaxSize to 268 602
+    Set Size to 265 483
+    Set piMaxSize to 273 602
     Set Label to "Function Maintenance"
     Set Auto_Clear_DEO_State to False
 
@@ -42,19 +42,20 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
     Set Main_DD To oFunctions_DD
     Set Server  To oFunctions_DD
 
-    Object oScrollingContainer is a cDbScrollingContainer
-        
-        Object oScrollingClientArea is a cDbScrollingClientArea
+//    Object oScrollingContainer is a cDbScrollingContainer
+//        
+//        Object oScrollingClientArea is a cDbScrollingClientArea
 
             Object oStandardFunctions_grp is a cRDCDbHeaderGroup
                 Set Size to 243 471
+                Set Location to 17 6
                 Set piMinSize to 134 248
-                Set Location to 4 5
                 Set Label to "Functions Maintenance"             
                 Set psImage to "FunctionLibrary.ico"
                 Set psNote to "Edit functions properties."
                 Set psToolTip to "To add a function, the name entered must be EXACTLY the same as the function name itself. Then the code must be added to the cRefactorDbView class (cRefactorDbView.pkg). See class code for standard function parameters."
                 Set Border_Style to Border_Normal
+                Set peAnchors to anNone
 
                 Object oFunctionsID is a cRDCDbForm
                     Entry_Item Functions.ID
@@ -245,9 +246,9 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
             
             End_Object
             
-        End_Object
-    
-    End_Object        
+//        End_Object
+//    
+//    End_Object        
     
     Procedure Activating            
         Send Clear of oFunctions_DD

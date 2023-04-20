@@ -102,7 +102,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
             Object oInfo_tb is a TextBox
                 Set Size to 10 251
-                Set Location to 5 126
+                Set Location to 4 126
                 Set Label to "- You can drag && drop a source file from Windows Explorer to this editor object"
             End_Object
         
