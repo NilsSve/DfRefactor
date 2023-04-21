@@ -172,12 +172,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Enabled_State to False
                 Set Label to "No of Lines:"
                 Set Value to "0"
-                Set Label_Col_Offset to 2 
-                Set Label_Row_Offset to 1
+                Set Label_Col_Offset to 0 
                 Set Label_Justification_Mode to JMode_Right
                 Set Form_Datatype to 0 
                 Set Label_FontWeight to fw_Bold
                 Set peAnchors to anBottomRight
+                Set Label_Row_Offset to 2
                 
                     Procedure Set Value Integer iItem String sValue
                     Integer iValue
@@ -201,7 +201,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Object oLegacyCodeFilename_fm is a cFileNameForm
                     Set Size to 13 344
                     Set Location to 28 129
-                    Set Label to "Legacy Code File"
+                    Set Label to "Legacy Code (left editor)"
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
                     Set peAnchors to anBottomLeftRight 
@@ -216,7 +216,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Object oRefactoredCodeFilename_fm is a cFileNameForm
                     Set Size to 13 343
                     Set Location to 43 129
-                    Set Label to "Refactored Code File"
+                    Set Label to "Refactored Code (right editor)"
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
                     Set peAnchors to anBottomLeftRight
@@ -288,7 +288,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Location to 197 72
                 Set Enabled_State to False
                 Set Label to "Elapsed:"
-                Set Label_Col_Offset to 2    
+                Set Label_Col_Offset to 0    
                 Set Label_Row_Offset to 1
                 Set Label_Justification_Mode to JMode_Right
                 Set Form_Datatype to Mask_Clock_Window
@@ -356,8 +356,15 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set psToolTip to "Refactors the legacy code from the left editor, then saves it to disk. (Ctrl+R)"
                     Set piImageSize to 24
                     
-                    Procedure OnClick                          
+                    Procedure OnClick   
+                        String sPath sErrFile                               
+                        Integer iRetval
                         Boolean bUseConstraints
+                        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
+                        Get vFolderFormat sPath to sPath
+                        Move CS_TestProgram to sErrFile
+                        Move (Replace(".src", sErrFile, ".err")) to sErrFile
+                        Get vDeleteFile (sPath + sErrFile) to iRetval
                         Get Checked_State of (phoUseConstraints_cb(ghoApplication)) to bUseConstraints
                         Delegate Send RefactoreCode bUseConstraints
                     End_Procedure

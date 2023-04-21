@@ -205,8 +205,8 @@ Object oMaintainFunctions is a dbView
     Object oSysFile_TotFunctionsSelected is a cRDCDbForm
         Entry_Item SysFile.SelectedFunctionTotal
         Set Server to oSysFile_DD
-        Set Location to 3 561
-        Set Size to 12 15
+        Set Location to 3 551
+        Set Size to 12 13
         Set Label to "Selected:"
         Set Enabled_State to False
         Set peAnchors to anTopRight

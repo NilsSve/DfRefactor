@@ -25,18 +25,6 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
     End_Procedure
                 
     Object oFunctions_DD is a cFunctionsDataDictionary
-//        Procedure Update
-//            Integer iState iType              
-//            Boolean bChangeWriteProtected
-//            
-//            Move Functions.Selected to iState
-//            Move Functions.bWriteProtected to bChangeWriteProtected
-//            If (bChangeWriteProtected = True) Begin
-//                Send UserError "This is a write protected system function which cannot be changed, as it is handled a bit differently."
-//                Procedure_Return
-//            End
-//            Forward Send Update
-//        End_Procedure
     End_Object 
 
     Set Main_DD To oFunctions_DD
