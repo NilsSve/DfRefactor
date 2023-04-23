@@ -844,10 +844,17 @@ Register_Procedure RefreshSelectionUpdate
                 Integer iSelectedFunctions iSelectedFolders
                 
                 Set Changed_State of oSysFile_DD to False
-                Get Checked_State to bChecked
-
                 Get CheckedItems of oFolders_grd to iSelectedFolders
+                // If selected folders = 0, it is probably because the
+                // tab-page/folders grid hasn't been activated and thus
+                // it is empty. Activate it, and switch back to this view:
+                If (iSelectedFolders = 0 and oFolders_tp(Self) <> 0) Begin
+                    Send Request_Next_Tab of (oMain_TabDialog(Self)) 3 
+                    Send Request_Next_Tab of (oMain_TabDialog(Self)) 3
+                End
                 Set Value of oNoOfSelectedFolders_fm to iSelectedFolders
+
+                Get Checked_State to bChecked
                 If (bChecked = True) Begin
                     Move 1 to iSelectedFunctions
                 End                             
@@ -1068,7 +1075,7 @@ Register_Procedure RefreshSelectionUpdate
     End_Function
 
     Function SummaryText Boolean bWriteLogFile Returns String
-        String sText sLogText sLogFile sPath sTimeText sProgram sFormatString sValue
+        String sText sLogText sLogFile sPath sTimeText sProgram sFormatString sValue sSWSFile
         Integer iChangedFiles iCount iSize
         Integer iFileCount iChannel
         tRefactorSettings RefactorSettings
@@ -1077,8 +1084,10 @@ Register_Procedure RefreshSelectionUpdate
         
         Move SysFile.iCountNumberOfChangedFiles to iChangedFiles
         Move SysFile.iCountNumberOfFiles        to iFileCount
-        Get pRefactorSettings  of ghoRefactorFunctionLibrary to RefactorSettings
-        Move ("  File Filter:  " * Trim(RefactorSettings.sFileFilter) + "\n") to sText
+        Get pRefactorSettings  of ghoRefactorFunctionLibrary to RefactorSettings             
+        Get psSWSFile of ghoApplication to sSWSFile
+        Append sText ("  SWS File:  " * Trim(sSWSFile) + "\n")
+        Append sText ("  File Filter:  " * Trim(RefactorSettings.sFileFilter) + "\n")
         Move (SizeOfArray(RefactorSettings.asFolderNames)) to iSize
         Append sText ("Number of Folders:" * String(iSize) + "\n")
         Decrement iSize
