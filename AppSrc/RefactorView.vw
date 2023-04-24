@@ -847,7 +847,8 @@ Register_Procedure RefreshSelectionUpdate
                 Get CheckedItems of oFolders_grd to iSelectedFolders
                 // If selected folders = 0, it is probably because the
                 // tab-page/folders grid hasn't been activated and thus
-                // it is empty. Activate it, and switch back to this view:
+                // it is empty. Activate it, and switch back to fill the folders grid.
+                // This is essential for the "Refactor" button routine to work.
                 If (iSelectedFolders = 0 and oFolders_tp(Self) <> 0) Begin
                     Send Request_Next_Tab of (oMain_TabDialog(Self)) 3 
                     Send Request_Next_Tab of (oMain_TabDialog(Self)) 3
