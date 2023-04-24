@@ -291,5 +291,11 @@ Define CS_Function       for "Function"
 Define CS_Contains       for "contains"
 Define CS_Select         for "[Select]"
 
+// DataFlex language text constants:
+Define CS_EndClass       for "End_Class"
+Define CS_EndObject      for "End_Object"
+Define CS_EndFunction    for "End_Function"
+Define CS_EndProcedure   for "End_Procedure"
+
 // cRegex Expression Constants:
 //
