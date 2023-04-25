@@ -102,7 +102,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
             Object oInfo_tb is a TextBox
                 Set Size to 10 251
-                Set Location to 4 126
+                Set Location to 5 126
                 Set Label to "- You can drag && drop a source file from Windows Explorer to this editor object"
             End_Object
         
@@ -167,8 +167,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
 
             Object oLegacyCode_NoOfLines_fm is a Form
-                Set Size to 10 16
-                Set Location to 197 474
+                Set Size to 10 18
+                Set Location to 197 472
                 Set Enabled_State to False
                 Set Label to "No of Lines:"
                 Set Value to "0"
@@ -176,8 +176,9 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Label_Justification_Mode to JMode_Right
                 Set Form_Datatype to 0 
                 Set Label_FontWeight to fw_Bold
-                Set peAnchors to anBottomRight
                 Set Label_Row_Offset to 2
+                Set FontWeight to fw_Bold
+                Set peAnchors to anBottomRight
                 
                     Procedure Set Value Integer iItem String sValue
                     Integer iValue
@@ -239,7 +240,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Location to 4 5
                 Set Label to "Refactored Code: (After)"
                 Set FontWeight to fw_Bold
-                Set FontPointHeight to 10
             End_Object
     
             Object oRefactoredCode_edt is a cScintillaRefactorEditor
@@ -262,14 +262,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
 
             Object oRefactoredCode_NoOfLines_fm is a Form
-                Set Size to 10 16
-                Set Location to 197 21
+                Set Size to 10 22
+                Set Location to 197 15
                 Set Enabled_State to False
                 Set Value to "0"
-//                Set Label to "No of Lines"
-//                Set Label_Col_Offset to -60
-//                Set Label_Justification_Mode to JMode_Right
                 Set Form_Datatype to 0 
+                Set FontWeight to fw_Bold
                 Set peAnchors to anBottomLeft
                 
                 Procedure Set Value Integer iItem String sValue
@@ -289,10 +287,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Enabled_State to False
                 Set Label to "Elapsed:"
                 Set Label_Col_Offset to 0    
-                Set Label_Row_Offset to 1
+                Set Label_Row_Offset to 2
                 Set Label_Justification_Mode to JMode_Right
                 Set Form_Datatype to Mask_Clock_Window
+                Set FontWeight to fw_Bold
                 Set peAnchors to anBottomLeft
+                Set Label_FontWeight to fw_Bold
             End_Object
 
             Object oAction_grp is a cRDCDbHeaderGroup
@@ -309,7 +309,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Entry_Item SysFile.SelectedFunctionTotal
                     Set Server to oSysFile_DD
                     Set Size to 13 13
-                    Set Location to 30 161
+                    Set Location to 30 141
                     Set Label_Justification_Mode to JMode_Right
                     Set Label to "Number of Selected Functions:"
                     Set psToolTip to "Total number of functions selected."
@@ -321,7 +321,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
     
                 Object oUseConstraints_cb is a CheckBox
-                    Set Location to 44 60
+                    Set Location to 44 40
                     Set Size to 8 109
                     Set Label to "Constrain Function Calls"
                     Set peAnchors to anBottomLeft
@@ -344,9 +344,9 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
     
                 Object oRefactor_btn is a Button
-                    Set Size to 30 78
-                    Set Location to 27 176
-                    Set Label to "&Refactor Code"
+                    Set Size to 30 98
+                    Set Location to 27 156
+                    Set Label to "&Start Refactoring!"
                     Set peAnchors to anBottomLeft
                     Set Default_State to True
                     // Note: We use Form_FontWeight instead of FontWeight to _not_ make the object larger
@@ -373,7 +373,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
                 Object oCompareProgram_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 27 259
+                    Set Location to 27 258
                     Set Label to "Co&mpare"
                     Set peAnchors to anBottomLeft
                     Set psImage to "Compare.ico"
@@ -396,7 +396,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     
                 Object oTestCompileRefactoredCode_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 43 259
+                    Set Location to 43 258
                     Set Label to "Compile"
                     Set peAnchors to anBottomLeft
                     Set psImage to "CompileProject.ico"
@@ -416,7 +416,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     
                 Object oShowErrorLog_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 43 316
+                    Set Location to 43 315
                     Set Label to "&Error Log"
                     Set peAnchors to anBottomLeft
                     Set psImage to "CompileProjectErrors.ico"

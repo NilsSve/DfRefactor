@@ -30,11 +30,19 @@ Object oMaintainFunctions is a dbView
     Set Main_DD To oFunctions_DD
     Set Server  To oFunctions_DD
 
-    Object oInfo_tb is a TextBox
-        Set Size to 10 275
-        Set Location to 4 126
-        Set Label to "List of Functions in the database. Double-Click a row to Edit, Right-Click for options"
+    Object oInfo1_tb is a TextBox
+        Set Auto_Size_State to False
+        Set Size to 11 335
+        Set Location to 4 9
+        Set Label to "List of available refactoring functions:"
         Set FontWeight to fw_Bold
+        Set FontPointHeight to 10
+    End_Object
+
+    Object oInfo2_tb is a TextBox
+        Set Size to 10 160
+        Set Location to 6 187
+        Set Label to "- Double-Click a row to Edit, right-click for grid options"
     End_Object
 
     Object oFunctionSelection_grd is a cRDCDbCJGrid
@@ -205,12 +213,15 @@ Object oMaintainFunctions is a dbView
     Object oSysFile_TotFunctionsSelected is a cRDCDbForm
         Entry_Item SysFile.SelectedFunctionTotal
         Set Server to oSysFile_DD
-        Set Location to 3 551
+        Set Location to 3 546
         Set Size to 12 13
         Set Label to "Selected:"
         Set Enabled_State to False
-        Set peAnchors to anTopRight
         Set Label_Col_Offset to 0
+        Set FontWeight to fw_Bold
+        Set FontPointHeight to 10
+        Set peAnchors to anTopRight
+        Set Label_FontWeight to fw_Bold
     End_Object
 
 //    Object oGridFontSize_cf is a cRDCComboForm
