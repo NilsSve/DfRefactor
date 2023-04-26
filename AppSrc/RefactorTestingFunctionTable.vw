@@ -167,8 +167,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
 
             Object oLegacyCode_NoOfLines_fm is a Form
-                Set Size to 10 18
-                Set Location to 197 472
+                Set Size to 10 20
+                Set Location to 197 470
                 Set Enabled_State to False
                 Set Label to "No of Lines:"
                 Set Value to "0"
@@ -180,7 +180,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set FontWeight to fw_Bold
                 Set peAnchors to anBottomRight
                 
-                    Procedure Set Value Integer iItem String sValue
+                Procedure Set Value Integer iItem String sValue
                     Integer iValue
                     String sFormatString 
                     Move sValue to iValue
@@ -262,8 +262,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
 
             Object oRefactoredCode_NoOfLines_fm is a Form
-                Set Size to 10 22
-                Set Location to 197 15
+                Set Size to 10 20
+                Set Location to 197 16
                 Set Enabled_State to False
                 Set Value to "0"
                 Set Form_Datatype to 0 
@@ -287,12 +287,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Enabled_State to False
                 Set Label to "Elapsed:"
                 Set Label_Col_Offset to 0    
-                Set Label_Row_Offset to 2
                 Set Label_Justification_Mode to JMode_Right
                 Set Form_Datatype to Mask_Clock_Window
+                Set Label_FontWeight to fw_Bold
+                Set Label_Row_Offset to 2
                 Set FontWeight to fw_Bold
                 Set peAnchors to anBottomLeft
-                Set Label_FontWeight to fw_Bold
             End_Object
 
             Object oAction_grp is a cRDCDbHeaderGroup
