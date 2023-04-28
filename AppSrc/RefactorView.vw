@@ -13,6 +13,7 @@ Use cRDCDbHeaderGroup.pkg
 Use cRDCDbForm.pkg
 Use cRDCDbSpinForm.pkg
 Use cRDCButton.pkg
+Use cRDCForm.pkg
 Use StatusLog.dg
 
 Use cFunctionsDataDictionary.dd
@@ -257,12 +258,12 @@ Register_Procedure RefreshSelectionUpdate
                 End_Object
 
                 Object oConstrainByType_cf is a ComboForm
-                    Set Size to 14 84
+                    Set Size to 14 99
                     Set Location to 10 461
                     Set peAnchors to anTopRight
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
-                    Set Label to "Constrain by Type"
+                    Set Label to "Constrain by Type:"
                     Set Entry_State to False
                     Set Combo_Sort_State to False
                   
@@ -721,19 +722,31 @@ Register_Procedure RefreshSelectionUpdate
         Set peAnchors to anBottomLeftRight
         Set pbUseLargeFontHeight to True
 
-        Object oNoOfSelectedFolders_fm is a Form
+        Object oNoOfSelectedFolders_fm is a cRDCForm
             Set Size to 13 15
             Set Location to 28 105
             Set Label_Justification_Mode to JMode_Right
             Set Label to "Number of Selected Folders:"
             Set psToolTip to "Total number of folders selected."
             Set Enabled_State to False
-            Set peAnchors to anBottomRight
             Set Label_FontWeight to fw_Bold
             Set Label_Col_Offset to 0
             Set FontWeight to fw_Bold  
             Set Form_Datatype to Mask_Numeric_Window   
-            Set Form_Mask to "####"
+            Set Form_Mask to "####"   
+            Set pbAutoEnable to True
+            Set peAnchors to anBottomRight
+
+            Function IsEnabled Returns Boolean
+                Boolean bEnabled bWorkspaceMode
+                String sSWSFile
+                Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
+                Get psSWSFile       of ghoApplication to sSWSFile
+                Move (bWorkspaceMode = True and sSWSFile <> "") to bEnabled
+                Set Visible_State to bEnabled
+                Function_Return bEnabled
+            End_Function
+
         End_Object
 
         Object oNoOfSelectedFunctions2_fm is a cRDCDbForm
