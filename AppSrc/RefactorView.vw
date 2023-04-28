@@ -737,6 +737,7 @@ Register_Procedure RefreshSelectionUpdate
             Set pbAutoEnable to True
             Set peAnchors to anBottomRight
 
+            // This will show/hide the control:
             Function IsEnabled Returns Boolean
                 Boolean bEnabled bWorkspaceMode
                 String sSWSFile
