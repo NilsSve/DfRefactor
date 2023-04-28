@@ -11,7 +11,7 @@ Use cRDCDbHeaderGroup.pkg
 Use cFileNameForm.pkg
 Use cScintillaRefactorEditor.pkg
 Use oEditorProperties.pkg
-Use mfiletime.pkg
+//Use mfiletime.pkg
 Use vwin32fh.pkg
 
 Use LogFileDialog.dg
