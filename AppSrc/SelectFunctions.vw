@@ -1,4 +1,4 @@
-Use DFClient
+Use Dfclient.pkg
 Use cCJGridColumnRowIndicator.pkg
 Use cRDCDbCJGrid.pkg
 Use cRDCDbCJGridColumn.pkg
@@ -13,7 +13,7 @@ Use Windows.pkg
 ACTIVATE_VIEW Activate_oMaintainFunctions FOR oMaintainFunctions
 Object oMaintainFunctions is a dbView
     Set Location to 2 4
-    Set Size to 145 589
+    Set Size to 140 589
     Set Label to "Functions List"
     Set Border_Style to Border_Thick
     Set pbAutoActivate to True
@@ -46,7 +46,7 @@ Object oMaintainFunctions is a dbView
     End_Object
 
     Object oFunctionSelection_grd is a cRDCDbCJGrid
-        Set Size to 125 578
+        Set Size to 120 578
         Set Location to 17 6
         Set Ordering to 5
         Set piLayoutBuild to 3
