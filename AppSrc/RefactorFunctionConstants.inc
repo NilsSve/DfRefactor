@@ -166,7 +166,7 @@ Define CS_SelectWorkspaceFile       for "Select a DataFlex workspace project fil
 Define CS_BrowseSourceFileTxt       for "Select File:"
 Define CS_CurrentSourceFileTxt      for "Current File:"
 Define CS_NoActiveSourceFileText    for "" 
-Define CS_NoWorkspaceSelected       for "- None"
+Define CS_NoWorkspaceSelected       for "- Start here!" //"- None"
 Define CS_WorkspaceFilterString     for "DataFlex Workspace Files (*.sws)|*.sws|Any file (*.*)|*.*"
 Define CS_OpenFileStdFilter         for "All files *.*|*.*|Programs *.src|*.src|Views *.vw|*.vw|Report Views *.rv|*.rv|Selection Lists *.sl|*.sl|Packages *.pkg|*.pkg"
 Define CS_SourceCodeFilters         for "DataFlex Source *.src;*.vw;*.sl;*.dg;*.rv;*.pkg;*.cl;*.wo;*.dd;*.bp;*.inc;*.nui;*.utl;*.mn;*.mnu|*.src;*.vw;*.sl;*.dg;*.rv;*.pkg;*.cl;*.wo;*.dd;*.bp;*.inc;*.nui;*.utl;*.mn;*.mnu"
@@ -242,8 +242,24 @@ Define CS_UnusedSourceFiles             for "ReportUnusedSourceFiles"
 Define CS_Compiler       for "DFComp.exe"
 Define CS_TestProgram    for "CompiledRefactoredCode.src"
 Define CS_TestErrFile    for "CompiledRefactoredCode.err"
-Define CS_CompOptions    for "-e3fv2i0"     
-Define CS_SWSFile        for "DFRefactor19.1.sws"
+Define CS_CompOptions    for "-e0fv2i0"     
+
+#IF (!@ = 190)
+    Define CS_SWSFile        for "DFRefactor19.0.sws"
+#ENDIF
+#IF (!@ = 191)
+    Define CS_SWSFile        for "DFRefactor19.1.sws"
+#ENDIF
+#IF (!@ = 200)
+    Define CS_SWSFile        for "DFRefactor20.0.sws"
+#ENDIF
+#IF (!@ = 201)
+    Define CS_SWSFile        for "DFRefactor20.1.sws"
+#ENDIF
+#IF (!@ = 230)
+    Define CS_SWSFile        for "DFRefactor23.0.sws"
+#ENDIF
+    
 Define CS_DFUnitTest     for "DFUnit_TestRunner"
 Define CS_DFRefactor     for "DFRefactor"
 Define CS_LegacyCode     for "LegacyCode.pkg"

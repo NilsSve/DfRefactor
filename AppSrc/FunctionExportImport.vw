@@ -512,7 +512,7 @@ Object oFunctionsExportImport is a dbView
                 Get ImportFile of ghoImportExportFunctions sFileName (&iSize) to iErrors
     
                 If (iErrors = 0) Begin
-                    Send Info_Box (String(iSize + 1) * "Successfully updated/added the Functions data table and code was updated/added for the" * CS_FunctionLibraryFile * "and" * CS_UnitTestsFile * "files!")
+                    Send Info_Box (String(iSize + 1) * "Records in the 'Functions' data table was successfully updated/added.\n\nCode was updated/added for these files:\n" + "- AppSrc\" + CS_FunctionLibraryFile * "and\n" + "- AppSrc\" + CS_UnitTestsFile)
                 End 
                 Else Begin
                     Send Info_Box ("The import failed with:" * String(iErrors) * "errors")

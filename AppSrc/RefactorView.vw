@@ -235,7 +235,7 @@ Register_Procedure RefreshSelectionUpdate
 
                 Object oSelectAll_btn is a Button
                     Set Size to 14 62
-                    Set Location to 10 267
+                    Set Location to 10 337
                     Set Label to "Select All"
                     Set psImage to "SelectAll.ico"
                     Set peAnchors to anTopRight
@@ -247,7 +247,7 @@ Register_Procedure RefreshSelectionUpdate
 
                 Object oDeselectAll_btn is a Button
                     Set Size to 14 62
-                    Set Location to 10 333
+                    Set Location to 10 403
                     Set Label to "Select None"
                     Set psImage to "SelectNone.ico"
                     Set peAnchors to anTopRight
@@ -259,7 +259,7 @@ Register_Procedure RefreshSelectionUpdate
 
                 Object oConstrainByType_cf is a ComboForm
                     Set Size to 14 99
-                    Set Location to 10 461
+                    Set Location to 10 531
                     Set peAnchors to anTopRight
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
@@ -320,8 +320,8 @@ Register_Procedure RefreshSelectionUpdate
     
                 Object oDisabledInfo_txt is a TextBox
                     Set Auto_Size_State to False
-                    Set Size to 22 100
-                    Set Location to 2 153
+                    Set Size to 7 485
+                    Set Location to 0 104
                     Set Justification_Mode to JMode_Left
                     Set FontWeight to fw_Bold
                     Set peAnchors to anTopRight
@@ -334,7 +334,7 @@ Register_Procedure RefreshSelectionUpdate
                             
                             Get Field_Current_Value of oSysFile_DD Field SysFile.bCountSourceLines to bSelected
                             If (bSelected = True) Begin
-                                Move 'Grid Disabled! Function: "Only count Source Lines" is selected!' to sText
+                                Move 'Grid is disabled because the Checkbox: "Only count Source Lines" above the "Start Refactoring" button has been checked!' to sText
                             End                 
                             Else Begin
                                 Move "" to sText
