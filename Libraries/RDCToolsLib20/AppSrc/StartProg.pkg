@@ -1,0 +1,217 @@
+// StartProg.pkg
+// Author: Bernhard Ponemayr
+// Date: 03.07.2002
+//
+// Replacement for the DataFlex runprogram command.
+//
+// Syntax:
+// Get gStartProgram Command Parameters Directory WindowVisible WaitUntilFinished to ReturnValue
+//
+// Parameters:
+// Command:    The program to run (with or without path)
+// Parameters: The parameters passed to the program
+// Directory:  The Working Directory of the Program (if blank, the current directory of vdf is used)
+// WindowVisible: TRUE if a result window should be visible (command prompt). May be changed by the program itself.
+// WaitUntilFinished: TRUE if the function should wait until the program has finished.
+//
+// Returns:
+//   -1 If the program could not be started
+//   ProcessID if the program was started and the WaitUntilFinished parameter was FALSE
+//   ExitCode of the started program if the program was started and the WaitUntilFinished parameter was TRUE
+//
+// Example:
+// Get gStartProgram "calc.exe" "" "" TRUE FALSE to iRetVal
+// Starts the Windows Calculator and returns the ProcessID of calc.exe if successful or -1
+//
+// Change log:
+// 07.03.2013 BP:  Double Quotes are now added before and after the Commandline to Support
+//                 long Paths with Blanks inside
+// 22.09.2014 NGS: Removed legacy commands like TYPEDEF, PUT & GETADDRESS to instead use Structs & Addressof function.
+//                 This has the advantage that it is possible bo "IFNDEF" code, which is not the case with
+//                 TYPE declarations. The Studio also knows this syntax, which makes it easier to make code changes.
+
+#IFNDEF _struct_tWinSecurityAttributes
+    Define STARTF_USESHOWWINDOW    for |CI$00000001
+    Define STARTF_USESIZE          for |CI$00000002
+    Define STARTF_USEPOSITION      for |CI$00000004
+    Define STARTF_USECOUNTCHARS    for |CI$00000008
+    Define STARTF_USEFILLATTRIBUTE for |CI$00000010
+    Define STARTF_RUNFULLSCREEN    for |CI$00000020  // ignored for non-x86 platforms
+    Define STARTF_FORCEONFEEDBACK  for |CI$00000040
+    Define STARTF_FORCEOFFFEEDBACK for |CI$00000080
+    Define STARTF_USESTDHANDLES    for |CI$00000100
+    Define STARTF_USEHOTKEY        for |CI$00000200
+    Define STILL_ACTIVE            for 259
+
+    Struct tWinSecurityAttributes
+        DWord nLength
+        Pointer lpDescriptor
+        Boolean bInherit
+    End_Struct
+#ENDIF
+
+#IFNDEF _struct_tStartInfo
+    Struct tStartInfo
+        DWord cb
+        Pointer lpReserved
+        Pointer lpDesktop
+        Pointer lpTitle
+        DWord dwX
+        DWord dwY
+        DWord dwXSize
+        DWord dwYSize
+        DWord dwXCountChars
+        DWord dwYCountChars
+        DWord dwFillAttribute
+        DWord dwFlags
+        UShort wShowWindow
+        UShort cbReserved2
+        Pointer lpReserved2
+        Handle hStdInput
+        Handle hStdOutput
+        Handle hStdError
+    End_Struct
+#ENDIF
+
+#IFNDEF _struct_tProcessInfo
+    Struct tProcessInfo
+        Handle hProcess
+        Handle hThread
+        DWord dwProcessId
+        DWord dwThreadId
+    End_Struct
+#ENDIF
+
+#IFNDEF get_CreateProcessEf
+    External_Function CreateProcessEf "CreateProcessA" kernel32.dll Pointer pName Pointer pCmdL Pointer lpPAttr Pointer lpTAttr Integer bInherit Integer dwCrFlag Pointer pEnv Pointer lpCurDir Pointer lpStartup Pointer lpProcInfo Returns Integer
+#ENDIF
+
+#IFNDEF get_GetExitCodeProcessEf
+    External_Function GetExitCodeProcessEf "GetExitCodeProcess" kernel32.dll Handle hProcess Pointer lpExitCode Returns Integer
+#ENDIF
+
+#IFNDEF get_CloseHandleEf
+    External_Function CloseHandleEf "CloseHandle" kernel32.dll Handle hHandle Returns Integer
+#ENDIF
+
+//HANDLE WINAPI OpenProcess(
+//  _In_  DWORD dwDesiredAccess,
+//  _In_  BOOL bInheritHandle,
+//  _In_  DWORD dwProcessId
+//);
+#IFNDEF GET_OpenProcessEf
+External_function OpenProcessEf "OpenProcess" kernel32.dll DWord dwAccess Integer bInherit Handle hPID Returns Integer
+#ENDIF
+
+//BOOL WINAPI TerminateProcess(
+//  _In_  HANDLE hProcess,
+//  _In_  UINT uExitCode
+//);
+#IFNDEF GET_TerminateProcessEf
+External_function TerminateProcessEf "TerminateProcess" kernel32.dll Handle hProcess Integer uExitCode Returns Integer
+#ENDIF
+
+#IFNDEF get_SleepEf
+    External_Function SleepEf "Sleep" kernel32.dll Integer iMilliSeconds Returns Integer
+#ENDIF
+
+#IFNDEF get_GetLastError
+  external_function GetLastError "GetLastError" kernel32.dll Returns Integer
+#ENDIF
+
+Function gStartProgram GLOBAL String sCommand String sParams String sDir Integer bVisible Integer bWaitForFinished Returns Integer
+    String sCmd sPara sWorkDir sExitCode
+    Pointer pCmd pWorkDir pStartup pProcessInfo pExitCode
+    Integer iRet iError iID iExitCode
+    Handle hProcess hThread
+    tWinSecurityAttributes aAttributes
+    tProcessInfo ProcessInfo
+    tStartInfo StartInfo
+
+    // Change 9th of March, 2013 Bernhard Ponemayr
+    // In some rare cases the sCommand needs to surrounded by quotes for the CreateProcess function
+    // to work properly.
+    If (Left(sCommand, 1) <> '"' and (Left(sCommand, 1) <> "'")) Begin
+        Move ('"' + sCommand + '"') to sCommand                                     // Add double Quotes to the Command if needed
+    End
+
+    Move (sCommand + " " + sParams + (Character(0))) to sCmd                        // Take Program and CmdLines
+    Move (sDir + (Character(0))) to sWorkDir
+    Move (AddressOf(sCmd)) to pCmd
+    Move (AddressOf(sWorkDir)) to pWorkDir
+    Move (OemToAnsi(pCmd,pCmd)) to iRet                                             // Convert to ANSI
+    Move (OemToAnsi(pWorkDir,pWorkDir)) to iRet
+    If (Trim(sDir) = "" or Trim(sDir) = ".") Begin
+        Move 0 to pWorkDir                                                          // If the Directory is empty or . use the current threads directory
+    End
+
+    Move (SizeOfType(tStartInfo)) to StartInfo.cb
+    Move STARTF_USESHOWWINDOW to StartInfo.dwFlags
+    If (bVisible = True) Begin
+        Move SW_SHOW to StartInfo.wShowWindow                                       // Make the window visible or not
+    End
+    Else Begin
+        Move SW_HIDE to StartInfo.wShowWindow
+    End
+   Move 0 to ProcessInfo.hProcess // must initialize a var before we can get an address of it
+
+    Move (AddressOf(StartInfo))    to pStartup
+    Move (AddressOf(ProcessInfo))  to pProcessInfo
+
+    Move (CreateProcessEf(0,pCmd,0,0,FALSE,0,0,pWorkDir,pStartup,pProcessInfo)) to iRet   // Create the process
+    Move (GetLastError()) to iError
+
+    If (iRet = 0) Begin
+        Function_Return -1                                                                // if creation failed return -1
+    End
+    Move ProcessInfo.hProcess to hProcess                                                 // Take the Process and Thread handles
+    Move ProcessInfo.hThread  to hThread
+    If (bWaitForFinished = True) Begin                                                    // Wait for the process finished
+        Move (ZeroString(32)) to sExitCode
+        Move (AddressOf(sExitCode)) to pExitCode
+        Move (GetExitCodeProcessEf(hProcess,pExitCode)) to iRet                           // Get the Process Exit Code
+        If (iRet = 0) Begin                                                               // Return 0 if the Exit Code could not be retrieved
+            If (hProcess) Begin
+                Move (CloseHandleEf(hProcess)) to iRet                                    // Take care to Destroy the Handles
+            End
+            If (hThread) Begin
+                Move (CloseHandleEf(hThread)) to iRet
+            End
+            Function_Return 0
+        End
+        Move (BytesToDword(sExitCode,1)) to iExitCode
+        While (iExitCode = STILL_ACTIVE)                                                  // Loop as long the Exit code is STILL_ACTIVE
+            Move (SleepEf(100)) to iRet                                                   // Very interesting how much faster the program is executed by this line :-)
+            move (ZeroString(32)) to sExitCode
+            Move (AddressOf(sExitCode)) to pExitCode
+            Move (GetExitCodeProcessEf(hProcess, pExitCode)) to iRet                      // All the same as above
+            If (iRet = 0) Begin
+                If (hProcess) Begin
+                    Move (CloseHandleEf(hProcess)) to iRet
+                End
+                If (hThread) Begin
+                    Move (CloseHandleEf(hThread)) to iRet
+                End
+                Function_Return 0
+            End
+            Move (BytesToDword(sExitCode, 1)) to iExitCode
+        End
+        If (hProcess) Begin
+            Move (CloseHandleEf(hProcess)) to iRet                                        // Destroy the handles
+        End
+        If (hThread) Begin
+            Move (CloseHandleEf(hThread)) to iRet
+        End
+        Function_Return iExitCode                                                         // Return the delivered exit-code
+    End
+
+    Move ProcessInfo.dwProcessId to iID                                                   // if not waiting return the delivered process-id
+    If (hProcess) Begin
+        Move (CloseHandleEf(hProcess)) to iRet                                            // Destroy the handles
+    End
+    If (hThread) Begin
+        Move (CloseHandleEf(hThread)) to iRet
+    End
+
+    Function_Return iID
+End_Function

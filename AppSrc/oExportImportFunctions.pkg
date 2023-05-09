@@ -67,7 +67,8 @@ End_Struct
 
 Define CS_FunctionLibraryFile       for "cRefactorFunctionLibrary.pkg"
 Define CS_UnitTestsFile             for "oRefactor_Unit_Tests.pkg"
-Define CS_ImpExpFileJson            for "DFRefactorImportExportFile.json"
+Define CS_ImpExpFileJson            for "DFRefactorImportExportFile.json" 
+Define CS_ImportBackupFolder        for "ImportBackup"
 Define CS_FunctionLibraryClassStart for "Class cRefactorFunctionLibrary is a cBaseRefactorFunctionLibrary"
 Define CS_Comment1                  for '// NOTE: Do *not* add any code after this "End_Class"!'
 Define CS_Comment2                  for '//       It will be removed by the Export/Import logic.'
@@ -179,6 +180,8 @@ Object oImportExportFunctions is a cObject
         Direct_Input channel iCh sFileName 
         Read_Block channel iCh uImportFileData -1
         
+        Close_Output channel iCh
+        Send Seq_Release_Channel iCh
         Function_Return uImportFileData
     End_Function
     
@@ -499,20 +502,33 @@ Object oImportExportFunctions is a cObject
     End_Function
     
     // Make a backup-copy of the passed Filename.
-    // Note: The filename must include the full path.
+    // Note: The filename must include the full path. 
+    // If the CS_ImportBackupFolder folder doesn't exist,
+    // it will be created.         
+    // A timestamp (date & time) will be added to the file name.
+    // Returns True if all went OK. 
     Function CreateBackupFile String sFileName Returns Boolean         
         Integer iRetVal
-        String sPath sBackupFile sSourceFile
+        String sPath sBackupFile sSourceFile 
+        Boolean bExists
         
         Get ParseFolderName sFileName to sPath
         Get vFolderFormat sPath to sPath 
-        Get ParseFileName   sFileName to sSourceFile
-        Move (Replace(".pkg", sSourceFile, "")) to sBackupFile
+        Get vFolderExists (sPath + CS_ImportBackupFolder) to bExists
+        If (bExists = False) Begin
+            Get vCreateDirectory (sPath + CS_ImportBackupFolder) to iRetVal
+            If (iRetVal <> 0) Begin
+                Send Info_Box ("Could not create import backup folder:" * String(sPath + CS_ImportBackupFolder))
+                Function_Return False
+            End                                                                                                  
+        End
+        Get ParseFileName sFileName to sSourceFile
+        Move (Replace(".pkg", Lowercase(sSourceFile), "")) to sBackupFile
         Move (sBackupFile + "." + String(CurrentDateTime()) + ".pkg") to sBackupFile 
         Move (Replaces(",", sBackupFile, "_")) to sBackupFile
         Move (Replaces(":", sBackupFile, "_")) to sBackupFile
         Move (Replaces("/", sBackupFile, "-")) to sBackupFile
-        Get vCopyFile (sPath + sSourceFile) (sPath + sBackupFile) to iRetVal
+        Get vCopyFile (sPath + sSourceFile) (sPath + CS_ImportBackupFolder + "\" + sBackupFile) to iRetVal
         
         Function_Return (iRetVal = 0)    
     End_Function
@@ -783,6 +799,10 @@ Object oImportExportFunctions is a cObject
     //    
     // Returns -1 is the passed sFunctionName doesn't exist in the asUnitCodeFile string array.
     // Else it returns the array item where it was found.
+    //
+    // ToDo: This needs to be more granulate; It can happen that the object with the psFunctionName exists,
+    //       but some procedure in that object was changed/added/removed.
+    //       OR if the psFunctionName was found *always* replace the code. 
     Function UnitCodeExists String[] asUnitCodeFile String[] asUnitCodeFileLC String sFunctionName Returns Integer
         Integer iRow
         String[] asUnitCode
@@ -792,6 +812,55 @@ Object oImportExportFunctions is a cObject
         Move (SearchArray(sFunctionName, asUnitCodeFileLC, Self, RefFunc(_FindFunctionCode))) to iRow 
 
         Function_Return iRow
+    End_Function      
+    
+    // Add new dummy code for objects that are yet not available (non-existing).
+    // Returns a string array with the new dummy code object.
+    Function CreateDummyCode String[] asUnitCodeFile String[] asUnitCodeFileLC String sFunctionName Returns String[]
+        Boolean bOK
+        String sTab1 sTab2 sTab3 sLine  
+        String[] asNewCode
+        
+        Move (Trim(sFunctionName)) to sFunctionName
+        Move "    " to sTab1
+        Move "        " to sTab2
+        Move "            " to sTab3
+        
+        // Object code:
+        Move (sTab1 + String("Object o") + sFunctionName + " is a cTestFixture") to sLine 
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move (sTab2 + (String("Set psFunctionName to ")) + '"' + sFunctionName + '"') to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move "" to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        
+        // Procedure code:
+        Move (sTab2 + "{Published=False}") to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move (sTab2 + "Procedure" * String(sFunctionName) + "_xx") to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move (sTab3 + "String sLine sExpected") to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move (sTab3 + "Boolean bChanged") to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move (sTab3 + "Move '' to sLine") to sLine 
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move (sTab3 + "Move '' to sExpected") to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move (sTab3 + "Get " + String(sFunctionName) * "ghoRefactorFunctionLibrary (&sLine) to bChanged") to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move (sTab3 + "Send AssertSAreEqual sExpected sLine") to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move (sTab2 + "End_Procedure") to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        
+        // End Object
+        Move "" to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        Move (sTab1 + "End_Object") to sLine
+        Move sLine to asNewCode[SizeOfArray(asNewCode)]
+        
+        Function_Return asNewCode
     End_Function  
     
     Function CopyUnitCode String[] asUnitCodeFile String[] asUnitCodeFileLC String sFunctionName Returns String[]
@@ -801,14 +870,15 @@ Object oImportExportFunctions is a cObject
         Boolean bFound bEnd
         
         Get UnitCodeExists asUnitCodeFile asUnitCodeFileLC sFunctionName to iRow
-        If (iRow = -1) Begin
+        If (iRow = -1) Begin   
+            Get CreateDummyCode asUnitCodeFile asUnitCodeFileLC sFunctionName to asUnitCode
             Get pasMissingUnitFunctions to asMissingUnitFunctions
             Move sFunctionName to asMissingUnitFunctions[SizeOfArray(asMissingUnitFunctions)]
             Set pasMissingUnitFunctions to asMissingUnitFunctions
             Function_Return asUnitCode    
         End
         
-        // Note! We assume that the "Object oxxx is a cTestFixture" is directly above the
+        // Note! We assume that the "Object oxxx is a cTestFixture" line is directly above the
         //      'Set psFunctionName to "xxx"' source code line! So substract by 1.
         Decrement iRow
         Move False to bEnd  
@@ -952,15 +1022,8 @@ Object oImportExportFunctions is a cObject
 
     Function UpdateUnitCodeArray tUnitTestCode asUnit String[] asUnitCodeFile Integer iFunction Boolean ByRef bErr Returns String[]
         String sFunctionName 
-        String[] asUnitCodeFileLC asMissingUnitFunctions
+        String[] asUnitCodeFileLC asMissingUnitFunctions asNewCode
         Integer iRow iCount iSize
-        
-        // For the very first function code we add a blank item at the end,
-        // so that we get a blank line before the imported functions, when
-        // printed to file.
-//        If (iFunction = 0) Begin
-//            Move "" to asUnitCodeFile[SizeOfArray(asUnitCodeFile)
-//        End
         
         Get _LowercaseCodeLibrary asUnitCodeFile to asUnitCodeFileLC
         Move (SizeOfArray(asUnitCodeFile)) to iSize
@@ -971,19 +1034,31 @@ Object oImportExportFunctions is a cObject
         
         Move asUnit.sFunctionName to sFunctionName
         Get UnitCodeExists asUnitCodeFile asUnitCodeFileLC sFunctionName to iRow
+        // 1a. If the function code already exists, that old code will first be removed, then the new function code will be added to the end.
         If (iRow <> -1) Begin
-            // If the function code already exists, that old code will first be removed, then the new function code will be added to the end.
             Get RemoveUnitCode asUnitCodeFile (&asUnitCodeFileLC) sFunctionName (&bErr) to asUnitCodeFile
             If (bErr = True) Begin
                 Function_Return asUnitCodeFile
+            End
+        End 
+        // 1b. If the object didn't exist in either the import file or current file; add dummy code
+        Else Begin
+            Move asUnit.iSourceLines to iCount
+            If (iCount = 0) Begin
+                Get CreateDummyCode asUnitCodeFile asUnitCodeFileLC sFunctionName to asNewCode
+                Move (SizeOfArray(asNewCode)) to asUnit.iSourceLines
+                Move sFunctionName            to asUnit.sFunctionName
+                Move asNewCode                to asUnit.UnitArray
             End
         End
         
         // 2. Add code for the function to the oRefactor_Unit_Tests object array:
         Move asUnit.iSourceLines to iCount
-        Get AddUnitCode asUnit asUnitCodeFile asUnitCodeFileLC (&bErr) to asUnitCodeFile
-        If (bErr = True) Begin
-            Function_Return asUnitCodeFile
+        If (iCount > 0) Begin
+            Get AddUnitCode asUnit asUnitCodeFile asUnitCodeFileLC (&bErr) to asUnitCodeFile
+            If (bErr = True) Begin
+                Function_Return asUnitCodeFile
+            End
         End
     
         Function_Return asUnitCodeFile

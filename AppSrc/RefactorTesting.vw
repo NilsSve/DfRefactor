@@ -571,7 +571,7 @@ Object oRefactorTesting is a cRefactorDbView
         
                 Function IsEnabled Returns Boolean
                     Integer iLines
-                    Get CM_GetLineCount of (phoEditorRefactored(ghoApplication)) to iLines
+                    Get Line_Count of (phoEditorRefactored(ghoApplication)) to iLines
                     Function_Return (iLines > 1)
                 End_Function
         
@@ -623,7 +623,7 @@ Object oRefactorTesting is a cRefactorDbView
         
                 Function IsEnabled Returns Boolean
                     Integer iLines
-                    Get CM_GetLineCount of (phoEditorRefactored(ghoApplication)) to iLines
+                    Get Line_Count of (phoEditorRefactored(ghoApplication)) to iLines
                     Function_Return (iLines > 1)
                 End_Function
         
@@ -704,7 +704,6 @@ Object oRefactorTesting is a cRefactorDbView
         End
         Decrement iSize  
         Set pbIsRefactoring of ghoApplication to True 
-        // Temporary disable all timers while we work:
         Send SuspendGUI of Desktop True
             
         For iCount from 0 to iSize
