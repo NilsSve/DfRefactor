@@ -419,18 +419,17 @@ Register_Procedure RefreshSelectionUpdate
                         End_Procedure
 
                     End_Object
-
-                    // A "oCheckbox_Col" column is created automatically by the cRDCCJGrid class.
-                    // Object oCheckbox_Col is a cCJGridColumn
-                    // End_Object
-
+                    
+                    // *** Main grid data load message ***
                     Procedure LoadData
                         String sHomePath sFolderName sDefaultFolders
-                        String[] asNoFolderList asStartFolder asFolderArray asDefaultFolders asSavedFolders
+                        String[] asStartFolder asFolderArray asEmptyArray
+                        tFolderData[] asSavedFolders 
+                        tFolderData FolderDataName
                         Handle hoDataSource hoFolderSelHeaDD
                         tDataSourceRow[] TheData TheDataEmpty
-                        Integer iSize iRow iCount iSavedSize iFolderCol iCheckBoxCol iDefaultFolders iFolder
-                        Boolean bChecked bUseDDO bExists
+                        Integer iSize iRow iCount iSavedSize iFolderCol iCheckBoxCol iFolder
+                        Boolean bChecked bUseDDO bExists bIsFolder
 
                         If (not(IsComObjectCreated(Self))) Begin
                             Procedure_Return
@@ -450,12 +449,10 @@ Register_Procedure RefreshSelectionUpdate
                             Send Cursor_Ready of Cursor_Control
                             Procedure_Return
                         End
-                        Decrement iSize   
                         
                         // If saved folders exists, they have previously been selected and
                         // will take precedense over other "standard" selections
                         // in the loop below.
-                        Move 0 to iSavedSize
                         Get private.phoFolderSelHeaDD of ghoApplication to hoFolderSelHeaDD
                         Move (hoFolderSelHeaDD <> 0) to bUseDDO
                         If (bUseDDO = True) Begin
@@ -464,9 +461,17 @@ Register_Procedure RefreshSelectionUpdate
                             If (bExists = True) Begin
                                 Get FindSavedFolders of hoFolderSelHeaDD sHomePath to asSavedFolders
                             End
-                            Move (SizeOfArray(asSavedFolders)) to iSavedSize
-                            Decrement iSavedSize
-                            Move (iSavedSize >= 0) to bUseDDO
+                            Move (SizeOfArray(asSavedFolders)) to iSize
+                            Decrement iSize
+                            Move (iSize >= 0) to bUseDDO
+                            If (bUseDDO = True) Begin
+                                // If there exists saved folders, use them only.
+                                Move asEmptyArray to asFolderArray 
+                                For iCount from 0 to iSize
+                                    Move asSavedFolders[iCount].sFolderName to sFolderName
+                                    Move sFolderName to asFolderArray[iCount]
+                                Loop
+                            End
                         End
 
                         Move 0 to iCount
@@ -475,21 +480,27 @@ Register_Procedure RefreshSelectionUpdate
                         Move TheDataEmpty to TheData
                         Get piColumnId of (phoData_Col(Self))     to iFolderCol
                         Get piColumnId of (phoCheckbox_Col(Self)) to iCheckBoxCol
-                        Get NoFolderListAsArray of ghoApplication False to asNoFolderList
 
-                        Move CS_DefaultSourceFolders to sDefaultFolders
-                        Move (Lowercase(sDefaultFolders)) to sDefaultFolders
-                        Move (StrSplitToArray(sDefaultFolders, "|")) to asDefaultFolders
-                        Move (SizeOfArray(asDefaultFolders)) to iDefaultFolders
-                        Decrement iDefaultFolders
-
-                        Move 0 to iRow
-                        For iCount from 0 to iSize
+                        Move 0 to iRow  
+                        Move (SizeOfArray(asFolderArray)) to iSize
+                        Decrement iSize
+                        For iCount from 0 to iSize                             
+                            Move False to bChecked
+                            Move -1 to iFolder
                             Move asFolderArray[iCount] to sFolderName
                             Move sFolderName to TheData[iRow].sValue[iFolderCol]
-                            Get IsFolderInDefaultsFolderList of ghoApplication sFolderName to bChecked
                             If (bUseDDO = True) Begin
-                                Get IsFolderName sFolderName asSavedFolders to bChecked
+                                Get IsFolderName sFolderName asSavedFolders to bIsFolder
+                                If (bIsFolder = True) Begin                      
+                                    Move sFolderName to FolderDataName.sFolderName
+                                    Move (SearchArray(FolderDataName, asSavedFolders)) to iFolder
+                                    If (iFolder <> -1) Begin
+                                        Move asSavedFolders[iFolder].bSelected to bChecked
+                                    End
+                                End
+                            End
+                            If (iFolder = -1) Begin
+                                Get IsFolderInDefaultsFolderList of ghoApplication sFolderName to bChecked
                             End
                             Move bChecked to TheData[iRow].sValue[iCheckBoxCol]
                             Increment iRow
@@ -507,9 +518,11 @@ Register_Procedure RefreshSelectionUpdate
                         Send Cursor_Ready of Cursor_Control
                     End_Procedure
                     
-                    Function IsFolderName String sFolderName String[] asSavedFolders Returns Boolean
+                    Function IsFolderName String sFolderName tFolderData[] asSavedFolders Returns Boolean
                         Integer iRow
-                        Move (SearchArray(sFolderName, asSavedFolders)) to iRow
+                        tFolderData FolderDataName
+                        Move sFolderName to FolderDataName.sFolderName
+                        Move (SearchArray(FolderDataName, asSavedFolders)) to iRow
                         Function_Return (iRow <> -1)
                     End_Function 
                     
@@ -517,21 +530,37 @@ Register_Procedure RefreshSelectionUpdate
                         Boolean bSave bOK
                         Handle hoDD        
                         String sHomeFolder
-                        String[] asSelectedFolders asSavedFolders
+                        String[]  asFolders
+                        tFolderData[] FoldersDataArray asSavedFolders
                         
-                        Move False to bSave
-                        Get SelectedItems to asSelectedFolders
+                        Move False to bSave      
+                        // I think we should save all folders, regardless if they have 
+                        // been selected or not.
+                        // Get SelectedItems to FoldersDataArray 
+                        Get AllItems to FoldersDataArray
                         Get psHomePath of ghoApplication to sHomeFolder
                         Get private.phoFolderSelHeaDD of ghoApplication to hoDD
                         Get FindSavedFolders of hoDD sHomeFolder to asSavedFolders
-                        Move (not(IsSameArray(asSelectedFolders, asSavedFolders))) to bSave
+//                        Get FoldersAsStringArray hoDD sHomeFolder FoldersDataArray to asFolders
+                        Move (not(IsSameArray(FoldersDataArray, asSavedFolders))) to bSave
                         If (bSave = True) Begin
-                            Get SaveSelectedFolders of hoDD sHomeFolder asSelectedFolders to bOK
+                            Get SaveSelectedFolders of hoDD sHomeFolder FoldersDataArray to bOK
                             If (bOK = False) Begin
                                 Send Info_Box "Could not save selected folders." 
                             End
                         End
-                    End_Procedure
+                    End_Procedure 
+                    
+                    Function FoldersAsStringArray Handle hoDD String sHomeFolder tFolderData[] FolderDataArray Returns String[]
+                        Integer iSize iCount
+                        String[] asFolders
+                        Move (SizeOfArray(FolderDataArray)) to iSize
+                        Decrement iSize
+                        For iCount from 0 to iSize
+                            Move FolderDataArray[iCount].sFolderName to asFolders[SizeOfArray(asFolders)]
+                        Loop                                                                             
+                        Function_Return asFolders
+                    End_Function
 
                     On_Key kClear         Send ActivateProcess  
                     On_Key Key_F2         Send SaveSelectedFolders
@@ -795,7 +824,7 @@ Register_Procedure RefreshSelectionUpdate
                 Integer iSelectedFunctions iFolders 
                 Handle hoFolderSelHeaDD
                 Boolean bExists bUseDDO  
-                String[] asSavedFolders
+                tFolderData[] asSavedFolders
 
                 Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
                 Get psSWSFile               of ghoApplication to sSWSFile
@@ -1309,7 +1338,7 @@ Register_Procedure RefreshSelectionUpdate
         Handle hoFolderSelHeaDD
         Boolean bExists bUseDDO
         String sHomePath 
-        String[] asSavedFolders
+        tFolderData[] asSavedFolders
                       
         Send LoadData of oFolders_grd
         Send OnChange of oSysFile_CountSourceLines_cb
