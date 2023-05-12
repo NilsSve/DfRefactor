@@ -354,7 +354,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set Form_FontWeight to FW_BOLD
                     Set psImage to "Start.ico"
                     Set psToolTip to "Refactors the legacy code from the left editor, then saves it to disk. (Ctrl+R)"
-                    Set piImageSize to 24
+                    Set piImageSize to 32
                     
                     Procedure OnClick   
                         String sPath sErrFile                               
