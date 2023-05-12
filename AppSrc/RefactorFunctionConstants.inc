@@ -83,26 +83,34 @@ Struct tBackupFiles
     DateTime dtFileDate
 End_Struct
 
-Struct tCodeComponents
-    String sIndentation
-    String sLineStartIndicator
-    String sLineEndIndicator
-    Boolean bHasIndicateCommand
+Struct tTokenizer
+    String sIndentation           // Line start indentation, one or more tabs or spaces.
+    String sLineStartIndicator    // [Select] Move "A" to "B"
+    String sLineEndIndicator      // ...to [Found]
+    Boolean bIsComment            // If the source code line starts with "//"
 #IFDEF IS$WIN64
     Integer iMissingAlignment1
 #ENDIF                
-    String sFirstLeftExpression
-    String sSecondLeftExpression
-    String sRightExpression
-    String sLeftCommand
-    String sLeftCommand2
-    String sCode   
-    String sOfStatement   
-    String sToStatement
-    String sRightComment 
-    Boolean bHasEndSemiColon   
+    Boolean bHasMultiLineString   // DF23 -> can e.g. be an SQL statement over several lines.
 #IFDEF IS$WIN64
     Integer iMissingAlignment2
+#ENDIF                
+    Boolean bHasIndicateCommand   // Indicate Found as...
+#IFDEF IS$WIN64
+    Integer iMissingAlignment3
+#ENDIF                
+    String sFirstLeftExpression   // If (A = B) Move...
+    String sSecondLeftExpression  // ...if a (a = b) Move (C * 300) to...
+    String sRightExpression       // to (asMyArray[SizeOfArray(asMyArray)]
+    String sLeftCommand           // If (x = y)...
+    String sLeftCommand2          // If (x = y) Move A to...
+    String sCode                  // The reminder of the source line
+    String sOfStatement           // Get AFunction of (phoWorkspace(ghoApplication))
+    String sToStatement           // Move x to y
+    String sRightComment          // Move x to y // This is a right side comment.
+    Boolean bHasEndSemiColon      // If the line ends with a semi-colon (;), indicating there is more code on next line.
+#IFDEF IS$WIN64
+    Integer iMissingAlignment4
 #ENDIF
 End_Struct
 

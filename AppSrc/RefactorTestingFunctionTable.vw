@@ -323,7 +323,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Object oUseConstraints_cb is a CheckBox
                     Set Location to 44 40
                     Set Size to 8 109
-                    Set Label to "Constrain Function Calls"
+                    Set Label to "Use selected Functions only"
                     Set peAnchors to anBottomLeft
                     Set psToolTip to "If checked only Functions selected on the 'Function List' tab-page will be called."
                     Set phoUseConstraints_cb of ghoApplication to Self
@@ -343,7 +343,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     
                 End_Object
     
-                Object oRefactor_btn is a Button
+                Object oRefactor_btn is a cRDCButton
                     Set Size to 30 98
                     Set Location to 27 156
                     Set Label to "&Start Refactoring!"
@@ -367,7 +367,14 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                         Get vDeleteFile (sPath + sErrFile) to iRetval
                         Get Checked_State of (phoUseConstraints_cb(ghoApplication)) to bUseConstraints
                         Delegate Send RefactoreCode bUseConstraints
-                    End_Procedure
+                    End_Procedure 
+                    
+                    Function IsEnabled Returns Boolean   
+                        Boolean bChecked
+                        Integer iFunctions
+                        Get Checked_State of oUseConstraints_cb to bChecked
+                        Function_Return (SysFile.SelectedFunctionTotal > 0 or bChecked = False)
+                    End_Function
                 
                 End_Object
         
