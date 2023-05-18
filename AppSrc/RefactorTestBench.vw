@@ -19,8 +19,8 @@ Use cSysFileDataDictionary.dd
 Use cFunctionsDataDictionary.dd  
 Use cFunctionsADataDictionary.dd
 
-Activate_View Activate_oFunctionTableTesting for oFunctionTableTesting
-Object oFunctionTableTesting is a cRefactorDbView
+Activate_View Activate_oRefactorTestBench for oRefactorTestBench
+Object oRefactorTestBench is a cRefactorDbView
     Set Border_Style to Border_Thick
     Set Size to 282 886
     Set Location to 2 7
@@ -559,7 +559,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move (CurrentDateTime()) to dtStart
         Set Value of (oRefactoredCode_Time_fm(Self)) to ""
         Move False to bLoopFound
-        Send Activate_oFunctionTableTesting
+        Send Activate_oRefactorTestBench
         
         Get phoEditorLegacy to hoEditor
         Get psCodeFile of hoEditor to sLegacyFileName
@@ -776,8 +776,8 @@ End_Object
 
 Procedure JumpToSourceLine Integer iLine
     Handle hoEdit
-    Move (phoEditorRefactored(oFunctionTableTesting(Self))) to hoEdit
-    Send Activate_oFunctionTableTesting
+    Move (phoEditorRefactored(oRefactorTestBench(Self))) to hoEdit
+    Send Activate_oRefactorTestBench
     Send JumpToSourceLine of hoEdit iLine    
 End_Procedure
             
