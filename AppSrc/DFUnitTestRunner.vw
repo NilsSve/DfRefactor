@@ -2,15 +2,17 @@ Use DFClient.pkg
 Use cUnitCommandBar.pkg
 Use DFUnit\Reporting\ReporterManager.pkg
 Use DFUnit\Reporting\Reporters\UIListReporter.pkg
+Use cRDCButtonDPI.pkg
 
 Activate_View Activate_DFUnitTestRunner_vw for DFUnitTestRunner_vw
 Object DFUnitTestRunner_vw is a View
-    Set Size to 545 271
-    Set Location to 0 0
+    Set Size to 545 237
+    Set Location to 0 0      
     Set Maximize_Icon to True
     Set Minimize_Icon to False
     Set Sysmenu_Icon to False
     Set Border_Style to Border_None
+    Set piMinSize to 250 235 
     Set pbAutoActivate to True
 
     Delegate Set phoTestView to Self
@@ -34,9 +36,29 @@ Object DFUnitTestRunner_vw is a View
     
     End_Object
 
+    Object oFirstRow_btn is a cRDCButtonDPI
+        Set Location to 9 105
+        Set Label to "View Top"
+
+        Procedure OnClick
+            Send Beginning_of_Data to oOutputBox
+        End_Procedure
+
+    End_Object
+
+    Object oLatestRow_btn is a cRDCButtonDPI
+        Set Location to 24 105
+        Set Label to "View Bottom"
+
+        Procedure OnClick
+            Send End_of_Data to oOutputBox
+        End_Procedure
+
+    End_Object
+
     Object oClose_btn is a Button
         Set Size to 30 61
-        Set Location to 9 195
+        Set Location to 9 161
         Set Label to "Exit"
         Set psImage to "ActionExit.ico"
         Set piImageSize to 36
@@ -50,7 +72,7 @@ Object DFUnitTestRunner_vw is a View
     End_Object
 
     Object oOutputBox is a cDFUnitUIListReporter
-        Set Size to 490 254
+        Set Size to 490 220
         Set Location to 46 13
         Set peAnchors to anAll
         Set Border_Style to Border_Thick
