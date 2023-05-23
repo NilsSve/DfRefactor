@@ -84,50 +84,33 @@ Struct tBackupFiles
 End_Struct
 
 Struct tTokenizer
+    Boolean bLineIsReady          // This is set when we don't need to process the line no more, e.g. a blank line.
+    Boolean bIsBlank              // It is a blank line (with no or many tabs and/or spaces.
+    Boolean bIsComment            // If the source code line starts with "//"
+    Boolean bIsImageStart         // Does the line start with a "/MyPageName"
+    Boolean bIsImageEnd           // Does the line start with a "/*"
+    Boolean bIsMultiLineString    // DF23 -> can e.g. be an SQL statement over several lines.
+    Boolean bHasEndSemiColon      // If the line ends with a semi-colon (;), indicating there is more code on next line.
+    Boolean bIsProcedure          // Is it a procedure declaration
+    Boolean bIsFunction           // Is it a function declaration
+    Boolean bIsCommandDeclaration // Is it a command declaration
+    
+    String sEndComment            // Move x to y *// This is a right side comment.*
     String sIndentation           // Line start indentation, one or more tabs or spaces.
+    Boolean bHasIndicateCommand   // *Indicate* Found as...
     String sLineStartIndicator    // [*Select*] Move "A" to "B"
     String sLineEndIndicator      // ...to [*Found*]
-    Boolean bIsComment            // If the source code line starts with "//"
-    Boolean bLineIsReady          // This is set when we don't need to process the line no more, e.g. a blank line.
-#IFDEF IS$WIN64
-    Integer iMissingAlignment1
-#ENDIF  
-#IFDEF IS$WIN64
-    Integer iMissingAlignment2
-#ENDIF                
-    Boolean bIsBlank              // It is a blank line (with no or many tabs and/or spaces.
-#IFDEF IS$WIN64
-    Integer iMissingAlignment3
-#ENDIF                
-    Boolean bIsMultiLineString   // DF23 -> can e.g. be an SQL statement over several lines.
-#IFDEF IS$WIN64
-    Integer iMissingAlignment4
-#ENDIF                
-    Boolean bHasIndicateCommand   // *Indicate* Found as...
-#IFDEF IS$WIN64
-    Integer iMissingAlignment5
-#ENDIF                
-    String sFirstLeftExpression   // If *(A = B)* Move...
-    String sSecondLeftExpression  // ...if a (a = b) Move (C * 300) to...
-    String sRightExpression       // to *(asMyArray[SizeOfArray(asMyArray)]*
-    String sLeftCommand           // *If* (x = y)...
-    String sLeftCommand2          // If (x = y) *Move* A to...
-    String sCode                  // The reminder of the source line
     String sOfStatement           // Get "Function" of *(phoWorkspace(ghoApplication))*
     String sToStatement           // Move x to *y*
-    String sEndComment            // Move x to y *// This is a right side comment.*
-    Boolean bHasEndSemiColon      // If the line ends with a semi-colon (;), indicating there is more code on next line.
-#IFDEF IS$WIN64
-    Integer iMissingAlignment5
-#ENDIF
-    Boolean bIsImageStart         // Does the line start with a "/MyPageName"
-#IFDEF IS$WIN64
-    Integer iMissingAlignment6
-#ENDIF
-    Boolean bIsImageEnd           // Does the line start with a "/*"
-#IFDEF IS$WIN64
-    Integer iMissingAlignment7
-#ENDIF  
+
+    String sLeftCommand           // *If* (x = y)... (left side of the "to" clause)
+    String sLeftCommand2          // If (x = y) *Move* A to...
+    String sFirstLeftExpression   // If *(A = B)* Move...
+    String sSecondLeftExpression  // ...if (a = b) Move *(10 + 300)* to...
+    String sRightExpression       // to *(asMyArray[SizeOfArray(asMyArray)]*
+    String sCode                  // The reminder of the source line
+    String sLine                  // The original source line
+    String sOverstrikeLine        // Source line with all string constants overstriked.
 End_Struct
 
 Struct tBooleanIndicator
@@ -141,9 +124,6 @@ Struct tOperatorsInfo
     Boolean bIsOperator
     Boolean bIsLegacy
     Integer iPos
-#IFDEF IS$WIN64
-    Integer iMissingAlignment1
-#ENDIF
     String  sOperator
 End_Struct
 
@@ -203,7 +183,7 @@ Define CS_VarArrayTypes             for "STRING[];INTEGER[];NUMBER[];DATE[];DATE
 Define CS_ValidLeftCharacters       for ("()[];,&+-*<>= " + Character(9)) // Character 9=tab char //"()[];,.&+-*<>= "
 
 Define CS_UnusedSourceLogFile       for "UnusedSourceFiles.txt"
-Define CS_CommentSymbol             for ("/"+"/")
+Define CS_CommentSymbol             for ("//")
 Define CS_ImageNameStart            for "/"
 Define CS_ImageNameEnd              for "/*"
 Define CS_StudioToolsPathStart      for "Software\Data Access Worldwide\DataFlex Tools\"
