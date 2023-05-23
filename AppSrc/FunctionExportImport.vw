@@ -503,7 +503,7 @@ Object oFunctionsExportImport is a dbView
                 String sFileName
                 Integer iSize iErrors iRetval
                 
-                Get YesNo_Box ("The Json import will make changes to your" * CS_FunctionLibraryFile * "and" * CS_UnitTestsFile * "files.\n\nBe sure to Save any changes before you commence!\nContinue?") to iRetval
+                Get YesNo_Box ("The Json import will make changes to your" * CS_FunctionLibraryFile * "and" * CS_UnitTestsFile * "files.\n\nBe sure to Save any changes in the Studio before you commence!\nContinue?") to iRetval
                 If (iRetval <> MBR_Yes) Begin
                     Procedure_Return
                 End
