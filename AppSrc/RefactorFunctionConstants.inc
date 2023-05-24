@@ -21,6 +21,11 @@ Enum_List
     Define CI_SplitWithSpaceAndSemicolon for 1
     Define CI_SplitWithSemicolon         for 2
     Define CI_SplitAddBeginEndBlock      for 3
+End_Enum_List  
+
+Enum_List
+    Define CI_FirstCommand
+    Define CI_SecondCommand
 End_Enum_List
 
 Struct tWorkspace
@@ -98,8 +103,8 @@ Struct tTokenizer
     String sEndComment            // Move x to y *// This is a right side comment.*
     String sIndentation           // Line start indentation, one or more tabs or spaces.
     Boolean bHasIndicateCommand   // *Indicate* Found as...
-    String sLineStartIndicator    // [*Select*] Move "A" to "B"
-    String sLineEndIndicator      // ...to [*Found*]
+    String sLineLeftIndicator     // [*Select*] Move "A" to "B"
+    String sLineRightIndicator    // ...to [*Found*]
     String sOfStatement           // Get "Function" of *(phoWorkspace(ghoApplication))*
     String sToStatement           // Move x to *y*
 
