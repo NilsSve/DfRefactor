@@ -551,7 +551,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     Procedure RefactoreCode Boolean bUseConstraints
         String[] asLegacyCode asRefactoredCode asSourceFiles
         String sLine sLegacyFileName sRefactoredFileName sFunctionName sParameter
-        Handle hoEditor ho
+        Handle hoLegacyEditor hoRefactoredEditor ho
         Integer iSize iCount iTabSize iRetval iFunctionID eSplitMode
         Boolean bChanged bLoopFound bisCOMProcxy bWriteLine bOK
         DateTime dtStart dtEnd
@@ -561,24 +561,24 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move False to bLoopFound
         Send Activate_oRefactorTestBench
         
-        Get phoEditorLegacy to hoEditor
-        Get psCodeFile of hoEditor to sLegacyFileName
+        Get phoEditorLegacy to hoLegacyEditor
+        Get psCodeFile of hoLegacyEditor to sLegacyFileName
         Get IsDataFlexCOMProxyClassesFile of ghoRefactorFunctionLibrary sLegacyFileName to bisCOMProcxy
         If (bisCOMProcxy = True) Begin
             Send Info_Box "This file is marked as a Studio COM Proxy classes auto generated file and will _not_ be refactored!"
             Procedure_Return
         End
 
-        Send UpdateStatusBar of hoEditor "" True
-        Get EditorDataAsStringArray of hoEditor to asLegacyCode
+        Send UpdateStatusBar of hoLegacyEditor "" True
+        Get EditorDataAsStringArray of hoLegacyEditor to asLegacyCode
         Move (SizeOfArray(asLegacyCode)) to iSize
         Decrement iSize  
 
-        Get phoEditorRefactored to hoEditor
-        Get psCodeFile of hoEditor to sRefactoredFileName
-        Set phoEditor to hoEditor
+        Get phoEditorRefactored to hoRefactoredEditor
+        Get psCodeFile of hoRefactoredEditor to sRefactoredFileName
+        Set phoEditor to hoRefactoredEditor
         If (iSize > 0) Begin
-            Send Delete_Data of hoEditor
+            Send Delete_Data of hoRefactoredEditor
         End        
         Else Begin
             Send Info_Box "No Legacy code found."
@@ -638,13 +638,13 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 If (iCount < iSize) Begin
                     Move (sLine + CS_CRLF) to sLine
                 End            
-                Send AppendText of hoEditor sLine
+                Send AppendText of hoRefactoredEditor sLine
             End
         Loop  
 
         Send PumpMsgQueue of Desktop  
-        Send UpdateStatusBar of hoEditor "Executing Editor functions..." True
-        Get EditorDataAsStringArray of hoEditor to asRefactoredCode
+        Send UpdateStatusBar of hoRefactoredEditor "Executing Editor functions..." True
+        Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
         
         // eEditor_Function
         Move False to bChanged
@@ -668,10 +668,10 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Constrained_Find Next
         Loop
         If (bChanged = True) Begin
-            Send SaveFile of hoEditor                    
-            Get EditorDataAsStringArray of hoEditor to asRefactoredCode
+            Send SaveFile of hoRefactoredEditor                    
+            Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
         End
-        Send UpdateStatusBar of hoEditor "" True
+        Send UpdateStatusBar of hoRefactoredEditor "" True
 
         // eOther_Function - A source file as a string array is passed.
         Move False to bChanged
@@ -693,7 +693,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Constrained_Find Next
         Loop
         If (bChanged = True) Begin
-            Get WriteDataToEditor of hoEditor asRefactoredCode to bOK
+            Get WriteDataToEditor of hoRefactoredEditor asRefactoredCode to bOK
         End
         
         // eOther_FunctionAll - All source files with full pathing is passed to these functions as a string array.
@@ -717,7 +717,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Constrained_Find Next
         Loop
         If (bChanged = True) Begin
-            Send LoadFile of hoEditor sRefactoredFileName
+            Send LoadFile of hoRefactoredEditor sRefactoredFileName
         End
         
         // eReport_Function - A source file as a string array is passed.
@@ -766,7 +766,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move (CurrentDateTime()) to dtEnd
         Set Value of (oRefactoredCode_Time_fm(Self)) to (dtEnd - dtStart)
         Set pbIsRefactoring of ghoApplication to False
-        Send UpdateStatusBar of hoEditor "Ready!" True
+        Send UpdateStatusBar of hoRefactoredEditor "Ready!" True
         Send Cursor_Ready of Cursor_Control
         // Re-enable timers:
         Send SuspendGUI of Desktop False
