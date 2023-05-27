@@ -457,85 +457,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
             End_Object
             
-//            Object oCompareprogram_fm is a dbForm
-//                Entry_Item SysFile.PathSourceCompareTool
-//                Set Server to oSysFile_DD
-//                Set Size to 12 140
-//                Set Location to 249 7
-//                Set Label_Col_Offset to 0
-//                Set Label_Row_Offset to 1
-//                Set Label_Justification_Mode to JMode_Top
-//                Set Label to "Select Compare Program:"
-//                Set psToolTip to "Select a file comparison tool, such as 'Beyond Compare', 'WinMerge', 'Araxis Merge' etc.. (Press F4)"
-//                Set peAnchors to anBottomLeftRight                                                                              
-//        
-//                Procedure Prompt
-//                    Integer bOpen
-//                    String sFileName
-//        
-//                    Get Show_Dialog of oOpenDialog to bOpen
-//                    If (bOpen) Begin
-//                        Get File_Name of oOpenDialog to sFileName
-//                        Set Value to sFileName
-//                        Set Changed_State to True
-//                        Set psFileCompareApp of ghoApplication to sFileName
-//                    End
-//                End_Procedure  
-//                
-//            End_Object
-//
-//            Object oSelectCompareProgram_btn is a cRDCButton
-//                Set Size to 14 41
-//                Set Location to 248 151
-//                Set Label to "Select"
-//                Set peAnchors to anBottomRight
-//                Set psImage to "ActionOpen.ico"
-//                Set psToolTip to "Select a file comparison tool, such as 'Beyond Compare', 'WinMerge', 'Araxis Merge' etc.. (Press F4)"
-//            
-//                Procedure OnClick
-//                    Send Prompt of oCompareprogram_fm
-//                End_Procedure
-//            End_Object    
-//            
-//            Object oSourceExplorerProgram_fm is a dbForm
-//                Entry_Item SysFile.PathStarZen
-//                Set Server to oSysFile_DD
-//                Set Size to 12 140
-//                Set Location to 273 7
-//                Set Prompt_Button_Mode to pb_PromptOn
-//                Set Label_Row_Offset to 1
-//                Set Label_Col_Offset to 0
-//                Set Label_Justification_Mode to JMode_Top
-//                Set Label to "StarZen's Source Code Explorer:"
-//                Set peAnchors to anBottomLeftRight                                                                              
-//    
-//                Procedure Prompt
-//                    Integer bOpen
-//                    String sFileName
-//    
-//                    Get Show_Dialog of oOpenDialog to bOpen
-//                    If (bOpen) Begin
-//                        Get File_Name of oOpenDialog to sFileName
-//                        Set Changed_Value Item 0 to sFileName
-//                        Set private.psStarZenSourceExplorer of ghoApplication to sFileName
-//                    End
-//                End_Procedure
-//    
-//            End_Object
-//
-//            Object oSelectSourceExplorerProgram_btn is a cRDCButton
-//                Set Size to 14 41
-//                Set Location to 272 151
-//                Set Label to "Select"
-//                Set peAnchors to anBottomRight
-//                Set psImage to "ActionOpen.ico"
-//                Set psToolTip to "Select a file comparison tool, such as 'Beyond Compare', 'WinMerge', 'Araxis Merge' etc.. (Press F4)"
-//            
-//                Procedure OnClick
-//                    Send Prompt of oSourceExplorerProgram_fm
-//                End_Procedure
-//            End_Object    
-
         End_Object
 
     End_Object
@@ -546,7 +467,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Send OnChange of oUseConstraints_cb 
     End_Procedure
 
-    // *** MAIN REFACTORING ROUTINE ***
+    // *** MAIN REFACTORING ROUTINE ***  
+    //
     // Testing of various refactor functions:
     Procedure RefactoreCode Boolean bUseConstraints
         String[] asLegacyCode asRefactoredCode asSourceFiles
@@ -563,7 +485,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
         Get phoEditorLegacy to hoLegacyEditor
         Get psCodeFile of hoLegacyEditor to sLegacyFileName
-        Get IsDataFlexCOMProxyClassesFile of ghoRefactorFunctionLibrary sLegacyFileName to bisCOMProcxy
+        Get _IsDataFlexCOMProxyClassesFile of ghoRefactorFunctionLibrary sLegacyFileName to bisCOMProcxy
         If (bisCOMProcxy = True) Begin
             Send Info_Box "This file is marked as a Studio COM Proxy classes auto generated file and will _not_ be refactored!"
             Procedure_Return

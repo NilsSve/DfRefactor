@@ -103,17 +103,17 @@ Struct tTokenizer
     String sEndComment            // Move x to y *// This is a right side comment.*
     String sIndentation           // Line start indentation, one or more tabs or spaces.
     Boolean bHasIndicateCommand   // *Indicate* Found as...
-    String sLineLeftIndicator     // [*Select*] Move "A" to "B"
-    String sLineRightIndicator    // ...to [*Found*]
+    String sLeftIndicator         // [*Select*] Move "A" to "B"
+    String sRightIndicator        // ...to [*Found*]
     String sOfStatement           // Get "Function" of *(phoWorkspace(ghoApplication))*
     String sToStatement           // Move x to *y*
 
-    String sLeftCommand           // *If* (x = y)... (left side of the "to" clause)
-    String sLeftCommand2          // If (x = y) *Move* A to...
-    String sFirstLeftExpression   // If *(A = B)* Move...
-    String sSecondLeftExpression  // ...if (a = b) Move *(10 + 300)* to...
-    String sRightExpression       // to *(asMyArray[SizeOfArray(asMyArray)]*
-    String sCode                  // The reminder of the source line
+    String sFirstLeftCommand      // *If* (x = y)... (left side of the "to" clause)
+    String sSecondLeftCommand     // If (x = y) *Move* A to...
+    String sLeftExpression        // If *(A = B)* Move...
+    String sOfExpression          // ...if (a = b) Move *(10 + 300)* to...
+    String sToExpression          // to *(asMyArray[SizeOfArray(asMyArray)]*
+//    String sCode                  // The reminder of the source line
     String sLine                  // The original source line
     String sOverstrikeLine        // Source line with all string constants overstriked.
 End_Struct
