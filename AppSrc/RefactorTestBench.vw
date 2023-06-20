@@ -507,6 +507,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Procedure_Return
         End
         
+        Send InitializeInterface of ghoRefactorFunctionLibrary
         // Suspend all timers while we work.
         Send SuspendGUI of Desktop True
         Set pbIsRefactoring of ghoApplication to True   
@@ -517,6 +518,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Send PumpMsgQueue of Desktop   
             // Read next source line
             Move asLegacyCode[iCount] to sLine
+            Send InitializeTokenizer of ghoRefactorFunctionLibrary sLine
             
             // These are functions that may potentially remove the line (Sets bWriteLIne to False)
             // eRemove_Functions

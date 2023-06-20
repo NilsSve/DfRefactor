@@ -6,7 +6,7 @@ Use cRDCButtonDPI.pkg
 
 Activate_View Activate_DFUnitTestRunner_vw for DFUnitTestRunner_vw
 Object DFUnitTestRunner_vw is a View
-    Set Size to 545 237
+    Set Size to 545 253
     Set Location to 0 0      
     Set Maximize_Icon to True
     Set Minimize_Icon to False
@@ -17,7 +17,7 @@ Object DFUnitTestRunner_vw is a View
 
     Delegate Set phoTestView to Self
         
-    Object oRunTestsButton is a Button
+    Object oRunTestsButton is a cRDCButtonDPI
         Set Size to 30 87
         Set Location to 9 12
         Set Label to "Run again"
@@ -37,8 +37,11 @@ Object DFUnitTestRunner_vw is a View
     End_Object
 
     Object oFirstRow_btn is a cRDCButtonDPI
+        Set Size to 14 66
         Set Location to 9 105
-        Set Label to "View Top"
+        Set Label to "View Top" 
+        Set piImageSize to 16
+        Set psImage to "ViewFirst.ico"
 
         Procedure OnClick
             Send Beginning_of_Data to oOutputBox
@@ -47,8 +50,11 @@ Object DFUnitTestRunner_vw is a View
     End_Object
 
     Object oLatestRow_btn is a cRDCButtonDPI
+        Set Size to 14 66
         Set Location to 24 105
         Set Label to "View Bottom"
+        Set piImageSize to 16
+        Set psImage to "ViewLast.ico"
 
         Procedure OnClick
             Send End_of_Data to oOutputBox
@@ -56,9 +62,9 @@ Object DFUnitTestRunner_vw is a View
 
     End_Object
 
-    Object oClose_btn is a Button
+    Object oClose_btn is a cRDCButtonDPI
         Set Size to 30 61
-        Set Location to 9 161
+        Set Location to 9 177
         Set Label to "Exit"
         Set psImage to "ActionExit.ico"
         Set piImageSize to 36
@@ -72,7 +78,7 @@ Object DFUnitTestRunner_vw is a View
     End_Object
 
     Object oOutputBox is a cDFUnitUIListReporter
-        Set Size to 490 220
+        Set Size to 490 236
         Set Location to 46 13
         Set peAnchors to anAll
         Set Border_Style to Border_Thick

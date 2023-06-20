@@ -11,21 +11,16 @@ Enum_List
 End_Enum_List
 
 Enum_List
-    Define CI_LeftExpression
-    Define CI_CommandExpression
-    Define CI_OfExpression
-    Define CI_ToTexpression
-End_Enum_List 
-
-Enum_List
     Define CI_SplitWithSpaceAndSemicolon for 1
     Define CI_SplitWithSemicolon         for 2
     Define CI_SplitAddBeginEndBlock      for 3
 End_Enum_List  
 
+{ EnumList="CI_FirstCommand, CI_SecondCommand, CI_ThirdCommand"}
 Enum_List
     Define CI_FirstCommand
     Define CI_SecondCommand
+    Define CI_ThirdCommand
 End_Enum_List
 
 Struct tWorkspace
@@ -86,44 +81,43 @@ Struct tBackupFiles
     String sFileName
     String sPath
     DateTime dtFileDate
-End_Struct
+End_Struct    
 
-Struct tTokenizer
-    Boolean bLineIsReady          // This is set when we don't need to process the line no more, e.g. a blank line.
-    Boolean bIsBlank              // It is a blank line (with no or many tabs and/or spaces.
-    Boolean bIsComment            // If the source code line starts with "//"
-    Boolean bIsImageStart         // Does the line start with a "/MyPageName"
-    Boolean bIsImageEnd           // Does the line start with a "/*"
-    Boolean bIsMultiLineString    // DF23 -> can e.g. be an SQL statement over several lines.
-    Boolean bHasEndSemiColon      // If the line ends with a semi-colon (;), indicating there is more code on next line.
-    Boolean bIsProcedure          // Is it a procedure declaration
-    Boolean bIsFunction           // Is it a function declaration
-    Boolean bIsCommandDeclaration // Is it a command declaration
-    
-    String sEndComment            // Move x to y *// This is a right side comment.*
-    String sIndentation           // Line start indentation, one or more tabs or spaces.
-    Boolean bHasIndicateCommand   // *Indicate* Found as...
-    String sLeftIndicator         // [*Select*] Move "A" to "B"
-    String sRightIndicator        // ...to [*Found*]
-    String sOfStatement           // Get "Function" of *(phoWorkspace(ghoApplication))*
-    String sToStatement           // Move x to *y*
+{ EnumList="{CI_SingleQuotes, CI_DoubleQuotes}" }
+Enum_List
+    Define CI_SingleQuotes
+    Define CI_DoubleQuotes
+End_Enum_List 
 
-    String sFirstLeftCommand      // *If* (x = y)... (left side of the "to" clause)
-    String sSecondLeftCommand     // If (x = y) *Move* A to...
-    String sLeftExpression        // If *(A = B)* Move...
-    String sOfExpression          // ...if (a = b) Move *(10 + 300)* to...
-    String sToExpression          // to *(asMyArray[SizeOfArray(asMyArray)]*
-//    String sCode                  // The reminder of the source line
-    String sLine                  // The original source line
-    String sOverstrikeLine        // Source line with all string constants overstriked.
-End_Struct
+{ EnumList="{CI_FirstIndicator, CI_SecondIndicator, CI_ToIndicator}" }
+Enum_List
+    Define CI_FirstIndicator
+    Define CI_SecondIndicator
+    Define CI_ToIndicator
+End_Enum_List 
 
-Struct tBooleanIndicator
-    Boolean bHasBracket  
-    Boolean bHasNot
+{ EnumList="{CI_LeftExpression1, CI_LeftExpression2, CI_OfExpression, CI_ToTexpression}" }
+Enum_List
+    Define CI_LeftExpression1
+    Define CI_LeftExpression2
+    Define CI_OfExpression
+    Define CI_ToTexpression
+End_Enum_List 
+
+Struct tExpression
+    { EnumList="{CI_LeftExpression1, CI_LeftExpression2, CI_OfExpression, CI_ToTexpression}" }
+    Integer eExpressionMode
+    Integer iStartPos 
+    Integer iLength 
     String sExpression
-    String sCode
-End_Struct        
+End_Struct   
+
+Struct tQuotedString
+    Integer iStartPos
+    Integer iEndPos
+    Integer iLength
+    String sStringContent
+End_Struct
 
 Struct tOperatorsInfo
     Boolean bIsOperator
@@ -131,6 +125,63 @@ Struct tOperatorsInfo
     Integer iPos
     String  sOperator
 End_Struct
+
+Struct tToken                     // Note: sOverStrikeLine should be used when using this struct (parameter to function)
+    Integer iStartPos             // The starting position for a keyword in a source line
+    String sCode                  // The code in the source line. Can be a single keyword or part of source linee
+End_Struct
+
+Struct tBooleanIndicator
+    Boolean bHasIndicateCommand   // "*Indicate* Found as..." or "If [Found] Indicate Err as (True = bTrue)"
+    Boolean bHasBracket           // If *[Seqeof]*
+    Boolean bHasNot
+    tToken FirstIndicator
+    tToken SecondIndicator
+    tToken ToIndicator
+End_Struct        
+
+Struct tTokenizer
+    Boolean bLineIsReady          // This is set when we don't need to process the line no more, e.g. a blank line or a commented line.
+    Boolean bIsBlank              // It is a blank line (with no or many tabs and/or spaces.
+    Boolean bIsComment            // If the source code line starts with "//"
+    Boolean bIsImageStart         // Does the line start with a "/MyPageName"
+    Boolean bIsImageEnd           // Does the line start with a "/*"
+    Boolean bHasEndSemiColon      // If the line ends with a semi-colon (;), indicating there is more code on next line.
+    Boolean bIsMultiLineString    // DF23 -> can e.g. be an SQL statement over several lines. Will not be acted on by the Tokenizier.
+    Boolean bIsOpenString         // If bHasEndSemiColon is True, or bIsMultiLineString is True the line can be an "open" string constant.
+    Boolean bIsDF23String         // DF23 -> can e.g. be an SQL statement, Javascript code etc. Will not be acted on by the Tokenizier.
+    Boolean bIsInFunction         // Are we in a function declaration
+    Boolean bIsInProcedure        // Are we in a procedure declaration
+    Boolean bIsInClass            // Are we in a command declaration
+    Boolean bIsInCommand          // Are we in a command declaration e.g. #Commmand Move...
+    Boolean bIsVariableDeclaration // Is the line a variable declaration
+    Boolean bHasOverstrikeChars   // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
+    Boolean bHasIfCommand         // True if at least one "if" on the line.
+    
+    String sOverstrikeLine        // Source line without indentation and string constants overstriked with "_" or "+".
+    String sLine                  // The original source line, untouched.
+    String sEndComment            // Move x to y *// This is a right side comment.*
+    String sIndentation           // Line start indentation, one or more tabs or spaces.
+
+    tBooleanIndicator IndicatorInfo // [*Select*] Move "A" to "B"
+
+    tToken LeftStatement         // *Get MyFunction* of oSomeObject. Part before the "of" and "to" keywords.
+    tToken OfStatement           // Get "Function" of *oMyObject*
+    tToken ToStatement           // Move x to *y*
+
+    tToken FirstLeftCommand      // *If* (x = y)... (left side of the "to" clause)
+    tToken SecondLeftCommand     // "If (x = y) *Move* A to" or "If (True) *Begin*"
+
+    String sLeftExpression1       // If *((iA * iB > 10) + (iD + iE)* > 100) Move (iA / iB) to
+    String sLeftExpression2       // If ((iA * iB > 10) + (iD + iE) > 100) Move *(iA / iB)* to
+    String sOfExpression          // Get psAppSrcPath of *(phoWorkspace(ghoApplication))* to
+    String sToExpression          // Move (True = False) to *(asMyArray[SizeOfArray(asMyArray)]*
+//    tExpression[] aExpression     // Struct array with all expressions within "()".
+
+    String[] asLineTokens         // The sOverstrikeLine is broken up by spaces to a string array, and expressions are kept together on one array line even if it contains spaces.
+    String[] asLineTokensLC       // The same content as array above *but* in LowerCase.
+    tOperatorsInfo OperatorsInfo  // Operator info e.g. "eq", "=", "lt", "<" etc.
+End_Struct        
 
 #IFNDEF clGreenGrey
     Define clGreenGrey              for (RGB(64, 84, 93))
@@ -183,10 +234,10 @@ Define CS_SourceFileFilters         for "Programs|*.src|Views|*.vw|Dialogs|*.dg|
 Define CS_CreateBackupFiles         for "CreateBackupFiles"
 Define CS_SummaryLogfileName        for "DFRefactoringLogFile.txt"
 
-Define CS_VarTypes                  for "STRING;INTEGER;NUMBER;DATE;DATETIME;BOOLEAN;HANDLE;REAL;VARIANT;TIMESPAN;ROWID;DECIMAL;BIGINT;REAL;UCHAR;ADDRESS;CHAR;CURRENCY;DWORD;FLOAT;POINTER;SHORT;TIME;UBIGINT;USHORT" // careful, cannot end on a semicolumn as you will introduce variable type equal to ""
-Define CS_VarArrayTypes             for "STRING[];INTEGER[];NUMBER[];DATE[];DATETIME[];BOOLEAN[];HANDLE[];REAL[];VARIANT[];TIMESPAN[];ROWID[];DECIMAL[];BIGINT[];REAL[];UCHAR[];ADDRESS[];CHAR[];CURRENCY[];DWORD[];FLOAT[];POINTER[];SHORT[];TIME[];UBIGINT[];USHORT[];STRING[][];INTEGER[][];NUMBER[][];DATE[][];DATETIME[][];BOOLEAN[][];HANDLE[][];REAL[][];VARIANT[][];TIMESPAN[][];ROWID[][];DECIMAL[][];BIGINT[][];REAL[][];UCHAR[][];ADDRESS[][];CHAR[][];CURRENCY[][];DWORD[][];FLOAT[][];POINTER[][];SHORT[][];TIME[][];UBIGINT[][];USHORT[][]"
-Define CS_ValidLeftCharacters       for ("()[];,&+-*<>= " + Character(9)) // Character 9=tab char //"()[];,.&+-*<>= "
+// Careful, these cannot end on a semicolumn as you will introduce variable type equal to ""
+Define CS_VarTypes                  for "STRING;INTEGER;NUMBER;DATE;DATETIME;BOOLEAN;HANDLE;REAL;VARIANT;TIMESPAN;ROWID;DECIMAL;BIGINT;REAL;UCHAR;ADDRESS;CHAR;CURRENCY;DWORD;FLOAT;POINTER;SHORT;TIME;UBIGINT;USHORT;WSTRING;LONGPTR;ULONGPTR;UINTEGER" 
 
+Define CS_ValidLeftCharacters       for ("()[];,&+-*<>= " + Character(9)) // Character 9=tab char //"()[];,.&+-*<>= "
 Define CS_UnusedSourceLogFile       for "UnusedSourceFiles.txt"
 Define CS_CommentSymbol             for ("//")
 Define CS_ImageNameStart            for "/"
@@ -316,6 +367,9 @@ Define CS_Local          for "Local"
 Define CS_GetAddress     for "GetAddress" 
 Define CS_AddressOf      for "AddressOf"
 Define CS_Function       for "Function"
+Define CS_FunctionEnd    for "Function_End"
+Define CS_Procedure      for "Procedure"
+Define CS_ProcedureEnd   for "Procedure_End"
 Define CS_Contains       for "contains"
 Define CS_Select         for "[Select]"
 

@@ -23,7 +23,6 @@ Open FunctionsA
 
 Class cBaseRefactorFunctionLibrary is a cObject
     Procedure Construct_Object
-        String[] asLocalVariableTypes asLocalVariableArrayTypes
 
         Forward Send Construct_Object
         Move Self to ghoRefactorFunctionLibrary
@@ -32,27 +31,45 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Property Boolean pbErr False
         
         Property Handle phoEditor
-        Property Integer peNewStyle eDDUnknown
+        Property Integer peNewStyle eDDUnknown 
+        Property Integer piTabSize
 
         Property tRefactorSettings pRefactorSettings
         //
         Property Boolean pbToggleState True     
-        Property Boolean pbInRepeatLoop False
-        Property Boolean pbInMultiLineSemiColon False
-        Property Boolean pbInMultiLineString False
-//        Property Boolean pbInAllignedMultiLineString False
+        Property Boolean pbInRepeatLoop False     
+        Property Boolean pbInProcedure False
+        Property Boolean pbInFunction False
+//        Property Boolean pbHasEndSemiColon False
+        Property Boolean pbIsInMultiLineString False
+        Property Boolean pbIsOpenString False
         
-        Property tTokenizer pTokenizer
+        // Contains all info from the current "sLine" source.
+        // *** To be used by all cRefactorFunctionLibrary functions ***
+        Property tTokenizer pTokenizer          
+        // Array of expressions inside "(" and ")" for a source line. Setup by the Tokenizer function.
+        Property tExpression[] paExpression
+        // Array of string constants that has been overwritten by the _OverstrikeStrings function. The
+        // content of the overstriked data is kept in the tTokenizer.sOverstrikeLine member and the 
+        // original string content(s) is kept in this paStringContent array property for the current source line.
+        Property tQuotedString[] paStringContent
         
-        Property String[] paCommands
-        Property String[] paCommandFunctions    
+        // All commands from the manual list in this class.
+        Property String[] pasCommands
+        // Commands that also exists as functions.
+        Property String[] pasCommandFunctions    
         Property String[] pasLocalVariableTypes
         Property String[] pasLocalVariableArrayTypes
-
-        Get StrSplitToArray CS_VarTypes ";" to asLocalVariableTypes
-        Set pasLocalVariableTypes to asLocalVariableTypes
-        Get StrSplitToArray CS_VarArrayTypes ";" to asLocalVariableArrayTypes
-        Set pasLocalVariableArrayTypes to asLocalVariableArrayTypes
+         
+        // Data from the Scintilla editor. See ScintillaParameters.dg
+        // Scoped words are; Begin/End While/Loop, Procedure/End_Procedure etc.
+        Property String[] pasScopeStart
+        // The closing scoped part. There is a 1-1 relationship between the two arrays.
+        Property String[] pasScopeEnd   
+        // All keywords from the Scintilla editor.
+        Property String[] pasKeyWords
+        // All operators from the Scintilla editor.
+        Property String[] pasOperators
 
         // Properties for the RemovePRoejctObjectStructure function:
         Property Boolean pbProjectObjectStructureStart False 
@@ -80,43 +97,6 @@ Class cBaseRefactorFunctionLibrary is a cObject
 
     End_Procedure
 
-    Procedure End_Construct_Object
-        Forward Send End_Construct_Object
-        Send AddAllCommands  
-        Send AddAllCommandFunctions
-    End_Procedure
-    
-    Procedure SaveErrorState
-        Set piLastErr to LastErr
-        If (Err = True) Begin
-            Set pbErr to True
-        End
-        Else Begin
-            Set pbErr to False
-        End   
-        Move False to Err
-        Move 0 to LastErr
-    End_Procedure
-    
-    Procedure RestoreErrorState
-        Get piLastErr to LastErr
-        If (pbErr(Self)) Begin
-            Move True to Err
-        End
-        Else Begin
-            Move False to Err
-        End
-    End_Procedure
-    
-    Procedure ResetProjectObjectStructureProperties
-        String[] asObjectNames
-        Set pbProjectObjectStructureStart to False 
-        Set pbProjectObjectStructureEnd   to False
-        Set pbRegisterAllObjectsStart     to False    
-        Set pbRegisterAllObjectsEnd       to False
-        Set pasObjectNames                to asObjectNames
-    End_Procedure
-
     // ToDo: *** MAIN PUBLIC MESSAGE for this system class ***
     //     All helper messages starts with an underscore "_".
     // Syntax:
@@ -126,127 +106,147 @@ Class cBaseRefactorFunctionLibrary is a cObject
     // cRefactorFunctionLibrary class can use those member values to do their thing.
     //
     // Note: If the line is a compound statement (one that spans over several lines),
-    //       e.g. it contains a ";" or one '"""', the function will set one of the
-    //       properties; pbInMultiLineSemiColon or pbInMultiLineString to true
-    //       Those properties will be reset to False as soon as the combound statement ends.
-    //       It also sets the two struct members; bHasEndSemiColon and bIsMultiLineString 
-    //       to true.
+    //       e.g. it contains a ";" or one '"""', the function will set the
+    //       properties; pbIsOpenString or pbInMultiLineString.
     Function Tokenizer String sLine Returns tTokenizer
         tTokenizer TokenizerData
+        tExpression[] aExpression        
         String sText sText2 sChar sCommand
         Boolean bFound bMoveCommand bInMultiLineString
         Integer iPos iStart iEnd
                                                 
         Move sLine to TokenizerData.sLine
-        // The _OverstrikeStrings is costly (slow) so it will only be called once for each source line.
-        //  It will overstrike string characters with "_" characters for a "A text" and "+" characters for a 'B text' 
-        // This is so the tokenizer not gets confused by the content in string constants.
-        // E.g. Move "We will *move* some of the warehouse" to sText -> Move "________________________________" to sText
-        // Thus most refactoring funtions should use the sOverstrikeLine member value, rather then the
-        // original sLine content itself.
-        Get _OverstrikeStrings sLine to TokenizerData.sOverstrikeLine
-        
         // Place all testings for cases for when we are done,
         // at the top of this function so we can jump out.
-        Get _IsCommentLine TokenizerData.sOverstrikeLine to TokenizerData.bIsComment
-        Get _IsBlankLine   TokenizerData.sOverstrikeLine to TokenizerData.bIsBlank
+        Get _IsCommentLine sLine to TokenizerData.bIsComment
+        Get _IsBlankLine   sLine to TokenizerData.bIsBlank
         If (TokenizerData.bIsComment = True or TokenizerData.bIsBlank = True) Begin
-            Set pbInMultiLineSemiColon to False
-            Set pbInMultiLineString    to False
-            Move True                  to TokenizerData.bLineIsReady 
+            Set pbIsInMultiLineString to False
+            Move True                 to TokenizerData.bLineIsReady 
             Set pTokenizer to TokenizerData
             Function_Return TokenizerData
         End  
         
+        // Get the indentation part
+        Get _Indentation (&TokenizerData) to TokenizerData.sIndentation
+        // Get the end comment part
+        Get _EndComment (&TokenizerData) to TokenizerData.sEndComment
+        
+        // These are properties that was set by a previous line. 
+        // Needs to be before the _OverstrikeStrings call, as they
+        // might get changed by that function.
+        Get pbIsInMultiLineString to TokenizerData.bIsMultiLineString
+        Get pbIsOpenString        to TokenizerData.bIsOpenString
+
+        //  This will overstrike string characters with "_" characters for a "some text" and "+" characters for a 'some other text' 
+        // This is so the tokenizer not gets confused by the content in string constants.
+        // E.g. Move "We will *move* some of the warehouse" to sText -> Move "________________________________" to sText
+        // Thus, most refactoring funtions should be using the sOverstrikeLine member value, rather then the
+        // original sLine content itself.
+        Get _OverstrikeStrings (&TokenizerData) to TokenizerData.sOverstrikeLine  
+
+        // Very old DataFlex syntax that used "image pages". Looks like; "/MyPage" and ends with "/*"
+        // We will do nothing with such lines.
         Get _IsImageStart TokenizerData.sOverstrikeLine to TokenizerData.bIsImageStart
         Get _IsImageEnd   TokenizerData.sOverstrikeLine to TokenizerData.bIsImageEnd  
         If (TokenizerData.bIsImageStart = True or TokenizerData.bIsImageEnd = True) Begin 
-            Set pbInMultiLineSemiColon to False
-            Set pbInMultiLineString    to False
+            Set pbIsInMultiLineString  to False   
+            Set pbIsOpenString         to False
             Move True to TokenizerData.bLineIsReady
             Set pTokenizer to TokenizerData
             Function_Return TokenizerData
         End
         
-        // ToDo: I wonder *should* we read all multi-lines to the same "sLine" param?
-        //       This would make the tokenizing much easier!?
-        //
-        // Multi-line strings for DF23 and up. (@, @SQL and """)
+        // Multi-line strings for DF23 and up. (@, @SQL or """)
         // The property pbInMultiLineString is set as soon as a
-        // multi-line string has been started (and not ended):
-        If (pbInMultiLineString(Self) = True) Begin
-            Get _IsMultLineStringEnd TokenizerData.sOverstrikeLine to bFound
+        // multi-line string is started (and not ended):
+        If (pbIsInMultiLineString(Self) = True) Begin
+            Get _IsDF23String (&TokenizerData) to TokenizerData.bIsDF23String
+            Get _IsMultiLineStringEnd (&TokenizerData) to bFound
             If (bFound = True) Begin
-                Set pbInMultiLineString to False                
+                Set pbIsInMultiLineString to False                
+                Set pbIsOpenString        to False
                 Move True to TokenizerData.bLineIsReady
                 Set pTokenizer to TokenizerData
                 Function_Return TokenizerData
             End
         End
-        
-        If (pbInMultiLineString(Self) = False) Begin
-            Get _IsMultiLineStringStart TokenizerData.sOverstrikeLine to bFound
+        Else Begin
+            Get _IsDF23String (&TokenizerData) to TokenizerData.bIsDF23String
+            Get _IsMultiLineStringStart (&TokenizerData) to bFound
             If (bFound = True) Begin
-                Set pbInMultiLineString to True  
+                Set pbIsInMultiLineString to True  
                 Move True to TokenizerData.bIsMultiLineString
+            End
+            If (TokenizerData.bIsDF23String = True or bFound = True) Begin
                 Move True to TokenizerData.bLineIsReady
                 Set pTokenizer to TokenizerData
                 Function_Return TokenizerData
             End
         End                       
         
-        Get _IsFunction TokenizerData.sOverstrikeLine           to TokenizerData.bIsFunction
-        Get _IsProcedure TokenizerData.sOverstrikeLine          to TokenizerData.bIsProcedure
-        Get _IsCommandDeclaration TokenizerData.sOverstrikeLine to TokenizerData.bIsCommandDeclaration
-        If (TokenizerData.bIsFunction = True or TokenizerData.bIsProcedure = True or TokenizerData.bIsCommandDeclaration = True) Begin
-            Move True to TokenizerData.bLineIsReady
+//        // This needs to be before the _IsFunctionDeclaration etc.
+//        Get _IsLineEndSemiColon sLine to bFound                    
+//        If (bFound = True) Begin
+//            Set pbIsInMultiLineString to True
+//            Move True to TokenizerData.bHasEndSemiColon
+//            Function_Return TokenizerData
+//        End
+        // *** End of tests that sets the TokenizerData.bLineIsReady = True.
+
+        Get _SplitSourceLineToStringArrays (&TokenizerData) to TokenizerData
+
+        // Set class properties to indicate if we are inside a function or a procedure.
+        // Needs to be after calling _OverstrikeStrings & _SplitSourceLineToStringArrays
+        Get _IsFunctionDeclaration TokenizerData.sOverstrikeLine to TokenizerData.bIsInFunction
+//        Get _isfu
+//        If (TokenizerData.bIsInFunction = True) Begin
+//            Set pbInFunction to True
+//        End
+//        If (TokenizerData.asLineTokensLC[0] = (Lowercase(CS_FunctionEnd))) Begin
+//            Set pbInFunction to False
+//        End
+        
+        Get _IsProcedureDeclaration TokenizerData.sOverstrikeLine to TokenizerData.bIsInProcedure  
+        If (TokenizerData.bIsInProcedure = True) Begin
+            Set pbInProcedure to True
+        End
+        If (TokenizerData.asLineTokensLC[0] = (Lowercase(CS_ProcedureEnd))) Begin
+            Set pbInProcedure to False
+        End
+        
+        Get _IsVariableDeclaration TokenizerData.sOverstrikeLine to TokenizerData.bIsVariableDeclaration
+        Get _IsCommandDeclaration  TokenizerData.sOverstrikeLine to TokenizerData.bIsInCommand
+        If (TokenizerData.bIsInFunction = True or TokenizerData.bIsInProcedure = True or TokenizerData.bIsInCommand = True) Begin
             Set pTokenizer to TokenizerData
             Function_Return TokenizerData
         End
-        // *** End of tests that sets the TokenizerData.bLineIsReady = True.
              
-        Get _IsLineEndSemiColon TokenizerData.sOverstrikeLine to bFound                    
-        If (bFound = True) Begin
-            Set pbInMultiLineString    to False
-            Set pbInMultiLineSemiColon to True
-            Move True to TokenizerData.bHasEndSemiColon
-        End
-        Else Begin
-            // ToDo: Do we need this property?
-            Set pbInMultiLineSemiColon to False
-        End
-
-        // Get the end comment part
-        // Note: Must be "sLine"
-        Get _EndComment sLine to TokenizerData.sEndComment
-        
-        // Get the indentation part
-        Get _Indentation TokenizerData.sOverstrikeLine to TokenizerData.sIndentation
         
         // Get start and end indicators
-        Get _IsKeywordInLine (CS_Indicate + "|") TokenizerData.sOverstrikeLine to bFound
-        If (bFound = True) Begin
-            Move True to TokenizerData.bHasIndicateCommand
-        End                                                
-        Get _LeftIndicator  TokenizerData.sOverstrikeLine to TokenizerData.sLeftIndicator
-        Get _RightIndicator TokenizerData.sOverstrikeLine to TokenizerData.sRightIndicator
+        // "Indicate [Select] as [not Found]" -> bHasIndicateCommand = True
+        Get _ExtractLegacyBooleanContent (&TokenizerData) to TokenizerData.IndicatorInfo
             
-        // Get the "of xxx" part (without the "of" word)
-        Get _OfStatement TokenizerData.sOverstrikeLine to TokenizerData.sOfStatement 
+        // Get the "*Move iA* to xxx" part
+        Get _LeftStatement (&TokenizerData) to TokenizerData.LeftStatement 
+        // Get the "of xxx" part
+        Get _OfStatement (&TokenizerData) to TokenizerData.OfStatement 
+        // Get the "to xxx" part
+        Get _ToStatement (&TokenizerData) to TokenizerData.ToStatement
         
-        // Get the "to xxx" part (without the "to" word)
-        Get _ToStatement TokenizerData.sOverstrikeLine to TokenizerData.sToStatement
-        
-        Get _LeftCommand TokenizerData.sOverstrikeLine CI_FirstCommand  to TokenizerData.sFirstLeftCommand
-        Get _LeftCommand TokenizerData.sOverstrikeLine CI_SecondCommand to TokenizerData.sSecondLeftCommand
+        Get _LeftCommand (&TokenizerData) CI_FirstCommand  to TokenizerData.FirstLeftCommand
+        Get _LeftCommand (&TokenizerData) CI_SecondCommand to TokenizerData.SecondLeftCommand
 
-        Get _ExpressionExtractor TokenizerData CI_LeftExpression to TokenizerData.sLeftExpression
-        Get _ExpressionExtractor TokenizerData CI_OfExpression   to TokenizerData.sOfExpression
-        Get _ExpressionExtractor TokenizerData CI_ToTexpression  to TokenizerData.sToExpression
-//        Move (Trim(sLine)) to TokenizerData.sCode  
+        Get _FetchExpression CI_LeftExpression1 to TokenizerData.sLeftExpression1
+        Get _FetchExpression CI_LeftExpression2 to TokenizerData.sLeftExpression2
+        Get _FetchExpression CI_OfExpression    to TokenizerData.sOfExpression
+        Get _FetchExpression CI_ToTexpression   to TokenizerData.sToExpression
 
-        // Set class property so functions of the cRefactorFunctionLibrary can use it,
-        // instead of all of them calling this Tokenizer function (which is costly)
+        // *** Note ***
+        // Intead of calling this Tokenizer function from the cRefactorFunctionLibrary,
+        // each function should do a "Get pTokenizer to TokenizerData" and use that ready-made tokenized data,
+        // that was created once for each source line by this function.
+        // This tokenizer call will be made automatically by the logic in the DFRefactor.src & TestBenchRefactorFunctions.src. 
         Set pTokenizer to TokenizerData
                                       
         Function_Return TokenizerData
@@ -254,39 +254,241 @@ Class cBaseRefactorFunctionLibrary is a cObject
     
     // ToDo: *** HELPER FUNCTIONS ***   
     //  
-    // Returns either the first or second command in the sLine, depending
-    // on the iCommandNumber parameter.
-    { EnumList="CI_FirstCommand, CI_SecondCommand"}
-    Function _LeftCommand String sOverstrikeLine Integer iCommandNumber Returns String
-        String sCommand
-        Integer iPos iSize iCount
-        String asCommands
+    // Splits up the tokens/elements of the input string into two string arrays, but without indentation and end comment.
+    // The line will be broken up by spaces " ", *except* for expressions. Each expression will exist as a
+    // separate member/item.
+    // The TokenizerData.asLineTokensLC will contain the same values, but LowerCased.
+    Function _SplitSourceLineToStringArrays tTokenizer ByRef TokenizerData Returns tTokenizer
+        String sOverstrikeLine 
+        String[] asLineTokens asLineTokensLC asLineTokensEmpty                     
+        String sLineTokens sExpression sReplace 
+        Integer iSize iCount iItem iPos
+        tExpression[] aExpressions aExpressionsEmpty
         
-        Get _FindCommand sOverstrikeLine to iPos
-        If (iPos = 0) Begin
-            Function_Return "" 
-        End       
+        // We need to retrieve expressions from the sOverstrikeLine, as they else will
+        // be splitted on several items (if expression contains spaces) in the array and 
+        // we want each expression as one array member.
+        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+        // _ExtractExpression is called recursively. That is why we use a procedure as it simplifies the work for us.
+        Send _ExtractExpression sOverstrikeLine (&aExpressions)
+        Move (SizeOfArray(aExpressions)) to iSize
+        Decrement iSize    
         
-        If (iCommandNumber = CI_FirstCommand) Begin
-            Get _ExtractCommand sOverstrikeLine iPos to sCommand
+        // If expressions exists, temporarily replace them with the "|" symbol, before
+        // splitting string to array.
+        If (iSize <> -1) Begin                 
+            Set paExpression to aExpressions
+            For iCount from 0 to iSize
+                Move (FillString("|", aExpressions[iCount].iLength)) to sReplace
+                Move (Pos(aExpressions[iCount].sExpression, sOverstrikeLine)) to iPos
+                If (iPos <> 0) Begin
+                    Move (Overstrike(sReplace, sOverstrikeLine, aExpressions[iCount].iStartPos)) to sOverstrikeLine
+                End
+            Loop
+        End
+        Else Begin
+            Set paExpression to aExpressionsEmpty
         End
 
-        If (iCommandNumber = CI_SecondCommand) Begin
-            Move (Mid(sOverstrikeLine, Length(sOverstrikeLine), iPos)) to sOverstrikeLine
-            Get _FindCommand sOverstrikeLine to iPos
-            If (iPos = 0) Begin
-                Function_Return "" 
-            End       
-            Get _ExtractCommand sOverstrikeLine iPos to sCommand
-        End 
-        Function_Return sCommand
+        Move (StrSplitToArray(sOverstrikeLine, " ")) to asLineTokens 
+
+        // If there were any expressions, place them back into the asLineTokens array.
+        If (iSize <> -1) Begin                 
+            For iCount from 0 to iSize
+                Move (FillString("|", aExpressions[iCount].iLength)) to sReplace
+                Move (SearchArray(sReplace, asLineTokens)) to iItem
+                If (iItem <> -1) Begin
+                    Move aExpressions[iCount].sExpression to asLineTokens[iItem]
+                End
+            Loop
+        End
+
+        // ToDo: Not sure we should remove empty members from the array.
+        //       It could be easier to re-assamble the source line if there are kept.
+        // Remove members that is just a space as we don't need/want them.
+        // They appear if multiple spaces exists between tokens.
+//        Move (SizeOfArray(asLineTokens)) to iSize
+//        Decrement iSize    
+//        For iCount from 0 to iSize
+//            Move (SearchArray(" ", asLineTokens)) to iItem
+//            If (iItem <> -1) Begin
+//                Move (RemoveFromArray(asLineTokens, iItem)) to asLineTokens
+//            End
+//            Else Begin
+//                Move iSize to iCount // Jump out.
+//            End
+//        Loop   
+        
+        // Also create an array with lowercased tokens;
+        Move (SizeOfArray(asLineTokens)) to iSize  
+        Decrement iSize
+        For iCount from 0 to iSize
+            Move (Lowercase(asLineTokens[iCount])) to asLineTokensLC[iCount]
+        Loop
+        
+        Move asLineTokens   to TokenizerData.asLineTokens
+        Move asLineTokensLC to TokenizerData.asLineTokensLC
+        Function_Return TokenizerData
+    End_Function 
+    
+    // Takes a source line as input. The "sOverstrikeLine" param *must* have been
+    // "cleaned" with the _OverstrikeStrings function so string constant content
+    // cannot interfere when scanning the source line for expressions.
+    // Returns a struct array with the start, length & expression(s).
+    // Returns an empty struct array if no opening parenthesis was found aka "(".
+    // Note: This is a recursive message, if needed it calls itself.
+    Procedure _ExtractExpression String sOverstrikeLine tExpression[] ByRef aExpressions
+        String sExpression sChar sTest 
+        Integer iSize iCount iStart iStop iItem iClauseOpen iClauseClosed iLength iPos  
+        tExpression[] aExpressionsEmpty
+
+        Move (Pos("(", sOverstrikeLine)) to iPos
+        If (iPos = 0) Begin  
+            Function_Return aExpressionsEmpty
+        End
+        
+        Move "" to sExpression          
+        Move -1 to iStop
+        
+        // We need to establish the first and last *matching* paranthesis positions.
+        Move 0 to iClauseOpen
+        Move 0 to iClauseClosed                                           
+        Move (Length(sOverstrikeLine)) to iSize
+        For iCount from iPos to iSize
+            Move (Mid(sOverstrikeLine, 1, iCount)) to sChar
+            If (sChar = "(") Begin
+                Increment iClauseOpen
+                If (iClauseOpen = 1) Begin
+                    Move iCount to iStart
+                End
+            End
+            If (sChar = ")") Begin
+                Increment iClauseClosed  
+                Move iCount to iStop
+            End
+            If (iClauseOpen > 0 and iClauseOpen = iClauseClosed) Break
+        Loop
+        
+        // If found, extract the expression and move info to struct array:
+        If (iStart < iStop) Begin  
+            Increment iStop
+            Move (iStop - iStart) to iLength
+            Move (Mid(sOverstrikeLine, iLength, iStart)) to sExpression
+            Move (SizeOfArray(aExpressions)) to iSize
+            Move iStart      to aExpressions[iSize].iStartPos
+            Move iLength     to aExpressions[iSize].iLength
+            Move sExpression to aExpressions[iSize].sExpression 
+            
+            // Finally set the expression mode:
+            { EnumList="{CI_LeftExpression, CI_OfExpression, CI_ToTexpression}" }
+            If (iSize = 0) Begin
+                Move CI_LeftExpression1 to aExpressions[iSize].eExpressionMode  
+            End 
+            Else Begin
+                Move CI_LeftExpression2 to aExpressions[iSize].eExpressionMode  
+            End
+                
+            Move (Pos(Lowercase(" " + CS_Of + " "), Lowercase(sOverstrikeLine))) to iPos
+            If (iPos <> 0 and iPos < iStart) Begin
+                Move CI_OfExpression to aExpressions[iSize].eExpressionMode
+            End
+            Move (Pos(Lowercase(" " + CS_to + " "), Lowercase(sOverstrikeLine))) to iPos
+            If (iPos <> 0 and iPos < iStart) Begin
+                Move CI_ToTexpression to aExpressions[iSize].eExpressionMode
+            End
+        End
+        
+        // Is there more than one expression? Then call this function *recursively*!
+        Move (Length(sOverstrikeLine)) to iSize
+        Move (Mid(sOverstrikeLine, iSize, iStop)) to sTest
+        Move (Pos("(", sTest)) to iItem
+        If (iItem <> 0) Begin
+            Move sTest to sOverstrikeLine
+            Send _ExtractExpression sOverstrikeLine (&aExpressions)
+        End                        
+        
+    End_Procedure
+    
+    // Function to return expressions from the source line;
+    // Only expressions in parenthesis "()" are acted upon and returned (Not square brackets)
+    // Note: It fetches the class property paExpression, where the expressions was saved by the Tokenizer function.
+    { EnumList="{CI_LeftExpression1, CI_LeftExpression2, CI_OfExpression, CI_ToTexpression}" }
+    Function _FetchExpression Integer eExpressionMode Returns String
+        String sExpression
+        Integer iSize iItem     
+        tExpression[] aExpression
+        tExpression Expression
+        
+        Get paExpression to aExpression
+        Move (SizeOfArray(aExpression)) to iSize
+        If (iSize = 0) Begin
+            Function_Return ""
+        End       
+
+        Move "" to sExpression
+        Move eExpressionMode to Expression.eExpressionMode
+        Move (SearchArray(Expression, aExpression)) to iItem
+        If (iItem = -1) Begin
+            Function_Return ""
+        End                   
+        Move aExpression[iItem].sExpression to sExpression
+
+        Function_Return sExpression
     End_Function
 
-    Function _ExtractCommand String sOverstrikeLine Integer iPos Returns String
-        String sCommand sChar
-        Integer iSize iCount
+    // Returns either the first or second command in the sLine, depending
+    // on the eCommandNumber parameter.
+    { EnumList="CI_FirstCommand, CI_SecondCommand, CI_ThirdCommand"}
+    Function _LeftCommand tTokenizer ByRef TokenizerData Integer eCommandNumber Returns tToken
+        String sOverstrikeLine 
+        Integer iPos iSize iCount iItem iCommand iNumber
+        String[] asCommands 
+        tToken Data
+        
+        If (TokenizerData.bLineIsReady = True) Begin
+            Function_Return Data
+        End                     
+        // This array contains lowecased commands
+        Get pasCommands to asCommands
+        Move -1 to iCommand
+        Move 0 to iNumber
+        Move (SizeOfArray(TokenizerData.asLineTokensLC)) to iSize
+        Decrement iSize
+        
+        For iCount from 0 to iSize
+            Move (SearchArray(TokenizerData.asLineTokensLC[iCount], asCommands)) to iItem 
+            If (iItem <> -1) Begin
+                If (eCommandNumber = iNumber) Begin
+                    Move iCount to iCommand
+                    Move iSize to iCount    // Jump out.
+                End
+                Increment iNumber
+            End 
+            Else If (TokenizerData.asLineTokensLC[iCount] = Lowercase(CS_If)) Begin
+                Increment iNumber
+                // The "If" statement is not included in the pasCommands array, but we want it here
+                If (eCommandNumber = CI_FirstCommand) Begin
+                    Move iCount to iCommand
+                    Move iSize to iCount    // Jump out.  
+                    Move 1 to iItem
+                End
+            End
+        Loop
+        
+        If (iItem <> -1 and iCommand <> -1) Begin
+            Move TokenizerData.asLineTokens[iCommand] to Data.sCode
+            Move (Pos(Data.sCode, TokenizerData.sOverstrikeLine)) to Data.iStartPos
+        End
+        Function_Return Data
+    End_Function
 
-        Move "" to sCommand
+    // ToDo: Needs to be revised. How should it work?
+    Function _ExtractCommand tTokenizer ByRef TokenizerData Integer iPos Returns String
+        String sOverstrikeLine sCommand sChar
+        Integer iSize iCount
+                                                            
+        Move "" to sCommand   
+        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
         Move (Length(sOverstrikeLine)) to iSize
         For iCount from iPos to iSize
             Move (Mid(sOverstrikeLine, 1, iCount)) to sChar
@@ -301,106 +503,191 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Function_Return sCommand
     End_Function
     
-    // Tries to find the first DataFlex command found in the passed string.
-    // Returns the starting pos of that same command (or 0 if not found).
-    Function _FindCommand String sOverStrike Returns Integer
+    // ToDo: Needs to be revised. E.g. a line like "[not Found] Move x to y" will fail.
+    Function _FirstToken String sLine Returns String
+        String sWord
+        Integer iPos
+        Boolean bIsCommentLineOrBlank bFound
+        
+        Get _IsCommentLineOrBlank sLine to bIsCommentLineOrBlank
+        If (bIsCommentLineOrBlank = True) Begin
+            Function_Return ""
+        End                   
+        
+        Move (Trim(sLine)) to sLine
+        Move (Pos(" ", sLine)) to iPos
+        If (iPos > 0) Begin
+            Move (Left(sLine, iPos - 1)) to sWord
+        End                                      
+        Else Begin             
+            // If the line consist of a single token/word
+            Move sLine to sWord
+        End
+        Function_Return sWord
+    End_Function  
+    
+    // Searches for the first DataFlex keyword for "sSource" in a source line line.
+    // Returns the Pos or 0 if not found.
+    Function _FindCommand tTokenizer ByRef TokenizerData String sSource Returns Integer
         Boolean bRemoved
-        Integer iCount iSize iPos iTest
-        String  sCommand sComment
+        Integer iSize iStart iEnd iPos iTest iLength
+        String  sOverStrikeLine sWord sLowerCase  
         String[] asCommands
 
-        Move 0 to iPos
-        Move (" " + sOverStrike) to sOverStrike
-        Get _EndComment sOverStrike to sComment
-        Get paCommands to asCommands
-        Move (SizeOfArray(asCommands)) to iSize
-        If (iSize = 0) Begin
-            Get paCommands to asCommands
-            Move (SizeOfArray(asCommands)) to iSize        
-        End
+        Move 0 to iPos          
+        Get pasCommands to asCommands
+        Move (Length(sSource)) to iLength
+        Move (SizeOfArray(TokenizerData.asLineTokensLC)) to iSize
         Decrement iSize
-        For iCount from 0 to iSize
-            Move asCommands[iCount] to sCommand
-            Move (Pos(" " + Lowercase(sCommand), Lowercase(sOverStrike))) to iTest // The command MUST start with a space and MIGHT end with a space.
-            If (iTest <> 0) Begin
-                If (iPos = 0) Begin
-                    Move iTest to iPos
+        
+
+        While (iLength > 0)                                
+            Move (Pos(" ", sSource)) to iPos
+            If (iPos > 0) Begin
+                Move (Left(sSource, (iPos -1))) to sWord
+                Move (Pos(Lowercase(sWord), Lowercase(sSource))) to iPos
+                Move (Trim(Lowercase(sWord))) to sLowerCase
+                Move (SearchArray(sLowerCase, asCommands)) to iTest
+                // If command not found, try next "word" in sSource;
+                If (iTest = -1) Begin     
+                    Move (Pos(" ", sSource)) to iPos
+                    Move (Mid(sSource, iLength, iPos)) to sSource
+                    Move (Trim(sSource)) to sSource
+                    Move (Length(sSource)) to iLength
                 End
                 Else Begin
-                    If (iTest < iPos) Begin
-                        Move iTest to iPos
-                    End
+                    Move 0 to iLength // Jump out.
                 End
             End
+            Else Begin
+                Move 0 to iLength // Jump out.
+            End
         Loop              
-        // We added a beginning " " at the top of this function, so adjust for that now.
-//        If (iPos = 1) Begin
-//            Move 0 to iPos
-//        End
+
         Function_Return iPos
+    End_Function   
+    
+    // It is assumed that the sWord is neither blank or part of a comment or text constant. 
+    // Check if the "sLine" is a global or a local variable declaraction (exist in pasLocalVariableTypes)
+    Function _IsVariableDeclaration String sLine Returns Boolean
+        Boolean bFound
+        String[] asLocalVariableTypes                          
+        Integer iItem
+        
+        Move (Lowercase(sLine)) to sLine
+        Move (sLine = "local") to bFound
+        If (bFound = False) Begin
+            Move (sLine = "global_variable") to bFound
+        End
+        If (bFound = False) Begin
+            Get pasLocalVariableTypes to asLocalVariableTypes
+            Move (SearchArray(sLine, asLocalVariableTypes)) to iItem
+            Move (iItem <> -1) to bFound
+        End                             
+        Function_Return bFound
+    End_Function
+
+    // It is assumed that the sWord is neither blank or part of a comment or text constant.
+    // Check if the "sWord" is a local variable declaraction *array* (exist in pasLocalVariableTypes)
+    Function _IsVariableArrayDeclaration String sLine Returns Boolean
+        Boolean bFound
+        String[] asLocalVariableArrayTypes                          
+        Integer iItem
+        
+        Get pasLocalVariableArrayTypes to asLocalVariableArrayTypes
+        Move (Lowercase(sLine)) to sLine
+        
+        Move (sLine = "local") to bFound
+        If (bFound = False) Begin
+            Move (sLine = "global_variable") to bFound
+        End
+        If (bFound = False) Begin
+            Move (SearchArray(sLine, asLocalVariableArrayTypes)) to iItem
+            Move (iItem <> -1) to bFound
+        End                             
+        Function_Return bFound
+    End_Function
+
+    // It is assumed that the sWord is neither blank or part of a comment or text constant.
+    Function _IsKeyWord String sWord Returns Boolean
+        Integer iItem
+        String[] asKeyWords
+        
+        Get pasKeyWords to asKeyWords
+        Move (Trim(Lowercase(sWord))) to sWord
+        Move (SearchArray(sWord, asKeyWords)) to iItem
+        
+        Function_Return (iItem <> -1)
     End_Function
     
     // Is it a Function declaration?
-    // It is assumed that the past "sLine" is not a comment or blank line.
     // Pass a source line param with overstriked string constants.
-    Function _IsFunction String sLine Returns Boolean
+    Function _IsFunctionDeclaration String sOverstrikeLine Returns Boolean
         Boolean bFound bComment 
         
         Move False to bFound
-        Move (Trim(sLine)) to sLine
-        Move (Pos(Lowercase("function "), Lowercase(sLine)) > 0) to bFound
+        Move (Pos(Lowercase("function "), Lowercase(sOverstrikeLine)) <> 0) to bFound
         
         Function_Return bFound
     End_Function
     
     // Is it a Procedure declaration?
-    // It is assumed that the past "sLine" is not a comment or blank line.
     // Pass a source line param with overstriked string constants.
-    Function _IsProcedure String sLine Returns Boolean
+    Function _IsProcedureDeclaration String sOverstrikeLine Returns Boolean
         Boolean bFound bComment 
         
         Move False to bFound
-        Get _IsCommentLine sLine to bComment
-        If (bComment = True) Begin
-            Function_Return bFound
-        End
-        Move (Trim(sLine)) to sLine
-        Move (Pos(Lowercase("procedure "), Lowercase(sLine)) > 0) to bFound
+        Move (Pos(Lowercase("procedure "), Lowercase(sOverstrikeLine)) <> 0) to bFound
         
         Function_Return bFound
     End_Function
     
-    Function _IsMethodStart String sLine Returns Boolean
-        Boolean bMethodStart
-
-        Move (Lowercase(Trim(sLine))) to sLine
-        Move (Left(sLine, 10) = "procedure " or Left(sLine, 9) = "function ") to bMethodStart
-
+    // Returns True if the sOverStrikeLine is the start of a Function *or* a Procedure.
+    Function _IsMethodStart String sOverStrikeLine Returns Boolean
+        Boolean bMethodStart        
+        
+        Get _IsFunctionDeclaration sOverStrikeLine to bMethodStart
+        If (bMethodStart = False) Begin
+            Get _IsProcedureDeclaration sOverStrikeLine to bMethodStart
+        End
         Function_Return bMethodStart
     End_Function
 
-    Function _IsMethodEnd String sLine Returns Boolean
+    Function _IsMethodEnd String sOverstrikeLine Returns Boolean
         Boolean bMethodEnd
-
-        Get _OverstrikeStrings sLine to sLine
-        Get _RemoveEndComment  sLine to sLine
-        Move (Lowercase(Trim(sLine))) to sLine
-        Move (Left(sLine, 14) = "end_procedure " or Left(sLine, 13) = "end_function ") to bMethodEnd
+        
+        Move (Lowercase(Trim(sOverstrikeLine))) to sOverstrikeLine
+        Move (Left(sOverstrikeLine, 14) = Lowercase(CS_EndProcedure) or Left(sOverstrikeLine, 13) = Lowercase(CS_EndFunction)) to bMethodEnd
 
         Function_Return bMethodEnd
     End_Function
 
-    // Is it a command declaration?
-    Function _IsCommandDeclaration String sLine Returns Boolean
+    // Is it a Class declaration?
+    // Pass a source line param with overstriked string constants.
+    Function _IsClassDeclaration String sOverstrikeLine Returns Boolean
         Boolean bFound bComment 
         
         Move False to bFound
-        Get _IsCommentLine sLine to bComment
-        If (bComment = True) Begin
-            Function_Return bFound
-        End
-        Move (Trim(sLine)) to sLine
-        Move (Pos(Lowercase("#" + CS_Command), Lowercase(sLine)) > 0) to bFound
+        Move (Pos(Lowercase("class "), Lowercase(sOverstrikeLine)) <> 0) to bFound
+        
+        Function_Return bFound
+    End_Function
+    
+    Function _IsClassEnd String sOverstrikeLine Returns Boolean
+        Boolean bClassEnd
+        
+        Move (Lowercase(Trim(sOverstrikeLine))) to sOverstrikeLine
+        Move (Left(sOverstrikeLine, 9) = Lowercase(CS_EndClass)) to bClassEnd
+
+        Function_Return bClassEnd
+    End_Function
+
+    // Is the line a command declaration?
+    Function _IsCommandDeclaration String sOverstrikeLine Returns Boolean
+        Boolean bFound bComment 
+        
+        Move False to bFound                                      
+        Move (Pos(Lowercase("#" + CS_Command), Lowercase(sOverstrikeLine)) <> 0) to bFound
         
         Function_Return bFound
     End_Function
@@ -445,28 +732,34 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Function_Return iLines
     End_Function
 
+    // ToDo: Should these "byRef sLine" methods be using a "tTokenizer ByRef TokenizerData"?
     // Note: It must only be the code part of a source line that is passed here.
     //       Use the Tokenizer helper function first.
     Function _AddExpressionParenthesis String ByRef sLine Returns Boolean
         String sText sStart sLast sExpression sExpression2 sLeft sRight sChar sPart1 sPart2 sOrg sCommand
         Boolean bFound bChanged bStartOperators bIfCommand bSecondCommand bWhile
         Integer iPos iPos2
+        tTokenizer TokenizerData
         
         Move sLine to sText    
         Move sLine to sOrg             
+        Get pTokenizer to TokenizerData
         // Do nothing if a Constrain command.
-        Get _HasCommand sText (CS_Constrain + " ") to bFound
+        Get _HasCommand TokenizerData.sOverstrikeLine (CS_Constrain + " ") to bFound
         If (bFound = True) Begin
             Function_Return False
         End
 
         Move "" to sStart
-        Move "" to sLast                                  
-        Get _ExpressionExtractor sText CI_LeftExpression to sExpression
+        Move "" to sLast              
+        Get _FetchExpression CI_LeftExpression1 to sExpression
         If (Trim(sExpression) = "") Begin
-            Get _ExpressionExtractor sText CI_OfExpression to sExpression
+            Get _FetchExpression CI_LeftExpression2 to sExpression
+        End
+        If (Trim(sExpression) = "") Begin
+            Get _FetchExpression CI_OfExpression to sExpression
             If (Trim(sExpression) = "") Begin
-                Get _ExpressionExtractor sText CI_ToTexpression to sExpression
+                Get _FetchExpression CI_ToTexpression to sExpression
             End
         End
         If (Trim(sExpression) = "") Begin
@@ -502,9 +795,10 @@ Class cBaseRefactorFunctionLibrary is a cObject
         
         Function_Return (sLine <> sOrg)
     End_Function   
-                   
+                                              
     // Helper message for _ClearFirstCompoundBeforeMethod
-    Procedure _WipeUntilPosition Integer iPos String ByRef sLine
+    // Overwrites thr string content with blanks up to the iPos position.
+    Procedure _WipeUntilPosition String ByRef sLine Integer iPos 
         Integer iChar
         If (iPos > 0) Begin
             For iChar from 1 to (iPos - 1)
@@ -513,10 +807,10 @@ Class cBaseRefactorFunctionLibrary is a cObject
         End
     End_Procedure
 
-    // With our refactoring logic if a line starts with if, else or on_key then the logic won't see
-    // send/get/set as the first string and that complicates our detection.
+    // With our refactoring logic if a line starts with if, else or on_key then the logic won't "see"
+    // send/get/set as the first word and that complicates our detection.
     // What this does is simply overwrite everything with spaces before our methods if
-    // we have such a compound statement.
+    // there is such a compound statement.
     // The variable sLine is not always lowercase.
     Function _ClearFirstCompoundBeforeMethod String ByRef sLine Returns Boolean
         Integer iPos
@@ -534,7 +828,7 @@ Class cBaseRefactorFunctionLibrary is a cObject
             If (iPos = 0) Begin
                 Move (Pos("set ", Lowercase(sLine))) to iPos
             End
-            Send _WipeUntilPosition iPos (&sLine)
+            Send _WipeUntilPosition (&sLine) iPos
         End       
         
         Function_Return (sLine <> sOrgLine)
@@ -573,149 +867,29 @@ Class cBaseRefactorFunctionLibrary is a cObject
 //        Function_Return sExpression    
 //    End_Function
     
-    // Function to return expressions from a source line;
-    // As expressions only expressions in rounded parenthesis "()" are acted upon and returned (Not square brackets)
-    { EnumList="{CI_LeftExpression, CI_OfExpression, CI_ToTexpression}" }
-    Function _ExpressionExtractor tTokenizer TokenizerData Integer eExpressionMode Returns String
-        String sExpression sText sChar sStart sLast sCommand 
-        Integer iStart iEnd iLength iLeftParantheses iRightParantheses iPos iCount iSize
-        Boolean bFound bOperator bParenthesis 
-        tOperatorsInfo OperatorsInfo
-        
-        Move TokenizerData.sOverstrikeLine to sText
-        Move (Pos("(", sText)) to iStart
-        Move (Pos(")", sText)) to iEnd 
-        Get _IsLogicalOperators sText to OperatorsInfo
-        If (OperatorsInfo.bIsOperator = False and (iStart < 1 or iEnd < 1) ) Begin
-            Function_Return ""
-        End
-        
-        Case Begin
-            Case (eExpressionMode = CI_LeftExpression) 
-                Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sText))) to iPos
-                If (iPos > 0) Begin
-                    Move (Left(sText, (iPos -1))) to sText
-                End                                       
-                Else Begin
-                    Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sText))) to iPos
-                End                                            
-                If (iPos > 0) Begin
-                    Move (Left(sText, (iPos - 1))) to sExpression
-                End
-                Case Break   
-            
-            Case (eExpressionMode = CI_CommandExpression)
-                If (Lowercase(TokenizerData.sFirstLeftCommand) = Lowercase(CS_If)) Begin
-                    Move (Lowercase(TokenizerData.sOverstrikeLine) contains (" " + Lowercase(CS_Move) + " ")) to bFound
-                    // ToDo: Needs to be finished after changes to the TokenizerData.    
-                    If (bFound) Begin
-                        
-                        Move (Trim(sText)) to sExpression
-                    End
-                End
-                Case Break
-            
-            Case (eExpressionMode = CI_OfExpression)
-                Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sText))) to iPos
-                If (iPos > 0) Begin
-                    Move (Mid(sText, Length(sText), (iPos + 3))) to sText
-                    Move (Pos((" " + Lowercase(CS_to) + " "), Lowercase(sText))) to iPos
-                    If (iPos > 0) Begin
-                        Move (Left(sText, (iPos -1))) to sText
-                    End
-                    Get _IsOperators sText to bOperator
-                    Move (sText contains "(" and sText contains ")") to bParenthesis
-                    If (bOperator = True or bParenthesis = True) Begin
-                        Move (Trim(sText)) to sExpression
-                    End
-                End
-                Else Begin
-                    Move "" to sExpression // Nothing to do.
-                End
-                Case Break
-            
-            Case (eExpressionMode = CI_ToTexpression)
-                Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sText))) to iPos
-                If (iPos > 0) Begin
-                    Move (Mid(sText, Length(sText), (iPos + 3))) to sText 
-                    Get _IsOperators sText to bOperator
-                    Move (sText contains "(" and sText contains ")") to bParenthesis
-                    If (bOperator = True or bParenthesis = True) Begin
-                        Move (Trim(sText)) to sExpression
-                    End
-                End 
-                Else Begin
-                    Move "" to sExpression // Nothing to do.
-                End
-                Case Break 
-            Case Else
-                Move "" to sExpression
-        Case End
-        
-        If (sText <> "") Begin
-            Get _IsLogicalOperators sText to OperatorsInfo
-            If (OperatorsInfo.bIsOperator = True) Begin
-                Get _ExtractParenthesisExpression sText to sExpression
-                If (sExpression = "") Begin
-                    Get _ExtractExpressionNoParenthesis sText OperatorsInfo to sExpression
-                End
-            End
-        End
-        
-        // Check if we have an expression like; "If (psWrkSpcOpenFileName(ghoApplication)) <> "" Send WrkSpcDoForAllFiles"
-        //   which in case we need to add "<>" to the sExpression.
-        Get _RemoveLeft sExpression (&sText) to bFound
-        If (bFound = True) Begin
-            Get _IsLogicalOperators sText to OperatorsInfo
-            If (OperatorsInfo.bIsOperator = True) Begin
-                Move (Pos(sExpression, TokenizerData.sLine)) to iPos
-                If (iPos <> "") Begin        
-                    Move (Left(TokenizerData.sLine, (iPos - 1))) to sStart
-                    Move (Replace(sStart, TokenizerData.sLine, "")) to TokenizerData.sLine
-                    Move (Trim(sText)) to sText 
-                    Move (Length(sText)) to iLength    
-                    Get _FindCommand sText to iPos
-                    If (iPos <> 0) Begin
-                        Move (Replace(sExpression, TokenizerData.sLine, "")) to TokenizerData.sLine 
-                        Move (Trim(TokenizerData.sLine)) to TokenizerData.sLine
-                        Move (Left(TokenizerData.sLine, (iPos -1))) to sStart 
-                        Move (Trim(sStart)) to sStart
-                        If (sStart <> "") Begin
-                            Move (Right(sStart, 1)) to sChar
-                            If (sChar <> ")") Begin
-                                Move (String(sExpression) * String(sStart)) to sExpression    
-                            End
-                        End
-                    End
-                End
-            End
-        End 
-        
-        Function_Return sExpression
-    End_Function
-
-    // Rturns the first expression that exist in the passed sText string and that is within parenthesis,
+    // Rturns the first expression that exist in the passed string and that is within parenthesis (),
     // else it returns a blank string.
-    Function _ExtractParenthesisExpression String sLine Returns String
-        String sExpression sChar
+    Function _ExtractParenthesisExpression tTokenizer ByRef TokenizerData Returns String
+        String sOverstrikeLine sExpression sChar
         Integer iLeftParantheses iRightParantheses iStart iEnd iCount iLength iPos
         tOperatorsInfo OperatorInfo
         
         Move "" to sExpression
         Move 0  to iLeftParantheses
         Move 0  to iRightParantheses
+        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
         
-        If (sLine <> "") Begin
-            Move (Pos("(", sLine)) to iStart
-            Move (RightPos(")", sLine)) to iEnd
-            Get _IsLogicalOperators sLine to OperatorInfo
+        If (sOverstrikeLine <> "") Begin
+            Move (Pos("(", sOverstrikeLine)) to iStart
+            Move (RightPos(")", sOverstrikeLine)) to iEnd
+            Get _LogicalOperators (&TokenizerData) to OperatorInfo
             If (OperatorInfo.bIsOperator = False or (iStart = 0 or iEnd = 0) ) Begin
                 Function_Return ""
             End 
 
-            Move (Length(sLine)) to iLength
+            Move (Length(sOverstrikeLine)) to iLength
             For iCount from iStart to iLength
-                Move (Mid(sLine, 1, iCount)) to sChar
+                Move (Mid(sOverstrikeLine, 1, iCount)) to sChar
                 If (sChar = "(" or sChar = ")") Begin
                     Add (sChar = "(") to iLeftParantheses
                     Add (sChar = ")") to iRightParantheses
@@ -723,13 +897,14 @@ Class cBaseRefactorFunctionLibrary is a cObject
                 End                        
                 If (iLeftParantheses = iRightParantheses) Break
             Loop
-            Move (Mid(sLine, (iPos - iStart + 1), iStart)) to sExpression
+            Move (Mid(sOverstrikeLine, (iPos - iStart + 1), iStart)) to sExpression
         End
         Function_Return sExpression
     End_Function
 
-    Function _ExtractExpressionNoParenthesis String sLine tOperatorsInfo OperatorsInfo Returns String
-        String sText sExpression sChar sFirst sLast sLeft sRight
+    // ToDo: Needs to be revised!
+    Function _ExtractExpressionNoParenthesis tTokenizer ByRef TokenizerData tOperatorsInfo OperatorsInfo Returns String
+        String sOverstrikeLine sText sExpression sChar sFirst sLast sLeft sRight
         Integer iCount iLength iSize iStart iEnd iPos
         Boolean bStop bSpace bParanthesis
         
@@ -738,16 +913,17 @@ Class cBaseRefactorFunctionLibrary is a cObject
             Function_Return ""
         End
         Move "" to sExpression  
-//        Move (Pos(Lowercase(" " + CS_As + " "), sLine)) to iPos 
+        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+//        Move (Pos(Lowercase(" " + CS_As + " "), sOverstrikeLine)) to iPos 
 //        If (iPos <> 0) Begin
-//            Move (Mid(sLine, Length(sLine), (iPos + 3))) to sText    
+//            Move (Mid(sOverstrikeLine, Length(sOverstrikeLine), (iPos + 3))) to sText    
 //        End
 //        Else Begin
             Move (OperatorsInfo.iPos - Length(OperatorsInfo.sOperator)) to iStart
-            Move (Left(sLine, (iStart + 1))) to sText
+            Move (Left(sOverstrikeLine, (iStart + 1))) to sText
 //        End
-        Get _StripConcatenatingSpaces sText to sText
-        Get _OverstrikeStrings (&sText) to sText
+        Get _StripConcatenatingSpaces (&TokenizerData) to sText
+        Get _OverstrikeStrings (&TokenizerData) to sText
         Move (Length(sText)) to iLength   
         Move (Pos(Lowercase(" " + CS_As + " "), sText)) to iPos 
         If (iPos <> 0) Begin
@@ -777,17 +953,17 @@ Class cBaseRefactorFunctionLibrary is a cObject
         If (sLeft = "") Begin
             Move sText to sLeft
         End
-        Move (Length(sLine)) to iLength   
+        Move (Length(sOverstrikeLine)) to iLength   
         
         // Then get the right part of the expression:
         Move 1 to iCount   
         Move False to bSpace
         Move (OperatorsInfo.iPos) to iStart
-        Move (Mid(sLine, iLength, (iStart + 1))) to sText  
+        Move (Mid(sOverstrikeLine, iLength, (iStart + 1))) to sText  
         Move (Length(sText)) to iLength
         Move (Pos(")", sText)) to bParanthesis
         Repeat
-            Move (Mid(sLine, 1, (iStart + iCount))) to sChar
+            Move (Mid(sOverstrikeLine, 1, (iStart + iCount))) to sChar
             If (bParanthesis = False) Begin
                 Move ((iCount >= iLength) or (bSpace = True and sChar = " ")) to bStop
             End 
@@ -805,19 +981,20 @@ Class cBaseRefactorFunctionLibrary is a cObject
         
         Function_Return (Trim(sExpression))
     End_Function
-
-    // Helper function.
+ 
+    // Helper function for the SplitInlineIfElseLine function.
     Function _BreakupCompoundStatement Integer iLineIndent String ByRef sLine Integer eSplitBy Integer iTabSize Returns Boolean
         Boolean bChanged
         Integer iPos
         String  sLineIndent sIndent sLine1 sLine2 sText
-
+        tTokenizer TokenizerData
+        
         Move False to bChanged
         Move (Lowercase(sLine)) to sText
         Move (Repeat(" ", iTabSize - 1)) to sIndent  // it's tabsize-1 because the text still has a space in front of it
         Move (Repeat(" ", iLineIndent)) to sLineIndent
-        Get _OverstrikeStrings sText to sText
-        Get _FindCommand sText to iPos
+        Get pTokenizer to TokenizerData
+        Get _FindCommand (&TokenizerData) sText to iPos
         If (iPos <> 0) Begin
             Move True to bChanged
             If (eSplitBy = eSplitBySpaceSemiColumn) Begin
@@ -840,122 +1017,318 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Function_Return bChanged
     End_Function
 
+    // Returns info about the start indicator part from a sOverstrikeLine line
+    // Returns e.g. info about: *[Found]*, in line "If [Found] Move (True = bTrue) to [Select]"
+    // Returns an empty struct if not found.
+    { EnumList="{CI_FirstIndicator, CI_SecondIndicator, CI_ToIndicator}" }
+//    Function _FindIndicator String sOverstrikeLine Integer eIndicatorMode Returns tBooleanIndicator
+//        String sIndicator sText sChar
+//        Integer iPos iStart
+//        Boolean bFound                                            
+//        tBooleanIndicator BooleanIndicator
+//        
+////        // This also checks that it isn't an array declaration.
+////        Get _IsIndicatorStatement sOverstrikeLine to bFound
+////        If (bFound = False) Begin
+////            Function_Return BooleanIndicator
+////        End   
+//
+//        Case Begin
+//            Case (eIndicatorMode = CI_FirstIndicator)
+//                Get _ExtractLegacyBooleanContent sOverstrikeLine to BooleanIndicator
+//                Case Break
+//            Case (eIndicatorMode = CI_SecondIndicator)
+//                Get _ExtractLegacyBooleanContent sOverstrikeLine to BooleanIndicator
+//                Case Break
+//            Case (eIndicatorMode = CI_FirstIndicator)
+//                Get _ExtractLegacyBooleanContent sOverstrikeLine to BooleanIndicator
+//                Case Break
+//        Case End
+//
+////        Move "" to sIndicator
+////        Move (Pos("[", sOverstrikeLine)) to iStart
+////        If (iStart <> 0) Begin    
+////            Move iStart to Data.iStartPos
+////            Move (Pos("]", sOverstrikeLine)) to iPos
+////            Move (Mid(sOverstrikeLine, (iPos - iStart -1), (iStart +1))) to sIndicator
+////        End     
+////        Move sIndicator to Data.sCode
+////        If (sIndicator = "") Begin
+////            Move 0 to Data.iStartPos
+////        End
+//        Function_Return BooleanIndicator
+//    End_Function
+        
+    // Returns info about the end indicator part that comes after the "to" operator.
+    // Returns e.g info about *[Seqeof]*, in line "Move [bFound] to [Seqeof]"
+    // Returns an empty struct if not found.
+//    Function _RightMostIndicator String sOverstrikeLine Returns tBooleanIndicator 
+//        String sIndicator sChar
+//        Integer iPos iStart iEnd
+//        Boolean bFound
+//        tBooleanIndicator BooleanIndicator
+//        
+//        // This also checks that it isn't an array declaration.
+//        Get _IsIndicatorStatement sOverstrikeLine to bFound
+//        If (bFound = False) Begin
+//            Function_Return BooleanIndicator
+//        End
+//        
+//        Move (Right(sOverstrikeLine, 1)) to sChar
+//        If (sChar = "]") Begin  
+//            Move (Pos(Lowercase(" " + CS_To + " "), Lowercase(sOverstrikeLine))) to iPos
+//            If (iPos > 0) Begin
+//                // Remove the first part of the sOverstrikeLine string to get the last indicator part.
+//                Move (Mid(sOverstrikeLine, Length(sOverstrikeLine), (iPos + 4))) to sOverstrikeLine
+//                Get _ExtractLegacyBooleanContent sOverstrikeLine to BooleanIndicator
+////                Move (iPos + 4) to Data.iStartPos
+////                Move (Replace("[", sIndicator, "")) to sIndicator
+////                Move (Replace("]", sIndicator, "")) to sIndicator
+//            End
+//        End
+//        
+//        Function_Return BooleanIndicator 
+//    End_Function
+    
     // Takes a string like: [not Seqeof] Begin
-    // and returns struct as: True, True, "(not(Seqeof))" and "Begin",
-    //   _but_ it doesn't do anything with a line that starts with a [Select] stetement;
-    //   "[Select] Indicate Select as Windowindex Eq Fieldindex"
-    // Note: The brackets _must_ be at the start of code line.
-    //       bHasBracket denotes that the line starts with a "[", bHasNot denotes that the expression has a "not" in it.
-    Function _ExtractIndicatorContent String sLine Returns tBooleanIndicator
-        Integer iPos                                             
-        String sText sChar sNot sBoolean sFirstWord sCommand sExpression
+    // and returns struct as: True, True, iStartPos and "(not(Seqeof))".
+    Function _ExtractLegacyBooleanContent tTokenizer TokenizerData Returns tBooleanIndicator
+        Integer iPos iStart iStop                                            
+        String sChar sNot sBoolean sFirstWord sCommand sExpression sOverstrikeLine 
         Boolean bRightSideIndicator bFound bIndicateWord
         tBooleanIndicator BooleanIndicator  
         tOperatorsInfo OperatorsInfo
         
-        Move False to BooleanIndicator.bHasBracket
-        Move False to BooleanIndicator.bHasNot
-        Move ""    to BooleanIndicator.sCode
-        Move ""    to BooleanIndicator.sExpression
+        // This also checks that it isn't an array declaration.          
+        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+        Get _IsIndicatorStatement sOverstrikeLine to bFound
+        If (bFound = False) Begin
+            Function_Return BooleanIndicator
+        End
+
+        Move (Lowercase(sOverstrikeLine) contains Lowercase(CS_Indicate)) to BooleanIndicator.bHasIndicateCommand 
+
+        // Get first indicator;
+        Move (Pos("[", sOverstrikeLine)) to iStart
+        Move (Pos("]", sOverstrikeLine)) to iStop
+        If (iStart <> 0 and iStop <> 0) Begin
+            Move (Mid(sOverstrikeLine, (iStop - iStart -1), (iStart + 1))) to sBoolean
+            Move sBoolean to BooleanIndicator.FirstIndicator.sCode
+            Move iStart   to BooleanIndicator.FirstIndicator.iStartPos  
+            Move True to BooleanIndicator.bHasBracket
+            Move (Pos((Lowercase(CS_Not) + " "), Lowercase(sBoolean))) to iPos
+            Move (iPos <> 0) to BooleanIndicator.bHasNot
+            
+            // Is there a second indicator before the "to" keyword?
+            Move (Mid(sOverstrikeLine, Length(sOverstrikeLine), (iStop + 1))) to sOverstrikeLine
+            Move (Pos("[", sOverstrikeLine)) to iStart
+            Move (Pos("]", sOverstrikeLine)) to iStop
+            If (iStart <> 0 and iStop <> 0) Begin
+                Move (Mid(sOverstrikeLine, (iStop - iStart -1), (iStart + 1))) to sBoolean
+                Move sBoolean to BooleanIndicator.SecondIndicator.sCode
+                Move iStart   to BooleanIndicator.SecondIndicator.iStartPos  
+                Move True to BooleanIndicator.bHasBracket
+                Move (Pos((Lowercase(CS_Not) + " "), Lowercase(sBoolean))) to iPos
+                Move (iPos <> 0) to BooleanIndicator.bHasNot
+            End    
+        End
         
-        Get _IsIndicatorStatement sLine to bFound
-        Move (Lowercase(sLine) contains Lowercase(CS_Indicate)) to bIndicateWord
+        // Get any indicator after the "to" keyword;
+        Move (Pos(Lowercase(" " + CS_To + " "), Lowercase(sOverstrikeLine))) to iPos
+        If (iPos > 0) Begin
+            Move (Mid(sOverstrikeLine, Length(sOverstrikeLine),(iPos +1))) to sOverstrikeLine
+            Move (Pos("[", sOverstrikeLine)) to iStart
+            Move (Pos("]", sOverstrikeLine)) to iStop
+            If (iStart > 0 and iStop <> 0) Begin
+                Move (Mid(sOverstrikeLine, (iStop - iStart -1), (iStart + 1))) to sBoolean
+                Move sBoolean to BooleanIndicator.ToIndicator.sCode
+                Move iStart   to BooleanIndicator.ToIndicator.iStartPos
+                Move True to BooleanIndicator.bHasBracket
+                Move (Pos((Lowercase(CS_Not) + " "), Lowercase(sBoolean))) to iPos
+                Move (iPos <> 0) to BooleanIndicator.bHasNot
+            End
+        End
+
+//        Move (RightPos("[", sOverstrikeLine)) to iStart
+//        Move (RightPos("]", sOverstrikeLine)) to iStop
+//        Move (Mid(sOverstrikeLine, (iStop - iStart -1), (iStart + 1))) to sBoolean
+//        Move iStart to BooleanIndicator.ToIndicator.iStartPos
+//        If (iStart <> 0 and iStop <> 0) Begin
+//            Move True to BooleanIndicator.bHasBracket
+//        End
+//        Move (Trim(sFirstWord)) to sCommand    
+//        Move (Trim(sBoolean)) to sBoolean
+//
+//        Move "" to sNot
+//        Move (Pos((Lowercase(CS_Not) + " "), Lowercase(sBoolean))) to iPos
+//        If (iPos <> 0) Begin
+//            Move (Mid(sBoolean, Length(sBoolean), (iPos + 4))) to sBoolean
+//            Move (String(CS_Not)) to sNot
+//        End                    
+//        Move (Pos((Lowercase(CS_Not) + " "), Lowercase(sBoolean))) to iPos
+//        If (sNot <> "") Begin
+//            Move True to BooleanIndicator.bHasNot
+//        End 
+//        Move (Trim(sCommand)) to BooleanIndicator.FirstIndicator.sCode
+            
+        Function_Return BooleanIndicator
+    End_Function
+    
+    // Takes a string like: [not Seqeof] Begin
+    // and returns struct as: True, True, iStartPos and "(not(Seqeof))".
+    // bHasBracket denotes that the expression contains a "not" as in [not Seqeof]. 
+    // Note: It does not act on lines with the legacy "Indicate" in it.
+    Function _ExtractIndicatorContent tTokenizer TokenizerData Integer eIndicatorMode Returns tBooleanIndicator
+        Integer iPos                                             
+        String sChar sNot sBoolean sFirstWord sCommand sExpression sOverstrikeLine
+        Boolean bRightSideIndicator bFound bIndicateWord
+        tBooleanIndicator BooleanIndicator  
+        tOperatorsInfo OperatorsInfo
+        
+        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+        // This also checks that it isn't an array declaration.
+        Get _IsIndicatorStatement sOverstrikeLine to bFound
+        Move (Lowercase(sOverstrikeLine) contains Lowercase(CS_Indicate)) to bIndicateWord
         If (bFound = False and bIndicateWord = False) Begin
             Function_Return BooleanIndicator
         End
-        Move (Trim(sLine)) to sText 
-        Get _OverstrikeStrings sText to sText
-        Move (sText contains "[" and sText contains "]") to BooleanIndicator.bHasBracket  
-        
-        Move "" to sNot
-        Get _RetrieveFirstWord sText to sFirstWord
-        // Is the indicator placed on the right hand side of the command?
-        Move (Pos("[", sFirstWord) = 0) to bRightSideIndicator
-        If (bRightSideIndicator = True) Begin
-            Move (Pos("[", sText)) to iPos
-            Move (Mid(sText, Length(sText), iPos)) to sBoolean
-        End
-        Else Begin
-            Move (Pos("]", sText)) to iPos
-            If (iPos <> 0) Begin
-                Move (Left(sText, iPos)) to sBoolean 
-                Move (Mid(sText, Length(sText), (iPos + 1))) to sFirstWord
-                Move sFirstWord to BooleanIndicator.sCode
-            End
-        End
-        Move (Trim(sFirstWord)) to sCommand
-        Move (Replaces("[", sBoolean, "")) to sBoolean
-        Move (Replaces("]", sBoolean, "")) to sBoolean
-        Move (Trim(sBoolean)) to sBoolean
-
-        Move (Pos((Lowercase(CS_Not) + " "), Lowercase(sBoolean))) to iPos
-        If (iPos <> 0) Begin
-            Move (Mid(sBoolean, Length(sBoolean), (iPos + 4))) to sBoolean
-            Move (String(CS_Not)) to sNot
-        End                    
-        If (sNot <> "") Begin
-            Move ("(" + String(sBoolean) * "=" * String(CS_False) + ")") to BooleanIndicator.sExpression 
-            Move True to BooleanIndicator.bHasNot
-        End 
-        Else If (Lowercase(sBoolean) = Lowercase(CS_Finderr)) Begin
-            Move ("(" + CS_Found * " = " * CS_False + ")") to BooleanIndicator.sExpression
-        End
-        Else Begin                
-            Get _IsLogicalOperators sText to OperatorsInfo
-            If (OperatorsInfo.bIsOperator = True) Begin
-                Get _ExtractParenthesisExpression sText to BooleanIndicator.sExpression
-                If (BooleanIndicator.sExpression = "") Begin
-                    Get _ExtractExpressionNoParenthesis sText OperatorsInfo to BooleanIndicator.sExpression
-                End
-//                Move True to BooleanIndicator.bHasNot 
-                Move sLine to sCommand
-            End
-            Else Begin
-                Move ("(" + String(sBoolean) + ")") to BooleanIndicator.sExpression
-                Move False to BooleanIndicator.bHasNot
-            End
-        End
-        Move (Trim(sCommand)) to BooleanIndicator.sCode
+        Get _ExtractLegacyBooleanContent TokenizerData to BooleanIndicator        
             
         Function_Return BooleanIndicator
     End_Function
     
     // Parses the method name from the string
-    Function _MethodName String sMethod Returns String
+    Function _MethodName String sOverstrikeLine Returns String
         Integer iPos
-        Get _RemoveFirstWord sMethod to sMethod
+        String sMethod
+        Get _RemoveFirstToken sOverstrikeLine sMethod to sMethod
         Move (Right(sMethod, (Length(sMethod) - iPos))) to sMethod
         If (Uppercase(Left(Trim(sMethod), 4)) = "SET ") Begin
-            Get _RemoveFirstWord sMethod to sMethod
+            Get _RemoveFirstToken sOverstrikeLine sMethod to sMethod
         End
         // Remove any trailing arguments
         Move (Pos(" ", sMethod)) to iPos
         Function_Return (Left(sMethod, (iPos - 1)))
-    End_Function
-
-    // For declarations like "string [] saAddress"
+    End_Function                      
+    
+    // For declarations like "String [] asAddress" 
+    // Is changed to: "String[] asAddress
+    // If the sLine is a local variable declaration, it starts
+    // with either a "local" keyword or one of the members
+    // in pasLocalVariableTypes.
     Function _NormalizeArrayNotation String ByRef sLine Returns Boolean
-        Boolean bChanged
-        String sText
-        Move sLine to sText
+        Boolean bChanged bFound
+        String sText sWord
+        
+        Move sLine to sText  
+        Get _FirstToken sLine to sWord
+        If (sWord = "") Begin
+            Function_Return False
+        End
+        Get _IsVariableDeclaration sWord to bFound
+        If (bFound = True) Begin
+            Function_Return False
+        End
+        
         While (Pos(" [", sText) > 0)
-          Move (Replace(" [", sText, "[")) to sText
+            Move (Replace(" [", sText, "[")) to sText
         Loop                                       
-        Move (sLine = sText) to bChanged
+        Move (sLine = sText) to bChanged             
+        If (bChanged = True) Begin
+            Move sText to sLine
+        End
         Function_Return bChanged
+    End_Function   
+    
+    // Returns True if the number of single- and double-quotes in the sLine param is not even.
+    Function _IsOpenString String sLine Returns Boolean
+        Boolean bIsOpenString                    
+        Integer iDoubleQuotes iSingleQuotes
+        UChar[] uaLine
+        
+        Move (StringToUCharArray(sLine)) to uaLine 
+        Move (CountArray(Ascii('"'), uaLine)) to iDoubleQuotes
+        Move (Mod(iDoubleQuotes, 2)) to bIsOpenString
+        If (bIsOpenString = False) Begin
+            Move (CountArray(Ascii("'"), uaLine)) to iSingleQuotes
+            Move (Mod(iSingleQuotes, 2)) to bIsOpenString
+        End
+
+        Function_Return bIsOpenString        
     End_Function
 
-    //  This will pad out the strings in a line and overstrike them
-    //  with _ characters for a "string" and + characters for a 'string'
-    // Note: It will also remove any end comment like; "Move x to y // Some comment"
-    Function _OverstrikeStrings String sLine Returns String
-        Boolean bDoubleQuote bSingleQuote bChanged
-        Integer iChar iLength
-        String  sChar sText sTrippelDoubleQuote sComment
+    // Returns the number of single or double quotes contained in the "sLine" param.
+    { EnumList="{CI_SingleQuotes, CI_DoubleQuotes}" }
+    Function _StringQuoteItems String sLine Integer eQuoteMode Returns Integer
+        Integer iQuotes
+        UChar[] uaLine
+        
+        Move (StringToUCharArray(sLine)) to uaLine 
+        If (eQuoteMode = CI_DoubleQuotes) Begin
+            Move (CountArray(Ascii('"'), uaLine)) to iQuotes
+        End
+        If (eQuoteMode = CI_SingleQuotes) Begin
+            Move (CountArray(Ascii("'"), uaLine)) to iQuotes
+        End
 
+        Function_Return iQuotes        
+    End_Function
+    
+    
+    // This will pad out the strings in a line and overstrike them
+    // with _ characters for a "string" and + characters for a 'string'
+    // It will also remove any end comment like; "Move x to y // Some comment",
+    //       and trim the return string.  
+    // If no quotes ("" or '') was found, the same string is returned. 
+    // Note: Other values in the passed ByRef structs may also be changed(!)
+    Function _OverstrikeStrings tTokenizer ByRef TokenizerData Returns String
+        Boolean bDoubleQuote bSingleQuote bChanged bFound bHasEndSemiColon bIsOpenString
+        Integer iChar iLength iPos iDoubleQuotes iSingleQuotes
+        String  sChar sText sTrippelDoubleQuote sComment sContent sSingleQ sDoubleQ
+        
+        // If we already have applied this function to a source line, do nothing.
+        If (TokenizerData.bHasOverstrikeChars = True) Begin
+            Function_Return TokenizerData.sOverstrikeLine
+        End              
+
+        // Does the sLine end with a semi-colon ";"?
+        Get _IsLineEndSemiColon TokenizerData.sLine to TokenizerData.bHasEndSemiColon
+        // Are we already in an "open" multi-line string? An "open" string is a string constant
+        // spread out over several lines. So there may be *no* quotes or an uneven number of quotes 
+        // in the sLine content, in case we need to treat the line differently.
+        If (pbIsOpenString(Self) = False) Begin
+            Get _IsOpenString TokenizerData.sLine to bIsOpenString
+            Set pbIsOpenString to bIsOpenString
+            Move bIsOpenString to TokenizerData.bIsOpenString
+        End 
+        
+        Get _EndComment (&TokenizerData) to sComment 
+        Move TokenizerData.sLine to sText
+        Move (Trim(sText)) to sText
+        If (sComment <> "") Begin
+            Move (Replace(sComment, sText, "")) to sText
+        End
         Move False to bChanged 
-        Move sLine to sText
         Move (Length(sText)) to iLength
+        Move (Pos('"', sText)) to iPos
+        If (iPos = 0) Begin
+            Move (Pos("'", sText)) to iPos
+            If (iPos = 0) Begin
+                Function_Return (Trim(sText))
+            End
+        End                                          
+        Move False to bDoubleQuote
+        Move False to bSingleQuote
+        If (TokenizerData.bIsMultiLineString = True and TokenizerData.bIsOpenString = True) Begin  
+            Get _IsOpenString sText to bIsOpenString
+            Get _StringQuoteItems sText CI_SingleQuotes to iSingleQuotes  
+            Move (Mod(iSingleQuotes, 2) = 0 and iSingleQuotes <> 0) to bDoubleQuote
+            If (bDoubleQuote = False) Begin
+                Get _StringQuoteItems sText CI_DoubleQuotes to iDoubleQuotes
+                Move (Mod(iDoubleQuotes, 2) = 0 and iDoubleQuotes <> 0) to bSingleQuote
+            End
+        End
+
         For iChar from 1 to iLength
             Move (Mid(sText, 1, iChar)) to sChar
             If (sChar = Character(9)) Begin                  // tab characters should be treated as a single space char, this keeps the
@@ -964,16 +1337,34 @@ Class cBaseRefactorFunctionLibrary is a cObject
                 Move " " to sChar
             End
             If (bDoubleQuote and sChar= '"') Begin
-                Move (Overstrike("_", sText, iChar)) to sText
                 Move True to bChanged
                 Move "" to sChar
                 Move False to bDoubleQuote
             End
             If (bSingleQuote and sChar = "'") Begin
-                Move (Overstrike("+", sText, iChar)) to sText
                 Move True to bChanged
                 Move "" to sChar
                 Move False to bSingleQuote
+            End
+            If (TokenizerData.bIsMultiLineString = True and TokenizerData.bIsOpenString = True) Begin
+                If (bDoubleQuote and sChar = "'") Begin
+                    Move False to bDoubleQuote
+                    Move True to bSingleQuote
+                End
+                Else If (bSingleQuote and sChar = '"') Begin
+                    Move False to bSingleQuote
+                    Move True to bDoubleQuote
+                End   
+                Else If (bDoubleQuote = False and bSingleQuote = False) Begin
+                    Move (Mid(sText, 1, iChar)) to sChar
+                    If (sChar = "'") Begin
+                        Move True to bDoubleQuote
+                    End
+                    If (sChar = '"') Begin
+                        Move True to bSingleQuote
+                    End                          
+                    Move "" to sChar
+                End
             End
             If (bSingleQuote = False and sChar ='"') Begin
                 Move (Mid(sText, 3, iChar)) to sTrippelDoubleQuote
@@ -987,24 +1378,163 @@ Class cBaseRefactorFunctionLibrary is a cObject
             If (bDoubleQuote = False and sChar = "'") Begin
                 Move True to bSingleQuote
             End
-            If bDoubleQuote Begin
-                Move (Overstrike("_", sText, iChar)) to sText
+            If bDoubleQuote Begin    
+                If (sChar <> '"') Begin
+                    Move (Overstrike("_", sText, iChar)) to sText 
+                    Append sContent sChar
+                End
                 Move True to bChanged
             End
             Else If bSingleQuote Begin
-                Move (Overstrike("+", sText, iChar)) to sText
+                If (sChar <> "'") Begin
+                    Move (Overstrike("+", sText, iChar)) to sText
+                    Append sContent sChar
+                End
                 Move True to bChanged
             End
-        Loop
+        Loop    
+        
+        If (bChanged = True) Begin                
+            Move True to TokenizerData.bHasOverstrikeChars
+            Move (Trim(sText)) to sText    
+            // Add back the end-of-line semi-colon:
+            If (TokenizerData.bHasEndSemiColon = True) Begin
+                Move (Left(sText, (Length(sText) -1))) to sText
+                Append sText ";"              
+                Move True to TokenizerData.bIsMultiLineString
+                Set pbIsInMultiLineString to True
+            End
+            Move sText to TokenizerData.sOverstrikeLine
+        End    
+        Else Begin
+            Move TokenizerData.sLine to TokenizerData.sOverstrikeLine
+            Move False to TokenizerData.bIsMultiLineString
+            Set pbIsInMultiLineString to False
+            Set pbIsOpenString to False
+        End
+        Function_Return TokenizerData.sOverstrikeLine
+    End_Function
 
-        If (bChanged = True) Begin   
-            Move sText to sLine
+    Function _Indentation tTokenizer ByRef TokenizerData Returns String
+        String sLine sText sIndentation
+        Move "" to sIndentation                          
+        Move TokenizerData.sLine to sLine
+        Move (Ltrim(sLine)) to sText
+        If (sText <> sLine) Begin
+            Move (Replace(sText, sLine, "")) to sIndentation
         End
-        Get _EndComment sLine to sComment 
-        If (sComment <> "") Begin
-            Move (Replace(sComment, sLine, "")) to sLine
+        Function_Return sIndentation
+    End_Function
+        
+    // Get the left part of the line up to but not including the "of or to" part..
+    Function _LeftStatement tTokenizer ByRef TokenizerData Returns tToken
+        String sOverstrikeLine sStatement
+        Integer iPos                                           
+        tToken Data
+        
+        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+        // Start by assuming there is no "of" or "to" keyword;
+        Move 1 to Data.iStartPos
+        Move (Trim(sOverstrikeLine)) to Data.sCode
+        
+        // Search for a "to" keyword;
+        Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sOverstrikeLine))) to iPos
+        If (iPos <> 0) Begin
+            Move (Left(sOverstrikeLine, (iPos - 1))) to sOverstrikeLine
+            Move (iPos + 4) to Data.iStartPos
+            Move (Trim(sOverstrikeLine)) to Data.sCode
+        End             
+
+        // Then search for a "of" keyword;
+        Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sOverstrikeLine))) to iPos
+        If (iPos <> 0) Begin
+            Move (Left(sOverstrikeLine, (iPos -1))) to sOverstrikeLine
+            Move (iPos + 4) to Data.iStartPos
+            Move (Trim(sOverstrikeLine)) to Data.sCode
         End
-        Function_Return sLine
+    
+        Function_Return Data 
+    End_Function
+
+    // Get the "of xxxx " part from a source line. But not the "to xxx" part and the "of" keyword.
+    Function _OfStatement tTokenizer ByRef TokenizerData Returns tToken
+        String sOverstrikeLine sOfStatement
+        Integer iPos                                           
+        tToken Data
+        
+        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+        Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sOverstrikeLine))) to iPos
+        If (iPos = 0) Begin
+            Function_Return Data
+        End
+        
+        Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sOverstrikeLine))) to iPos
+        Move (iPos + 4) to Data.iStartPos
+        Move (Mid(sOverstrikeLine, (Length(sOverstrikeLine) -1), (iPos + Length(CS_Of) + 1))) to sOfStatement
+        Move (Left(sOverstrikeLine, (iPos - 1))) to sOverstrikeLine
+        // If an "to sVariable" expression exist, remove it.
+        Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sOfStatement))) to iPos
+        If (iPos <> 0) Begin
+            Move (Left(sOfStatement, (iPos - 1))) to sOfStatement    
+        End
+        Move (Trim(sOfStatement)) to sOfStatement
+    
+        Move sOfStatement to Data.sCode
+        Function_Return Data 
+    End_Function
+
+    // Get the "to xxx" part, but without the "to" keyword.
+    Function _ToStatement tTokenizer ByRef TokenizerData Returns tToken
+        String sOverstrikeLine sToStatement
+        Integer iPos                               
+        tToken Data
+        
+        Move "" to sToStatement
+        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+        Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sOverstrikeLine))) to iPos
+        If (iPos = 0) Begin
+            Function_Return Data
+        End
+        Move (iPos + 4) to Data.iStartPos
+        Move (Mid(sOverstrikeLine, (Length(sOverstrikeLine) -1), (iPos + Length(CS_To) + 1))) to sToStatement
+        Move (Trim(sToStatement)) to Data.sCode
+        
+        Function_Return Data
+    End_Function
+    
+    // Returns the end comment if one exists.
+    // Else returns an empty string
+    Function _EndComment tTokenizer ByRef TokenizerData Returns String
+        Integer iPos
+        String sLine sComment
+
+        Move "" to sComment                             
+        Move TokenizerData.sLine to sLine
+        Move (Trim(sLine)) to sLine
+        Move (Pos(CS_CommentSymbol, sLine)) to iPos
+        // Only remove comment if the line is not commented at the beginning.
+        If (iPos > 1) Begin
+            Move (Pos(CS_CommentSymbol, sLine)) to iPos
+            Move (Mid(sLine, Length(sLine), iPos)) to sComment
+        End
+        Function_Return sComment
+    End_Function
+
+    // It takes any source line as a parameter and
+    // returns the same string without the end comment.
+    Function _RemoveEndComment String sLine Returns String
+        Integer iPos
+        String sTest
+        
+        Move sLine to sTest
+        Move (Trim(sTest)) to sTest
+        Move (Pos(CS_CommentSymbol, sTest)) to iPos
+        // Only remove comment if the line is not commented at the beginning.
+        If (iPos > 1) Begin
+            Move (RightPos(CS_CommentSymbol, sLine)) to iPos
+            Move (Left(sLine, iPos - 1)) to sLine
+        End
+        Function_Return (Rtrim(sLine))
     End_Function
 
     Function _RemoveComments String ByRef sLine Returns Boolean
@@ -1019,189 +1549,51 @@ Class cBaseRefactorFunctionLibrary is a cObject
             Move True to bRemoved
         End
         Function_Return bRemoved
-    End_Function    
-
-    Function _Indentation String sOverstrikeLine Returns String
-        String sText sIndentation
-        Move "" to sIndentation
-        Move (Ltrim(sOverstrikeLine)) to sText
-        If (sText <> sOverstrikeLine) Begin
-            Move (Replace(sText, sOverstrikeLine, "")) to sIndentation
-        End
-        Function_Return sIndentation
-    End_Function
-        
-    // Returns the start indicator part from a square bracket expression
-    // E.g. Returns "Not Seqeof" from "[Not Seqeof]"  
-    // Note: It only does this for the line start indicators:
-    //       A "If [Not Found]" line will return a blank string.
-    // Returns a blank string if no such expression was found.
-    Function _LeftIndicator String sOverstrikeLine Returns String
-        String sIndicator sText sChar
-        Integer iPos
-        Boolean bFound        
-        
-        Move "" to sIndicator
-        Get _IsIndicatorStatement sOverstrikeLine to bFound
-        If (bFound = False) Begin
-            Function_Return sIndicator
-        End
-
-        Move (Ltrim(sOverstrikeLine)) to sText
-        Move (Left(sText, 1)) to sChar
-        If (sChar = "[") Begin
-            Move (Pos("]", sText)) to iPos
-            Move (Left(sText, (iPos -1))) to sIndicator
-            Move (Left(sIndicator, 1)) to sChar
-            If (sChar = "[") Begin
-                Move (Replace("[", sIndicator, "")) to sIndicator
-            End
-            Move (Right(sIndicator, 1)) to sChar
-            If (sChar = "]") Begin
-                Move (Replace("]", sIndicator, "")) to sIndicator
-            End
-        End
-        Function_Return sIndicator
-    End_Function
-        
-    // Returns the end indicator part from square bracket expression(s).
-    // E.g. Returns "Seqeof" from "Move [bFound] to [Seqeof]"
-    // Returns a blank string if no such expression was found.
-    Function _RightIndicator String sOverstrikeLine Returns String
-        String sIndicator sText sChar
-        Integer iPos iStart iEnd
-        Boolean bFound
-        
-        Move "" to sIndicator
-        Get _IsIndicatorStatement sOverstrikeLine to bFound
-        If (bFound = False) Begin
-            Function_Return sIndicator
-        End
-
-        Move (Trim(sOverstrikeLine)) to sText    
-        Get _RemoveEndComment sText to sText
-        Move (Right(sText, 1)) to sChar
-        If (sChar = "]") Begin  
-            Move (Pos(Lowercase(" to "), Lowercase(sText))) to iPos
-            If (iPos > 0) Begin
-                Move (Mid(sText, Length(sText), (iPos + 4))) to sText
-            End
-            // We need also check that this isn't an array/struct value.
-            Move (Pos(" [", sText)) to iStart
-            If (iStart > 0) Begin
-                Move (Pos("]", sText)) to iEnd
-                Move (Mid(sText, Length(sText), (iStart +1))) to sIndicator
-                Move (Left(sIndicator, 1)) to sChar
-                If (sChar = "[") Begin
-                    Move (Replace("[", sIndicator, "")) to sIndicator
-                End
-                Move (Right(sIndicator, 1)) to sChar
-                If (sChar = "]") Begin
-                    Move (Replace("]", sIndicator, "")) to sIndicator
-                End
-            End
-        End
-        
-        Function_Return sIndicator
-    End_Function
-
-    // Get the " of xxxx " part from a source line (but not " to xxx" part.
-    Function _OfStatement String sOverstrikeLine Returns String
-        String sOfStatement sText
-        Boolean bOfStatement
-        Integer iPos
-        
-        Move (Lowercase(sOverstrikeLine)) to sText
-        Move (sText contains (" " + Lowercase(CS_Of) + " ")) to bOfStatement
-        If (bOfStatement = True) Begin
-            Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sOverstrikeLine))) to iPos
-            Move (Mid(sOverstrikeLine, (Length(sOverstrikeLine) -1), (iPos + Length(CS_Of) + 1))) to sOfStatement
-            Move (Left(sOverstrikeLine, (iPos - 1))) to sOverstrikeLine
-            // If an " to sVariable" expression exist, remove it.
-            Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sOfStatement))) to iPos
-            If (iPos <> 0) Begin
-                Move (Left(sOfStatement, (iPos - 1))) to sOfStatement    
-            End
-            Move (Trim(sOfStatement)) to sOfStatement
-        End    
+    End_Function  
     
-        Function_Return sOfStatement    
+    Function _IsKeyWord String sToken Returns Boolean
+        String[] asKeyWords
+        Integer iItem
+        Get pasKeyWords to asKeyWords
+        Move (Trim(Lowercase(sToken))) to sToken
+        Move (SearchArray(sToken, asKeyWords)) to iItem
+        Function_Return (iItem <> -1)
     End_Function
 
-    // Get the " to xxx" part
-    Function _ToStatement String sOverstrikeLine Returns String
-        Boolean bToStatement
-        String sText sToStatement
-        Integer iPos
+    // Removes the first token, i.e first part of the input string
+    // until the first space and returns the reminder, unless the string
+    // only consists of a single token, in case the same value will be returned.
+    Function _RemoveFirstToken String sOverStrikeLine Returns String
+        Integer iPos iItem
+        Boolean bChanged  
+        String sToken
         
-        Get _RemoveEndComment sOverstrikeLine to sOverstrikeLine
-        Move "" to sToStatement
-        Move (Lowercase(sOverstrikeLine)) to sText
-        Move (sText contains (" " + Lowercase(CS_To) + " ")) to bToStatement
-        If (bToStatement = True) Begin
-            Move (Pos((" " + Lowercase(CS_To) + " "), sText)) to iPos
-            Move (Mid(sOverstrikeLine, Length(sOverstrikeLine), (iPos +1))) to sToStatement
-            Move (Replace(sToStatement, sOverstrikeLine, "")) to sOverstrikeLine
-            Move (Replace((CS_To) + " ", sToStatement, "")) to sToStatement
-            Move (Trim(sToStatement)) to sToStatement
-        End        
-    
-        Function_Return sToStatement
-    End_Function
-    
-    // Returns the end comment if one exists.
-    // Else returns an empty string
-    Function _EndComment String sOverstrikeLine Returns String
-        Integer iPos
-        String sComment
-
-        Move "" to sComment
-        Move (Trim(sOverstrikeLine)) to sOverstrikeLine
-        Move (Pos(CS_CommentSymbol, sOverstrikeLine)) to iPos
-        // Only remove comment if the line is not commented at the beginning.
-        If (iPos > 1) Begin
-            Move (Pos(CS_CommentSymbol, sOverstrikeLine)) to iPos
-            Move (Mid(sOverstrikeLine, Length(sOverstrikeLine), iPos)) to sComment
-        End
-        Function_Return sComment
-    End_Function
-
-    // Returns an end comment if exists. It also removes the end comment
-    // from the passed string.
-    Function _RemoveEndComment String sLine Returns String
-        Integer iPos
-        String sTest
-
-        Move (Trim(sLine)) to sTest
-        Move (Pos(CS_CommentSymbol, sTest)) to iPos
-        // Only remove comment if the line is not commented at the beginning.
-        If (iPos > 1) Begin
-            Move (Pos(CS_CommentSymbol, sLine)) to iPos
-            Move (Left(sLine, iPos - 1)) to sLine
-        End
-        Function_Return sLine
-    End_Function
-
-    // Removes the first word of any input string
-    // all up to the first space encountered
-    Function _RemoveFirstWord String sLine Returns String
-        Integer iPos
-        Boolean bChanged
-        Move (Trim(sLine)) to sLine
-        Get _NormalizeArrayNotation (&sLine) to bChanged
-        Move (Pos(" ", sLine)) to iPos
-        Function_Return (Right(sLine, (Length(sLine) - iPos)))
+        Get _NormalizeArrayNotation (&sOverStrikeLine) to bChanged
+        Move (Pos(" ", sOverStrikeLine)) to iPos
+        Move (Right(sOverStrikeLine, (Length(sOverStrikeLine) - iPos))) to sToken
+        Move (Trim(sToken)) to sToken             
+        Move (Replace(sToken, sOverStrikeLine, "")) to sOverStrikeLine
+        
+        Function_Return sOverStrikeLine
     End_Function
 
     // Returns the first word of any input string
     // all up to the first space encountered
-    Function _RetrieveFirstWord String sLine Returns String
+    Function _RetrieveFirstToken String sOverStrikeLine Returns String
         String sFirstWord
+        Integer iPos
         Boolean bChanged
-        Get _RemoveFirstWord sLine            to sFirstWord
-        Move (Replace(sFirstWord, sLine, "")) to sFirstWord
-        Move (Trim(sFirstWord))               to sFirstWord
-        Get _NormalizeArrayNotation (&sFirstWord) to bChanged
+        
+        Get _NormalizeArrayNotation (&sOverStrikeLine) to bChanged  
+        Move (Trim(sOverStrikeLine)) to sOverStrikeLine
+        Move (Pos(" ", sOverStrikeLine)) to iPos
+        If (iPos = 0) Begin
+            Move "" to sFirstWord
+        End                      
+        Else Begin
+            Move (Left(sOverStrikeLine, (iPos -1))) to sFirstWord
+        End
+        Move (Trim(sFirstWord)) to sFirstWord
         Function_Return sFirstWord
     End_Function
 
@@ -1209,7 +1601,7 @@ Class cBaseRefactorFunctionLibrary is a cObject
     // RemoveLeft(":", "MSSQLDRV:JOBB")         -> "JOBB"
     // RemoveLeft("D", "ABC")                   -> "ABC"
     // RemoveLeft("is ", "This is an example")  -> "an example"    
-    // Note: It it also looks within strings aka "This is a string"
+    // Note: It it also looks within strings e.g. "This is a string"
     Function _RemoveLeft String sSubString String ByRef sHostString Returns Boolean
         Integer iPosStart iPosEnd 
         String sText
@@ -1297,12 +1689,13 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Function_Return sReturn
     End_Function
 
-    Function _SingleCommandSyntaxToFunction String ByRef sLine String sKeyWord Returns Boolean
+    // ToDo: Redo!!!
+    Function _SingleCommandSyntaxToFunction String sLine String sKeyWord Returns Boolean
         Boolean bChanged bIsCommentOrBlank bFound bIfStatement bIsFirstKeyWord
-        tTokenizer TokenizerData
         String sText sLowerKeyWord sLowerCase sFirstWord sExpression
         Integer iPos
-        
+        tExpression[] aExpression 
+Function_Return        
         Move False to bChanged
         Move False to bIsFirstKeyWord  
         Move "" to sExpression
@@ -1317,26 +1710,27 @@ Class cBaseRefactorFunctionLibrary is a cObject
             Function_Return False
         End
         
+        Get paExpression to aExpression  
         Get _HasIfCommand sText to bIfStatement
         Move (Lowercase(sKeyWord)) to sLowerKeyWord
         If (bIfStatement = False) Begin
-            Get _RetrieveFirstWord sText to sFirstWord
+            Get _RetrieveFirstToken sText to sFirstWord
             If (Lowercase(sFirstWord) = Lowercase(sKeyWord)) Begin
-                Get _RemoveFirstWord sText to sText
+                Get _RemoveFirstToken sText to sLine
             End    
 //            If (Lowercase(sFirstWord) <> sLowerKeyWord) Begin
 //                Function_Return False
 //            End
         End
         If (bIfStatement = True) Begin
-//            Get _ExpressionExtractor sText CI_LeftExpression to sExpression  
+            Get _FetchExpression aExpression CI_LeftExpression1 to sExpression  
             If (Trim(sExpression) <> "") Begin
                 Move (Pos(sExpression, sText)) to iPos
                 Move (Mid(sText, Length(sText), (iPos + Length(sExpression)))) to sText
                 Move (Mid(sLine, Length(sLine), (iPos + Length(sExpression)))) to sLine
             End
             // Do we still have the keyword in the line?
-            Get _HasCommand sText sKeyWord to bFound
+            Get _HasCommand sLine sKeyWord to bFound
             If (bFound = False) Begin   
                 Move (String(sExpression) + String(sLine)) to sLine 
                 If (bIfStatement = True) Begin
@@ -1348,7 +1742,6 @@ Class cBaseRefactorFunctionLibrary is a cObject
         
 //        Move (Pos(sLowerKeyWord, Lowercase(sText))) to iPos
         Move sLine to sText
-        Get pTokenizer to TokenizerData
         
         // If the line starts with the Key word.
 //        If (Pos(sLowerKeyWord, Lowercase(TokenizerData.sCode)) = 1) Begin
@@ -1358,7 +1751,7 @@ Class cBaseRefactorFunctionLibrary is a cObject
 //            Move (" " + String(sLowerKeyWord) + " ") to sLowerKeyWord
 //        End
 //        Move (Lowercase(TokenizerData.sCode) contains sLowerKeyWord) to bFound
-        Get _RetrieveFirstWord sText to sFirstWord
+        Get _RetrieveFirstToken sLine to sFirstWord
         Move (Lowercase(sFirstWord) = Lowercase(sKeyWord)) to bFound
         If (bFound = False) Begin      
 //            If (sExpression <> "") Begin
@@ -1367,8 +1760,8 @@ Class cBaseRefactorFunctionLibrary is a cObject
             Function_Return False
         End
         
-        Move (Lowercase(TokenizerData.sOverstrikeLine)) to sText
-        Move (Mid(TokenizerData.sOverstrikeLine, (Length(TokenizerData.sOverstrikeLine)), (Length(sKeyWord) + 1))) to sText
+        Move (Lowercase(sLine)) to sText
+        Move (Mid(sLine, (Length(sLine)), (Length(sKeyWord) + 1))) to sText
         Move (Ltrim(sText)) to sText   
         If (sKeyWord = CS_Pos) Begin
             Move (Lowercase(sText)) to sLowerCase
@@ -1379,19 +1772,22 @@ Class cBaseRefactorFunctionLibrary is a cObject
                 Move True to bChanged
             End
         End                                                                                                                              
-        If (Length(TokenizerData.sEndComment)  > 0) Begin
-            Move (TokenizerData.sIndentation + "Move" * "(" + String(sKeyWord) + "(" + String(sText) + "))" * CS_To * String(TokenizerData.sToStatement) * String(TokenizerData.sEndComment)) to sLine
-            Move True to bChanged
-        End
-        Else Begin
-            Move (TokenizerData.sIndentation + "Move" * "(" + String(sKeyWord) + "(" + String(sText) + "))" * CS_To * String(TokenizerData.sToStatement)) to sLine
-            Move True to bChanged
-        End
+
+        // ToDo: temp commented out to be able to compile!
+//        If (Length(TokenizerData.sEndComment)  > 0) Begin
+//            Move (TokenizerData.sIndentation + "Move" * "(" + String(sKeyWord) + "(" + String(sText) + "))" * CS_To * String(TokenizerData.ToStatement.sCode) * String(TokenizerData.sEndComment)) to sLine
+//            Move True to bChanged
+//        End
+//        Else Begin
+//            Move (TokenizerData.sIndentation + "Move" * "(" + String(sKeyWord) + "(" + String(sText) + "))" * CS_To * String(TokenizerData.ToStatement.sCode)) to sLine
+//            Move True to bChanged
+//        End
         
         Function_Return bChanged
     End_Function
 
-    // Helper function. This is a list of commands that also exists as global build in functions.
+    // ToDo: Redo logic with (SearchArray(xxx))
+    // Helper function. This is a list of commands that also exists as DataFlex string functions.
     Function _TestCommandFunctions String sTest Returns Integer
         Boolean bRemoved
         Integer iCount iSize iPos iTest
@@ -1400,11 +1796,10 @@ Class cBaseRefactorFunctionLibrary is a cObject
 
         Move 0 to iPos
         Get _RemoveComments (&sTest) to bRemoved
-        Get paCommandFunctions to asCommandFunctions
+        Get pasCommandFunctions to asCommandFunctions
         Move (SizeOfArray(asCommandFunctions)) to iSize
         If (iSize = 0) Begin
-//            Send AddAllCommandFunctions
-            Get paCommandFunctions to asCommandFunctions
+            Get pasCommandFunctions to asCommandFunctions
             Move (SizeOfArray(asCommandFunctions)) to iSize        
         End
         Decrement iSize
@@ -1426,7 +1821,7 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Function_Return iPos
     End_Function
 
-    Function _HasDoubleExpression String sLine Returns Boolean
+    Function _HasDoubleExpression String sExpression Returns Boolean
         Boolean bFound      
         Integer iCount iSize iOpCount iParanthesis
         String sChar sOperators
@@ -1434,9 +1829,9 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Move False to bFound  
         Move 0 to iParanthesis           
         Move "<=>" to sOperators
-        Move (Length(sLine)) to iSize
+        Move (Length(sExpression)) to iSize
         For iCount from 1 to iSize
-            Move (Mid(sLine, 1, iCount)) to sChar
+            Move (Mid(sExpression, 1, iCount)) to sChar
             If (sChar = "(") Begin
                 Increment iOpCount          
                 Increment iParanthesis
@@ -1460,10 +1855,9 @@ Class cBaseRefactorFunctionLibrary is a cObject
     Function _HasCommand String sOverstrikeLine String sCommand Returns Boolean
         Boolean bFound bOk
         String sText
-        
+
         Move False to bFound 
-        Move sOverstrikeLine to sText
-        Get _RemoveEndComment sText to sText
+        Get _RemoveEndComment sOverstrikeLine to sText
         Move (Lowercase(sText) contains (String(Lowercase(sCommand)))) to bFound
         
         Function_Return bFound
@@ -1490,9 +1884,8 @@ Class cBaseRefactorFunctionLibrary is a cObject
     
     Function _IsCommentLine String sLine Returns Boolean
         Boolean bIsComment
-        Integer iPos
         
-        Move False to bIsComment
+        Move (Trim(sLine)) to sLine
         Move (Left(Trim(sLine), 2) = CS_CommentSymbol) to bIsComment
         
         Function_Return bIsComment
@@ -1547,7 +1940,7 @@ Class cBaseRefactorFunctionLibrary is a cObject
     Function _IsFirstWord String sLine String sCommand Returns Boolean
         Boolean bFound
         Integer iPos  
-        String sFirstWord
+        String sFirstWord 
         
         Move (Ltrim(Lowercase(sLine))) to sLine
         Move (Ltrim(Lowercase(sCommand))) to sCommand
@@ -1562,18 +1955,16 @@ Class cBaseRefactorFunctionLibrary is a cObject
     End_Function   
     
     // Returns True if source line contains a "[Found]", or "[FindErr]".
-    Function _IsFoundOrFindErrIndicator String sLine Returns Boolean
+    Function _IsFoundOrFindErrIndicator tTokenizer ByRef TokenizerData Returns Boolean
         Boolean bFound
         Integer iLeft iRight iPos
-        String sText
+        String sLine sText 
         
-        Get _IsIndicatorStatement sLine to bFound
-        If (bFound = False) Begin
+        If (TokenizerData.IndicatorInfo.bHasIndicateCommand = False) Begin
             Function_Return False
         End
 
-        Get _RemoveComments (&sLine) to bFound
-        Get _OverstrikeStrings sLine to sText  
+        Move TokenizerData.sOverstrikeLine to sText  
         Get _StripConcatenatingSpaces sText to sLine
         Move (Pos("[", sLine)) to iLeft
         Move (Pos("]", sLine)) to iRight
@@ -1593,46 +1984,45 @@ Class cBaseRefactorFunctionLibrary is a cObject
     
     // Returns True iif the source line contains both an "if" and a "begin", but NOT If-Else-Begin statement.
     // Note: The source line must first have been stripped of any comments
-    Function _HasIfAndBeginStatement String sLine Returns Boolean
-        Boolean bisIfBegin bHasBeginStatement 
-        Get _HasIfCommand sLine to bisIfBegin
-        Get _HasBeginStatement sLine to bHasBeginStatement
+    Function _HasIfAndBeginStatement tTokenizer ByRef TokenizerData Returns Boolean
+        Boolean bisIfBegin bHasBeginStatement                       
+        
+        Get _HasIfCommand TokenizerData.sOverstrikeLine to bisIfBegin
+        Get _HasBeginStatement TokenizerData.sOverstrikeLine to bHasBeginStatement
         Function_Return (bisIfBegin = True and bHasBeginStatement = True)
     End_Function   
     
-    Function _HasIfCommand String sLine Returns Boolean
+    Function _HasIfCommand String sOverstrikeLine Returns Boolean
         Boolean bFound
-        Get _HasCommand sLine (CS_If + " ") to bFound
+        Get _HasCommand sOverstrikeLine (CS_If + " ") to bFound
         Function_Return bFound
     End_Function                                                  
     
-    Function _IsImagePageStartOrEnd String sLine Boolean bCheckImageStart Returns Boolean
+    Function _IsImagePageStartOrEnd String sOverstrikeLine Boolean bCheckImageStart Returns Boolean
         Boolean bFound
         Integer iPos
-
+        
         Move False to bFound
-        Move (Trim(sLine)) to sLine
         If (bCheckImageStart = True) Begin
-            Get _IsImageStart sLine to bFound
+            Get _IsImageStart sOverstrikeLine to bFound
         End
         Else Begin                 
-            Get _IsImageEnd sLine to bFound
+            Get _IsImageEnd sOverstrikeLine to bFound
         End
 
         Function_Return bFound
     End_Function
 
     // Old DF syntax that used pages, e.g. "/MyPage"
-    Function _IsImageStart String sLine Returns Boolean
+    Function _IsImageStart String sOverstrikeLine Returns Boolean
         Boolean bIsChar
         Integer iPos
         String sChar
 
         Move False to bIsChar
-        Move (Trim(sLine)) to sLine
-        Move (Pos(CS_ImageNameStart, sLine)) to iPos
+        Move (Pos(CS_ImageNameStart, sOverstrikeLine)) to iPos
         If (iPos = 1) Begin
-            Move (Mid(sLine, 1, 2)) to sChar
+            Move (Mid(sOverstrikeLine, 1, 2)) to sChar
             Move ("abcdefghijklmnopqrstuvwxyz" contains Lowercase(sChar)) to bIsChar
         End
 
@@ -1640,81 +2030,91 @@ Class cBaseRefactorFunctionLibrary is a cObject
     End_Function 
     
     // Old DF syntax that used pages. To mark end of a page these two characters were used: "/*"
-    Function _IsImageEnd String sLine Returns Boolean
+    Function _IsImageEnd String sOverstrikeLine Returns Boolean
         Boolean bFound
         Integer iPos
-        Move (Pos(CS_ImageNameEnd, sLine)) to iPos
+        Move (Pos(CS_ImageNameEnd, sOverstrikeLine)) to iPos
         Move (iPos = 1) to bFound
         Function_Return bFound
     End_Function
 
     // Returns True if source code contains both a "[" and a "]", but not a "[]"
-    Function _IsIndicatorStatement String sLine Returns Boolean
+    Function _IsIndicatorStatement String sOverStrikeLine Returns Boolean
         Boolean bFound bIndicatorWord
         Integer iLeft iRight iPos
         String sChar sLeftBracket
         
-        Get _IsCommentLineOrBlank sLine to bFound
+        Get _IsCommentLineOrBlank sOverStrikeLine to bFound
         If (bFound = True) Begin
             Function_Return False
         End
-        Get _RemoveComments (&sLine) to bFound
-        Get _OverstrikeStrings sLine to sLine
-        Move (Left(sLine, 1)) to sChar
+        Get _RemoveComments (&sOverstrikeLine) to bFound
+        Move (Left(sOverstrikeLine, 1)) to sChar
         If (sChar = "[") Begin
             Move "[" to sLeftBracket
         End                         
         Else Begin
             Move " [" to sLeftBracket
         End
-//        Move (Lowercase(sLine) contains Lowercase(CS_Indicate + " ")) to bIndicatorWord
-        Move (bIndicatorWord = True or (sLine contains sLeftBracket and sLine contains "]")) to bFound
+//        Move (Lowercase(sOverstrikeLine) contains Lowercase(CS_Indicate + " ")) to bIndicatorWord
+        Move (bIndicatorWord = True or (sOverstrikeLine contains sLeftBracket and sOverstrikeLine contains "]")) to bFound
         If (bFound = True) Begin
-            Move (Pos(sLeftBracket, sLine)) to iLeft
-            Move (Pos("]", sLine)) to iRight
+            Move (Pos(sLeftBracket, sOverstrikeLine)) to iLeft
+            Move (Pos("]", sOverstrikeLine)) to iRight
             Move ((iRight - iLeft) > 1) to bFound
         End
         Function_Return (bIndicatorWord or bFound)
     End_Function
 
-    // Note: The sKeywords string must be separated by "|" _and_ end with a "|".
-    Function _IsKeywordInLine String sKeywords String sOverstrikeLine Returns Boolean
+    // Note: The sKeywords string must be separated by "|".
+    Function _IsKeywordInLine String sKeywords String[] asLineTokensLC Returns Boolean
         String sKeyword sChar  
-        Integer iPos   
-        Boolean bOK
+        String[] asKeywords 
+        Integer iPos iSize iCount iTo iFrom iItem
+        Boolean bOK 
 
         Move (Lowercase(sKeywords)) to sKeywords
-        Move (Lowercase(sOverstrikeLine)) to sOverstrikeLine
-        Get _RemoveStringsFromLine sOverstrikeLine to sOverstrikeLine
-        Move (Pos(" ", sOverstrikeLine)) to iPos
-        // Then there is only one "word" in sOverstrikeLine. Check if the sKeywords = sOverstrikeLine
-        If (iPos = 0) Begin
-            Move (Replace("|", sKeywords, "")) to sKeyword
-            If (Trim(sKeyword) = Trim(sOverstrikeLine)) Begin
-                Function_Return True
-            End
-        End
-        
-        While (sKeywords <> "")
-            Move (Left(sKeywords, (Pos("|", sKeywords)))) to sKeyword
-            Move (Replace(sKeyword, sKeywords, "")) to sKeywords
-            Move (Trim(Replace("|", sKeyword, ""))) to sKeyword
-            Move ((sKeyword <> "") and ((Pos((" " + sKeyword + " "), sOverstrikeLine)) <> 0)) to bOK
-            If (bOK = False) Begin
-                Move ((sKeyword <> "") and ((Pos((sKeyword + " "), sOverstrikeLine)) <> 0) ) to bOK
-            End
-            // Also check if this might be the very first statement on the sOverstrikeLine 
-            If (bOK = True) Begin    
-                Move (Left(sKeyword, 1)) to sChar
-                // Is this a command?
-                If (sChar = "#") Begin
-                    Function_Return False
-                End
-                Else Begin
-                    Function_Return True
-                End
+        Move (StrSplitToArray(sKeywords, "|")) to asKeywords
+        Move (SizeOfArray(asKeywords)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            Move (SearchArray(asKeywords[iCount], asLineTokensLC)) to iItem
+            If (iItem <> -1) Begin
+                Function_Return True    
             End
         Loop
+        
+//        Get _RemoveStringsFromLine sOverstrikeLine to sOverstrikeLine
+//        Move (Pos(" ", sOverstrikeLine)) to iPos
+//        // Then there is only one "word" in sOverstrikeLine. Check if the sKeywords = sOverstrikeLine
+//        If (iPos = 0) Begin
+//            Move (Replace("|", sKeywords, "")) to sKeyword
+//            If (Trim(sKeyword) = Trim(sOverstrikeLine)) Begin
+//                Function_Return True
+//            End
+//        End
+//        
+//        While (sKeywords <> "")
+//            Move (Left(sKeywords, (Pos("|", sKeywords)))) to sKeyword
+//            Move (Replace(sKeyword, sKeywords, "")) to sKeywords
+//            Move (Trim(Replace("|", sKeyword, ""))) to sKeyword
+//            Move ((sKeyword <> "") and ((Pos((" " + sKeyword + " "), sOverstrikeLine)) <> 0)) to bOK
+//            If (bOK = False) Begin
+//                Move ((sKeyword <> "") and ((Pos((sKeyword + " "), sOverstrikeLine)) <> 0) ) to bOK
+//            End
+//            // Also check if this might be the very first statement on the sOverstrikeLine 
+//            If (bOK = True) Begin    
+//                Move (Left(sKeyword, 1)) to sChar
+//                // Is this a command?
+//                If (sChar = "#") Begin
+//                    Function_Return False
+//                End
+//                Else Begin
+//                    Function_Return True
+//                End
+//            End
+//        Loop
+
         Function_Return False
     End_Function
 
@@ -1722,90 +2122,91 @@ Class cBaseRefactorFunctionLibrary is a cObject
     // Returns True if the code contains any of "gt, ge, lt, le, eq, ne" OR ">, >=, <, <=, =, <>" 
     // It returns a tOperatorsInfo struct with; bisOperator, bIsLegacy, iPos and sOperator. 
     // Note: It only looks for the first occurance of a logical operator in the passed sLine parameter.
-    Function _IsLogicalOperators String sLine Returns tOperatorsInfo
+    Function _LogicalOperators tTokenizer ByRef TokenizerData Returns tOperatorsInfo
         Boolean bHas 
         tOperatorsInfo OperatorsInfo
+        String sOverStrikeLine
         
-        Get _IsCommentLineOrBlank sLine to bHas
-        If (bHas = True) Begin
+        Get _IsCommentLineOrBlank TokenizerData.sLine to bHas
+        If (TokenizerData.bIsBlank = True or TokenizerData.bIsComment = True) Begin
             Function_Return OperatorsInfo
         End
-        Get _RemoveComments (&sLine) to bHas
-        Get _OverstrikeStrings sLine to sLine 
-        Move (Lowercase(sLine)) to sLine
+        Move TokenizerData.sOverstrikeLine to sOverStrikeLine
+        Get _RemoveComments (&sOverStrikeLine) to bHas
+        Move (Lowercase(sOverStrikeLine)) to sOverStrikeLine
 
         Case Begin                
             // "Legacy" operators;
-            Case (sLine contains " gt ")
-                Move (Pos(" gt ", sLine))   to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains " gt ")
+                Move (Pos(" gt ", sOverstrikeLine))   to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move True                   to OperatorsInfo.bIsLegacy
                 Move "gt"                   to OperatorsInfo.sOperator
                 Case Break
-            Case (sLine contains " ge ")
-                Move (Pos(" ge ", sLine))   to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains " ge ")
+                Move (Pos(" ge ", sOverstrikeLine))   to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move True                   to OperatorsInfo.bIsLegacy
                 Move "ge"                   to OperatorsInfo.sOperator
                 Case Break
-            Case (sLine contains " lt ")
-                Move (Pos(" lt ", sLine))   to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains " lt ")
+                Move (Pos(" lt ", sOverstrikeLine))   to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move True                   to OperatorsInfo.bIsLegacy
                 Move "lt"                   to OperatorsInfo.sOperator
                 Case Break
-            Case (sLine contains " le ")
-                Move (Pos(" le ", sLine))   to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains " le ")
+                Move (Pos(" le ", sOverstrikeLine))   to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move True                   to OperatorsInfo.bIsLegacy
                 Move "le"                   to OperatorsInfo.sOperator
                 Case Break
-            Case (sLine contains " eq ")
-                Move (Pos(" eq ", sLine))   to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains " eq ")
+                Move (Pos(" eq ", sOverstrikeLine))   to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move True                   to OperatorsInfo.bIsLegacy
                 Move "eq"                   to OperatorsInfo.sOperator
                 Case Break
-            Case (sLine contains " ne ")
-                Move (Pos(" ne ", sLine))   to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains " ne ")
+                Move (Pos(" ne ", sOverstrikeLine))   to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move True                   to OperatorsInfo.bIsLegacy
                 Move "ne"                   to OperatorsInfo.sOperator
                 Case Break
             
             // "Modern" operators;
-            Case (sLine contains ">")
-                Move (Pos(">", sLine))      to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains ">")
+                Move (Pos(">", sOverstrikeLine))      to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move False                  to OperatorsInfo.bIsLegacy
                 Move ">"                    to OperatorsInfo.sOperator
                 Case Break
-            Case (sLine contains ">=")
-                Move (Pos(">=", sLine))     to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains ">=")
+                Move (Pos(">=", sOverstrikeLine))     to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move False                  to OperatorsInfo.bIsLegacy
                 Move ">="                   to OperatorsInfo.sOperator
                 Case Break
-            Case (sLine contains "<")
-                Move (Pos("<", sLine))      to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains "<")
+                Move (Pos("<", sOverstrikeLine))      to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move False                  to OperatorsInfo.bIsLegacy
                 Move "<"                    to OperatorsInfo.sOperator
                 Case Break
-            Case (sLine contains "<=")
-                Move (Pos("<=", sLine))     to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains "<=")
+                Move (Pos("<=", sOverstrikeLine))     to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move False                  to OperatorsInfo.bIsLegacy
                 Move "<="                   to OperatorsInfo.sOperator
                 Case Break
-            Case (sLine contains "=")
-                Move (Pos("=", sLine))      to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains "=")
+                Move (Pos("=", sOverstrikeLine))      to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move False                  to OperatorsInfo.bIsLegacy
                 Move "="                    to OperatorsInfo.sOperator
                 Case Break
-            Case (sLine contains "<>")
-                Move (Pos("<>", sLine))     to OperatorsInfo.iPos
+            Case (sOverstrikeLine contains "<>")
+                Move (Pos("<>", sOverstrikeLine))     to OperatorsInfo.iPos
                 Move True                   to OperatorsInfo.bIsOperator
                 Move False                  to OperatorsInfo.bIsLegacy
                 Move "<>"                   to OperatorsInfo.sOperator
@@ -1822,34 +2223,34 @@ Class cBaseRefactorFunctionLibrary is a cObject
     
     // Pass only the code part of a source line.
     // Returns True if the code contains any of "gt, ge, lt, le, eq, ne", in other words it is an expression.
-    Function _IsLegacyOperators String sLine Returns Boolean
+    Function _HasLegacyOperators tTokenizer ByRef TokenizerData Returns Boolean
         Boolean bHas bFound
+        String sOverStrikeLine
         
-        Get _IsCommentLineOrBlank sLine to bFound
-        If (bFound = True) Begin
+        If (TokenizerData.bIsBlank = True or TokenizerData.bIsComment = True) Begin
             Function_Return False
         End
-        Get _RemoveComments (&sLine) to bHas
-        Get _OverstrikeStrings sLine to sLine 
-        Move (Lowercase(sLine)) to sLine
+        Move TokenizerData.sOverstrikeLine to sOverStrikeLine
+        Get _RemoveComments (&sOverStrikeLine) to bHas
+        Move (Lowercase(sOverStrikeLine)) to sOverStrikeLine
 
         Case Begin
-            Case (sLine contains " gt ")
+            Case (sOverStrikeLine contains " gt ")
                 Move True to bHas
                 Case Break
-            Case (sLine contains " ge ")
+            Case (sOverStrikeLine contains " ge ")
                 Move True to bHas
                 Case Break
-            Case (sLine contains " lt ")
+            Case (sOverStrikeLine contains " lt ")
                 Move True to bHas
                 Case Break
-            Case (sLine contains " le ")
+            Case (sOverStrikeLine contains " le ")
                 Move True to bHas
                 Case Break
-            Case (sLine contains " eq ")
+            Case (sOverStrikeLine contains " eq ")
                 Move True to bHas
                 Case Break
-            Case (sLine contains " ne ")
+            Case (sOverStrikeLine contains " ne ")
                 Move True to bHas
                 Case Break
             Case Else
@@ -1861,29 +2262,30 @@ Class cBaseRefactorFunctionLibrary is a cObject
     
     // Pass only the code part of a source line.
     // Returns True if the code contains any of ">, >= <, <=, =, <>", in other words it is an expression.
-    Function _IsOperators String sLine Returns Boolean
+    Function _IsOperators tTokenizer ByRef TokenizerData Returns Boolean
         Boolean bHas
+        String sOverStrikeLine
         
-        Get _RemoveComments (&sLine) to bHas 
-        Get _OverstrikeStrings sLine to sLine
+        Move TokenizerData.sOverstrikeLine to sOverStrikeLine
+        Get _RemoveComments (&sOverStrikeLine) to bHas 
 
         Case Begin
-            Case (sLine contains ">")
+            Case (sOverStrikeLine contains ">")
                 Move True to bHas
                 Case Break
-            Case (sLine contains ">=")
+            Case (sOverStrikeLine contains ">=")
                 Move True to bHas
                 Case Break
-            Case (sLine contains "<")
+            Case (sOverStrikeLine contains "<")
                 Move True to bHas
                 Case Break
-            Case (sLine contains "<=")
+            Case (sOverStrikeLine contains "<=")
                 Move True to bHas
                 Case Break
-            Case (sLine contains "=")
+            Case (sOverStrikeLine contains "=")
                 Move True to bHas
                 Case Break
-            Case (sLine contains "<>")
+            Case (sOverStrikeLine contains "<>")
                 Move True to bHas
                 Case Break
             Case Else
@@ -1895,49 +2297,80 @@ Class cBaseRefactorFunctionLibrary is a cObject
     
     // It is assumed that blank and commented lines has been checked prior
     // using this function.
-    // It will return True if the "sLine" parameter contains any of the DF23's new string's start.
-    // If not found it returns false.
-    Function _IsMultiLineStringStart String sLine Returns Boolean
+    // It will return True if the source line contains any of the DF23's new string's.
+    Function _IsDF23String tTokenizer ByRef TokenizerData Returns Boolean
         Integer iPos
         Boolean bFound  
-        String sSource
+        String sOverStrikeLine
         
-        // No point in trying to check if property already set to True.
-        If (pbInMultiLineString(Self) = True) Begin
+        Move TokenizerData.sOverstrikeLine to sOverStrikeLine
+        Get _RemoveEndComment sOverStrikeLine to sOverstrikeLine
+        Move (Trim(sOverstrikeLine)) to sOverstrikeLine  
+        
+        // First check for tripple double-quotes:
+        Move (Pos('"""', sOverstrikeLine)) to iPos
+        Move (iPos <> 0) to bFound
+        
+        // Second check is for "@" type multi-line string:
+        If (bFound = False) Begin
+            Move (Pos('@"', sOverstrikeLine) <> 0) to bFound
+            If (bFound = False) Begin
+                Move (Pos("@'", sOverstrikeLine) <> 0) to bFound
+            End           
+            // We have passed a sOverStrike string, thus the quotes surrounding
+            // that string constant has been replaced with "_" or "+" characters.
+            If (bFound = False) Begin
+                Move (Pos("@_", sOverstrikeLine) <> 0) to bFound
+            End
+            If (bFound = False) Begin
+                Move (Pos("@+'", sOverstrikeLine) <> 0) to bFound
+            End
+            If (bFound = False) Begin
+                Move (Pos(Lowercase("@SQL"), Lowercase(sOverstrikeLine)) <> 0) to bFound
+            End
+        End
+        Function_Return bFound
+    End_Function  
+    
+    // It is assumed that blank and commented lines has been checked prior
+    // using this function.
+    // It will return True if the "sLine" parameter contains any of the DF23's new string's start.
+    // If not found it returns false.
+    Function _IsMultiLineStringStart tTokenizer ByRef TokenizerData Returns Boolean
+        Integer iPos
+        Boolean bFound  
+        String sLine sSource
+        
+        Get _IsDF23String (&TokenizerData) to bFound
+        If (bFound = False) Begin
             Function_Return False
         End                      
         
-        Get _RemoveEndComment sLine to sLine
-        Move (Trim(sLine)) to sLine  
-        
-        // Check first for tripple double-quotes:
+        Move False to bFound              
+        Move (Trim(TokenizerData.sLine)) to sLine
+        // Check for first tripple double-quotes:
         Move (Pos('"""', sLine)) to iPos
         Move (iPos <> 0) to bFound
+        // Check for second tripple quote """ as in;
+        // @SQL""" SELECT * FROM Customer WHERE Customer.Name = 'John Doe' """
         If (bFound = True) Begin
-            // We must also check forïa second tripple quote """ as in;
-            // @SQL""" SELECT * FROM Customer WHERE Customer.Name = 'John Doe' """
             Move (Mid(sLine, Length(sLine), (iPos + 3))) to sSource
             Move (Pos('"""', sSource)) to iPos
-            // If found we should return False as the line then is "finished"  
+            // If found we should return False as the multi-line string is contained on a single line.
             If (iPos <> 0) Begin
                 Function_Return False
             End
             Move (iPos = 0) to bFound        
         End  
-        
-        // Check for "@" type multi-line string:
-        If (bFound = False) Begin
-            Move (Pos("@", sLine) <> 0) to bFound
-            If (bFound = True) Begin
-                // Take anything inside quotes, single or double, out of the equation:
-                Get _OverstrikeStrings sLine to sSource
-                // We do this twice because the _OverstrikeStrings function is "costly".
-                Move (Pos("@", sSource) <> 0) to bFound
-                If (bFound = False) Begin
-                    Move (Pos(Lowercase("@SQL"), Lowercase(sSource)) <> 0) to bFound
-                End
+        Else Begin
+            Move (Pos("@", sLine)) to iPos
+            If (iPos <> 0) Begin
+                // We need to make sure that the "@" char is not in a quotes string  constant.
+                Move (Pos("@", sLine)) to iPos
+                Move (iPos <> 0) to bFound        
             End
         End
+        
         Function_Return bFound
     End_Function  
     
@@ -1946,21 +2379,16 @@ Class cBaseRefactorFunctionLibrary is a cObject
     // It will return True if the "sLine" parameter contains any of the DF23's new string's end,
     // which can be these characters; ', " or """.
     // If not found it returns false.
-    Function _IsMultLineStringEnd String sLine Returns Boolean
+    Function _IsMultiLineStringEnd tTokenizer ByRef TokenizerData Returns Boolean
         Boolean bFound
-        String sChar
+        String sLine sChar
         
         // If a multi string hasn't been started; no point in testing further.
-        If (pbInMultiLineString(Self) = False) Begin
+        If (pbIsInMultiLineString(Self) = False) Begin
             Function_Return False
         End
         
-        // ToDo: The _OverstrikeStrings function is a *costly* operation as it will be 
-        // called by each and every cRefactorFunctionLibrary function for every source line.
-        // Do we need it? And if so, how do we optimize it?
-        // Get _OverstrikeStrings sLine to sLine 
-        
-        Get _RemoveEndComment sLine to sLine
+        Move TokenizerData.sOverstrikeLine to sLine
         Move (Trim(sLine)) to sLine
         Move (Right(sLine, 1)) to sChar
         Move (sChar = '"' or sChar = "'") to bFound
@@ -1974,10 +2402,10 @@ Class cBaseRefactorFunctionLibrary is a cObject
 
     Function _IsLineEndSemiColon String sOverstrikeLine Returns Boolean
         Boolean bRemoved
-
-        Get _RemoveEndComment sOverstrikeLine to sOverstrikeLine
-        Move (RTrim(sOverstrikeLine)) to sOverstrikeLine
-        If (Right(sOverstrikeLine, 1) = ";") Begin
+        String sLine
+        Get _RemoveEndComment sOverstrikeLine to sLine
+        Move (RTrim(sLine)) to sLine
+        If (Right(sLine, 1) = ";") Begin
             Function_Return True
         End
         Function_Return False
@@ -1988,9 +2416,8 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Boolean bRemoved
         Boolean bFound
         
-        Move sLine to sLine // dummy line which appears to fix a runtime byref error (???) 
         Get _IsLineEndSemiColon sLine to bFound
-        If (bFound = False) Begin
+        If (bFound = False) Begin              
             Move (Lowercase(sLine)) to sLine
             If (Right(sLine, 5) = "begin") Begin
                 Move True to bFound
@@ -2000,36 +2427,36 @@ Class cBaseRefactorFunctionLibrary is a cObject
     End_Function    
     
     // Returns True iif the source line is a "Loop" statement.
-    Function _IsLoopStatement String sLine Returns Boolean
+    Function _IsLoopStatement String sOverstrikeLine Returns Boolean
         Boolean bFound
-        Get _HasCommand sLine (" " + CS_Loop) to bFound
+        Get _HasCommand sOverstrikeLine (" " + CS_Loop) to bFound
         Function_Return bFound
     End_Function   
 
-    Function _IsMoveCommand String sLine Returns Boolean
+    Function _IsMoveCommand String sOverstrikeLine Returns Boolean
         Boolean bFound
-        Get _HasCommand sLine (" " + String(CS_Move) + " ") to bFound
+        Get _HasCommand sOverstrikeLine (" " + String(CS_Move) + " ") to bFound
         If (bFound = False) Begin
-            Get _HasCommand sLine (String(CS_Move) + " ") to bFound
+            Get _HasCommand sOverstrikeLine (String(CS_Move) + " ") to bFound
         End
         Function_Return bFound
     End_Function                                                  
     
     // Returns True iif the source line is a "Until" statement.
-    Function _IsUntilStatement String sLine Returns Boolean
+    Function _IsUntilStatement String sOverstrikeLine Returns Boolean
         Boolean bFound
-        Get _HasCommand sLine (" " + CS_Until) to bFound
+        Get _HasCommand sOverstrikeLine (" " + CS_Until) to bFound
         If (bFound = False) Begin
-            Get _HasCommand sLine (CS_Until + " ") to bFound
+            Get _HasCommand sOverstrikeLine (CS_Until + " ") to bFound
             If (bFound = False) Begin
-                Get _HasCommand sLine (CS_Until) to bFound
+                Get _HasCommand sOverstrikeLine (CS_Until) to bFound
             End
         End  
             
         Function_Return bFound
     End_Function   
 
-    Function _IsVariableDeclarationLine String sLine Returns Boolean
+    Function _IsVariableDeclarationLine String sOverstrikeLine Returns Boolean
         Boolean bVariableDeclaration
         String[] asLocalVariableTypes asLocalVariableArrayTypes
         Integer iRetval
@@ -2038,8 +2465,8 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Move False to bVariableDeclaration
         Get pasLocalVariableTypes      to asLocalVariableTypes
         Get pasLocalVariableArrayTypes to asLocalVariableArrayTypes
-        Move (Trim(sLine)) to sLine
-        Get _RetrieveFirstWord sLine to sFirstWord
+        
+        Get _RetrieveFirstToken sOverstrikeLine to sFirstWord
         Move (Uppercase(sFirstWord)) to sFirstWord
         Move (SearchArray(sFirstWord, asLocalVariableTypes)) to iRetval
         If (iRetval <> -1) Begin
@@ -2055,26 +2482,26 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Function_Return bVariableDeclaration
     End_Function
 
-    Function _IsVariableInLine String sLine String sVariableName Returns Boolean
+    Function _IsVariableInLine String sOverstrikeLine String sVariableName Returns Boolean
         Boolean bIsUseLine
         String sChar
         Integer iPos
 
-        Move False to bIsUseLine
-        Move (Uppercase(sLine)) to sLine
-        Move (Uppercase(sVariableName)) to sVariableName
+        Move False to bIsUseLine                              
+        Move (Lowercase(sOverStrikeLine)) to sOverStrikeLine
+        Move (Lowercase(sVariableName))   to sVariableName
 
-        If (sLine contains sVariableName) Begin
-            Move (Pos(sVariableName, sLine)) to iPos
+        If (sOverStrikeLine contains sVariableName) Begin
+            Move (Pos(sVariableName, sOverStrikeLine)) to iPos
             If (iPos > 0) Begin
                 Repeat
-                    Move (Mid(sLine, 1, (iPos - 1))) to sChar
+                    Move (Mid(sOverStrikeLine, 1, (iPos - 1))) to sChar
                     If (CS_ValidLeftCharacters contains sChar) Begin
                         Move True to bIsUseLine
                     End
                     If (bIsUseLine = False) Begin
-                        Move (Replace(sVariableName, sLine, "")) to sLine
-                        Move (Pos(sVariableName, sLine)) to iPos
+                        Move (Replace(sVariableName, sOverStrikeLine, "")) to sOverStrikeLine
+                        Move (Pos(sVariableName, sOverStrikeLine)) to iPos
                     End
                 Until (bIsUseLine = True or iPos = 0)
             End
@@ -2083,11 +2510,13 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Function_Return bIsUseLine
     End_Function
 
-    Function _IsProjectObjectStructureLine String sLine String[] ByRef asObjectNames Returns Boolean
+    // ToDo: Needs to be revised
+    Function _IsProjectObjectStructureLine String sOverstrikeLine String[] ByRef asObjectNames Returns Boolean
         Boolean bWriteLine
         Integer iPos iSize
-        String sObjectName
+        String sLine sObjectName
 
+        Move sOverstrikeLine to sLine
         Move (Trim(sLine)) to sLine
         Move True to bWriteLine
         Move (Pos(CS_CommentSymbol, sLine)) to iPos
@@ -2110,23 +2539,23 @@ Class cBaseRefactorFunctionLibrary is a cObject
     End_Function
 
     // Returns True iif the source line contains a "Repeat" statement.
-    Function _IsRepeatStatement String sLine Returns Boolean
+    Function _IsRepeatStatement String sOverstrikeLine Returns Boolean
         Boolean bFound
-        Get _HasCommand sLine (" " + CS_Repeat) to bFound
+        Get _HasCommand (&sOverstrikeLine) (" " + CS_Repeat) to bFound
         Function_Return bFound
     End_Function   
     
-    Function _IsRegisterObjectInArray String sLine String[] ByRef asObjectNames Returns Boolean
+    Function _IsRegisterObjectInArray String sOverstrikeLine String[] ByRef asObjectNames Returns Boolean
         Boolean bWriteLine bRegisterObjectStart
         Integer iPos
-
-        Move False to bWriteLine
-        Get _IsRegisterAllObjectsStart sLine to bRegisterObjectStart
+        
+        Move False to bWriteLine                          
+        Get _IsRegisterAllObjectsStart sOverstrikeLine to bRegisterObjectStart
         If (bRegisterObjectStart = False) Begin
-            Move (Lowercase(sLine)) to sLine
-            Move (Replace("register_object", sLine, "")) to sLine
-            Move (Trim(sLine)) to sLine
-            Move (SearchArray(sLine, asObjectNames)) to iPos
+            Move (Lowercase(sOverstrikeLine)) to sOverstrikeLine
+            Move (Replace("register_object", sOverstrikeLine, "")) to sOverstrikeLine
+            Move (Trim(sOverstrikeLine)) to sOverstrikeLine
+            Move (SearchArray(sOverstrikeLine, asObjectNames)) to iPos
             Move (iPos = -1) to bWriteLine
         End
 
@@ -2136,7 +2565,8 @@ Class cBaseRefactorFunctionLibrary is a cObject
     Function _IsStudioGeneratedComment String sLine String sComment Returns Boolean
         String sText
         
-        Move (Lowercase(sLine)) to sText      
+        Move sLine to sText      
+        Move (Trim(sText)) to stext
         
         If (sText contains (CS_CommentSymbol + Lowercase(sComment))) Begin
             Function_Return True 
@@ -2149,9 +2579,9 @@ Class cBaseRefactorFunctionLibrary is a cObject
     End_Function
     
     // Returns True iif the source line contains a "While" statement.
-    Function _HasWhileStatement String sLine Returns Boolean
+    Function _HasWhileStatement tTokenizer ByRef TokenizerData Returns Boolean
         Boolean bFound
-        Get _HasCommand sLine (CS_While + " ") to bFound
+        Get _HasCommand (&TokenizerData) (CS_While + " ") to bFound
         Function_Return bFound
     End_Function   
     
@@ -2188,6 +2618,7 @@ Class cBaseRefactorFunctionLibrary is a cObject
     Function _IsRegisterObjectLine String sLine Returns Boolean
         Boolean bFound
         Integer iPos
+        
         Move False to bFound
         Move (Pos(CS_RegisterObject, sLine)) to iPos
         If (iPos = 1) Begin
@@ -2219,180 +2650,148 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Function_Return sLine
     End_Function
 
-    // *** Other low level functions ***
-    //
-    // Splits a line to a string array.
-    // Ignores any special characters, spaces or new line, CR "multi line"
-    Function _SplitTextByLengthPure String sText Integer iCount Returns String[]
-        String sLine
-        String[] saText
-    
-        Move sText to sLine
-    
-        While (Length(sLine) > 0)
-            Move (Mid(sLine, iCount, 1)) to saText[(SizeOfArray(saText))]
-            Move (Mid(sLine, (Length(sLine) - iCount), (iCount + 1))) to sLine
+    // Lowercases all values in the passed asArray, and then returns the changed array. 
+    // This is to make it easier to find keywords kept in string array properties.
+    Function _LowercaseArrayValues String[] asArray Returns String[]
+        String sValue
+        Integer iSize iCount
+        Move (SizeOfArray(asArray)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            Move asArray[iCount] to sValue
+            Move (Lowercase(sValue)) to asArray[iCount]
         Loop
+        Function_Return asArray
+    End_Function
     
-        Function_Return saText
-    End_Function
-
-    // Splits a string to a string array.
-    Function _Split String sSplitKey String sText Returns String[]
-        String[] sArray
-        Integer iLeftPos
-        Boolean bAtLeastOneSplit
-    
-        Move (ResizeArray(sArray, 0)) to sArray
-        If ((sSplitKey = "") and ((Length(sSplitKey)) = 0)) Begin
-            For iLeftPos from 1 to ((Length(sText)))
-                Move (Mid(sText, 1, iLeftPos)) to sArray[SizeOfArray(sArray)]
-            Loop
-        End
-        Else Begin
-            Move (Pos(sSplitKey, sText)) to iLeftPos
-    
-            While (iLeftPos > 0)
-                Move True to bAtLeastOneSplit
-                Move (Left(sText, iLeftPos - 1)) to sArray[SizeOfArray(sArray)]
-                Move (Right(sText, ((Length(sText) - (iLeftPos + (Length(sSplitKey))) )+1))) to sText
-                Move (Pos(sSplitKey, sText)) to iLeftPos
-            Loop
-    
-            // Include text to the right of the last split character.
-            Move sText to sArray[SizeOfArray(sArray)]
-        End
-    
-        Function_Return sArray
-    End_Function
-
-    // Creates a string by joining array elements using a separator (e.g. ",")
-    Function _JoinArray Global String[] saValues String sSeparator Returns String
-        Integer i iLength
-        String sRet
-        Move "" to sRet
-        Move (SizeOfArray(saValues)-1) to iLength
-        For i from 0 to iLength
-            // First element
-            If (i = 0) Begin
-                Append sRet saValues[i]
-            End
-            // Other elements
-            Else Begin
-                Append sRet sSeparator saValues[i]
-            End
-        Loop
-        Function_Return sRet
-    End_Function
-
-    // Convert Integer to a binary value
-    // Courtesy of Frank Cheng.
-    Function _IntToBinary Global Integer i Returns String
-        String sResult
-        If (i < 0) Function_Return ""
-        Move "" to sResult
-        Repeat
-            Move (String(Mod(i, 2)) + sResult) to sResult
-            Move (i / 2) to i
-        Until (i = 0)
-        Function_Return sResult
-    End_Function
-
-    // Courtesy of Frank Cheng.
-    // There is another verion (HexToInt) in mStrConv.pkg
-    Function _HexToInt2 Global String sNum Returns Integer
-        Integer iLength iDigit iNum iPower
-        Move (Length(sNum)) to iLength
-        Move 1 to iPower
-        Move 0 to iNum
-        While (iLength > 0)
-            Move (Ascii(Mid(sNum,1,iLength))) to iDigit
-            Subtract (If(iDigit > 57, 55, 48)) from iDigit
-            Add (iDigit * iPower) to iNum
-            Move (iPower * 16) to iPower
-            Decrement iLength
-        Loop
-        Function_Return iNum
-    End_Function
-
-    // Curtesy of Evertjan Dondergoor DAE
-    Function _SQLDateTimeToDFDateTime String s Returns DateTime
-        DateTime dt
-        Integer iYear iMonth iDay
-        Integer iHour iMinute iSecond
-
-        Move (Mid(s, 4,  1)) to iYear
-        Move (Mid(s, 2,  6)) to iMonth
-        Move (Mid(s, 2,  9)) to iDay
-        Move (Mid(s, 2, 12)) to iHour
-        Move (Mid(s, 2, 15)) to iMinute
-        Move (Mid(s, 2, 18)) to iSecond
-
-        Move (DateSetYear  (dt, iYear  )) to dt
-        Move (DateSetMonth (dt, iMonth )) to dt
-        Move (DateSetDay   (dt, iDay   )) to dt
-        Move (DateSetHour  (dt, iHour  )) to dt
-        Move (DateSetMinute(dt, iMinute)) to dt
-        Move (DateSetSecond(dt, iSecond)) to dt
-
-        Function_Return dt
-    End_Function
-
-    // Returns True if the "sCheckFieldName" field exists in the passed iFile datbase table.
-    // If it doesn't exist, False is returned
-    Function _IsFieldExisting Integer iFile String sCheckFieldName Returns Boolean
-        Integer iNumFields iCount                                      
-        String sFieldName
-      
-        Get_Attribute DF_FILE_NUMBER_FIELDS of iFile to iNumFields
-        Decrement iNumFields
-        For iCount from 0 to iNumFields  
-            Get_Attribute DF_FIELD_NAME of iFile iCount to sFieldName        
-            If ((Uppercase (sFieldName)) = (Uppercase (sCheckFieldName))) Begin
-                Function_Return True
-            End
-        Loop
-      
-        Function_Return False
-    End_Function
-
     // *** System (private) Messages ***
     //    
     Procedure AddCommand String sCommand
-        String[] Commands
+        String[] asCommands asCommandsLC
 
-        Get paCommands to Commands
-        Move (Lowercase(sCommand)) to sCommand
-        Move sCommand to Commands[SizeOfArray(Commands)]
-        Set paCommands to Commands
+        Get pasCommands to asCommands   
+        // Note: The value is lowercased.
+        Move (Trim(Lowercase(sCommand))) to sCommand
+        Move sCommand to asCommands[SizeOfArray(asCommands)]
+        Set pasCommands   to asCommands
     End_Procedure
 
     Procedure AddCommandFunction String sCommand
-        String[] aCommandFunctions
+        String[] asCommandFunctions
 
-        Get paCommandFunctions to aCommandFunctions
-        Move (Lowercase(sCommand)) to sCommand
-        Move sCommand to aCommandFunctions[SizeOfArray(aCommandFunctions)]
-        Set paCommandFunctions to aCommandFunctions
+        Get pasCommandFunctions to asCommandFunctions
+        Move (Trim(Lowercase(sCommand))) to sCommand
+        Move sCommand to asCommandFunctions[SizeOfArray(asCommandFunctions)]
+        Set pasCommandFunctions to asCommandFunctions
     End_Procedure
 
-    // Command list used for testing against inline if/else statements et. al.
-    // Note that it is not a complete command list and that we should be careful
-    // about commands that might be used as functions or in functions!
-    // For example, it is by intention that none of the variable declaration commands
-    // are added as things like If (Convert(sVer,String)="ab") would complicate our testing
-    //
-    // All commands can be entered case insensitive
-    // Standalone commands can end on a end of line, such as Abort.
-    // Other commands need more parameters and in such case we can improve our success rate
-    // by adding a space character.
-    //
-    Procedure AddAllCommands
-        String[] Empty
+    // Removes any keyword from the pasCommands array that also exists
+    // in the pasCommandFunctions array.
+    Procedure RemoveFunctionsFromCommandsArray 
+        String[] asCommands
+        String[] asCommandFunctions
+        String sFunction sDeleteItem sKeyword
+        Integer iSize iCount iItem
+        
+        Get pasCommands to asCommands
+        Get pasCommandFunctions to asCommandFunctions
+        Move (SizeOfArray(asCommandFunctions)) to iSize
+        Decrement iSize
+        Move "ZZZZZ" to sDeleteItem 
+        
+        For iCount from 0 to iSize
+            Move asCommandFunctions[iCount] to sFunction
+            Move (SearchArray(sFunction, asCommands)) to iItem
+            If (iItem <> -1) Begin
+                Move sDeleteItem to asCommands[iItem]
+            End
+        Loop
+        
+        Move (SortArray(asCommands)) to asCommands
+        Move (SearchArray(sDeleteItem, asCommands)) to iItem
+        If (iItem <> -1) Begin
+            Move (ResizeArray(asCommands, (iSize - (iSize - iItem)))) to asCommands
+        End
+        
+        Set pasCommands to asCommands
+    End_Procedure  
+    
+    // Sets the pasLocalVariableArrayTypes array property based on content
+    // from a pasLocalVariableTypes array.
+    // The pasLocalVariableTypes array contains variable declarations like; string, integer...
+    // The pasLocalVariableArrayTypes will be filled wtih declarations like; string[], string[][], integer[], integer[][] etc.
+    Procedure Set LocalVariableArrayTypes String[] asLocalVariableTypes
+        Integer iSize iCount
+        String[] asLocalVariableArrayTypes
+        String sVariable
+        
+        Move (SizeOfArray(asLocalVariableTypes)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            Move asLocalVariableTypes[iCount] to sVariable
+            Append sVariable "[]" 
+            Move sVariable to asLocalVariableArrayTypes[SizeOfArray(asLocalVariableArrayTypes)]
+            Append sVariable "[]" 
+            Move sVariable to asLocalVariableArrayTypes[SizeOfArray(asLocalVariableArrayTypes)]
+        Loop
+        Move (SortArray(asLocalVariableArrayTypes)) to asLocalVariableArrayTypes
+        Set pasLocalVariableArrayTypes to asLocalVariableArrayTypes
+    End_Procedure
+    
+    // This is called from End_Construct_Object and fills several keyword string array properties.
+    Procedure AddAllKeyWords
+        String[] Empty asScopeStart asScopeEnd asKeywords asOperators asCommands
+        String[] asLocalVariableTypes asLocalVariableArrayTypes
+        String sPath sFileName
+        Integer iCh 
+        tSCLanguage SCLanguage
 
-        Set paCommands to Empty
+        // Local variable declarations
+        Get StrSplitToArray CS_VarTypes ";" to asLocalVariableTypes
+        Get _LowercaseArrayValues asLocalVariableTypes to asLocalVariableTypes
+        Move (SortArray(asLocalVariableTypes)) to asLocalVariableTypes
+        Set pasLocalVariableTypes to asLocalVariableTypes
+        Set LocalVariableArrayTypes to asLocalVariableTypes
 
-        //Send AddCommand "Repeat"  // nope, it is a function too
+        Get pSCLanguage of ghoApplication to SCLanguage
+
+        // Scoped words
+        Move SCLanguage.saScopeStart to asScopeStart
+        Get _LowercaseArrayValues asScopeStart to asScopeStart
+        Move (SortArray(asScopeStart)) to asScopeStart
+        Set pasScopeStart to asScopeStart
+        
+        Move SCLanguage.saScopeStop to asScopeEnd
+        Get _LowercaseArrayValues asScopeEnd to asScopeEnd
+        Move (SortArray(asScopeEnd)) to asScopeEnd
+        Set pasScopeEnd to asScopeEnd
+
+        // Keywords
+        Move SCLanguage.saKeywords to asKeywords
+        Get _LowercaseArrayValues asKeywords to asKeywords
+        Move (SortArray(asKeywords)) to asKeywords
+        Set pasKeyWords to asKeywords
+        
+        // Operators
+        Move SCLanguage.saOperators to asOperators
+        Get _LowercaseArrayValues asOperators to asOperators
+        Move (SortArray(asOperators)) to asOperators
+        Set pasOperators to asOperators
+        
+        // ToDo: Not sure we need this array property any more, instead we could use the above arrays.
+        //
+        // Command list used for testing against inline if/else statements et. al.
+        // Note that it is not a complete command list and that we should be careful
+        // about commands that might be used as functions or in functions!
+        // For example, it is by intention that none of the variable declaration commands
+        // are added as things like If (Convert(sVer,String)="ab") would complicate our testing
+        //
+        // Standalone commands can end on a end of line, such as Abort.
+        // Other commands need more parameters and in such case we can improve our success rate
+        // by adding a space character.
+        //
+        // Start by resetting array property to "blank", in case it was called before.
+        Set pasCommands to Empty
         Send AddCommand "Abort"
         Send AddCommand "Abort_Transaction"
         Send AddCommand "Activate_View "
@@ -2400,6 +2799,7 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Send AddCommand "Address "
         Send AddCommand "Append "
         Send AddCommand "Append_Output "
+        Send AddCommand "Ascii"
         Send AddCommand "Attach "
         Send AddCommand "Begin_Constraints"
         Send AddCommand "Begin_Transaction"
@@ -2408,7 +2808,8 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Send AddCommand "Calc "
         Send AddCommand "Calculate "
         Send AddCommand "Call_Driver "
-        Send AddCommand "CallStackDump "
+        Send AddCommand "CallStackDump "  
+        Send AddCommand "Character"
         Send AddCommand "Case "
         Send AddCommand "Clear "
         Send AddCommand "Close "
@@ -2443,6 +2844,7 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Send AddCommand "For "
         Send AddCommand "For_All "
         Send AddCommand "Forward "
+        Send AddCommand "Function"
         Send AddCommand "Function_Return " // you might have code that does not return a value, I'd consider that a warning
         Send AddCommand "Get "
         Send AddCommand "Get_Argument_Size "
@@ -2470,11 +2872,18 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Send AddCommand "GetBuff_String "
         Send AddCommand "GetDskInfo "
         Send AddCommand "Global_Variable "
+        Send AddCommand "Gosub"
+        Send AddCommand "Goto"
+        Send AddCommand "GotoXY"
         Send AddCommand "Include_Resource "
+        Send AddCommand "Include_Text"
         Send AddCommand "Increment "
         Send AddCommand "Indicate "
         Send AddCommand "Indicator "
+        Send AddCommand "Input"
         Send AddCommand "Load_Def "
+        Send AddCommand "Left"
+        Send AddCommand "Length"
         Send AddCommand "Load_Driver "
         Send AddCommand "Lock"
         Send AddCommand "Login "
@@ -2482,12 +2891,14 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Send AddCommand "Make_Directory "
         Send AddCommand "Make_File "
         Send AddCommand "Make_Temp_File "
+        Send AddCommand "Mid"
         Send AddCommand "Move "
         Send AddCommand "Movedate "
         Send AddCommand "Moveint "
         Send AddCommand "Movenum "
         Send AddCommand "Movereal "
         Send AddCommand "Movestr "
+        Send AddCommand "MoveVar"
         Send AddCommand "NewRecord "
         Send AddCommand "On_Item"
         Send AddCommand "On_key "
@@ -2495,7 +2906,10 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Send AddCommand "Output "
         Send AddCommand "Output_Aux_File "
         Send AddCommand "Output_Wrap"
+        Send AddCommand "Pad"
+        Send AddCommand "Pos"
         Send AddCommand "Playwave "
+        Send AddCommand "Procedure"
         Send AddCommand "Procedure_Return"
         Send AddCommand "Property "
         Send AddCommand "Put "
@@ -2510,8 +2924,11 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Send AddCommand "Relate "
         Send AddCommand "Remove_Directory "
         Send AddCommand "Renamefile "
+        Send AddCommand "Repeat"
+        Send AddCommand "Replace"
         Send AddCommand "Report_Breaks "
         Send AddCommand "Reread"
+        Send AddCommand "Right"
         Send AddCommand "RunProgram "
         Send AddCommand "Save "
         Send AddCommand "SaveRecord "
@@ -2542,9 +2959,11 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Send AddCommand "Subtract "
         Send AddCommand "Sysdate "
         Send AddCommand "Sysdate4 "
+        Send AddCommand "Trim"
         Send AddCommand "Unload_Driver "
         Send AddCommand "Unlock"   
         Send AddCommand "Until"
+        Send AddCommand "Uppercase"
         Send AddCommand "Valid_Drive "
         Send AddCommand "ValueTreeDeserializeParameter "
         Send AddCommand "ValueTreeSerializeParameter "
@@ -2564,18 +2983,310 @@ Class cBaseRefactorFunctionLibrary is a cObject
         Send AddCommand "ZeroFile "
         Send AddCommand "ZeroString "
         Send AddCommand "ZeroType "
+        
+        Get pasCommands to asCommands
+        Move (SortArray(asCommands)) to asCommands
+        Set pasCommands to asCommands 
+        
+        // ToDo: Not sure if we should remove the functions from the commands array;
+        //Send RemoveFunctionsFromCommandsArray
     End_Procedure
 
+    // Commands that also exists as DataFlex functions;
     Procedure AddAllCommandFunctions
         String[] Empty
 
-        Set paCommandFunctions to Empty
+        Set pasCommandFunctions to Empty
 
-        Send AddCommandFunction "Repeat"  
-        Send AddCommandFunction "If "
-        Send AddCommandFunction "Else "  
-        Send AddCommandFunction "Pos"
+        Send AddCommandFunction "Append"
+        Send AddCommandFunction "Ascii"
+        Send AddCommandFunction "Character"
+        Send AddCommandFunction "Else"  
+        Send AddCommandFunction "If"
         Send AddCommandFunction "Insert"
+        Send AddCommandFunction "Left"
+        Send AddCommandFunction "Length"
+        Send AddCommandFunction "Mid"  
+        Send AddCommandFunction "Pad"
+        Send AddCommandFunction "Pos"
+        Send AddCommandFunction "Repeat"  
+        Send AddCommandFunction "Replace"
+        Send AddCommandFunction "Right"
+        Send AddCommandFunction "Trim"
+        Send AddCommandFunction "Uppercase"
     End_Procedure
 
+    Procedure End_Construct_Object
+        Forward Send End_Construct_Object
+        Send AddAllCommandFunctions
+        Send AddAllKeyWords     
+        // Although this is done automatically here,
+        // it should also be send before each refactoring starts,
+        // in case e.g. the tab-size has been changed.
+        // This has been put here for the DFUnit_Testrunner.
+        Send InitializeInterface
+    End_Procedure        
+    
+    Procedure InitTabSize
+        Integer iID iTabSize
+        
+        Move FunctionsA.ID to iID
+        Clear FunctionsA
+        Move CS_EditorReIndent to FunctionsA.Function_Name
+        Find eq FunctionsA by Index.5
+        If (Found = False) Begin
+            Error ("Could not find function:" * CS_EditorReIndent +"\nin the 'Functions' table. It is used for setting the tab-size. Cannot continue.")
+            Abort
+        End
+        Move (Trim(FunctionsA.Parameter)) to iTabSize
+        // Reset record buffert:
+        If (iID <> 0) Begin
+            Move iID to FunctionsA.ID
+            Find Eq FunctionsA by Index.1
+        End
+        Set piTabSize to iTabSize
+    End_Procedure
+    
+    Procedure SaveErrorState
+        Set piLastErr to LastErr
+        If (Err = True) Begin
+            Set pbErr to True
+        End
+        Else Begin
+            Set pbErr to False
+        End   
+        Move False to Err
+        Move 0 to LastErr
+    End_Procedure
+    
+    Procedure RestoreErrorState
+        Get piLastErr to LastErr
+        If (pbErr(Self)) Begin
+            Move True to Err
+        End
+        Else Begin
+            Move False to Err
+        End
+    End_Procedure    
+    
+    // Must be send before the refactoring process is started
+    // It initializes necessary parameters.
+    Procedure InitializeInterface
+        Send SaveErrorState
+        Send InitTabSize
+    End_Procedure
+    
+    Procedure ResetProjectObjectStructureProperties
+        String[] asObjectNames
+        Set pbProjectObjectStructureStart to False 
+        Set pbProjectObjectStructureEnd   to False
+        Set pbRegisterAllObjectsStart     to False    
+        Set pbRegisterAllObjectsEnd       to False
+        Set pasObjectNames                to asObjectNames
+    End_Procedure
+
+//    Procedure AddEditorCommands String[] asKeyWords
+//        String[] asCommandFunctions
+//        String sFunction sDeleteItem sKeyword
+//        Integer iSize iCount iItem
+//        
+//        Move "ZZZZZ" to sDeleteItem
+//        // Start by lowercasing all asKeyWords values.
+//        // We do that so it is easier to find and match keywords/commands.
+//        Get _LowercaseArrayValues asKeyWords to asKeyWords       
+//               
+//        Get pasCommandFunctions to asCommandFunctions
+//        Move (SizeOfArray(asCommandFunctions)) to iSize
+//        Decrement iSize
+//        for iCount from 0 to iSize
+//            Move asCommandFunctions[iCount] to sFunction
+//            Move (SearchArray(sFunction, asKeyWords)) to iItem
+//            If (iItem <> -1) Begin
+//                Move sDeleteItem to asKeyWords[iItem]
+//            End
+//        Loop
+//        Move (SortArray(asKeywords)) to asKeywords
+//        Move (SearchArray(sDeleteItem, asKeyWords)) to iItem
+//        If (iItem <> -1) Begin
+//            Move (ResizeArray(asKeyWords, (iSize - (iSize - iItem)))) to asKeyWords
+//        End
+//        
+//        Set pasKeyWords to asKeywords
+//    End_Procedure  
+    
+    // *** Other low level functions ***
+    //
+    //     These functions are commented out for now, but if any of them is needed, just un-comment.
+    // Splits a line to a string array.
+    // Ignores any special characters, spaces or new line, CR "multi line"
+
+    // Returns True if the "sCheckFieldName" field exists in the passed iFile datbase table.
+    // If it doesn't exist, False is returned
+//    Function _IsFieldExisting Integer iFile String sCheckFieldName Returns Boolean
+//        Integer iNumFields iCount                                      
+//        String sFieldName
+//      
+//        Get_Attribute DF_FILE_NUMBER_FIELDS of iFile to iNumFields
+//        Decrement iNumFields
+//        For iCount from 0 to iNumFields  
+//            Get_Attribute DF_FIELD_NAME of iFile iCount to sFieldName        
+//            If ((Uppercase (sFieldName)) = (Uppercase (sCheckFieldName))) Begin
+//                Function_Return True
+//            End
+//        Loop
+//      
+//        Function_Return False
+//    End_Function
+//
+//    Function _SplitTextByLengthPure String sText Integer iCount Returns String[]
+//        String sLine
+//        String[] saText
+//    
+//        Move sText to sLine
+//    
+//        While (Length(sLine) > 0)
+//            Move (Mid(sLine, iCount, 1)) to saText[(SizeOfArray(saText))]
+//            Move (Mid(sLine, (Length(sLine) - iCount), (iCount + 1))) to sLine
+//        Loop
+//    
+//        Function_Return saText
+//    End_Function
+//
+//    // Splits a string to a string array.
+//    Function _Split String sSplitKey String sText Returns String[]
+//        String[] sArray
+//        Integer iLeftPos
+//        Boolean bAtLeastOneSplit
+//    
+//        Move (ResizeArray(sArray, 0)) to sArray
+//        If ((sSplitKey = "") and ((Length(sSplitKey)) = 0)) Begin
+//            For iLeftPos from 1 to ((Length(sText)))
+//                Move (Mid(sText, 1, iLeftPos)) to sArray[SizeOfArray(sArray)]
+//            Loop
+//        End
+//        Else Begin
+//            Move (Pos(sSplitKey, sText)) to iLeftPos
+//    
+//            While (iLeftPos > 0)
+//                Move True to bAtLeastOneSplit
+//                Move (Left(sText, iLeftPos - 1)) to sArray[SizeOfArray(sArray)]
+//                Move (Right(sText, ((Length(sText) - (iLeftPos + (Length(sSplitKey))) )+1))) to sText
+//                Move (Pos(sSplitKey, sText)) to iLeftPos
+//            Loop
+//    
+//            // Include text to the right of the last split character.
+//            Move sText to sArray[SizeOfArray(sArray)]
+//        End
+//    
+//        Function_Return sArray
+//    End_Function
+//
+//    // Creates a string by joining array elements using a separator (e.g. ",")
+//    Function _JoinArray Global String[] saValues String sSeparator Returns String
+//        Integer i iLength
+//        String sRet
+//        Move "" to sRet
+//        Move (SizeOfArray(saValues)-1) to iLength
+//        For i from 0 to iLength
+//            // First element
+//            If (i = 0) Begin
+//                Append sRet saValues[i]
+//            End
+//            // Other elements
+//            Else Begin
+//                Append sRet sSeparator saValues[i]
+//            End
+//        Loop
+//        Function_Return sRet
+//    End_Function
+//
+//    // Convert Integer to a binary value
+//    // Courtesy of Frank Cheng.
+//    Function _IntToBinary Global Integer i Returns String
+//        String sResult
+//        If (i < 0) Function_Return ""
+//        Move "" to sResult
+//        Repeat
+//            Move (String(Mod(i, 2)) + sResult) to sResult
+//            Move (i / 2) to i
+//        Until (i = 0)
+//        Function_Return sResult
+//    End_Function
+//
+//    // Courtesy of Frank Cheng.
+//    // There is another verion (HexToInt) in mStrConv.pkg
+//    Function _HexToInt2 Global String sNum Returns Integer
+//        Integer iLength iDigit iNum iPower
+//        Move (Length(sNum)) to iLength
+//        Move 1 to iPower
+//        Move 0 to iNum
+//        While (iLength > 0)
+//            Move (Ascii(Mid(sNum,1,iLength))) to iDigit
+//            Subtract (If(iDigit > 57, 55, 48)) from iDigit
+//            Add (iDigit * iPower) to iNum
+//            Move (iPower * 16) to iPower
+//            Decrement iLength
+//        Loop
+//        Function_Return iNum
+//    End_Function
+//
+//    // Curtesy of Evertjan Dondergoor DAE
+//    Function _SQLDateTimeToDFDateTime String s Returns DateTime
+//        DateTime dt
+//        Integer iYear iMonth iDay
+//        Integer iHour iMinute iSecond
+//
+//        Move (Mid(s, 4,  1)) to iYear
+//        Move (Mid(s, 2,  6)) to iMonth
+//        Move (Mid(s, 2,  9)) to iDay
+//        Move (Mid(s, 2, 12)) to iHour
+//        Move (Mid(s, 2, 15)) to iMinute
+//        Move (Mid(s, 2, 18)) to iSecond
+//
+//        Move (DateSetYear  (dt, iYear  )) to dt
+//        Move (DateSetMonth (dt, iMonth )) to dt
+//        Move (DateSetDay   (dt, iDay   )) to dt
+//        Move (DateSetHour  (dt, iHour  )) to dt
+//        Move (DateSetMinute(dt, iMinute)) to dt
+//        Move (DateSetSecond(dt, iSecond)) to dt
+//
+//        Function_Return dt
+//    End_Function
+//
+//    Function _IntToHex Number iInput Returns String 
+//        String sOutput
+//        Boolean bNegative
+//        UChar[] ucData
+//        Integer iRemain
+//        
+//        If (iInput < 0) Begin
+//            Move (iInput * -1) to iInput
+//            Move True to bNegative
+//        End
+//        While (iInput >= 16)
+//            Move (Mod (iInput, 16)) to iRemain
+//            Move (iInput / 16)        to iInput
+//            If (iRemain < 10) Begin
+//                Move (Cast (48 + iRemain, UChar)) to ucData[SizeOfArray(ucData)]
+//            End
+//            Else Begin
+//                Move (Cast (65 + iRemain - 10, UChar)) to ucData[SizeOfArray(ucData)]
+//            End
+//        Loop
+//        If (iInput < 10) Begin
+//            Move (Cast (48 + iInput, UChar)) to ucData[SizeOfArray(ucData)]
+//        End
+//        Else Begin
+//            Move (Cast (65 + iInput - 10, UChar)) to ucData[SizeOfArray(ucData)]
+//        End
+//        Move (ReverseArray(ucData)) to ucData
+//        If (bNegative) Begin
+//            Move (sOutput + "-" + UCharArrayToString (ucData)) to sOutput
+//        End
+//        Else Begin
+//            Move (sOutput + UCharArrayToString (ucData)) to sOutput
+//        End
+//        Function_Return sOutput
+//    End_Function
+        
 End_Class

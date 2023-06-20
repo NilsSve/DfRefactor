@@ -912,19 +912,6 @@ Register_Procedure RefreshSelectionUpdate
 
     End_Object
 
-    // Hidden object!
-    // This _must_ be here, else we will get infinite recursion and a crash because there
-    // will be no object to take the focus when the view is disabled.
-//    Object oHidden_Focus_Object is a Form
-//        Set Size to 13 27
-//        Set Location to 280 150
-//        Set Label to "Hidden focus object!"
-//        Set Visible_State to False
-//        Set Label_Justification_Mode to JMode_Right
-//        Set Label_Col_Offset to 2
-//    End_Object
-
-
     Procedure InitializeCounters
         Send ResetLineCounters of (Main_DD(Self))
         Set piNoOfUnusedLocalVariables of (phoRemoveUnusedLocals(ghoRefactorFunctionLibrary)) to 0
@@ -1050,6 +1037,7 @@ Register_Procedure RefreshSelectionUpdate
             Procedure_Return
         End
 
+        Send InitializeInterface    of ghoRefactorFunctionLibrary
         Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
         Get psCurrentSourceFileName of ghoApplication to sFileName
         Get pRefactorSettings       of ghoRefactorFunctionLibrary to RefactorSettings
@@ -1063,7 +1051,7 @@ Register_Procedure RefreshSelectionUpdate
 
         Move False to Err
         Move 0 to LastErr
-        Send InitializeCounters 
+        Send InitializeCounters
         Move (CurrentDateTime()) to dtExecStart
         
         // *** Business Process where the calls to selected refactoring functions are made ***
