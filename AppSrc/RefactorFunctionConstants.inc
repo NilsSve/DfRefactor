@@ -155,15 +155,15 @@ Struct tTokenizer
     Boolean bIsInClass            // Are we in a command declaration
     Boolean bIsInCommand          // Are we in a command declaration e.g. #Commmand Move...
     Boolean bIsVariableDeclaration // Is the line a variable declaration
-    Boolean bHasOverstrikeChars   // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
     Boolean bHasIfCommand         // True if at least one "if" on the line.
     
+    Boolean bHasOverstrikeChars   // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
     String sOverstrikeLine        // Source line without indentation and string constants overstriked with "_" or "+".
     String sLine                  // The original source line, untouched.
     String sEndComment            // Move x to y *// This is a right side comment.*
     String sIndentation           // Line start indentation, one or more tabs or spaces.
 
-    tBooleanIndicator IndicatorInfo // [*Select*] Move "A" to "B"
+    tBooleanIndicator IndicatorInfo // [*Select*] Move "A" to "B" etc.
 
     tToken LeftStatement         // *Get MyFunction* of oSomeObject. Part before the "of" and "to" keywords.
     tToken OfStatement           // Get "Function" of *oMyObject*
