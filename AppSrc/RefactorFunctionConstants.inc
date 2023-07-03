@@ -147,7 +147,7 @@ Struct tTokenizer
     Boolean bIsImageStart         // Does the line start with a "/MyPageName"
     Boolean bIsImageEnd           // Does the line start with a "/*"
     Boolean bHasEndSemiColon      // If the line ends with a semi-colon (;), indicating there is more code on next line.
-    Boolean bIsMultiLineString    // DF23 -> can e.g. be an SQL statement over several lines. Will not be acted on by the Tokenizier.
+    Boolean bIsInMultiLineString  // DF23 -> can e.g. be an SQL statement over several lines. Will not be acted on by the Tokenizier.
     Boolean bIsOpenString         // If bHasEndSemiColon is True, or bIsMultiLineString is True the line can be an "open" string constant.
     Boolean bIsDF23String         // DF23 -> can e.g. be an SQL statement, Javascript code etc. Will not be acted on by the Tokenizier.
     Boolean bIsInFunction         // Are we in a function declaration
@@ -157,14 +157,14 @@ Struct tTokenizer
     Boolean bIsVariableDeclaration // Is the line a variable declaration
     Boolean bHasIfCommand         // True if at least one "if" on the line.
     
-    Boolean bHasOverstrikeChars   // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
-    String sOverstrikeLine        // Source line without indentation and string constants overstriked with "_" or "+".
     String sLine                  // The original source line, untouched.
     String sEndComment            // Move x to y *// This is a right side comment.*
     String sIndentation           // Line start indentation, one or more tabs or spaces.
+    Boolean bHasOverstrikeChars   // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
+    String sOverstrikeLine        // Source line without indentation and string constants overstriked with "_" or "+".
+    tQuotedString[] aStringContent // Struct string array with original text string constants for the sLine content.
 
     tBooleanIndicator IndicatorInfo // [*Select*] Move "A" to "B" etc.
-
     tToken LeftStatement         // *Get MyFunction* of oSomeObject. Part before the "of" and "to" keywords.
     tToken OfStatement           // Get "Function" of *oMyObject*
     tToken ToStatement           // Move x to *y*
