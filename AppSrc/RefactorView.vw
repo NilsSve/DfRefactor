@@ -763,7 +763,7 @@ Register_Procedure RefreshSelectionUpdate
             Set FontWeight to fw_Bold  
             Set Form_Datatype to Mask_Numeric_Window   
             Set Form_Mask to "####"   
-            Set pbAutoEnable to True
+            Set pbAutoEnable to False
             Set peAnchors to anBottomRight
 
             // This will show/hide the control:
