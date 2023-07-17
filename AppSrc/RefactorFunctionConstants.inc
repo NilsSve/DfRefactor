@@ -141,46 +141,46 @@ Struct tBooleanIndicator
 End_Struct        
 
 Struct tTokenizer
-    Boolean bLineIsReady          // This is set when we don't need to process the line no more, e.g. a blank line or a commented line.
-    Boolean bIsBlank              // It is a blank line (with no or many tabs and/or spaces.
-    Boolean bIsComment            // If the source code line starts with "//"
-    Boolean bIsImageStart         // Does the line start with a "/MyPageName"
-    Boolean bIsImageEnd           // Does the line start with a "/*"
-    Boolean bHasEndSemiColon      // If the line ends with a semi-colon (;), indicating there is more code on next line.
-    Boolean bIsInMultiLineString  // DF23 -> can e.g. be an SQL statement over several lines. Will not be acted on by the Tokenizier.
-    Boolean bIsOpenString         // If bHasEndSemiColon is True, or bIsMultiLineString is True the line can be an "open" string constant.
-    Boolean bIsDF23String         // DF23 -> can e.g. be an SQL statement, Javascript code etc. Will not be acted on by the Tokenizier.
-    Boolean bIsInFunction         // Are we in a function declaration
-    Boolean bIsInProcedure        // Are we in a procedure declaration
-    Boolean bIsInClass            // Are we in a command declaration
-    Boolean bIsInCommand          // Are we in a command declaration e.g. #Commmand Move...
-    Boolean bIsVariableDeclaration // Is the line a variable declaration
-    Boolean bHasIfCommand         // True if at least one "if" on the line.
+    Boolean bLineIsReady                // This is set when we don't need to process the line no more, e.g. a blank line or a commented line.
+    Boolean bIsBlank                    // It is a blank line (with no or many tabs and/or spaces.
+    Boolean bIsInImage                  // Are we within a "/MyPageName" -- "/*" area?
+    Boolean bIsComment                  // If the source code line starts with "//"
+    Boolean bIsInDF23MultiLineComment   // For DF 23 and up. New comment syntax: Start = /* and End = */
+    Boolean bHasEndSemiColon            // If the line ends with a semi-colon (;), indicating there is more code on next line.
+    Boolean bIsInDF23MultiLineString    // DF23 -> can e.g. be an SQL statement over several lines. Will not be acted on by the Tokenizier.
+    Boolean bIsOpenString               // If bHasEndSemiColon is True, or bIsMultiLineString is True the line can be an "open" string constant.
+    Boolean bIsDF23String               // DF23 -> can e.g. be an SQL statement, Javascript code etc. Will not be acted on by the Tokenizier.
+    Boolean bIsInFunction               // Are we in a function declaration
+    Boolean bIsInProcedure              // Are we in a procedure declaration
+    Boolean bIsInClass                  // Are we in a command declaration
+    Boolean bIsInCommand                // Are we in a command declaration e.g. #Commmand Move...
+    Boolean bIsVariableDeclaration      // Is the line a variable declaration
+    Boolean bHasIfCommand               // True if at least one "if" on the line.
     
-    String sLine                  // The original source line, untouched.
-    String sEndComment            // Move x to y *// This is a right side comment.*
-    String sIndentation           // Line start indentation, one or more tabs or spaces.
-    Boolean bHasOverstrikeChars   // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
-    String sOverstrikeLine        // Source line without indentation and string constants overstriked with "_" or "+".
-    tQuotedString[] aStringContent // Struct string array with original text string constants for the sLine content.
+    String sLine                        // The original source line, untouched.
+    String sEndComment                  // Move x to y *// This is a right side comment.*
+    String sIndentation                 // Line start indentation, one or more tabs or spaces.
+    Boolean bHasOverstrikeChars         // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
+    String sOverstrikeLine              // Source line without indentation and string constants overstriked with "_" or "+".
+    tQuotedString[] aStringContent      // Struct string array with original text string constants for the sLine content.
 
-    tBooleanIndicator IndicatorInfo // [*Select*] Move "A" to "B" etc.
-    tToken LeftStatement         // *Get MyFunction* of oSomeObject. Part before the "of" and "to" keywords.
-    tToken OfStatement           // Get "Function" of *oMyObject*
-    tToken ToStatement           // Move x to *y*
+    tBooleanIndicator IndicatorInfo     // [*Select*] Move "A" to "B" etc.
+    tToken LeftStatement                // *Get MyFunction* of oSomeObject. Part before the "of" and "to" keywords.
+    tToken OfStatement                  // Get "Function" of *oMyObject*
+    tToken ToStatement                  // Move x to *y*
 
-    tToken FirstLeftCommand      // *If* (x = y)... (left side of the "to" clause)
-    tToken SecondLeftCommand     // "If (x = y) *Move* A to" or "If (True) *Begin*"
+    tToken FirstLeftCommand             // *If* (x = y)... (left side of the "to" clause)
+    tToken SecondLeftCommand            // "If (x = y) *Move* A to" or "If (True) *Begin*"
 
-    String sLeftExpression1       // If *((iA * iB > 10) + (iD + iE)* > 100) Move (iA / iB) to
-    String sLeftExpression2       // If ((iA * iB > 10) + (iD + iE) > 100) Move *(iA / iB)* to
-    String sOfExpression          // Get psAppSrcPath of *(phoWorkspace(ghoApplication))* to
-    String sToExpression          // Move (True = False) to *(asMyArray[SizeOfArray(asMyArray)]*
-//    tExpression[] aExpression     // Struct array with all expressions within "()".
+    String sLeftExpression1             // If *((iA * iB > 10) + (iD + iE)* > 100) Move (iA / iB) to
+    String sLeftExpression2             // If ((iA * iB > 10) + (iD + iE) > 100) Move *(iA / iB)* to
+    String sOfExpression                // Get psAppSrcPath of *(phoWorkspace(ghoApplication))* to
+    String sToExpression                // Move (True = False) to *(asMyArray[SizeOfArray(asMyArray)]*
+//    tExpression[] aExpression           // Struct array with all expressions within "()".
 
-    String[] asLineTokens         // The sOverstrikeLine is broken up by spaces to a string array, and expressions are kept together on one array line even if it contains spaces.
-    String[] asLineTokensLC       // The same content as array above *but* in LowerCase.
-    tOperatorsInfo OperatorsInfo  // Operator info e.g. "eq", "=", "lt", "<" etc.
+    String[] asLineTokens               // The sOverstrikeLine is broken up by spaces to a string array, and expressions are kept together on one array line even if it contains spaces.
+    String[] asLineTokensLC             // The same content as array above *but* in LowerCase.
+    tOperatorsInfo OperatorsInfo        // Operator info e.g. "eq", "=", "lt", "<" etc.
 End_Struct        
 
 #IFNDEF clGreenGrey
@@ -242,6 +242,8 @@ Define CS_UnusedSourceLogFile       for "UnusedSourceFiles.txt"
 Define CS_CommentSymbol             for ("//")
 Define CS_ImageNameStart            for "/"
 Define CS_ImageNameEnd              for "/*"
+Define CS_DF23CommentStart          for "/*"
+Define CS_DF23CommentEnd            for "*/"
 Define CS_StudioToolsPathStart      for "Software\Data Access Worldwide\DataFlex Tools\"
 Define CS_StudioToolsPathEnd        for "\Studio\Preferences\File Extensions"
 Define CS_StudioCodeEditorPath      for "\Studio\Code-Editor"
