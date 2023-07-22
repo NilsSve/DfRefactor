@@ -176,7 +176,7 @@ Struct tTokenizer
     String sLeftExpression2             // If ((iA * iB > 10) + (iD + iE) > 100) Move *(iA / iB)* to
     String sOfExpression                // Get psAppSrcPath of *(phoWorkspace(ghoApplication))* to
     String sToExpression                // Move (True = False) to *(asMyArray[SizeOfArray(asMyArray)]*
-//    tExpression[] aExpression           // Struct array with all expressions within "()".
+    tExpression[] aExpressions          // Struct array with all expressions within "()" and their position on the source line.
 
     String[] asLineTokens               // The sOverstrikeLine is broken up by spaces to a string array, and expressions are kept together on one array line even if it contains spaces.
     String[] asLineTokensLC             // The same content as array above *but* in LowerCase.
