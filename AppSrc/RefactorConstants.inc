@@ -164,7 +164,6 @@ Struct tTokenizer
     String sOverstrikeLine              // Source line without indentation and string constants overstriked with "_" or "+".
     tQuotedString[] aStringContent      // Struct string array with original text string constants for the sLine content.
 
-    tBooleanIndicator IndicatorInfo     // [*Select*] Move "A" to "B" etc.
     tToken LeftStatement                // *Get MyFunction* of oSomeObject. Part before the "of" and "to" keywords.
     tToken OfStatement                  // Get "Function" of *oMyObject*
     tToken ToStatement                  // Move x to *y*
@@ -180,6 +179,7 @@ Struct tTokenizer
 
     String[] asLineTokens               // The sOverstrikeLine is broken up by spaces to a string array, and expressions are kept together on one array line even if it contains spaces.
     String[] asLineTokensLC             // The same content as array above *but* in LowerCase.
+    tBooleanIndicator IndicatorInfo     // [*Select*] Move "A" to "B" etc.
     tOperatorsInfo OperatorsInfo        // Operator info e.g. "eq", "=", "lt", "<" etc.
 End_Struct        
 
