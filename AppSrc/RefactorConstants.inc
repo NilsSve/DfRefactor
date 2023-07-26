@@ -162,7 +162,7 @@ Struct tTokenizer
     String sIndentation                 // Line start indentation, one or more tabs or spaces.
     Boolean bHasOverstrikeChars         // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
     String sOverstrikeLine              // Source line without indentation and string constants overstriked with "_" or "+".
-    tQuotedString[] aStringContent      // Struct string array with original text string constants for the sLine content.
+//    tQuotedString[] aStringContent      // Struct string array with original text string constants for the sLine content.
 
     tToken LeftStatement                // *Get MyFunction* of oSomeObject. Part before the "of" and "to" keywords.
     tToken OfStatement                  // Get "Function" of *oMyObject*
@@ -177,7 +177,7 @@ Struct tTokenizer
     String sToExpression                // Move (True = False) to *(asMyArray[SizeOfArray(asMyArray)]*
     tExpression[] aExpressions          // Struct array with all expressions within "()" and their position on the source line.
 
-    String[] asLineTokens               // The sOverstrikeLine is broken up by spaces to a string array, and expressions are kept together on one array line even if it contains spaces.
+    String[] asLineTokens               // The sOverstrikeLine is broken up by spaces to a string array, but expressions are kept together on one array line even if it contains spaces.
     String[] asLineTokensLC             // The same content as array above *but* in LowerCase.
     tBooleanIndicator IndicatorInfo     // [*Select*] Move "A" to "B" etc.
     tOperatorsInfo OperatorsInfo        // Operator info e.g. "eq", "=", "lt", "<" etc.
