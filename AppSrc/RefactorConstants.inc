@@ -162,6 +162,7 @@ Struct tTokenizer
     String sIndentation                 // Line start indentation, one or more tabs or spaces.
     Boolean bHasOverstrikeChars         // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
     String sOverstrikeLine              // Source line without indentation and string constants overstriked with "_" or "+".
+// ToDo: Finish tQuotedString function.
 //    tQuotedString[] aStringContent      // Struct string array with original text string constants for the sLine content.
 
     tToken LeftStatement                // *Get MyFunction* of oSomeObject. Part before the "of" and "to" keywords.
