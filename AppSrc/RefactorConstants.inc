@@ -227,7 +227,7 @@ Define CS_SelectWorkspaceFile       for "Select a DataFlex workspace project fil
 Define CS_BrowseSourceFileTxt       for "Select File:"
 Define CS_CurrentSourceFileTxt      for "Current File:"
 Define CS_NoActiveSourceFileText    for "" 
-Define CS_NoWorkspaceSelected       for "- Start here!" //"- None"
+Define CS_NoWorkspaceSelected       for "- START HERE!" //"- None"
 Define CS_WorkspaceFilterString     for "DataFlex Workspace Files (*.sws)|*.sws|Any file (*.*)|*.*"
 Define CS_OpenFileStdFilter         for "All files *.*|*.*|Programs *.src|*.src|Views *.vw|*.vw|Report Views *.rv|*.rv|Selection Lists *.sl|*.sl|Packages *.pkg|*.pkg"
 Define CS_SourceCodeFilters         for "DataFlex Source *.src;*.vw;*.sl;*.dg;*.rv;*.pkg;*.cl;*.wo;*.dd;*.bp;*.inc;*.nui;*.utl;*.mn;*.mnu|*.src;*.vw;*.sl;*.dg;*.rv;*.pkg;*.cl;*.wo;*.dd;*.bp;*.inc;*.nui;*.utl;*.mn;*.mnu"
