@@ -320,12 +320,14 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set FontWeight to fw_Bold 
                 End_Object
     
-                Object oUseConstraints_cb is a CheckBox
+                Object oUseConstraints_cb is a dbCheckbox
+                    Entry_Item SysFile.bConstrainFunctionCalls
+                    Set Server to oSysFile_DD
                     Set Location to 44 40
                     Set Size to 8 109
                     Set Label to "Use selected Functions only"
                     Set peAnchors to anBottomLeft
-                    Set psToolTip to "If checked only Functions selected on the 'Function List' tab-page will be called."
+                    Set psToolTip to "If checked only Functions selected for the 'Function List' tab-page will be called."
                     Set phoUseConstraints_cb of ghoApplication to Self
                     
                     Procedure OnChange
