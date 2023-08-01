@@ -104,6 +104,13 @@ Enum_List
     Define CI_ToTexpression
 End_Enum_List 
 
+{ EnumList="{CI_LeftPart, CI_OfPart, CI_ToPart}" }
+Enum_List
+    Define CI_LeftPart
+    Define CI_OfPart
+    Define CI_ToPart
+End_Enum_List 
+
 Struct tExpression
     { EnumList="{CI_LeftExpression1, CI_LeftExpression2, CI_OfExpression, CI_ToTexpression}" }
     Integer eExpressionMode
