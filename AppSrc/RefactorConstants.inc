@@ -374,7 +374,9 @@ Define CS_FunctionEnd    for "Function_End"
 Define CS_Procedure      for "Procedure"
 Define CS_ProcedureEnd   for "Procedure_End"
 Define CS_Contains       for "contains"
-Define CS_Select         for "[Select]"
+Define CS_Select         for "[Select]" 
+Define CS_Shadow_State   for "Shadow_State"
+Define CS_Object_Shadow_State for "Object_Shadow_State"
 
 // Various DataFlex language text constants:
 Define CS_EndClass       for "End_Class"

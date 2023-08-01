@@ -4,14 +4,14 @@
 Use cRefactorDbView.pkg
 Use DFEntry.pkg
 Use cDbScrollingContainer.pkg
-Use DFEnChk.pkg
 Use Dfenrad.pkg
 Use cRDCDbHeaderGroup.pkg
 Use cRDCDbForm.pkg
 Use cRDCDbComboForm.pkg
-
+Use cRDCDbCheckbox.pkg
 Use cFunctionsDataDictionary.dd
 Use dfEnRad.pkg
+Use DFEnChk.pkg
 
 ACTIVATE_VIEW Activate_oFunctionMaintenance_vw FOR oFunctionMaintenance_vw
 Object oFunctionMaintenance_vw is a cRefactorDbView
@@ -115,7 +115,14 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
                                       "Report All - All source files as a string array with full path.")
                 End_Object 
 
-//                Object oFunctions_bWriteProtected is a dbCheckbox
+                Object oFunctions_bPrivateFunction is a cRDCDbCheckBox
+                    Entry_Item Functions.bPrivateFunction
+                    Set Location to 142 267
+                    Set Size to 10 60
+                    Set Label to "Private Function"
+                End_Object
+
+//                Object oFunctions_bWriteProtected is a cRDCDbCheckBox
 //                    Entry_Item Functions.bWriteProtected
 //                    Set Location to 157 79
 //                    Set Size to 10 60
@@ -123,7 +130,7 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
 //                    Set Enabled_State to False
 //                End_Object
 
-                Object oFunctions_bHasParameter is a dbCheckBox
+                Object oFunctions_bHasParameter is a cRDCDbCheckBox
                     Entry_Item Functions.bHasParameter
                     Set Location to 155 112
                     Set Size to 10 60

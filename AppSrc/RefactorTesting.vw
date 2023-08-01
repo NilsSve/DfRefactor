@@ -729,7 +729,6 @@ Object oRefactorTesting is a cRefactorDbView
             
             If (bWriteLine = True) Begin
                 // Asolvi specific function:
-                Get ChangewsDoTranslateTo_                  of ghoRefactorFunctionLibrary (&sLine) to bChanged // Done!
                 Get ChangeLegacyShadow_State                of ghoRefactorFunctionLibrary (&sLine) to bChanged
 
                 Get ChangeFoundAndFindErrIndicators         of ghoRefactorFunctionLibrary (&sLine) to bChanged

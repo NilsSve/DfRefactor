@@ -348,7 +348,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Object oRefactor_btn is a cRDCButton
                     Set Size to 30 98
                     Set Location to 27 156
-                    Set Label to "&Start Refactoring!"
+                    Set Label to "Start &Refactoring!"
                     Set peAnchors to anBottomLeft
                     Set Default_State to True
                     // Note: We use Form_FontWeight instead of FontWeight to _not_ make the object larger
