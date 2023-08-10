@@ -134,7 +134,7 @@ Struct tOperatorsInfo
 End_Struct
 
 Struct tToken                     // Note: sOverStrikeLine should be used when using this struct (parameter to function)
-    Integer iStartPos             // The starting position for a keyword in a source line
+    Integer iStartPos             // The starting position for a keyword in a source line, except for any indentation.
     String sCode                  // The code in the source line. Can be a single keyword or part of source linee
 End_Struct
 
@@ -373,6 +373,8 @@ Define CS_Finderr        for "Finderr"
 Define CS_Sysdate4       for "Sysdate4"
 Define CS_Constrain      for "Constrain"
 Define CS_Until          for "Until"
+Define CS_Reread         for "Reread"
+Define CS_Lock           for "Lock"
 Define CS_Local          for "Local"
 Define CS_GetAddress     for "GetAddress" 
 Define CS_AddressOf      for "AddressOf"
