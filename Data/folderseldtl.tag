@@ -1,0 +1,4 @@
+ID
+FolderSelHeaID
+FolderName
+bSelected

@@ -1,3 +1,23 @@
+// Copyright (c) 2018 Nils Svedmyr, RDC Tools International
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to Use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to Do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in All
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE is PROVIDED "AS IS", WITHOUT WARRANTY of ANY KIND, EXPRESS or
+// IMPLIED, INCLUDING BUT not LIMITED to THE WARRANTIES of MERCHANTABILITY,
+// FITNESS for a PARTICULAR PURPOSE and NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS or COPYRIGHT HOLDERS BE LIABLE for ANY CLAIM, DAMAGES or OTHER
+// LIABILITY, WHETHER IN an ACTION of CONTRACT, TORT or OTHERWISE, ARISING from,
+// OUT of or IN CONNECTION WITH THE SOFTWARE or THE Use OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 Use Windows.pkg
 Use DFClient.pkg
 Use cFilesystem.pkg
@@ -138,13 +158,20 @@ Struct tToken                     // Note: sOverStrikeLine should be used when u
     String sCode                  // The code in the source line. Can be a single keyword or part of source linee
 End_Struct
 
+Struct tBooleanToken              // Note: sOverStrikeLine should be used when using this struct (parameter to function)
+    Integer iStartPos             // The starting position for a keyword of the sOverstrikeLine member.
+    String sCode                  // The code of the source line. Can be a single keyword or part of source linee
+    Boolean bHasBracket           // If the bracket contains a "not" keyword e.g. [Not Found]
+    Boolean bHasNot
+End_Struct
+
 Struct tBooleanIndicator
     Boolean bHasIndicateCommand   // "*Indicate* Found as..." or "If [Found] Indicate Err as (True = bTrue)"
-    Boolean bHasBracket           // If *[Seqeof]*
-    Boolean bHasNot
-    tToken FirstIndicator
-    tToken SecondIndicator
-    tToken ToIndicator
+//    Boolean bHasBracket           // If *[Seqeof]*
+//    Boolean bHasNot
+    tBooleanToken FirstIndicator
+    tBooleanToken SecondIndicator
+    tBooleanToken ToIndicator
 End_Struct        
 
 Struct tTokenizer
