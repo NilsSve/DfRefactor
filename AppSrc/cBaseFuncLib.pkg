@@ -382,7 +382,7 @@ Class cBaseFuncLib is a cObject
         
         // Get start and end indicators
         // "Indicate [Select] as [not Found]" -> bHasIndicateCommand = True
-        Get _ExtractLegacyBooleanContent (&TokenizerData) to TokenizerData.IndicatorInfo
+        Get _ExtractLegacyBooleanContent (&TokenizerData) to TokenizerData.BooleanIndicator
             
         // Get the "*Move iA* to xxx" part
         Get _LeftStatement (&TokenizerData) to TokenizerData.LeftStatement 
@@ -450,9 +450,21 @@ Class cBaseFuncLib is a cObject
             Move aExpressionsEmpty to TokenizerData.aExpressions
         End
 
-        Move (StrSplitToArray(sOverstrikeLine, " ")) to asLineTokens 
-
+        Move (StrSplitToArray(sOverstrikeLine, " ")) to asLineTokens
+        Move (SizeOfArray(asLineTokens)) to iSize
+        Decrement iSize
+        // Remove any empty items:
+        For iCount from 0 to iSize
+            If (asLineTokens[iCount] = "") Begin
+                Move (RemoveFromArray(asLineTokens, iCount)) to asLineTokens
+                Decrement iSize   
+                Decrement iCount
+            End
+        Loop
+        
         // If there were any expressions, place them back into asLineTokens as items.
+        Move (SizeOfArray(aExpressions)) to iSize
+        Decrement iSize    
         If (iSize <> -1) Begin                 
             For iCount from 0 to iSize
                 Move (FillString("|", aExpressions[iCount].iLength)) to sReplace
@@ -796,7 +808,7 @@ Class cBaseFuncLib is a cObject
     //       Use the Tokenizer helper function first.
     Function _AddExpressionParenthesis tTokenizer TokenizerData String ByRef sLine Returns Boolean
         String sText sStart sLast sExpression sExpression2 sLeft sRight sChar sPart1 sPart2 sOrg sCommand
-        Boolean bFound bChanged bStartOperators bIfCommand bSecondCommand bWhile
+        Boolean bFound bChanged bStartOperators bSecondCommand bWhile
         Integer iPos iPos2
         
         Move sLine to sText    
@@ -1263,134 +1275,265 @@ Class cBaseFuncLib is a cObject
         Function_Return BooleanIndicator
     End_Function  
     
-    Function _ReplaceBrackets String sOverStrikeLine Returns String
-        Move (Replaces("[", sOverStrikeLine, "")) to sOverStrikeLine
-        Move (Replaces("]", sOverStrikeLine, "")) to sOverStrikeLine
-        Function_Return sOverStrikeLine
-    End_Function 
-    
     Function _HasBracket tBooleanIndicator BooleanIndicator Returns Boolean
         Boolean bTrue
-        Move (BooleanIndicator.FirstIndicator.bHasBracket = True or ;
-              BooleanIndicator.SecondIndicator.bHasBracket = True or ;
-              BooleanIndicator.ToIndicator.bHasBracket = True) to bTrue
+        Move (BooleanIndicator.FirstBoolean.bHasBracket = True or ;
+              BooleanIndicator.SecondBoolean.bHasBracket = True or ;
+              BooleanIndicator.ToBoolean.bHasBracket = True) to bTrue
         Function_Return bTrue
     End_Function
     
     Function _HasNot tBooleanIndicator BooleanIndicator Returns Boolean
         Boolean bTrue
-        Move (BooleanIndicator.FirstIndicator.bHasNot = True or ;
-              BooleanIndicator.SecondIndicator.bHasNot = True or ;
-              BooleanIndicator.ToIndicator.bHasNot = True) to bTrue
+        Move (BooleanIndicator.FirstBoolean.bHasNot = True or ;
+              BooleanIndicator.SecondBoolean.bHasNot = True or ;
+              BooleanIndicator.ToBoolean.bHasNot = True) to bTrue
         Function_Return bTrue
+    End_Function  
+    
+    {Visibility = Private}
+    Function _HasTokenBracket String sToken Returns Boolean
+        Boolean bHasBracket
+        Move (Left(Trim(sToken), 1) = "[") to bHasBracket
+        Function_Return bHasBracket
     End_Function
     
-    // Takes a string like: [not Seqeof] Begin
-    // and returns struct as: True, True, iStartPos and "(not(Seqeof))".
+    {Visibility = Private}
+    Function _HasTokenNotBracket String sToken Returns Boolean
+        Boolean bHasNot bHasBracket     
+        Move False to bHasNot
+        Get _HasTokenBracket sToken to bHasBracket
+        If (bHasBracket = True) Begin
+            Move ((Lowercase(sToken) contains Lowercase(CS_Not) or sToken contains "~") and not(sToken contains "]")) to bHasNot
+            If (bHasNot = True) Begin               
+                // Make sure the "Not" is not part of a variable name. Cannot use " " (space) as the sTokens from
+                // the asLineTokensLC array does not contain ending spaces. 
+                Move (Length(sToken) = 4) to bHasNot
+            End
+        End
+        Function_Return bHasNot
+    End_Function
+    
+    {Visibility = Private}
+    Function _ReplaceBrackets String sToken Returns String
+        Move (Replaces("[", sToken, "")) to sToken
+        Move (Replaces("]", sToken, "")) to sToken
+        Function_Return (Trim(sToken))
+    End_Function 
+    
+    // Takes a tTokenizer struct as parameter and
+    // returns a tBooleanIndicator struct.
+    // Works on strings containing e.g. "[not Seqeof] Begin"
+    //                             and  "Indicate Found as bTrue"
+    // If brackets "[]" are found they will be *removed* and the corresponding
+    // struct member bHasBracket will be set to True.
+    // If the "Not" keyword is found, it will be *removed* and
+    // the corresponding struct member bHasNot will be set to True.
+    // The first boolean is placed in the FirstBoolean struct member,
+    // the next one (if any) before the "as" or "to" keyword in the second struct member,
+    // and anything to the right of "as" or "to" keyword in the ToBoolean struct member.
+    //
+    // Iif (if-and-only-if) there are more than one variable on the right hand side of the "as"
+    // keyword, those words will be surrounded with paranthesis, to make them an expression.
+    // E.g. "Indicate Select as WindowIndex Eq FieldIndex"
+    // will result in the ToBoolean.sCode member be populated with: "(WindowIndex Eq FieldIndex)"
     Function _ExtractLegacyBooleanContent tTokenizer TokenizerData Returns tBooleanIndicator
-        Integer iPos iStart iStop iItem iSize
-        String sChar sNot sBoolean sFirstToken sCommand sExpression sOverstrikeLine 
-        Boolean bRightSideIndicator bFound bIndicateWord bHasStartBracket
+        Integer iPos iCount iItem iSize
+        String sChar sNot sToken sCommand sExpression sOverstrikeLine 
+        Boolean  bFound bIndicate bMove bHasStartBracket bExpression bSystemBoolean bSecond bIf bHasNot
         tBooleanIndicator BooleanIndicator  
         tOperatorsInfo OperatorsInfo
         
-        // This also checks that it isn't an array declaration.          
-        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+        Move TokenizerData.sOverstrikeLine to sOverstrikeLine   
+        // This checks if there is an "Indicate" command *or* a boolean within brackets, eg. "[Found]"
+        // It also checks that it isn't an array declaration.          
         Get _IsIndicatorStatement sOverstrikeLine to bFound
         If (bFound = False) Begin
             Function_Return BooleanIndicator
         End
 
-        Move (SearchArray(Lowercase(CS_Indicate), TokenizerData.asLineTokensLC) <> -1) to BooleanIndicator.bHasIndicateCommand
-        // ToDo: Make the new struct design work here:
-        Move TokenizerData.asLineTokens[0] to sFirstToken
-        Move (Left(sFirstToken, 1) = "[") to bHasStartBracket
-        
-        // First indicator;
-        Move (Pos("[", sOverstrikeLine)) to iStart
-        Move (Pos("]", sOverstrikeLine)) to iStop
-        If (iStart <> 0 and iStop <> 0) Begin
-            Move (Mid(sOverstrikeLine, (iStop - iStart -1), (iStart + 1))) to sBoolean
-            Move True        to BooleanIndicator.FirstIndicator.bHasBracket
-            Move sBoolean    to BooleanIndicator.FirstIndicator.sCode
-            Move iStart      to BooleanIndicator.FirstIndicator.iStartPos  
-            Move (Pos((Lowercase(CS_Not) + " "), Lowercase(sBoolean))) to iPos
-            Move (iPos <> 0) to BooleanIndicator.FirstIndicator.bHasNot
-            
-            // Second indicator before the "to" keyword
-            Move (Mid(sOverstrikeLine, Length(sOverstrikeLine), (iStop + 1))) to sBoolean
-            Move (Pos("[", sBoolean)) to iStart
-            Move (Pos("]", sBoolean)) to iStop
-            If (iStart <> 0 and iStop <> 0) Begin
-                Move (Mid(sBoolean, (iStop - iStart -1), (iStart + 1))) to sBoolean
-                Move True        to BooleanIndicator.SecondIndicator.bHasBracket
-                Move sBoolean    to BooleanIndicator.SecondIndicator.sCode
-                Move (Pos(sBoolean, sOverstrikeLine)) to iStart
-                Move iStart      to BooleanIndicator.SecondIndicator.iStartPos  
-                Move (Pos((Lowercase(CS_Not) + " "), Lowercase(sBoolean))) to iPos
-                Move (iPos <> 0) to BooleanIndicator.SecondIndicator.bHasNot
-            End    
-        End
-        
-        // Indicator after the "to" keyword;
-        Move (Pos(Lowercase(" " + CS_To + " "), Lowercase(sOverstrikeLine))) to iPos
-        If (iPos > 0) Begin
-            Move (Mid(sOverstrikeLine, Length(sOverstrikeLine),(iPos +1))) to sBoolean
-            Move (Pos("[", sBoolean)) to iStart
-            Move (Pos("]", sBoolean)) to iStop
-            If (iStart > 0 and iStop <> 0) Begin
-                Move (Mid(sBoolean, (iStop - iStart -1), (iStart + 1))) to sBoolean
-                Move True         to BooleanIndicator.ToIndicator.bHasBracket
-                Move sBoolean     to BooleanIndicator.ToIndicator.sCode
-                Move (Pos(sBoolean, sOverstrikeLine)) to iStart
-                Move iStart       to BooleanIndicator.ToIndicator.iStartPos
-                Move (Pos((Lowercase(CS_Not) + " "), Lowercase(sBoolean))) to iPos
-                Move (iPos <> 0)  to BooleanIndicator.ToIndicator.bHasNot
-            End
-        End
-        Else Begin
-            // Indicator after the "as" keyword. This will be the second indicator.
-            Move (Pos(Lowercase(" " + CS_As + " "), Lowercase(sOverstrikeLine))) to iPos 
-            If (iPos <> 0) Begin     
-                Move (Mid(sOverstrikeLine, Length(sOverstrikeLine),(iPos +1))) to sBoolean
-                Move (Pos("[", sBoolean)) to iStart
-                Move (Pos("]", sBoolean)) to iStop
-                If (iStart > 0 and iStop <> 0) Begin
-                    Move (Mid(sBoolean, (iStop - iStart -1), (iStart + 1))) to sBoolean
-                    Move True         to BooleanIndicator.SecondIndicator.bHasBracket
-                    Move sBoolean     to BooleanIndicator.SecondIndicator.sCode
-                    Move (Pos(sBoolean, sOverstrikeLine)) to iStart
-                    Move iStart       to BooleanIndicator.SecondIndicator.iStartPos
-                    Move (Pos((Lowercase(CS_Not) + " "), Lowercase(sBoolean))) to iPos
-                    Move (iPos <> 0)  to BooleanIndicator.SecondIndicator.bHasNot
-                End
-//                Move (SizeOfArray(TokenizerData.asLineTokensLC)) to iSize
-//                Move (SearchArray(Lowercase(CS_As), TokenizerData.asLineTokensLC)) to iItem
-//                // If result is <= 2, we have another boolean on the right side of the "as" statement.
-//                // Else it is an expression and we do nothing.
-//                If (iSize - (iSize - iItem) <= 2) Begin
-//                    Move 0 to iItem
-//                    If (TokenizerData.asLineTokensLC[0] = Lowercase(CS_If) or TokenizerData.asLineTokensLC[0] = Lowercase(CS_Indicate)) Begin
-//                        Move 1 to iItem
-//                    End
-//                    Move (TokenizerData.asLineTokensLC[iItem] contains (Lowercase(CS_Not) + " ")) to BooleanIndicator.bHasNot
-//                    Move TokenizerData.asLineTokens[iItem] to sBoolean
-//                    Move (Replace("[", sBoolean, ""))      to sBoolean
-//                    Move (Replace("]", sBoolean, ""))      to sBoolean
-//                    Move sBoolean to BooleanIndicator.FirstIndicator.sCode
-//                    Move (Pos(TokenizerData.asLineTokens[1], TokenizerData.sLine)) to BooleanIndicator.FirstIndicator.iStartPos
-//                    Move (SizeOfArray(TokenizerData.asLineTokens)) to iItem
-//                    Decrement iItem
-//                    Move TokenizerData.asLineTokens[iItem] to sBoolean
-//                    Move (Replace("[", sBoolean, ""))      to sBoolean
-//                    Move (Replace("]", sBoolean, ""))      to sBoolean
-//                    Move sBoolean                          to BooleanIndicator.SecondIndicator.sCode
-//                End
-//                Move (Pos(TokenizerData.asLineTokens[iItem], TokenizerData.sLine)) to BooleanIndicator.SecondIndicator.iStartPos
-            End
-        End
+        Move (SizeOfArray(TokenizerData.asLineTokensLC)) to iSize
+        Decrement iSize
+        Move (SearchArray(Lowercase(CS_Indicate), TokenizerData.asLineTokensLC) <> -1) to BooleanIndicator.bHasIndicateCommand 
 
+        Move 0 to iItem
+        Move TokenizerData.asLineTokens[iItem] to sToken
+        Move (Left(sToken, 1) = "[") to bHasStartBracket
+        Move (Lowercase(sToken) = Lowercase(CS_If)) to bIf
+        // Start bracket is e.g. '[Select] Indicate Select as WindowIndex Eq FieldIndex' or '[Found] Command' 
+        //                   or  'If [False] Indicate Select as Windowindex Eq Fieldindex'
+        If (bHasStartBracket = True or bIf = True) Begin
+            If (bIf = True) Begin
+                Increment iItem
+                Move TokenizerData.asLineTokens[iItem] to sToken
+            End
+            Get _HasTokenBracket    sToken to BooleanIndicator.FirstBoolean.bHasBracket
+            Get _HasTokenNotBracket sToken to BooleanIndicator.FirstBoolean.bHasNot
+            If (BooleanIndicator.FirstBoolean.bHasNot = True) Begin                 
+                // Note that e.g. "[Not True]" in the TokenizerData.asLineTokens array are two separate items, one after the other.
+                Move sToken to sNot
+                Increment iItem
+                Move TokenizerData.asLineTokens[iItem] to sToken
+            End
+            Move (Pos(Lowercase(sToken), Lowercase(TokenizerData.sOverstrikeLine))) to BooleanIndicator.FirstBoolean.iStartPos
+            If (BooleanIndicator.SecondBoolean.bHasNot = True) Begin
+                Move (Replace(sNot, sToken, "")) to sToken  
+            End                        
+            Get _ReplaceBrackets sToken to BooleanIndicator.FirstBoolean.sCode
+            
+            // E.g. "[Found] Reread"
+            If (SizeOfArray(TokenizerData.asLineTokens) = 2) Begin
+                Function_Return BooleanIndicator
+            End              
+            // E.g. "[Not Found] Lock"
+            If (BooleanIndicator.FirstBoolean.bHasNot = True and SizeOfArray(TokenizerData.asLineTokens) = 3) Begin
+                Function_Return BooleanIndicator
+            End
+            
+            // Second boolean?
+            // If the line starts with an bracket indicator we may have a second boolean before the "as" or "to" keyword.
+            // e.g. "[Select] Indicate [Found] as bFound"
+            // If that sToken is not a known keyword, it must be a boolean variable.
+            Increment iItem
+            If (BooleanIndicator.FirstBoolean.bHasNot = True) Begin
+                Increment iItem    
+            End
+            Move TokenizerData.asLineTokens[iItem] to sToken
+            Move (Lowercase(sToken) <> Lowercase(CS_As) and Lowercase(sToken) <> Lowercase(CS_To)) to bSecond
+            If (bSecond = True) Begin
+                Move (Lowercase(sToken) = Lowercase(CS_Indicate)) to bIndicate
+                Move (Lowercase(sToken) = Lowercase(CS_Move))     to bMove
+                Increment iItem    
+                If (iSize > iItem) Begin
+                    If (bHasStartBracket = True and bIndicate = False and bMove = False) Begin
+                        Increment iItem
+                    End                                                                          
+                End
+                Move TokenizerData.asLineTokens[iItem] to sToken
+                Move (Lowercase(sToken) = Lowercase(CS_Indicate)) to bIndicate
+                If (bIndicate = True and iSize > iItem) Begin   
+                    // "If [Found] Indicate Err as..."
+                    Increment iItem
+                    Move TokenizerData.asLineTokens[iItem] to sToken
+                End
+                
+                Move (Lowercase(sToken) <> Lowercase(CS_As) and Lowercase(sToken) <> Lowercase(CS_To)) to bSecond
+                If (bSecond = True) Begin
+                    Get _IsKeyWord sToken to bFound 
+                    If (bFound = True) Begin                                                                           
+                        // It is also OK with a system boolean; "Found", "Finderr" or "Err" (listed as keywords)
+                        Get _IsSystemBoolean sToken to bSystemBoolean
+                        Move (bSystemBoolean = False) to bFound
+                    End
+                    If (bFound = False) Begin
+                        // To find the start position in the sOverstrikeLine, we need take into consideration that the second
+                        // boolean may share the same name as the first one; aka '[Select] Indicate Select as...'
+                        Get _HasTokenBracket    sToken to BooleanIndicator.SecondBoolean.bHasBracket
+                        Get _HasTokenNotBracket sToken to BooleanIndicator.SecondBoolean.bHasNot
+                        If (BooleanIndicator.SecondBoolean.bHasNot = True) Begin
+                            Move sToken to sNot
+                            Increment iItem
+                            Move (sToken * String(TokenizerData.asLineTokens[iItem])) to sToken
+                        End
+                        Move (Pos(" " + Lowercase(sToken), Lowercase(TokenizerData.sOverstrikeLine))) to iPos
+                        Move (iPos + 1) to BooleanIndicator.SecondBoolean.iStartPos
+                        If (BooleanIndicator.SecondBoolean.bHasNot = True) Begin
+                            Move (Replace(sNot, sToken, "")) to sToken  
+                        End                        
+                        Get _ReplaceBrackets sToken to BooleanIndicator.SecondBoolean.sCode
+                    End
+                End
+            End
+        End    
+        
+        // If the line does *not* start with a bracket indicator "[Found]"
+        Else Begin 
+            Increment iItem
+            Move TokenizerData.asLineTokens[iItem] to sToken
+            Move (Lowercase(sToken) = Lowercase(CS_Indicate)) to bIndicate
+            If (bIndicate = True) Begin   
+                // "If [Found] Indicate Err as..."
+                Increment iItem
+                Move TokenizerData.asLineTokens[iItem] to sToken
+            End
+            Get _IsKeyWord sToken to bFound    
+            If (bFound = True) Begin                                                                           
+                // It is also OK with system booleans.
+                Get _IsSystemBoolean sToken to bSystemBoolean
+                Move (bSystemBoolean = False) to bFound
+            End
+            If (bFound = False) Begin
+                Get _HasTokenBracket sToken    to BooleanIndicator.FirstBoolean.bHasBracket
+                Get _HasTokenNotBracket sToken to BooleanIndicator.FirstBoolean.bHasNot 
+                Move BooleanIndicator.FirstBoolean.bHasNot to bHasNot
+                If (bHasNot = True) Begin
+                    Move sToken to sNot
+                    Increment iItem
+                    Move (sToken * String(TokenizerData.asLineTokens[iItem])) to sToken
+                End
+                Move (Pos(" " + Lowercase(sToken) + " ", Lowercase(TokenizerData.sOverstrikeLine))) to iPos
+                Move (iPos + 1) to BooleanIndicator.FirstBoolean.iStartPos
+                If (bHasNot = True) Begin
+                    Move (Replace(sNot, sToken, "")) to sToken
+                End
+                Get _ReplaceBrackets sToken to BooleanIndicator.FirstBoolean.sCode
+            End
+        End
+        
+        // Anything after the "as" or "to" keyword?   
+        Move (SearchArray(Lowercase(CS_As), TokenizerData.asLineTokensLC)) to iItem
+        If (iItem = -1) Begin
+            Move (SearchArray(Lowercase(CS_To), TokenizerData.asLineTokensLC)) to iItem
+        End
+        If (iItem <> -1) Begin
+            // If result is = 1, we have a single boolean on the right side of the "as" statement.
+            If ((iSize - iItem) = 1) Begin  
+                Increment iItem
+                Move TokenizerData.asLineTokens[iItem] to sToken
+                Get _HasTokenBracket sToken    to BooleanIndicator.ToBoolean.bHasBracket
+                Get _HasTokenNotBracket sToken to BooleanIndicator.ToBoolean.bHasNot
+                If (BooleanIndicator.ToBoolean.bHasNot = True) Begin
+                    Move sToken to sNot
+                    Increment iItem
+                    Move (sToken * String(TokenizerData.asLineTokens[iItem])) to sToken
+                End
+                Move (Pos(" " + Lowercase(sToken), Lowercase(TokenizerData.sOverstrikeLine))) to iPos
+                Move (iPos + 1) to BooleanIndicator.ToBoolean.iStartPos
+                If (BooleanIndicator.ToBoolean.bHasNot = True) Begin
+                    Move (Replace(sNot, sToken, "")) to sToken
+                End
+                Get _ReplaceBrackets sToken to BooleanIndicator.ToBoolean.sCode
+            End
+            // Else there is an expression on the right hand side of the "as"
+            Else Begin
+                Move "" to sToken
+                For iCount from (iItem + 1) to iSize
+                    Append sToken TokenizerData.asLineTokens[iCount] " "
+                Loop
+                Move (Trim(sToken)) to sToken
+                Move (Pos(sToken, sOverstrikeLine)) to BooleanIndicator.ToBoolean.iStartPos
+                Move (Pos("(", sToken) and Pos(")", sToken)) to bExpression
+                If (bExpression = False) Begin
+                    Move ("(" + sToken + ")") to sToken
+                End
+                Move sToken to BooleanIndicator.ToBoolean.sCode
+            End
+        End  
+        
         Function_Return BooleanIndicator
+    End_Function  
+    
+    Function _IsSystemBoolean String sToken Returns Boolean
+        Integer iItem
+        String[] asSystemBooleans
+        Move "found"    to asSystemBooleans[SizeOfArray(asSystemBooleans)]
+        Move "finderr"  to asSystemBooleans[SizeOfArray(asSystemBooleans)]
+        Move "err"      to asSystemBooleans[SizeOfArray(asSystemBooleans)]
+        Move "seqeof"   to asSystemBooleans[SizeOfArray(asSystemBooleans)]
+        Move "seqeol"   to asSystemBooleans[SizeOfArray(asSystemBooleans)]
+        Move (Lowercase(sToken)) to sToken
+        Move (SearchArray(sToken, asSystemBooleans)) to iItem
+        Function_Return (iItem <> -1)
     End_Function
     
     // Helper function for the SplitInlineIfElseLine function.
@@ -2265,7 +2408,8 @@ Function_Return // Temp!
         Integer iLeft iRight iPos
         String sLine sText 
         
-        If (TokenizerData.IndicatorInfo.FirstIndicator.bHasBracket = False) Begin
+        Get _HasBracket TokenizerData.BooleanIndicator to bFound
+        If (bFound = False) Begin
             Function_Return False
         End
 
@@ -2382,7 +2526,7 @@ Function_Return // Temp!
         Function_Return sOverstrikeLine
     End_Function
 
-    // Returns True if source code contains both a "[" and a "]", but not a "[]"
+    // Returns True if source code contains the "Indicate" keyword *or* a "[" and a "]", but not a "[]"
     Function _IsIndicatorStatement String sOverStrikeLine Returns Boolean
         Boolean bFound bIndicatorWord
         Integer iLeft iRight iPos
