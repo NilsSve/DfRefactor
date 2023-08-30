@@ -109,13 +109,6 @@ Enum_List
     Define CI_DoubleQuotes
 End_Enum_List 
 
-{ EnumList="{CI_FirstIndicator, CI_SecondIndicator, CI_ToIndicator}" }
-Enum_List
-    Define CI_FirstIndicator
-    Define CI_SecondIndicator
-    Define CI_ToIndicator
-End_Enum_List 
-
 { EnumList="{CI_LeftExpression1, CI_LeftExpression2, CI_OfExpression, CI_ToTexpression}" }
 Enum_List
     Define CI_LeftExpression1
@@ -161,17 +154,22 @@ End_Struct
 Struct tBooleanToken              // Note: sOverStrikeLine should be used when using this struct (parameter to function)
     Integer iStartPos             // The starting position for a keyword of the sOverstrikeLine member.
     String sCode                  // The code of the source line. Can be a single keyword or part of source linee
-    Boolean bHasBracket           // If the bracket contains a "not" keyword e.g. [Not Found]
-    Boolean bHasNot
+    Boolean bHasBracket           // If *[Seqeof]*
+    Boolean bHasNot               // If the bracket contains a "not" keyword e.g. [Not Found]
 End_Struct
+
+{ EnumList="{CI_FirstBoolean, CI_SecondBoolean, CI_ToBoolean}" }
+Enum_List
+    Define CI_FirstBoolean
+    Define CI_SecondBoolean
+    Define CI_ToBoolean           // Part after "to" or "as"
+End_Enum_List 
 
 Struct tBooleanIndicator
     Boolean bHasIndicateCommand   // "*Indicate* Found as..." or "If [Found] Indicate Err as (True = bTrue)"
-//    Boolean bHasBracket           // If *[Seqeof]*
-//    Boolean bHasNot
-    tBooleanToken FirstIndicator
-    tBooleanToken SecondIndicator
-    tBooleanToken ToIndicator
+    tBooleanToken FirstBoolean    // First boolean variable info
+    tBooleanToken SecondBoolean   // Second boolean variable, if any (left of "to" and "as")
+    tBooleanToken ToBoolean       // Boolean info after the "to" or "as"
 End_Struct        
 
 Struct tTokenizer
@@ -196,7 +194,7 @@ Struct tTokenizer
     String sIndentation                 // Line start indentation, one or more tabs or spaces.
     Boolean bHasOverstrikeChars         // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
     String sOverstrikeLine              // Source line without indentation and string constants overstriked with "_" or "+".
-// ToDo: Finish tQuotedString function.
+// ToDo: Finish tQuotedString function. Needed?
 //    tQuotedString[] aStringContent      // Struct string array with original text string constants for the sLine content.
 
     tToken LeftStatement                // *Get MyFunction* of oSomeObject. Part before the "of" and "to" keywords.
@@ -214,7 +212,7 @@ Struct tTokenizer
 
     String[] asLineTokens               // The sOverstrikeLine is broken up by spaces to a string array, but expressions are kept together on one array line even if it contains spaces.
     String[] asLineTokensLC             // The same content as array above *but* in LowerCase.
-    tBooleanIndicator IndicatorInfo     // [*Select*] Move "A" to "B" etc.
+    tBooleanIndicator BooleanIndicator  // [*Select*] Move iA to iB or "*Indicate* x as y" See: Function _ExtractLegacyBooleanContent.
     tOperatorsInfo OperatorsInfo        // Operator info e.g. "eq", "=", "lt", "<" etc.
 End_Struct        
 
@@ -397,6 +395,7 @@ Define CS_Find           for "Find"
 Define CS_Send           for "Send"
 Define CS_Found          for "Found"
 Define CS_Finderr        for "Finderr"
+Define CS_Err            for "Err"
 Define CS_Sysdate4       for "Sysdate4"
 Define CS_Constrain      for "Constrain"
 Define CS_Until          for "Until"
