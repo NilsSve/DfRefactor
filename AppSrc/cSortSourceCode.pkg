@@ -1,0 +1,831 @@
+// Copyright (c) 2018 Nils Svedmyr, RDC Tools International
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to Use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to Do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in All
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE is PROVIDED "AS IS", WITHOUT WARRANTY of ANY KIND, EXPRESS or
+// IMPLIED, INCLUDING BUT not LIMITED to THE WARRANTIES of MERCHANTABILITY,
+// FITNESS for a PARTICULAR PURPOSE and NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS or COPYRIGHT HOLDERS BE LIABLE for ANY CLAIM, DAMAGES or OTHER
+// LIABILITY, WHETHER IN an ACTION of CONTRACT, TORT or OTHERWISE, ARISING from,
+// OUT of or IN CONNECTION WITH THE SOFTWARE or THE Use OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// 
+// Description:
+//   Functions to sort classes, procedures & functions from a source file.
+//
+Use GlobalFunctionsProcedures.pkg
+Use File_dlg.pkg
+Use seq_chnl.pkg
+Use vwin32fh.pkg
+
+Struct tMethod
+    String sMethodName
+    Integer iLines
+End_Struct
+
+Struct tClass
+    tMethod[] FunctionsData
+    tMethod[] ProceduresData
+End_Struct
+
+Struct tSourceCode
+    String sClassName
+    tClass ClassData
+    Integer iLines
+End_Struct
+
+Define CS_SortBackupFolder   for "SortSourceBackup"
+Define CS_LF                 for (Character(10))
+Define CS_CR                 for (Character(13))
+Define CS_CRLF               for (Character(13) + Character(10))
+Define CS_Construct_Object   for "Construct_Object"
+Define CS_End_Construct_Object for "End_Construct_Object"
+Define CS_ObjectStart        for "Object "
+Define CS_ObjectEnd          for "End_Object"
+Define CS_ClassStart         for "Class "
+Define CS_ClassEnd           for "End_Class"
+Define CS_FunctionStart      for "Function "
+Define CS_ProcedureStart     for "Procedure "
+#IFNDEF CS_FunctionEnd
+    Define CS_FunctionEnd    for "End_Function"
+    Define CS_ProcedureEnd   for "End_Procedure"
+#ENDIF
+#IFNDEF CS_CommentSymbol
+    Define CS_CommentSymbol  for ("//")
+#ENDIF
+
+Class cSortSourceCode is a cObject
+    Procedure Construct_Object
+        Forward Send Construct_Object
+
+        Property String psSourceFile
+        Property String psBackupSourceFile
+        Property String psLineBreak
+        Property Boolean pbSortFunctions   True
+        Property Boolean pbSortProcedures  True
+        Property Boolean pbSortClassesOnly True
+    End_Procedure
+
+    Procedure End_Construct_Object
+        Forward Send End_Construct_Object
+    End_Procedure
+
+    // Custom comparison functions for string arrays:
+    // The compiler *must* find these SearchArray helper functions before they can be used in code.
+    Function _FindEqualCode String sArrayValue String sSearchText Returns Integer
+        If (Trim(Lowercase(sArrayValue)) = Lowercase(sSearchText)) ;
+            Function_Return (EQ)
+        Function_Return (GT)
+    End_Function
+
+    // Note: By calling other functions here it *will* slow down the SearchArray function consideribly!
+    //       But we don't have large string arrays to search, so I think we can live with it.
+    // Example: The line - 'Define CS_ObjectEnd          for "End_Object"' would return True,
+    //          when searching for: End_Object, which would mess up our source array completely.
+    // ToDo: Is there a better way? We will spend most of the time here when sorting a file... 
+    Function _FindMethodCode String sArrayValue String sSearchText Returns Integer
+        Boolean bComment bStringConstant
+        Get _IsCommentLine sArrayValue to bComment
+        If (bComment = True) ;
+            Function_Return (LT)
+        Get _OverstrikeStrings sArrayValue to sArrayValue
+        If (Lowercase(sArrayValue) contains Lowercase(sSearchText)) ;
+            Function_Return (EQ)
+        Function_Return (GT)
+    End_Function
+
+    Function _IsCommentLine String sLine Returns Boolean
+        Boolean bIsComment
+        Move (Trim(sLine)) to sLine
+        Move (Left(Trim(sLine), 2) = CS_CommentSymbol) to bIsComment
+        Function_Return bIsComment
+    End_Function
+
+    //  This will overstrike string constants in a sLine with
+    //  _ characters for a "string" and + characters for a 'string'
+    Function _OverstrikeStrings String sLine Returns String
+        Boolean bDoubleQuote bSingleQuote bChanged
+        Integer iChar iLength
+        String  sChar sText
+
+        Move False to bChanged
+        Move sLine to sText
+        Move (sLine contains '"') to bDoubleQuote
+        Move (sLine contains "'") to bSingleQuote
+        If (bDoubleQuote = False and bSingleQuote = False) Begin
+            Function_Return sLine
+        End
+        Move False to bDoubleQuote
+        Move False to bSingleQuote
+
+        Move (Length(sText)) to iLength
+        For iChar from 1 to iLength
+            Move (Mid(sText, 1, iChar)) to sChar
+            If (sChar = Character(9)) Begin                  // tab characters should be treated as a single space char, this keeps the
+                Move (Overstrike(" ",sText, iChar)) to sText // position in the string the same.
+                Move True to bChanged
+                Move " " to sChar
+            End
+            If (bDoubleQuote and sChar= '"') Begin
+                Move (Overstrike("_", sText, iChar)) to sText
+                Move True to bChanged
+                Move "" to sChar
+                Move False to bDoubleQuote
+            End
+            If (bSingleQuote and sChar = "'") Begin
+                Move (Overstrike("+", sText, iChar)) to sText
+                Move True to bChanged
+                Move "" to sChar
+                Move False to bSingleQuote
+            End
+            If (bSingleQuote = False and sChar ='"') Begin
+                Move True to bDoubleQuote
+            End
+            If (bDoubleQuote = False and sChar = "'") Begin
+                Move True to bSingleQuote
+            End
+            If bDoubleQuote Begin
+                Move (Overstrike("_", sText, iChar)) to sText
+                Move True to bChanged
+            End
+            Else If bSingleQuote Begin
+                Move (Overstrike("+", sText, iChar)) to sText
+                Move True to bChanged
+            End
+        Loop
+
+        If (bChanged = True) Begin
+            Move sText to sLine
+        End
+        Function_Return sLine
+    End_Function
+
+    // Code that appears after the last End_Class line.
+    Function BottomCode String[] asSourceFile tSourceCode[] TheData Returns String[]
+        String[] asBottomCode
+        String sLine sClassName
+        Integer iSize iCount iStart iItem iClasses iLines
+        Boolean bIsClassEnd
+
+        Move (SizeOfArray(TheData)) to iClasses
+        Move TheData[iClasses -1].sClassName to sClassName
+        Move (CS_ClassStart + String(sClassName)) to sClassName
+        Move TheData[iClasses -1].iLines to iLines
+
+        Move 0 to iItem
+        Move (SizeOfArray(asSourceFile)) to iSize
+        Decrement iSize
+        Move (SearchArray(sClassName, asSourceFile, Self, RefFunc(_FindMethodCode))) to iStart
+        Move (iStart + iLines) to iStart
+        For iCount from iStart to iSize
+            Move asSourceFile[iCount] to sLine
+            Get IsMetaStart sLine CS_ClassEnd to bIsClassEnd
+            If (bIsClassEnd = False) Begin
+                Move sLine to asBottomCode[iItem]
+                Increment iItem
+            End
+        Loop
+        Function_Return asBottomCode
+    End_Function
+
+    // Copies the code text for the passed sMethodName from the passed source code strin array "asSourceFile",
+    // and returns a string array as the result.
+    // It alsoo tries to include comments above/before the function declaration.
+    // Note: For comments to be successfully "included" the comment lines must be immediately above
+    //       the function declaration, without any "empty" line. A commend line must start with either "//" or the meta-tag "{"
+    // If sFunctionName was not found, the returned array will be empty.
+    Function CopyMethodCode String[] asSourceFile String[] asSourceFileLC String sMethodName Boolean bFunction Returns String[]
+        Integer iCh iRow iCount iSize
+        String[] asMethodCode asComments
+        String sEndMethodLC sSourceLineLC
+        Boolean bFound bEnd
+
+        Get MethodCodeExists asSourceFileLC sMethodName bFunction to iRow
+        If (iRow = -1) Begin
+            Function_Return asMethodCode
+        End
+
+        Get CopyMethodComment asSourceFile iRow to asComments
+        Move (iRow - SizeOfArray(asComments)) to iRow
+
+        Move False to bEnd
+        Move 0 to iCount
+        If (bFunction = True) Begin
+            Move (Lowercase(CS_FunctionEnd)) to sEndMethodLC
+        End
+        Else Begin
+            Move (Lowercase(CS_ProcedureEnd)) to sEndMethodLC
+        End
+
+        Move (SizeOfArray(asSourceFile)) to iSize
+        Decrement iSize
+        Repeat
+            Move asSourceFile[iRow]   to asMethodCode[iCount]
+            Move asSourceFileLC[iRow] to sSourceLineLC
+            Move (Trim(sSourceLineLC) = sEndMethodLC) to bEnd
+            Increment iCount
+            Increment iRow
+        Until (bEnd = True or iCount >= iSize)
+
+        Function_Return asMethodCode
+    End_Function
+
+    // Reads comments written on top of a declared method name (Like this very text)
+    // Note that there may be *no* blank lines inbetween, as this logic stops as soon as
+    // it finds a blank line. It is ok though to leave the rest of a line blank after a "//".
+    // Returns a string array with the found comment lines, that would be *five* items for this text.
+    // Note: Asides from "//" lines, meta data lines are also copied e.g. "{ Visibility=Public }"
+    //
+    Function CopyMethodComment String[] asSourceFile Integer iRow Returns String[]
+        String[] asComments
+        String sLine sMetaTag sCommentTag
+        Integer iCount iSize
+        Boolean bComment
+
+        Move (SizeOfArray(asSourceFile)) to iSize
+        Move "{" to sMetaTag
+        Move "//" to sCommentTag
+        Move 1 to iCount
+        Repeat
+            If (iRow - iCount >= 0) Begin
+                Move asSourceFile[iRow - iCount] to sLine
+                Move (Trim(sLine)) to sLine
+                Move (Left(sLine, 1) = sMetaTag) to bComment
+                If (bComment = False) Begin
+                    Move (Left(sLine, 2) = sCommentTag) to bComment
+                End
+                If (bComment = True) Begin
+                    Move sLine to asComments[SizeOfArray(asComments)]
+                End
+            End
+            Increment iCount
+        Until (sLine = "" or iCount >= iSize) // Last part is just for extra safety!
+
+        Function_Return asComments
+    End_Function
+
+    // Make a backup-copy for the passed Filename in a folder below
+    // the current source folder.
+    // Note: The filename must include the full path.
+    // If the CS_SortBackupFolder folder doesn't exist,
+    // it will be created.
+    // A timestamp (date & time) will be added to the file name.
+    // Returns True if all went OK.
+    Function CreateBackupFile String sFileName Returns Boolean
+        Integer iRetVal
+        String sPath sBackupFile sSourceFile
+        Boolean bExists
+
+        Get ParseFolderName sFileName to sPath
+        Get vFolderFormat sPath to sPath
+        Get vFolderExists (sPath + CS_SortBackupFolder) to bExists
+        If (bExists = False) Begin
+            Get vCreateDirectory (sPath + CS_SortBackupFolder) to iRetVal
+            If (iRetVal <> 0) Begin
+                Send Info_Box ("Could not create import backup folder:" * String(sPath + CS_SortBackupFolder))
+                Function_Return False
+            End
+        End
+        Get ParseFileName sFileName to sSourceFile
+        Move (Replace(".pkg", sSourceFile, "")) to sBackupFile
+        Move (sBackupFile + "." + String(CurrentDateTime()) + ".pkg") to sBackupFile
+        Move (Replaces(",", sBackupFile, "_")) to sBackupFile
+        Move (Replaces(":", sBackupFile, "_")) to sBackupFile
+        Move (Replaces("/", sBackupFile, "-")) to sBackupFile
+        Move (sPath + CS_SortBackupFolder + "\" + sBackupFile) to sBackupFile
+        Set psBackupSourceFile to sBackupFile
+        Get vCopyFile (sPath + sSourceFile) sBackupFile to iRetVal
+
+        Function_Return (iRetVal = 0)
+    End_Function
+
+    Function FillSourceCodeStruct String[] asSourceFile Returns tSourceCode
+        Boolean bSortFunctions bSortProcedures pbSortClassesOnly
+        Boolean bIsClassStart bIsClassEnd bIsFunctionStart bIsFunctionEnd bIsProcedureStart bIsProcedureEnd bFound
+        tSourceCode[] TheData
+        tMethod FunctionData ProcedureData EmptyMethod
+        Integer iCount iSize iItem iClassItem iFuncItem iProcItem iSizeOf iClassSize iFuncSize iProcSize
+        String sLine sName sClassName
+
+//        Get pbSortFunctions      to bSortFunctions
+//        Get pbSortProcedures     to bSortProcedures
+//        Get pbSortClassesOnly to pbSortClassesOnly
+
+        Move 0 to iItem
+        Move 0 to iClassItem
+        Move 0 to iClassSize
+        Move 0 to iFuncItem
+        Move 0 to iProcItem
+        Move 0 to iFuncSize
+        Move 0 to iProcSize
+        Move False to bIsClassStart
+        Move False to bIsClassEnd
+        Move False to bIsFunctionStart
+        Move False to bIsFunctionEnd
+        Move False to bIsProcedureStart
+        Move False to bIsProcedureEnd
+
+        Move (SizeOfArray(asSourceFile)) to iSize
+        Decrement iSize
+
+        For iCount from 0 to iSize
+            Move asSourceFile[iCount] to sLine
+            If (bIsClassStart = False) Begin
+                Get IsMetaStart sLine CS_ClassStart to bIsClassStart
+            End
+            Get IsMetaEnd sLine CS_ClassEnd to bIsClassEnd
+            If (bIsClassStart = True and bIsClassEnd = False) Begin
+                Increment iClassSize
+                Get IsMetaStart sLine CS_ClassStart to bFound
+                If (bIsClassStart = True and bFound = True) Begin
+                    Get MetaName sLine CS_ClassStart to TheData[iItem].sClassName
+                End
+
+                // Functions:
+                If (bIsProcedureStart = False) Begin
+                    If (bIsFunctionStart = False) Begin
+                        Get IsMetaStart sLine CS_FunctionStart to bIsFunctionStart
+                    End
+                    Get IsMetaEnd sLine CS_FunctionEnd   to bIsFunctionEnd
+                    If (bIsFunctionStart = True and bIsFunctionEnd = False) Begin
+                        If (bIsFunctionStart = True and FunctionData.sMethodName = "") Begin
+                            Move 0 to iFuncSize
+                            Get MetaName sLine CS_FunctionStart to FunctionData.sMethodName
+                        End
+                        If (bIsFunctionStart = False) Begin
+                            Get IsMetaStart sLine CS_FunctionStart to bIsFunctionStart
+                        End
+                        Get IsMetaEnd sLine CS_FunctionEnd to bIsFunctionEnd
+                        If (bIsFunctionEnd = False) Begin
+                            Increment iFuncSize
+                        End
+                    End
+                    If (bIsFunctionEnd = True) Begin
+                        Move (iFuncSize + 1) to FunctionData.iLines
+                        Move FunctionData to TheData[iItem].ClassData.FunctionsData[iFuncItem]
+                        Move EmptyMethod to FunctionData
+                        Move False to bIsFunctionStart
+                        Increment iFuncItem
+                    End
+                End
+
+                // Procedures:
+                If (bIsFunctionStart = False) Begin
+                    If (bIsProcedureStart = False) Begin
+                        Get IsMetaStart sLine CS_ProcedureStart to bIsProcedureStart
+                    End
+                    Get IsMetaEnd sLine CS_ProcedureEnd to bIsProcedureEnd
+                    If (bIsProcedureStart = True and bIsProcedureEnd = False) Begin
+                        If (bIsProcedureStart = True and ProcedureData.sMethodName = "") Begin
+                            Move 0 to iProcSize
+                            Get MetaName sLine CS_ProcedureStart to ProcedureData.sMethodName
+                        End
+                        If (bIsProcedureStart = False) Begin
+                            Get IsMetaStart sLine CS_ProcedureStart to bIsProcedureStart
+                        End
+                        Get IsMetaEnd sLine CS_ProcedureEnd to bIsProcedureEnd
+                        If (bIsProcedureEnd = False) Begin
+                            Increment iProcSize
+                        End
+                    End
+                    If (bIsProcedureEnd = True) Begin
+                        Move (iProcSize +1) to ProcedureData.iLines
+                        Move ProcedureData to TheData[iItem].ClassData.ProceduresData[iProcItem]
+                        Move EmptyMethod to ProcedureData
+                        Move False to bIsProcedureStart
+                        Increment iProcItem
+                    End
+                End
+            End
+
+            If (bIsClassEnd = True) Begin
+                Move False to bIsClassStart
+                Move False to bIsClassEnd
+                Move False to bIsFunctionStart
+                Move False to bIsFunctionEnd
+                Move False to bIsProcedureStart
+                Move False to bIsProcedureEnd
+                Move EmptyMethod to FunctionData
+                Move EmptyMethod to ProcedureData
+                Move 0 to iFuncItem
+                Move 0 to iProcItem
+                Move 0 to iFuncSize
+                Move 0 to iProcSize
+                Move iClassSize to TheData[iItem].iLines
+                Increment iItem
+                Move 0 to iClassSize
+                Increment iClassItem
+            End
+        Loop
+
+        Function_Return TheData
+    End_Function
+
+    // Returns True if the passed line = the sMetaString
+    // If the line contains any end comment it will be stripped before the comparison.
+    Function IsMetaEnd String sLine String sMetaString Returns Boolean
+        Move (Trim(Lowercase(sLine))) to sLine
+        Get RemoveEndComment sLine to sLine
+        Function_Return (Left(sLine, Length(sMetaString)) = Lowercase(sMetaString))
+    End_Function
+
+    // Returns True if the passed line starts with the sMetaString
+    Function IsMetaStart String sLine String sMetaString Returns Boolean
+        Move (Trim(Lowercase(sLine))) to sLine
+        Function_Return (Left(sLine, Length(sMetaString)) = Lowercase(sMetaString))
+    End_Function
+
+    // Lower cases all values for the passed string array to make searches/compares easier:
+    // String arrays using this method all ends with the "LC" suffix.
+    Function LowercaseStringArray String[] asSourceFile Returns String[]
+        String[] asSourceFileLC
+        Integer iSize iCount
+
+        Move (SizeOfArray(asSourceFile)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            Move (Lowercase(asSourceFile[iCount])) to asSourceFileLC[iCount]
+        Loop
+
+        Function_Return asSourceFileLC
+    End_Function
+
+    // ToDo: *** MAIN METHOD ***
+    // Returns a string with a result text.
+    // Pass the full source file name to read & sort (including full path).
+    //
+    Function MainSortingMethod String sFileName Returns String
+        Boolean bOK
+        String sRetval
+        String[] asSourceFile
+        tSourceCode[] TheData
+        Integer iSize
+
+        Move ("Success! Classes, functions and procedures were sorted alphabetically for the source file:\n" + String(sFileName)) to sRetval
+        Get CreateBackupFile sFileName to bOK
+        If (bOK = False) Begin
+            Function_Return "Fail. The CreateBackupFile function could not create a backup file and the process was cancelled."
+        End
+
+        Get ReadSourceFile sFileName False (&iSize) to asSourceFile
+        If (SizeOfArray(asSourceFile) = 0) Begin
+            Function_Return "The selected file was empty!"
+        End
+
+        Get FillSourceCodeStruct asSourceFile to TheData
+        Get SortClassesAndMethods TheData to TheData
+        Get SaveSourceCode asSourceFile TheData sFileName to bOK
+        If (bOK = False) Begin
+            Move "An error occured and the source file was *not* properly written to disk. Inspect the result and possibly rename & copy the backup file over the changed source file." to sRetval
+        End
+        Function_Return sRetval
+    End_Function
+
+    // Returns a Class- Function- or Procedure-NAME from the passed "sLine" source line
+    // sMetaString can be e.g. CS_CLassStart, CS_FunctionStart or CS_ProcedureStart
+    Function MetaName String sLine String sMetaString Returns String
+        Integer iPos
+        String sMetaName
+        Move (Lowercase(sLine)) to sMetaName
+        Move (Pos(Lowercase(sMetaString), sMetaName)) to iPos
+        Move (Mid(sLine, Length(sLine), (iPos + Length(sMetaString)))) to sMetaName
+        Move (Trim(sMetaName)) to sMetaName
+        Move (Pos(" ", sMetaName)) to iPos
+        If (iPos <> 0) Begin
+            Move (Left(sMetaName, (iPos -1))) to sMetaName
+        End
+        // Handle "Procedure Set xMethodname"
+        If (Lowercase(sMetaName) = Lowercase(CS_Set)) Begin
+            Move (Pos(Lowercase(CS_Set), Lowercase(sLine))) to iPos
+            If (iPos <> 0) Begin
+                Move (Mid(sLine, Length(sLine), (iPos + Length(CS_Set) +1))) to sMetaName
+                Move (Pos(" ", sMetaName)) to iPos
+                If (iPos <> 0) Begin
+                    Move (Left(sMetaName, (iPos -1))) to sMetaName
+                    Move (CS_Set * String(sMetaName)) to sMetaName
+                End
+            End
+        End
+        Function_Return (Trim(sMetaName))
+    End_Function
+
+    // Returns -1 is the passed sMethodName doesn't exist in the asSourceFileLC (Lower Case) string array.
+    // Else it returns the array item where it was found.
+    // If the bFunction is false we are looking for a procedure, else it is a function.
+    Function MethodCodeExists String[] asSourceFileLC String sMethodName Boolean bFunction Returns Integer
+        Integer iRow
+        String[] asFunctionCode
+
+        Move (Trim(sMethodName)) to sMethodName
+        If (bFunction = True) Begin
+            Move ("function" * Lowercase(sMethodName)) to sMethodName
+        End
+        Else Begin
+            Move ("procedure" * Lowercase(sMethodName)) to sMethodName
+
+        End
+        Move (SearchArray(sMethodName, asSourceFileLC, Self, RefFunc(_FindMethodCode))) to iRow
+
+        Function_Return iRow
+    End_Function
+
+    // Reads the content of the passed sFileName source file and returns it as a string array.
+    // The sFileName must contain the full path.
+    // Line-ending characters like CR and LF are stripped for each line.
+    // No checking is done if the file exists or not.
+    // If something went wrong an empty string array will be returned.
+    Function ReadSourceFile String sFileName Integer ByRef iSize Returns String[]
+        Integer iCh iFileSize iCount
+        String[] asSourceFile
+        String sLine sLastLine sLineBreak
+        Boolean bStart bEnd bEndOfFile bLastLineBreak
+        Handle hoFunctionLibrary
+
+        Move False to bEndOfFile
+        Move ""    to sLastLine
+        Move False to bStart
+        Move False to bEnd
+        Move 0 to iCount
+
+        Get Seq_New_Channel to iCh
+        If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
+            Send Info_Box "No free channel available for input. (ReadSourceFile function)."
+            Move -1 to iSize
+            Function_Return asSourceFile
+        End
+
+        // By setting the size of the array before we start reading,
+        // it makes the process much faster. A new ResizeArray is performed
+        // after the file has been read.
+        Get vWin32_APIFileSize sFilename to iFileSize
+        Move (ResizeArray(asSourceFile, iFileSize)) to asSourceFile
+
+        // Set the linebreak character to use for the file to CR + LF,
+        // because that is what the Studio uses when saving a file. And it seems to be because
+        // the compiler can get confused when there is only a LF.
+        // The readline automatically reads until LF, but does not include it in the read string.
+        Move CS_CRLF to sLineBreak
+        Set psLineBreak to sLineBreak
+
+        // Need to use binary read mode as we want to use CR+LF as the line delimiter.
+        // The filemode options don't seem to work as documented, not sure why.
+        Direct_Input channel iCh ("binary:" + sFilename)
+
+        While (bEndOfFile = False)
+            Readln channel iCh sLine
+            // Remove any trailing spaces:
+            Move (Rtrim(sLine)) to sLine
+            Move (SeqEof) to bEndOfFile
+
+            If (bEndOfFile and Length(sLastLine) > 0) Begin
+                If (Right(sLastLine, 1) = CS_CR) Begin
+                    Move True to bLastLineBreak
+                End
+            End
+            Move sLine to sLastLine
+
+            // Remove any CR or LF at the end of line.
+            // The Line_Feed character is already removed by the Readln command.
+            // When the WriteCodeLibraryFile is called, it will add CR+LF for each array item.
+            // All this hazzle because the Compiler is expecting each line to end with a CR+LF,
+            // else it gets confused and generates errors on what seems to be a perfectly normal
+            // source code line.
+            If (Right(sLine, 1) = CS_CR) Begin
+                Move (Left(sLine, Length(sLine) - 1)) to sLine
+            End
+            If (Right(sLine, 1) = CS_LF) Begin
+                Move (Left(sLine, Length(sLine) - 1)) to sLine
+            End
+
+            If (bEndOfFile = False) Begin
+                Move sLine to asSourceFile[iCount]
+                Increment iCount
+            End
+        Loop
+
+        Move (ResizeArray(asSourceFile, iCount)) to asSourceFile
+        Move iCount to iSize
+        Close_Input channel iCh
+        Send Seq_Release_Channel iCh
+
+        Function_Return asSourceFile
+    End_Function
+
+    // It takes any source line as a parameter and
+    // returns the same string without the end comment.
+    Function RemoveEndComment String sLine Returns String
+        Integer iPos
+        String sTest
+
+        Move sLine to sTest
+        Move (Trim(sTest)) to sTest
+        Move (Pos(CS_CommentSymbol, sTest)) to iPos
+        // Only remove comment if the line is not commented at the beginning.
+        If (iPos > 1) Begin
+            Move (RightPos(CS_CommentSymbol, sLine)) to iPos
+            Move (Left(sLine, iPos - 1)) to sLine
+        End
+        Function_Return (Rtrim(sLine))
+    End_Function
+
+    // Builds the output string array and writes it to disk.
+    // Returns True if all went right.
+    Function SaveSourceCode String[] asSourceFile tSourceCode[] TheData String sFileName Returns Boolean
+        Integer iCount iSize iRow iRows iClasses iClassCount iLines iItem
+        Boolean bOK bErr
+        String[] asEndArray asEndArrayLC asMethodCode asNewSourceCode
+        tMethod[] FunctionsArray ProceduresArray
+        String sMethodName sClassName sLine
+
+        // We will be working with this string array and gradually making it smaller and smaller,
+        // to make it possible to search for non-unique source lines such as "Procedure Construct_Object"
+        Move asSourceFile to asEndArray
+        Get LowercaseStringArray asEndArray to asEndArrayLC
+
+        Move (SizeOfArray(TheData)) to iClasses
+        Move 0 to iClassCount
+        Move TheData[iClassCount].sClassName to sClassName
+        Move (CS_ClassStart + String(sClassName)) to sClassName
+        Move (SearchArray(sClassName, asEndArray, Self, RefFunc(_FindMethodCode))) to iItem
+        If (iItem <> -1) Begin
+            Move asEndArray[iItem] to sClassName
+            Move sClassName to asNewSourceCode[SizeOfArray(asNewSourceCode)]
+        End
+
+        Repeat
+            // Procedures:
+            Move TheData[iClassCount].ClassData.ProceduresData to ProceduresArray
+            Move (SizeOfArray(ProceduresArray)) to iSize
+            Decrement iSize
+            For iCount from 0 to iSize
+                Move ProceduresArray[iCount].sMethodName to sMethodName
+                Move ProceduresArray[iCount].iLines      to iLines
+                Get CopyMethodCode asEndArray asEndArrayLC sMethodName False to asMethodCode
+                Move (AppendArray(asNewSourceCode, asMethodCode)) to asNewSourceCode
+                // Add a blank line
+                Move "" to asNewSourceCode[SizeOfArray(asNewSourceCode)]
+            Loop
+
+            // Functions:
+            Move TheData[iClassCount].ClassData.FunctionsData  to FunctionsArray
+            Move (SizeOfArray(FunctionsArray)) to iSize
+            Decrement iSize
+            For iCount from 0 to iSize
+                Move FunctionsArray[iCount].sMethodName to sMethodName
+                Move FunctionsArray[iCount].iLines      to iLines
+                Get CopyMethodCode asEndArray asEndArrayLC sMethodName True to asMethodCode
+                Move (AppendArray(asNewSourceCode, asMethodCode)) to asNewSourceCode
+                // Add a blank line
+                Move "" to asNewSourceCode[SizeOfArray(asNewSourceCode)]
+            Loop
+
+            Move CS_ClassEnd to sLine
+            Move (SearchArray(sLine, asEndArray, Self, RefFunc(_FindMethodCode))) to iItem
+            If (iItem <> -1) Begin
+                Move asEndArray[iItem] to sLine
+            End
+            Move sLine to asNewSourceCode[SizeOfArray(asNewSourceCode)]
+            Increment iClassCount
+            If (iClassCount < iClasses) Begin
+                Move "" to asNewSourceCode[SizeOfArray(asNewSourceCode)]
+                Move TheData[iClassCount].sClassName to sClassName
+                Move (CS_ClassStart + String(sClassName)) to sClassName
+                Move (SearchArray(sClassName, asEndArray, Self, RefFunc(_FindMethodCode))) to iItem
+                If (iItem <> -1) Begin
+                    Move asEndArray[iItem] to sLine
+                    Move sLine to asNewSourceCode[SizeOfArray(asNewSourceCode)]
+                    Move (SizeOfArray(asEndArray)) to iSize
+                    Decrement iSize
+                    Move (CopyArray(asEndArray, iItem, iSize)) to asEndArray
+                    Get LowercaseStringArray asEndArray to asEndArrayLC
+                End
+            End
+        Until (iClassCount = iClasses)
+
+        // Write the updated source files back to disk:
+        Get WriteSourceCodeFile asSourceFile asNewSourceCode TheData sFileName to bOK
+        Function_Return bOK
+    End_Function
+
+    Function SortClassesAndMethods tSourceCode[] TheData Returns tSourceCode
+        tMethod[] FunctionsArray ProceduresArray EmptyMethod
+        tMethod   ProceduresMove
+        Integer iSize iCount iClass iItem iProcItems
+        String sLine
+
+        Move 0 to iClass
+        // Sort classes
+        Move (SortArray(TheData)) to TheData
+        Move (SizeOfArray(TheData)) to iSize
+        Decrement iSize
+        // Sort methods
+        For iCount from 0 to iSize
+            Move TheData[iCount].ClassData.FunctionsData  to FunctionsArray
+            Move (SortArray(FunctionsArray))  to FunctionsArray
+            Move FunctionsArray to TheData[iCount].ClassData.FunctionsData
+
+            Move TheData[iCount].ClassData.ProceduresData to ProceduresArray
+            Move (SizeOfArray(ProceduresArray)) to iProcItems
+            If (iProcItems <> 0) Begin
+                Move (SortArray(ProceduresArray)) to ProceduresArray
+                // We also want to have the "Procedure Construct_Object" and "End_Construct_Object to appear on top
+                // of the procedure array.
+                Move CS_Construct_Object to ProceduresMove.sMethodName
+                Move (SearchArray(ProceduresMove, ProceduresArray)) to iItem
+                If (iItem <> -1) Begin
+                    Move ProceduresArray[iItem] to ProceduresMove
+                    Move (RemoveFromArray(ProceduresArray, iItem)) to ProceduresArray
+                    Move (InsertInArray(ProceduresArray, 0, ProceduresMove)) to ProceduresArray
+                End
+                Move CS_End_Construct_Object to ProceduresMove.sMethodName
+                Move (SearchArray(ProceduresMove, ProceduresArray)) to iItem
+                If (iItem <> -1) Begin
+                    Move ProceduresArray[iItem] to ProceduresMove
+                    Move (RemoveFromArray(ProceduresArray, iItem)) to ProceduresArray
+                    Move (InsertInArray(ProceduresArray, 1, ProceduresMove)) to ProceduresArray
+                End
+                Move ProceduresArray to TheData[iCount].ClassData.ProceduresData
+            End
+        Loop
+
+        Function_Return TheData
+    End_Function
+
+    // Code from the top of file up to but not including the
+    // first "Class xxx" line.
+    Function TopCode String[] asSourceFile Returns String[]
+        String[] asTopCode
+        String sLine
+        Integer iSize iCount iItem
+        Boolean bIsClassStart
+
+        Move 0 to iItem
+        Move (SizeOfArray(asSourceFile)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            Move asSourceFile[iCount] to sLine
+            Get IsMetaStart sLine CS_ClassStart to bIsClassStart
+            If (bIsClassStart = True) Begin
+                Move iSize to iCount // We're done.
+            End
+            Else Begin
+                Move sLine to asTopCode[iItem]
+                Increment iItem
+            End
+        Loop
+        Function_Return asTopCode
+    End_Function
+
+    Function WriteSourceCodeFile String[] asSourceFile String[] asCode tSourceCode[] TheData String sFileName Returns Boolean
+        String sLine sLineBreak
+        String[] asSourceFileTop asSourceFileBottom
+        Integer iCount iSize iCh iErrors iRow
+        Boolean bOK
+
+        Move False to Err
+        Get psLineBreak     to sLineBreak
+        Get Seq_New_Channel to iCh
+        If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
+            Send Stop_Box "No free channel available for writing sorted source code. Process interrupted."
+            Function_Return False
+        End
+
+        Get TopCode asSourceFile to asSourceFileTop
+        Get BottomCode asSourceFile TheData to asSourceFileBottom
+        Direct_Output channel iCh sFilename
+
+        // 1. Write the top part:
+        Move (SizeOfArray(asSourceFileTop)) to iSize
+        Decrement iSize
+        for iCount from 0 to iSize
+            Write channel iCh asSourceFileTop[iCount] sLineBreak
+        Loop
+
+        Move (SizeOfArray(asCode)) to iSize
+        Decrement iSize
+        // 2. Write the sorted class code part:
+        for iCount from 0 to iSize
+            Write channel iCh asCode[iCount] sLineBreak
+        Loop
+
+        // 1. Write the bottom part:
+        Move (SizeOfArray(asSourceFileBottom)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            Write channel iCh asSourceFileBottom[iCount] sLineBreak
+        Loop
+
+        Close_Output channel iCh
+        Send Seq_Release_Channel iCh
+        Function_Return (Err = False)
+    End_Function
+
+End_Class

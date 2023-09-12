@@ -169,7 +169,7 @@ Struct tBooleanIndicator
     Boolean bHasIndicateCommand   // "*Indicate* Found as..." or "If [Found] Indicate Err as (True = bTrue)"
     tBooleanToken FirstBoolean    // First boolean variable info
     tBooleanToken SecondBoolean   // Second boolean variable, if any (left of "to" and "as")
-    tBooleanToken ToBoolean       // Boolean info after the "to" or "as"
+    tBooleanToken ToBoolean       // Boolean info after the "to" or "as" 
 End_Struct        
 
 Struct tTokenizer
@@ -405,9 +405,9 @@ Define CS_Local          for "Local"
 Define CS_GetAddress     for "GetAddress" 
 Define CS_AddressOf      for "AddressOf"
 Define CS_Function       for "Function"
-Define CS_FunctionEnd    for "Function_End"
+Define CS_FunctionEnd    for "End_Function"
 Define CS_Procedure      for "Procedure"
-Define CS_ProcedureEnd   for "Procedure_End"
+Define CS_ProcedureEnd   for "End_Procedure"
 Define CS_Contains       for "contains"
 Define CS_Select         for "[Select]" 
 Define CS_Shadow_State   for "Shadow_State"
