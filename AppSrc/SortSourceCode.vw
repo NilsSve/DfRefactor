@@ -12,7 +12,7 @@ Use cRDCButton.pkg
 
 Activate_View Activate_oSortSourceCode for oSortSourceCode
 Object oSortSourceCode is a dbView
-    Set Size to 345 522
+    Set Size to 351 522
     Set Location to 2 2
     Set Label to "Sort Class Code"
     Set Border_Style to Border_Thick
@@ -213,7 +213,7 @@ Object oSortSourceCode is a dbView
 
     Object oSortFunctions_cb is a CheckBox
         Set Size to 10 50
-        Set Location to 324 61
+        Set Location to 324 10
         Set Label to "Sort Functions"
         Set Checked_State to True 
         Set Visible_State to False
@@ -221,7 +221,7 @@ Object oSortSourceCode is a dbView
 
     Object oSortProcedures_cb is a CheckBox
         Set Size to 10 50
-        Set Location to 324 131
+        Set Location to 324 73
         Set Label to "Sort Procedures"
         Set Checked_State to True
         Set Visible_State to False
@@ -229,15 +229,15 @@ Object oSortSourceCode is a dbView
 
     Object oSortWithinClassesOnly_cb is a CheckBox
         Set Size to 10 50
-        Set Location to 324 202
+        Set Location to 324 144
         Set Label to "Sort methods in Classes Only"
         Set Checked_State to True
         Set Visible_State to False
     End_Object
 
     Object oSaveSource_btn is a Button
-        Set Size to 23 61
-        Set Location to 318 456
+        Set Size to 28 61
+        Set Location to 317 456
         Set Label to "Save New Source"
         Set psImage to "ActionSave.ico"
         Set MultiLineState to True
@@ -272,13 +272,13 @@ Object oSortSourceCode is a dbView
     End_Object    
 
     Object oRestoreSourceFile_btn is a cRDCButton
-        Set Size to 23 61
-        Set Location to 318 353
+        Set Size to 28 61
+        Set Location to 317 364
         Set Label to "Restore Source File"
         Set psImage to "UndoRefactoring.ico"
         Set MultiLineState to True
         Set piImageSize to 24  
-        Set psToolTip to "Restore the newly written file by overwriting it by the backup file (original source file)."
+        Set psToolTip to "Restore the newly written file by overwriting it with the backup file (original source file)."
         Set Enabled_State to False
     
         Procedure OnClick
@@ -322,5 +322,38 @@ Object oSortSourceCode is a dbView
         End_Function                        
         
     End_Object    
+
+    Object oOpenContainingFolder_btn is a cRDCButton
+        Set Size to 28 61
+        Set Location to 317 300
+        Set Label to "Open Containing Folder"
+        Set psImage to "ActionOpenContainingFolder.ico"
+        Set MultiLineState to True
+        Set piImageSize to 24  
+        Set psToolTip to "Open the containg folder for the backup file in Windows Explorer."
+        Set Enabled_State to False
+    
+        Procedure OnClick
+            String sPath sFileName
+
+            Get psBackupSourceFile of oSortSourceCode to sFileName
+            Get ParseFolderName sFileName to sPath
+
+            // We want to have that file to be selected in Windows Explorer
+            If (sFileName <> "") Begin
+                Move ("/select, " + sFileName) to sPath
+            End
+            Send vShellExecute "open" "explorer.exe" sPath ""
+        End_Procedure
+        
+        Function IsEnabled Returns Boolean
+            String sBackupFile
+            Boolean bExists
+            Get psBackupSourceFile of oSortSourceCode to sBackupFile
+            File_Exist sBackupFile bExists
+            Function_Return (bExists = True)
+        End_Function                        
+        
+    End_Object
     
 End_Object
