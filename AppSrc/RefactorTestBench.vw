@@ -526,12 +526,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             // eRemove_Functions
             Move True to bWriteLine
             Constraint_Set (Self + 1) Clear  
-            Constrained_Clear eq FunctionsA by Index.2   
+            Constrained_Clear eq FunctionsA by Index.4   
             If (bUseConstraints = True) Begin
                 Constrain FunctionsA.Selected eq True
             End
             Constrain FunctionsA.Type eq eRemove_Function
-            Constrained_Find First FunctionsA by Index.2
+            Constrained_Find First FunctionsA by Index.4
             While (Found)                          
                 Move (Trim(FunctionsA.Parameter)) to sParameter
                 Move (Trim(FunctionsA.Function_Name)) to sFunctionName
@@ -547,12 +547,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 
                 // eStandard_Function
                 Constraint_Set (Self + 2) Clear  
-                Constrained_Clear eq FunctionsA by Index.2
+                Constrained_Clear eq FunctionsA by Index.4
                 If (bUseConstraints = True) Begin
                     Constrain FunctionsA.Selected eq True
                 End
                 Constrain FunctionsA.Type eq eStandard_Function
-                Constrained_Find First FunctionsA by Index.2
+                Constrained_Find First FunctionsA by Index.4
                 While (Found)
                     Move (Trim(FunctionsA.Parameter)) to sParameter
                     Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
@@ -575,12 +575,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         // eEditor_Function
         Move False to bChanged
         Constraint_Set (Self + 3) Clear  
-        Constrained_Clear eq FunctionsA by Index.2
+        Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
         End
         Constrain FunctionsA.Type eq eEditor_Function
-        Constrained_Find First FunctionsA by Index.2
+        Constrained_Find First FunctionsA by Index.4
         While (Found)
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
@@ -602,12 +602,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         // eOther_Function - A source file as a string array is passed.
         Move False to bChanged
         Constraint_Set (Self + 4) Clear  
-        Constrained_Clear eq FunctionsA by Index.2
+        Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
         End
         Constrain FunctionsA.Type eq eOther_Function
-        Constrained_Find First FunctionsA by Index.2
+        Constrained_Find First FunctionsA by Index.4
         While (Found)
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
@@ -626,12 +626,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move sRefactoredFileName to asSourceFiles[0]
         Move False to bChanged
         Constraint_Set (Self + 4) Clear  
-        Constrained_Clear eq FunctionsA by Index.2
+        Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
         End
         Constrain FunctionsA.Type eq eOther_FunctionAll
-        Constrained_Find First FunctionsA by Index.2
+        Constrained_Find First FunctionsA by Index.4
         While (Found)
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
@@ -650,12 +650,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         // Makes no source code changes
         Move False to bChanged
         Constraint_Set (Self + 4) Clear  
-        Constrained_Clear eq FunctionsA by Index.2
+        Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
         End
         Constrain FunctionsA.Type eq eReport_Function
-        Constrained_Find First FunctionsA by Index.2
+        Constrained_Find First FunctionsA by Index.4
         While (Found)
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
@@ -672,12 +672,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move sLegacyFileName to asSourceFiles[0]
         Move False to bChanged
         Constraint_Set (Self + 4) Clear  
-        Constrained_Clear eq FunctionsA by Index.2
+        Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
         End
         Constrain FunctionsA.Type eq eReport_FunctionAll
-        Constrained_Find First FunctionsA by Index.2
+        Constrained_Find First FunctionsA by Index.4
         While (Found)
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
