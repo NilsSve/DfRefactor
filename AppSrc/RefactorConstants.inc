@@ -152,10 +152,10 @@ Struct tToken                     // Note: sOverStrikeLine should be used when u
 End_Struct
 
 Struct tBooleanToken              // Note: sOverStrikeLine should be used when using this struct (parameter to function)
-    Integer iStartPos             // The starting position for a keyword of the sOverstrikeLine member.
-    String sCode                  // The code of the source line. Can be a single keyword or part of source linee
+    String sCode                  // The boolean parameter within a square bracket e.g. "Found" for: "[Found]"
     Boolean bHasBracket           // If *[Seqeof]*
-    Boolean bHasNot               // If the bracket contains a "not" keyword e.g. [Not Found]
+    Boolean bHasNot               // If the bracket contains a "not" keyword e.g. [Not Found] or tilde "~" symbol.
+    Boolean bDoubleBoolean        // [Found ~Found], ie two boolean indicators within the square brackets.
 End_Struct
 
 { EnumList="{CI_FirstBoolean, CI_SecondBoolean, CI_ToBoolean}" }
@@ -165,11 +165,12 @@ Enum_List
     Define CI_ToBoolean           // Part after "to" or "as"
 End_Enum_List 
 
-Struct tBooleanIndicator
+Struct tBooleanIndicator          // Square bracket indicator info:
     Boolean bHasIndicateCommand   // "*Indicate* Found as..." or "If [Found] Indicate Err as (True = bTrue)"
     tBooleanToken FirstBoolean    // First boolean variable info
     tBooleanToken SecondBoolean   // Second boolean variable, if any (left of "to" and "as")
-    tBooleanToken ToBoolean       // Boolean info after the "to" or "as" 
+    tBooleanToken ToBoolean       // Boolean info after the "to" 
+    tBooleanToken AsBoolean       // Boolean info after the "as" 
 End_Struct        
 
 Struct tTokenizer
@@ -386,6 +387,7 @@ Define CS_Self           for "Self"
 Define CS_Move           for "Move"
 Define CS_Indicate       for "Indicate"  
 Define CS_Not            for "Not"
+Define CS_Tilde          for "~"
 Define CS_True           for "True"   
 Define CS_False          for "False"
 Define CS_DfTrue         for "DfTrue"
@@ -413,7 +415,7 @@ Define CS_ProcedureEnd   for "End_Procedure"
 Define CS_Contains       for "contains"
 Define CS_Select         for "[Select]" 
 Define CS_Shadow_State   for "Shadow_State"
-Define CS_Object_Shadow_State for "Object_Shadow_State"
+Define CS_Object_Shadow_State for "Object_Shadow_State"  
 
 // Various DataFlex language text constants:
 Define CS_EndClass       for "End_Class"

@@ -424,12 +424,13 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
     
                 Object oShowErrorLog_btn is a cRDCButton
-                    Set Size to 14 53
-                    Set Location to 43 315
-                    Set Label to "&Error Log"
+                    Set Size to 23 53
+                    Set Location to 31 315
+                    Set Label to "Compile &Errors"
                     Set peAnchors to anBottomLeft
-                    Set psImage to "CompileProjectErrors.ico"
-                    Set psToolTip to "Show Error log from compilation (Ctrl+E)"
+                    Set psImage to "CompileErrors.ico"
+                    Set psToolTip to "Show compilation errors (Ctrl+E)"
+                    Set MultiLineState to True
                 
                     Procedure OnClick
                         String sAppSrcPath
