@@ -10,8 +10,8 @@ Use cRDCHeaderGroup.pkg
 Use cRDCCJGrid.pkg 
 Use cRDCButton.pkg
 
-Activate_View Activate_oSortSourceCode for oSortSourceCode
-Object oSortSourceCode is a dbView
+Activate_View Activate_oSortSourceCode_vw for oSortSourceCode_vw
+Object oSortSourceCode_vw is a dbView
     Set Size to 351 522
     Set Location to 2 2
     Set Label to "Sort Class Code"
@@ -39,8 +39,8 @@ Object oSortSourceCode is a dbView
             
             Procedure Page Integer iPageObject  
                 String sVal
-                Append sVal "Utility to sort a source file's classes, procedures and functions. "
-                Append sVal "Select the source file of choice and press the 'Save New Source' button."
+                Append sVal "Utility to sort any source file's classes, procedures and functions, alphabetically, in that order. "
+                Append sVal "Select a source file (F4) and press the 'Save Sorted Source File' button."
                 Append sVal (CS_CR + "Note: A backup copy of the selected source file will be created in the AppSrc" * "'" + CS_SortBackupFolder + "'" * "sub-folder.")
                 Move (Replaces("\n", sVal, (CS_CR))) to sVal
                 Set Label to sVal
@@ -95,6 +95,7 @@ Object oSortSourceCode is a dbView
                 tSourceCode[] TheData
                 
                 Move (oSortSourceCode(Self)) to ho
+                Set psSourceFile of ho to sFileName
                 Set psBackupSourceFile of ho to ""
                 Get ReadSourceFile of ho sFileName False (&iSize) to asSourceFile
                 If (SizeOfArray(asSourceFile) = 0) Begin
@@ -105,8 +106,14 @@ Object oSortSourceCode is a dbView
                 Get FillSourceCodeStruct of ho asSourceFile to TheData
                 Get SortClassesAndMethods of ho TheData to TheData
                 Send FillData of oSourceFileData_grd TheData
+            End_Procedure  
+            
+            Procedure Clear 
+                Set psSourceFile of (oSortSourceCode(Self)) to ""
+                Set Value to ""
             End_Procedure
             
+            On_Key kClear Send Clear_All
         End_Object
     
         Object oOpen_btn is a Button
@@ -128,16 +135,17 @@ Object oSortSourceCode is a dbView
     Object oShowSort_grp is a cRDCHeaderGroup
         Set Size to 154 509
         Set Location to 152 6
-        Set Label to "Sort Info"
+        Set Label to "Sort Result"
         Set psImage to "ActionSort.ico"
-        Set psNote to "Class Sort Info. Note: Construct_Object/End_Construct_Object are always at top"
+        Set psNote to "Class Sort Result. Note: Construct_Object/End_Construct_Object are always at top"
         Set psToolTip to "Sorted result for Classes, Procedures and Functions. Note: Construct_Object/End_Construct_Object are always at top"
-        Set peAnchors to anNone
+        Set peAnchors to anNone 
 
         Object oSourceFileData_grd is a cRDCCJGrid
             Set Size to 115 461
             Set Location to 30 38
-            Set pbShowFooter to True
+            Move 0 to ghoProjectIniFile 
+//            Set pbShowFooter to True
     
             Object oCJGridColumnRowIndicator is a cCJGridColumnRowIndicator
             End_Object
@@ -206,7 +214,59 @@ Object oSortSourceCode is a dbView
                 
                 Send InitializeData TheData
                 Send MoveToFirstRow
+            End_Procedure   
+
+//            Function Server Returns Integer  
+//                Function_Return Self
+//            End_Function         
+//                        
+//            Function Main_File Returns Integer
+//            End_Function         
+//            
+//            Function FindByRowIndex Returns Integer
+//            End_Function         
+//            
+//            Function Ordering Returns Integer
+//            End_Function         
+//            
+//            Function Request_Read Returns Integer
+//            End_Function         
+//            
+//            Function HasRecord Returns Integer
+//            End_Function         
+//            
+//            Function CurrentRowId  Returns RowID
+//            End_Function
+//            
+//            Function HasRecord  Returns Boolean
+//            End_Function
+//            
+//            Procedure FindByRowId  Integer iFile RowID riRowId
+//            End_Procedure
+//            
+//            Procedure ReadByRowId  Integer iFile RowID riRowId
+//            End_Procedure
+//            
+//            Function ReadByRowIdEx Integer iFile RowID riId Returns Boolean
+//            End_Function
+//            
+//            Function FindByRowIdEx Integer iFile RowID riId Returns Boolean
+//            End_Function
+//    
+//            Procedure Suggested_Ordering
+//            End_Procedure               
+//
+//            Procedure DoSetCurrentRow
+//            End_Procedure
+            
+            Procedure Clear
+                Handle hoDataSource
+                Get phoDataSource to hoDataSource
+                Send ResetAll of hoDataSource
+//                Send Clear of oSourceFileName_fm
             End_Procedure
+            
+            On_Key kClear Send Clear_All
         End_Object
 
     End_Object
@@ -235,10 +295,10 @@ Object oSortSourceCode is a dbView
         Set Visible_State to False
     End_Object
 
-    Object oSaveSource_btn is a Button
+    Object oSaveSource_btn is a cRDCButton
         Set Size to 28 61
         Set Location to 317 456
-        Set Label to "Save New Source"
+        Set Label to "Save Sorted Source File"
         Set psImage to "ActionSave.ico"
         Set MultiLineState to True
         Set piImageSize to 24
@@ -269,6 +329,13 @@ Object oSortSourceCode is a dbView
             Send Info_Box sRetVal
         End_Procedure
     
+        Function IsEnabled Returns Boolean
+            String sSourceFile
+            Boolean bExists
+            Get psSourceFile of oSortSourceCode to sSourceFile
+            Function_Return (sSourceFile <> "")
+        End_Function                        
+        
     End_Object    
 
     Object oRestoreSourceFile_btn is a cRDCButton
@@ -355,5 +422,10 @@ Object oSortSourceCode is a dbView
         End_Function                        
         
     End_Object
+
+    Procedure Clear_All
+        Broadcast Recursive Send Clear of oSortSourceCode_vw
+    End_Procedure
     
+    On_Key kClear Send Clear_All
 End_Object
