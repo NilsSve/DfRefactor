@@ -147,10 +147,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                         If (iLines > 1) Begin
                             Procedure_Return
                         End
-//                        Get ReadImageDataToStringArray 1 to asLegacyCode 
                         Move (oLegacyCodeFilename_fm(Self)) to ho
                         Get psCodeFile of (phoEditorLegacy(ghoApplication)) to sFileName
-//                        Send SaveData of ho asLegacyCode
                         Send LoadFile sFileName   
                         Send OnModified
                     End     
@@ -499,7 +497,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move (SizeOfArray(asLegacyCode)) to iSize
         Decrement iSize  
 
-        Get phoEditorRefactored to hoRefactoredEditor
+        Get phoEditorRefactored to hoRefactoredEditor         
+        
         Get psCodeFile of hoRefactoredEditor to sRefactoredFileName
         Set phoEditor to hoRefactoredEditor
         If (iSize > 0) Begin
@@ -523,8 +522,9 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Move asLegacyCode[iCount] to sLine
             Send InitializeTokenizer of ghoRefactorFunctionLibrary sLine
             
-            // These are functions that may potentially remove the line (Sets bWriteLIne to False)
             // eRemove_Functions
+            // These are functions that may potentially remove the line (Sets bWriteLIne to False),
+            // so we execute them first.
             Move True to bWriteLine
             Constraint_Set (Self + 1) Clear  
             Constrained_Clear eq FunctionsA by Index.4   
@@ -544,9 +544,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Constrained_Find Next
             Loop
             
+            // eStandard_Function
             If (bWriteLine = True) Begin
-                
-                // eStandard_Function
                 Constraint_Set (Self + 2) Clear  
                 Constrained_Clear eq FunctionsA by Index.4
                 If (bUseConstraints = True) Begin
@@ -562,16 +561,26 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Constrained_Find Next
                 Loop
                 
-                If (iCount < iSize) Begin
-                    Move (sLine + CS_CRLF) to sLine
-                End            
-                Send AppendText of hoRefactoredEditor sLine
+//                If (iCount < iSize) Begin
+//                    Move (sLine + CS_CRLF) to sLine
+//                End
+//                Send AppendText of hoRefactoredEditor sLine  
+                Move sLine to asRefactoredCode[iCount]
             End
         Loop  
+        
+        If (SizeOfArray(asRefactoredCode) <> 0) Begin
+            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
+            If (bOK = True) Begin
+                Send LoadFile of hoRefactoredEditor sRefactoredFileName
+            End
+        End
 
         Send PumpMsgQueue of Desktop  
         Send UpdateStatusBar of hoRefactoredEditor "Executing Editor functions..." True
-        Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
+        If (SysFile.SelectedEditorFunctions <> 0) Begin
+            Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
+        End
         
         // eEditor_Function
         Move False to bChanged
@@ -620,6 +629,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Constrained_Find Next
         Loop
         If (bChanged = True) Begin
+//        Get WriteToDisk of hoRefactoredEditor to bChanged 
+        
             Get WriteDataToEditor of hoRefactoredEditor asRefactoredCode to bOK
         End
         
