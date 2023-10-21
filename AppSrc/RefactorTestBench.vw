@@ -250,8 +250,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
                 Procedure OnModified
                     Integer iLines
-                    
-                    Forward Send OnModified
                     Get Line_Count to iLines
                     Set Value of oRefactoredCode_NoOfLines_fm to iLines                    
                 End_Procedure          
@@ -353,7 +351,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     // because of the bold font.
                     Set Form_FontWeight to FW_BOLD
                     Set psImage to "Start.ico"
-                    Set psToolTip to "Refactors the legacy code from the left editor, then saves it to disk. (Ctrl+R)"
+                    Set psToolTip to "Refactors the legacy code from the left editor, then saves it to disk. (Ctrl+F5)"
                     Set piImageSize to 32
                     
                     Procedure OnClick   
