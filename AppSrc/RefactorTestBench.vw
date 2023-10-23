@@ -30,9 +30,6 @@ Object oRefactorTestBench is a cRefactorDbView
     Set pbAcceptDropFiles to True
     Set phoTestView of ghoApplication to Self
 
-    Property Handle phoEditorLegacy
-    Property Handle phoEditorRefactored   
-        
     Object oSysFile_DD is a cSysFileDataDictionary
         // We don't care about data-loss in this view.
         // Note that it won't help to try to set the Data_Loss & Exit_Loss
@@ -109,7 +106,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Object oLegacyCode_edt is a cScintillaRefactorEditor
                 Set Size to 176 484
                 Set Location to 17 6
-                Delegate Set phoEditorLegacy to (Self)
                 Set phoEditorLegacy of ghoApplication to (Self)
                 Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
 
@@ -123,9 +119,9 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Handle ho
                     
                     If (bLast = True) Begin
-                        Set pbIsFileDropped to False
+                        Set pbIsFileDropped to False 
+                        Set Value of oLegacyCodeFilename_fm to sFileName 
                         Send LoadFile sFileName 
-                        Send SaveFile 
                     End 
                     // We use a property to only show info_box once if multiple files are dropped.
                     Else If (pbIsFileDropped(Self) = False) Begin
@@ -205,11 +201,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set Label_Justification_Mode to JMode_Right
                     Set peAnchors to anBottomLeftRight 
                     Set Label_FontWeight to fw_Bold
-
-                    Procedure Set Value Integer iItem String sFileName
-                        Forward Set Value to sFileName
-                        Set psLegacySourceFile of ghoApplication to sFileName
-                    End_Procedure
                 End_Object
 
                 Object oRefactoredCodeFilename_fm is a cFileNameForm
@@ -220,11 +211,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set Label_Justification_Mode to JMode_Right
                     Set peAnchors to anBottomLeftRight
                     Set Label_FontWeight to fw_Bold
-
-                    Procedure Set Value Integer iItem String sFileName
-                        Forward Set Value to sFileName
-                        Set psRefactoredSourceFile of ghoApplication to sFileName
-                    End_Procedure
                 End_Object
 
             End_Object
@@ -243,7 +229,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Object oRefactoredCode_edt is a cScintillaRefactorEditor
                 Set Size to 176 377
                 Set Location to 17 6
-                Delegate Set phoEditorRefactored to (Self)  
                 Delegate Set phoEditor to (Self)
                 Set phoEditorRefactored of ghoApplication to (Self)
                 Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_RefactoredCode)
@@ -482,8 +467,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move False to bLoopFound
         Send Activate_oRefactorTestBench
         
-        Get phoEditorLegacy to hoLegacyEditor
-        Get psCodeFile of hoLegacyEditor to sLegacyFileName
+        Get phoEditorLegacy of ghoApplication to hoLegacyEditor
+        Get psCodeFile      of hoLegacyEditor to sLegacyFileName
         Get _IsDataFlexCOMProxyClassesFile of ghoRefactorFunctionLibrary sLegacyFileName to bisCOMProcxy
         If (bisCOMProcxy = True) Begin
             Send Info_Box "This file is marked as a Studio COM Proxy classes auto generated file and will _not_ be refactored!"
@@ -495,10 +480,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move (SizeOfArray(asLegacyCode)) to iSize
         Decrement iSize  
 
-        Get phoEditorRefactored to hoRefactoredEditor         
-        
-        Get psCodeFile of hoRefactoredEditor to sRefactoredFileName
-        Set phoEditor to hoRefactoredEditor
+        Get phoEditorRefactored of ghoApplication to hoRefactoredEditor        
+        Get psCodeFile      of hoRefactoredEditor to sRefactoredFileName
         If (iSize > 0) Begin
             Send Delete_Data of hoRefactoredEditor
         End        
@@ -601,10 +584,10 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End
             Constrained_Find Next
         Loop
-        If (bChanged = True) Begin
-            Send SaveFile of hoRefactoredEditor                    
-            Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
-        End
+//        If (bChanged = True) Begin
+//            Send SaveFile of hoRefactoredEditor                    
+//            Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
+//        End
         Send UpdateStatusBar of hoRefactoredEditor "" True
 
         // eOther_Function - A source file as a string array is passed.
@@ -712,7 +695,7 @@ End_Object
 
 Procedure JumpToSourceLine Integer iLine
     Handle hoEdit
-    Move (phoEditorRefactored(oRefactorTestBench(Self))) to hoEdit
+    Move (phoEditorRefactored(ghoApplication)) to hoEdit
     Send Activate_oRefactorTestBench
     Send JumpToSourceLine of hoEdit iLine    
 End_Procedure
