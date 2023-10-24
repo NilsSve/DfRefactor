@@ -525,7 +525,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Constrained_Find Next
             Loop
             
-            // eStandard_Function
+            // eStandard_Function - Line-by-line
             If (bWriteLine = True) Begin
                 Constraint_Set (Self + 2) Clear  
                 Constrained_Clear eq FunctionsA by Index.4
@@ -542,10 +542,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Constrained_Find Next
                 Loop
                 
-//                If (iCount < iSize) Begin
-//                    Move (sLine + CS_CRLF) to sLine
-//                End
-//                Send AppendText of hoRefactoredEditor sLine  
                 Move sLine to asRefactoredCode[iCount]
             End
         Loop  
@@ -584,13 +580,15 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End
             Constrained_Find Next
         Loop
-//        If (bChanged = True) Begin
-//            Send SaveFile of hoRefactoredEditor                    
-//            Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
-//        End
+        If (bChanged = True) Begin
+            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
+            If (bOK = True) Begin
+                Send LoadFile of hoRefactoredEditor sRefactoredFileName
+            End
+        End
         Send UpdateStatusBar of hoRefactoredEditor "" True
 
-        // eOther_Function - A source file as a string array is passed.
+        // eOther_Function - One source file as a string array is passed.
         Move False to bChanged
         Constraint_Set (Self + 4) Clear  
         Constrained_Clear eq FunctionsA by Index.4
@@ -610,9 +608,10 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Constrained_Find Next
         Loop
         If (bChanged = True) Begin
-//        Get WriteToDisk of hoRefactoredEditor to bChanged 
-        
-            Get WriteDataToEditor of hoRefactoredEditor asRefactoredCode to bOK
+//            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
+//            If (bOK = True) Begin
+                Send LoadFile of hoRefactoredEditor sRefactoredFileName
+//            End
         End
         
         // eOther_FunctionAll - All source files with full pathing is passed to these functions as a string array.
@@ -682,6 +681,13 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Constrained_Find Next
         Loop
         
+        If (bChanged = True) Begin
+//            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
+//            If (bOK = True) Begin
+                Send LoadFile of hoRefactoredEditor sRefactoredFileName
+//            End
+        End
+
         Move (CurrentDateTime()) to dtEnd
         Set Value of (oRefactoredCode_Time_fm(Self)) to (dtEnd - dtStart)
         Set pbIsRefactoring of ghoApplication to False
