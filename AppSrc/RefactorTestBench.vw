@@ -453,7 +453,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
     // *** MAIN REFACTORING ROUTINE ***  
     //
-    // Testing of various refactor functions:
+    // Testing of refactor functions.
+    // Can be all or a selection of functions.
     Procedure RefactoreCode Boolean bUseConstraints
         String[] asLegacyCode asRefactoredCode asSourceFiles
         String sLine sLegacyFileName sRefactoredFileName sFunctionName sParameter

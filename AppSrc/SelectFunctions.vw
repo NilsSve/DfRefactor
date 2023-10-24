@@ -182,7 +182,19 @@ Object oMaintainFunctions is a dbView
             Send ComRedraw  
             Send WriteString of ghoApplication CS_Settings CS_GridFontSize iSize
         End_Procedure 
-    
+        
+        Procedure SelectAll
+            Send SelectAll of (Server(Self))
+            Send RefreshSelectionUpdate
+        End_Procedure
+
+        Procedure SelectNone
+            Send DeSelectAll of (Server(Self))
+            Send RefreshSelectionUpdate
+        End_Procedure
+        
+        On_Key Key_Ctrl+Key_A Send SelectAll
+        On_Key Key_Ctrl+Key_N Send SelectNone
     End_Object
 
     // To enable Ctrl+MouseWheel in the grid to change font size.
@@ -267,7 +279,7 @@ Object oMaintainFunctions is a dbView
 
     Set Verify_Save_msg to (RefFunc(No_Confirmation))
 
-    On_Key Key_Escape Send None
-    On_Key Key_Ctrl+Key_S Send Request_Save
+    On_Key Key_Escape      Send None
+    On_Key Key_Ctrl+Key_S  Send Request_Save
     On_Key Key_Ctrl+Key_F4 Send None
 End_Object 
