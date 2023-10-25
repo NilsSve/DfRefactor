@@ -642,7 +642,10 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Constrained_Find Next
         Loop
         If (bChanged = True) Begin
-            Send LoadFile of hoRefactoredEditor sRefactoredFileName
+            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
+            If (bOK = True) Begin
+                Send LoadFile of hoRefactoredEditor sRefactoredFileName
+            End
         End
         
         // eReport_Function - A source file as a string array is passed.
