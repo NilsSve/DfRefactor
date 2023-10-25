@@ -462,6 +462,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Integer iSize iCount iTabSize iRetval iFunctionID eSplitMode
         Boolean bChanged bLoopFound bisCOMProcxy bWriteLine bOK
         DateTime dtStart dtEnd
+
+        Get Checked_State of oUseConstraints_cb to bOK
+        If (SysFile.SelectedFunctionTotal = 0 and bOK = True) Begin
+            Send Info_Box "You need to select at least one function first. Or unselect the checkbox 'Use selected Functions only'"
+            Procedure_Return
+        End
         
         Move (CurrentDateTime()) to dtStart
         Set Value of (oRefactoredCode_Time_fm(Self)) to ""
