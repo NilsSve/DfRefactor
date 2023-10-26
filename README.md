@@ -1,6 +1,6 @@
 DFRefactor - The Automated Refactoring Tool for DataFlex
 
-_Click the "<> Code" button and select "Download zip file", then unzip the DataDistrib.zip file to a Data folder and unzip the AppSrcManifestFiles.zip to the AppSrc folder and you should be able to open the workspace in the DataFlex Studio._
+_Click the "<> Code" button and either select "Download zip file" and also unzip the DataDistrib.zip file to a Data folder. Then unzip the AppSrcManifestFiles.zip to the AppSrc folder and you should be able to open the workspace in the DataFlex Studio._
 
 DFRefactor is a tool written in DataFlex that helps with refactoring of old DataFlex code. It consists of a series of functions to help in the refactoring process. Each refactoring function that can be used to refactor code must be entered to the main function repository; the RefavtorFunctionLibrary.pkg class.
 That same function must also be registered with the FuntionMaintenance view.
