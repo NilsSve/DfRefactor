@@ -1,6 +1,6 @@
 DFRefactor - The Automated Refactoring Tool for DataFlex
 
-_Click the "<> Code" button and either select "Open with GitHub Desktop", which is the preferred method, (It can be downloaded here: https://desktop.github.com/)
+_Click the "<> Code" button and either select "Open with GitHub Desktop", which is the preferred method, (The GitHub software can be downloaded from: https://desktop.github.com/)
 - or you can select the "Download zip file" and after unpacking also unpack the DataDistrib.zip file to the Data folder and the AppSrcManifestFiles.zip to the AppSrc folder.
 - You should now be able to open the workspace in the DataFlex Studio from version 19.0 and up.
 - The main advantage of using the GitHub Desktop client is that you get instent notification if something has changed in the main repository, so you can fetch again (refresh your workspace).
