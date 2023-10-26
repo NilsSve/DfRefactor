@@ -122,6 +122,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                         Set pbIsFileDropped to False 
                         Set Value of oLegacyCodeFilename_fm to sFileName 
                         Send LoadFile sFileName 
+                        Send Activate
                     End 
                     // We use a property to only show info_box once if multiple files are dropped.
                     Else If (pbIsFileDropped(Self) = False) Begin
@@ -313,7 +314,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     
                     Procedure OnChange
                         Boolean bState  
-                        Integer iFunctions
+                        Integer iFunctions    
+                        Send Request_Save
                         Get Checked_State to bState
                         If (bState = False) Begin                                
                             Get_Attribute DF_FILE_RECORDS_USED of Functions.File_Number to iFunctions
@@ -488,7 +490,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Decrement iSize  
 
         Get phoEditorRefactored of ghoApplication to hoRefactoredEditor        
-        Get psCodeFile      of hoRefactoredEditor to sRefactoredFileName
+        Get psCodeFile of hoRefactoredEditor      to sRefactoredFileName
         If (iSize > 0) Begin
             Send Delete_Data of hoRefactoredEditor
         End        
@@ -502,71 +504,80 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Send SuspendGUI of Desktop True
         Set pbIsRefactoring of ghoApplication to True   
         Send Cursor_Wait of Cursor_Control
-        
-        For iCount from 0 to iSize
-            // Need this to show "Number of lines:" changes
-            Send PumpMsgQueue of Desktop   
-            // Read next source line
-            Move asLegacyCode[iCount] to sLine
-            Send InitializeTokenizer of ghoRefactorFunctionLibrary sLine
-            
-            // eRemove_Functions
-            // These are functions that may potentially remove the line (Sets bWriteLIne to False),
-            // so we execute them first.
-            Move True to bWriteLine
-            Constraint_Set (Self + 1) Clear  
-            Constrained_Clear eq FunctionsA by Index.4   
-            If (bUseConstraints = True) Begin
-                Constrain FunctionsA.Selected eq True
-            End
-            Constrain FunctionsA.Type eq eRemove_Function
-            Constrained_Find First FunctionsA by Index.4
-            While (Found)                          
-                Move (Trim(FunctionsA.Parameter)) to sParameter
-                Move (Trim(FunctionsA.Function_Name)) to sFunctionName
-                Move (Eval("get_" - (sFunctionName))) to iFunctionID
-                Get iFunctionID of ghoRefactorFunctionLibrary (&sLine) sParameter to bChanged
-                If (bChanged = True) Begin
-                    Move False to bWriteLine
-                End
-                Constrained_Find Next
-            Loop
-            
-            // eStandard_Function - Line-by-line
-            If (bWriteLine = True) Begin
-                Constraint_Set (Self + 2) Clear  
-                Constrained_Clear eq FunctionsA by Index.4
+
+        If (SysFile.SelectedStandardFunctions > 0 or bUseConstraints = False) Begin
+            For iCount from 0 to iSize
+                // Need this to show "Number of lines:" changes
+                Send PumpMsgQueue of Desktop   
+                // Read next source line
+                Move asLegacyCode[iCount] to sLine
+                Send InitializeTokenizer of ghoRefactorFunctionLibrary sLine
+                
+                // eRemove_Functions
+                // These are functions that may potentially remove the line (Sets bWriteLIne to False),
+                // so we execute them first.
+                Move True to bWriteLine
+                Constraint_Set (Self + 1) Clear  
+                Constrained_Clear eq FunctionsA by Index.4   
                 If (bUseConstraints = True) Begin
                     Constrain FunctionsA.Selected eq True
                 End
-                Constrain FunctionsA.Type eq eStandard_Function
+                Constrain FunctionsA.Type eq eRemove_Function
                 Constrained_Find First FunctionsA by Index.4
-                While (Found)
+                While (Found)                          
                     Move (Trim(FunctionsA.Parameter)) to sParameter
-                    Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
+                    Move (Trim(FunctionsA.Function_Name)) to sFunctionName
                     Move (Eval("get_" - (sFunctionName))) to iFunctionID
                     Get iFunctionID of ghoRefactorFunctionLibrary (&sLine) sParameter to bChanged
+                    If (bChanged = True) Begin
+                        Move False to bWriteLine
+                    End
                     Constrained_Find Next
                 Loop
                 
-                Move sLine to asRefactoredCode[iCount]
+                // eStandard_Function - Line-by-line
+                If (bWriteLine = True) Begin
+                    Constraint_Set (Self + 2) Clear  
+                    Constrained_Clear eq FunctionsA by Index.4
+                    If (bUseConstraints = True) Begin
+                        Constrain FunctionsA.Selected eq True
+                    End
+                    Constrain FunctionsA.Type eq eStandard_Function
+                    Constrained_Find First FunctionsA by Index.4
+                    While (Found)
+                        Move (Trim(FunctionsA.Parameter)) to sParameter
+                        Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
+                        Move (Eval("get_" - (sFunctionName))) to iFunctionID
+                        Get iFunctionID of ghoRefactorFunctionLibrary (&sLine) sParameter to bChanged
+                        Constrained_Find Next
+                    Loop
+                    
+                    Move sLine to asRefactoredCode[iCount]
+                End
+            Loop  
+            
+            If (SizeOfArray(asRefactoredCode) <> 0) Begin
+                Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
+                If (bOK = True) Begin
+                    Send LoadFile of hoRefactoredEditor sRefactoredFileName
+                End
             End
-        Loop  
-        
-        If (SizeOfArray(asRefactoredCode) <> 0) Begin
-            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
-            If (bOK = True) Begin
-                Send LoadFile of hoRefactoredEditor sRefactoredFileName
+            Send PumpMsgQueue of Desktop  
+            If (SysFile.SelectedEditorFunctions <> 0) Begin
+                Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
             End
         End
 
-        Send PumpMsgQueue of Desktop  
-        Send UpdateStatusBar of hoRefactoredEditor "Executing Editor functions..." True
-        If (SysFile.SelectedEditorFunctions <> 0) Begin
-            Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
-        End
-        
         // eEditor_Function
+        Send UpdateStatusBar of hoRefactoredEditor "Executing Editor functions..." True  
+        // If no "eStandard_Function" calls were made, we need to load the source file
+        // into the refactor editor.
+        If (SizeOfArray(asRefactoredCode) = 0) Begin
+            Move asLegacyCode to asRefactoredCode
+            Send LoadFile of hoRefactoredEditor sLegacyFileName  
+            Set psCodeFile of hoRefactoredEditor to sRefactoredFileName
+            Get WriteToDisk of hoRefactoredEditor to bOK
+        End
         Move False to bChanged
         Constraint_Set (Self + 3) Clear  
         Constrained_Clear eq FunctionsA by Index.4
@@ -588,7 +599,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Constrained_Find Next
         Loop
         If (bChanged = True) Begin
-            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
+            Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
+            Get WriteStringArrayToDisk  of hoRefactoredEditor asRefactoredCode to bOK
             If (bOK = True) Begin
                 Send LoadFile of hoRefactoredEditor sRefactoredFileName
             End
