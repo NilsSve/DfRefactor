@@ -362,33 +362,10 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     End_Function
                 
                 End_Object
-        
-                Object oCompareProgram_btn is a cRDCButton
+
+                Object oCompileRefactoredCode_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 27 258
-                    Set Label to "Co&mpare"
-                    Set peAnchors to anBottomLeft
-                    Set psImage to "Compare.ico"
-                    Set psToolTip to "Starts the selected compare program and passes the two source files (Ctrl+M). It automatically saves the source files first."
-                
-                    Procedure OnClick
-                        String sCompareApp
-                        Send Execute of (oSave_ToolItem(ghoCommandBars))
-                        Get psFileCompareApp of ghoApplication to sCompareApp
-                        Send CompareFiles of ghoApplication sCompareApp
-                    End_Procedure
-            
-                    Function IsEnabled Returns Boolean
-                        Integer iLines
-                        Get SC_LineCount of (phoEditor(Self)) to iLines
-                        Function_Return (iLines > 1)
-                    End_Function
-            
-                End_Object
-    
-                Object oTestCompileRefactoredCode_btn is a cRDCButton
-                    Set Size to 14 53
-                    Set Location to 43 258
+                    Set Location to 29 256
                     Set Label to "Compile"
                     Set peAnchors to anBottomLeft
                     Set psImage to "CompileProject.ico"
@@ -405,11 +382,11 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     End_Function
             
                 End_Object
-    
-                Object oShowErrorLog_btn is a cRDCButton
-                    Set Size to 23 53
-                    Set Location to 31 315
-                    Set Label to "Compile &Errors"
+
+                Object oShowCompileErrors_btn is a cRDCButton
+                    Set Size to 14 53
+                    Set Location to 43 256
+                    Set Label to "&Errors"
                     Set peAnchors to anBottomLeft
                     Set psImage to "CompileErrors.ico"
                     Set psToolTip to "Show compilation errors (Ctrl+E)"
@@ -437,6 +414,30 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                         Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
                         Get SC_LineCount of (phoEditorRefactored(ghoApplication)) to iLines
                         Function_Return (bExists = True and iLines > 1)
+                    End_Function
+            
+                End_Object
+        
+                Object oStartCompareProgram_btn is a cRDCButton
+                    Set Size to 23 53
+                    Set Location to 32 316
+                    Set Label to "Co&mpare Code"
+                    Set peAnchors to anBottomLeft
+                    Set psImage to "Compare.ico"
+                    Set psToolTip to "Starts the selected compare program and passes the two source files (Ctrl+M). It automatically saves the source files first."
+                    Set MultiLineState to True
+                
+                    Procedure OnClick
+                        String sCompareApp
+                        Send Execute of (oSave_ToolItem(ghoCommandBars))
+                        Get psFileCompareApp of ghoApplication to sCompareApp
+                        Send CompareFiles of ghoApplication sCompareApp
+                    End_Procedure
+            
+                    Function IsEnabled Returns Boolean
+                        Integer iLines
+                        Get SC_LineCount of (phoEditor(Self)) to iLines
+                        Function_Return (iLines > 1)
                     End_Function
             
                 End_Object
