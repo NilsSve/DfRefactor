@@ -144,8 +144,9 @@ Object oSortSourceCode_vw is a dbView
         Object oSourceFileData_grd is a cRDCCJGrid
             Set Size to 115 461
             Set Location to 30 38
+            Set pbAllowEdit to False
+            Set pbAllowAppendRow to False
             Move 0 to ghoProjectIniFile 
-//            Set pbShowFooter to True
     
             Object oCJGridColumnRowIndicator is a cCJGridColumnRowIndicator
             End_Object
@@ -171,9 +172,11 @@ Object oSortSourceCode_vw is a dbView
                 tMethod[] ProcsArray FuncsArray              
                 String sClassName sProcName sFuncName
                 
+                Move 0 to iProcs
+                Move 0 to iFuncs
                 Get piColumnId of oClassData_Col to iClassCol
-                Get piColumnId of oProcData_Col to iProcCol
-                Get piColumnId of oFuncData_Col to iFuncCol
+                Get piColumnId of oProcData_Col  to iProcCol
+                Get piColumnId of oFuncData_Col  to iFuncCol
                 Move (SizeOfArray(TheSource)) to iClasses
                 Set psFooterText of oClassData_Col to ("No of Classes" * String(iClasses))
                 Move 0 to iStart
@@ -185,34 +188,36 @@ Object oSortSourceCode_vw is a dbView
                     Move (sClassName * "(" + String(iLines) + ")") to sClassName
                     
                     Move TheSource[iClassCount].ClassData.ProceduresData to ProcsArray
-                    Move (SizeOfArray(ProcsArray)) to iProcs 
-                    Set psFooterText of oProcData_Col to ("No of Procedures" * String(iProcs))
-                    Decrement iProcs
-                    For iCount from 0 to iProcs
+                    Move (SizeOfArray(ProcsArray)) to iSize
+                    Decrement iSize
+                    For iCount from 0 to iSize
                         Move ProcsArray[iCount].sMethodName to sProcName
                         Move ProcsArray[iCount].iLines      to iLines
                         Move (sProcName * "(" + String(iLines) + ")") to sProcName
                         Move sClassName to TheData[iCount + iStart].sValue[iClassCol]
                         Move sProcName  to TheData[iCount + iStart].sValue[iProcCol]
                     Loop
+                    Move (iProcs + SizeOfArray(ProcsArray)) to iProcs 
                     
                     Move TheSource[iClassCount].ClassData.FunctionsData to FuncsArray
-                    Move (SizeOfArray(FuncsArray)) to iFuncs
-                    Set psFooterText of oFuncData_Col to ("No of Functions" * String(iFuncs))
-                    Decrement iFuncs
-                    For iCount from 0 to iFuncs
+                    Move (SizeOfArray(FuncsArray)) to iSize
+                    Decrement iSize
+                    For iCount from 0 to iSize
                         Move FuncsArray[iCount].sMethodName to sFuncName
                         Move FuncsArray[iCount].iLines      to iLines
                         Move (sFuncName * "(" + String(iLines) + ")") to sFuncName
                         Move sClassName to TheData[iCount + iStart].sValue[iClassCol]
                         Move sFuncName  to TheData[iCount + iStart].sValue[iFuncCol]
                     Loop
+                    Move (iFuncs + SizeOfArray(FuncsArray)) to iFuncs
                     
                     Move (SizeOfArray(TheData)) to iStart
                     Increment iClassCount
                 Loop
                 
                 Send InitializeData TheData
+                Set psFooterText of oProcData_Col to ("Total No of Procedures" * String(iProcs))
+                Set psFooterText of oFuncData_Col to ("Total No of Functions" * String(iFuncs))
                 Send MoveToFirstRow
             End_Procedure   
 
@@ -266,6 +271,9 @@ Object oSortSourceCode_vw is a dbView
 //                Send Clear of oSourceFileName_fm
             End_Procedure
             
+            Procedure OnComRowRClick Variant llRow Variant llItem
+            End_Procedure
+
             On_Key kClear Send Clear_All
         End_Object
 
