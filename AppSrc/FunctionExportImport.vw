@@ -122,13 +122,31 @@ Object oFunctionsExportImport is a dbView
             Set Default_State to True
         
             Procedure OnClick
-                Handle hoGrid  
-                Integer iID
+                Handle hoGrid hoDD 
+                Integer iID iItem
                 String sFunctionName
+                tFolderData[] asDataArray
+                tFolderData FunctionData
                 
                 Delegate Get phoSelection_grd to hoGrid
-                Get Field_Current_Value of oFunctions_DD Field FunctionsA.ID to iID
-                Get Field_Current_Value of oFunctions_DD Field FunctionsA.Function_Name to sFunctionName
+                Move (Main_DD(Self)) to hoDD
+                Get Field_Current_Value of hoDD Field FunctionsA.ID to iID
+                Get Field_Current_Value of hoDD Field FunctionsA.Function_Name to sFunctionName
+                
+                // We guard against the same function is added more than once.
+                Get AllItems of oSelection_grd to asDataArray 
+                Move -1 to iItem
+                If (SizeOfArray(asDataArray) > 0) Begin
+                    Move sFunctionName to FunctionData.sFolderName
+                    Move (SearchArray(FunctionData, asDataArray)) to iItem 
+                    // This is strange, but the following line always returns = 0(!)
+                    // That doesn't matter to us in this case as the casing should always be the same.
+                    // Move (SearchArray(FunctionData, asDataArray, Desktop, RefFunc(DFSTRICMP))) to iItem
+                End
+                If (iItem <> -1) Begin
+                    Send Info_Box "Function already selected."
+                    Procedure_Return
+                End
                 If (iID <> 0) Begin
                     Send AddItem of hoGrid iID sFunctionName
                     Send DoSetCheckboxFooterText of hoGrid
