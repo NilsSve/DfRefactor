@@ -362,6 +362,9 @@ Define CS_DFUnitTest     for "DFUnit_TestRunner"
 Define CS_DFRefactor     for "DFRefactor"
 Define CS_LegacyCode     for "LegacyCode.pkg"
 Define CS_RefactoredCode for "RefactoredCode.pkg"
+Define CS_ImpExpFileJson for "DFRefactorImportExportFile.json" 
+Define CS_ExportJsonFile for "ExportJsonFile"
+Define CS_ImportJsonFile for "ImportJsonFile"
 
 // Refactor Testing program:
 Define CS_Trim           for "Trim"    

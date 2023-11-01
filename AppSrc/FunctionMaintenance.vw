@@ -14,12 +14,14 @@ Use dfEnRad.pkg
 Use DFEnChk.pkg
 
 ACTIVATE_VIEW Activate_oFunctionMaintenance_vw FOR oFunctionMaintenance_vw
-Object oFunctionMaintenance_vw is a cRefactorDbView
+Object oFunctionMaintenance_vw is a dbView
     Set Location to 5 5
     Set Size to 265 483
     Set piMaxSize to 273 602
     Set Label to "Function Maintenance"
     Set Auto_Clear_DEO_State to False
+    Set pbAutoActivate to True
+    Set Verify_Save_msg to (RefFunc(No_Confirmation))
 
     Procedure Log_Status String sMsg
     End_Procedure
@@ -259,10 +261,11 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
 //        Forward Send Exiting_Scope hoNewScope
 //        Set pbVisible of (oFindToolBar(ghoCommandBars)) to False
 //        Send ComRecalcLayout of ghoCommandBars
-//    End_Procedure
+//    End_Procedure        
 
     On_Key Key_Escape Send None
-    On_Key Key_Ctrl+Key_S Send Request_Save
+    On_Key Key_Ctrl+Key_S  Send Request_Save
+    On_Key Key_Ctrl+Key_F2 Send Request_Save
     On_Key Key_Ctrl+Key_F4 Send None
 End_Object 
 

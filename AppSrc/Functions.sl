@@ -25,9 +25,15 @@ CD_Popup_Object oFunctions_sl is a dbModalPanel
         Set Size to 105 259
         Set Location to 5 5
         Set peAnchors to anAll
+        Set pbAllowColumnRemove to False
         Set psLayoutSection to "oFunctions_sl_oSelList"
-        Set Ordering to 1
-        Set pbAutoServer to True
+        Set pbUseAlternateRowBackgroundColor to True
+        Set pbShowRowFocus to True
+        Set pbUseFocusCellRectangle to True
+        Set pbShadeSortColumn to False
+        Set pbAutoServer to False
+        Set piSelectedRowBackColor to clGreenGreyLight
+        Set piHighlightBackColor   to clGreenGreyLight
 
         Object oFunctions_ID is a cDbCJGridColumn
             Entry_Item Functions.ID
@@ -41,12 +47,11 @@ CD_Popup_Object oFunctions_sl is a dbModalPanel
             Set psCaption to "Function Name"
         End_Object 
 
-        Object oFunctions_Type is a cDbCJGridColumn
-            Entry_Item Functions.Type
-            Set piWidth to 117
-            Set psCaption to "Type"
-            Set pbComboButton to True
-        End_Object 
+        Object oFunctions_Function_Description is a cDbCJGridColumn
+            Entry_Item Functions.Function_Description
+            Set piWidth to 200
+            Set psCaption to "Function Description"
+        End_Object
 
     End_Object 
 

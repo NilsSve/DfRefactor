@@ -7,8 +7,8 @@ Use cRDCComboForm.pkg
 
 Use cSysFileDataDictionary.dd
 Use cFunctionsDataDictionary.dd
-Use cdbCJGridColumn.pkg
-Use Windows.pkg
+
+Register_Function MyDelete_Confirmation Returns Integer
 
 ACTIVATE_VIEW Activate_oMaintainFunctions FOR oMaintainFunctions
 Object oMaintainFunctions is a dbView
@@ -24,7 +24,6 @@ Object oMaintainFunctions is a dbView
     End_Object
 
     Object oFunctions_DD is a cFunctionsDataDictionary  
-        Set No_Delete_State to True
     End_Object 
 
     Set Main_DD To oFunctions_DD
@@ -42,7 +41,7 @@ Object oMaintainFunctions is a dbView
     Object oInfo2_tb is a TextBox
         Set Size to 10 160
         Set Location to 6 187
-        Set Label to "- Double-Click a row to Edit, right-click for grid options"
+        Set Label to "- Space to select. Double-Click to Edit, right-click for grid options."
     End_Object
 
     Object oFunctionSelection_grd is a cRDCDbCJGrid
@@ -53,13 +52,9 @@ Object oMaintainFunctions is a dbView
         Set pbHeaderReorders to True
         Set pbHeaderTogglesDirection to True
         Set pbAllowAppendRow to False
-        Set pbAllowDeleteRow to False
         Set pbAllowInsertRow to False
         Set pbAutoAppend to False
-
-//        Object oCJGridColumnRowIndicator is a cCJGridColumnRowIndicator
-//            Set piWidth to 17
-//        End_Object
+        Set Verify_Delete_msg to (RefFunc(MyDelete_Confirmation))
 
         Object oFunctions_ID is a cRDCDbCJGridColumn
             Entry_Item Functions.ID
@@ -99,6 +94,7 @@ Object oMaintainFunctions is a dbView
             Set psCaption to "Type"
             Set peHeaderAlignment to xtpAlignmentCenter  
             Set pbComboButton to True
+            // pbEditable *must* be set after the pbComboButton setting.
             Set pbEditable to False
         End_Object                    
 
@@ -107,7 +103,7 @@ Object oMaintainFunctions is a dbView
             Set piWidth to 65
             Set psCaption to "Option"  
             Set psToolTip to "For some functions an extra parameter setting can be passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
-            Set pbEditable to False
+//            Set pbEditable to False
 
             Function OnGetTooltip Integer iRow String sValue String sText Returns String
                 Get RowValue of oFunctions_ParameterHelp iRow to sText
@@ -140,8 +136,13 @@ Object oMaintainFunctions is a dbView
         End_Procedure
 
         Procedure OnComRowDblClick Variant llRow Variant llItem
-            Integer iFunctionID
-            Forward Send OnComRowDblClick llRow llItem
+            Integer iFunctionID iSelectedCol iParameterCol
+            Get piColumnId of oFunctions_Parameter to iParameterCol
+            Get SelectedColumn to iSelectedCol
+            If (iSelectedCol = iParameterCol) Begin
+                Procedure_Return
+            End
+            Forward Send OnComRowDblClick llRow llItem   
             Get Field_Current_Value of oFunctions_DD Field Functions.ID to iFunctionID
             Delegate Send ActivateFunctionsView iFunctionID
         End_Procedure
@@ -191,10 +192,30 @@ Object oMaintainFunctions is a dbView
         Procedure SelectNone
             Send DeSelectAll of (Server(Self))
             Send RefreshSelectionUpdate
-        End_Procedure
+        End_Procedure 
+        
+        // This is so the "Delete" button in the toolbar is disabled, as we
+        // do not allow deletion in this view.
+        Function DEO_Object Returns Boolean
+            Function_Return False
+        End_Function
         
         On_Key Key_Ctrl+Key_A Send SelectAll
         On_Key Key_Ctrl+Key_N Send SelectNone
+    End_Object
+
+    Object oSysFile_TotFunctionsSelected is a cRDCDbForm
+        Entry_Item SysFile.SelectedFunctionTotal
+        Set Server to oSysFile_DD
+        Set Location to 3 546
+        Set Size to 12 13
+        Set Label to "Selected:"
+        Set Enabled_State to False
+        Set Label_Col_Offset to 0
+        Set FontWeight to fw_Bold
+        Set FontPointHeight to 10
+        Set peAnchors to anTopRight
+        Set Label_FontWeight to fw_Bold
     End_Object
 
     // To enable Ctrl+MouseWheel in the grid to change font size.
@@ -222,64 +243,31 @@ Object oMaintainFunctions is a dbView
        Set Windows_Override_State to True    
     End_Procedure
         
-    Object oSysFile_TotFunctionsSelected is a cRDCDbForm
-        Entry_Item SysFile.SelectedFunctionTotal
-        Set Server to oSysFile_DD
-        Set Location to 3 546
-        Set Size to 12 13
-        Set Label to "Selected:"
-        Set Enabled_State to False
-        Set Label_Col_Offset to 0
-        Set FontWeight to fw_Bold
-        Set FontPointHeight to 10
-        Set peAnchors to anTopRight
-        Set Label_FontWeight to fw_Bold
-    End_Object
-
-//    Object oGridFontSize_cf is a cRDCComboForm
-//        Set Size to 13 32
-//        Set Location to 7 457
-//        Set Label to "Grid font size"
-//        Set psToolTip to "Sets the font size for grids"
-//        Set Label_Col_Offset to 2
-//        Set Label_Justification_Mode to JMode_Right
-//        Set Entry_State to False
-//        Set Combo_Sort_State to False
-//
-//        Procedure Combo_Fill_List
-//            Integer iSize
-//
-//            Send Combo_Add_Item "6"
-//            Send Combo_Add_Item "7"
-//            Send Combo_Add_Item "8"
-//            Send Combo_Add_Item "9"
-//            Send Combo_Add_Item "10"
-//            Send Combo_Add_Item "11"
-//            Send Combo_Add_Item "12"
-//            Send Combo_Add_Item "13"
-//            Send Combo_Add_Item "14"
-//            Send Combo_Add_Item "15"
-//            Send Combo_Add_Item "16"
-//
-//            Get ReadString of ghoApplication CS_Settings CS_GridFontSize 8 to iSize
-//            Set Value to iSize
-//        End_Procedure
-//
-//        Procedure OnChange     
-//            Integer iSize
-//            Get Value to iSize
-//            Send WriteString of ghoApplication CS_Settings CS_GridFontSize iSize
-//            Broadcast Recursive Send DoChangeFontSize of (Client_Id(ghoCommandBars))
-//        End_Procedure
-//
-//    End_Object
+    // Automatically save any changes when leaving this view.
+    Procedure Exiting_Scope Handle hoNewScope Returns Integer
+        Integer iRetVal
+        Boolean bHasChange
+        Get Should_Save of (Main_DD(Self)) to bHasChange
+        If (bHasChange = True) Begin
+            Send Request_Save
+        End
+        Forward Get msg_Exiting_Scope hoNewScope to iRetVal
+        Procedure_Return iRetVal
+    End_Procedure
 
     Procedure Close_Panel
     End_Procedure
-
+    
+    Function MyDelete_Confirmation Returns Integer
+        Send Info_Box "You are not allowd to delete records here."
+        Function_Return 1    
+    End_Function
+    
+    Set Verify_Delete_msg to (RefFunc(MyDelete_Confirmation))
     Set Verify_Save_msg to (RefFunc(No_Confirmation))
 
     On_Key Key_Escape      Send None
     On_Key Key_Ctrl+Key_S  Send Request_Save
+    On_Key Key_F2          Send Request_Save
     On_Key Key_Ctrl+Key_F4 Send None
 End_Object 

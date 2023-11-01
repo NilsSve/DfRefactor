@@ -17,7 +17,7 @@ Use cCJGridColumn.pkg
 ACTIVATE_VIEW Activate_oFunctionsExportImport FOR oFunctionsExportImport
 Object oFunctionsExportImport is a dbView
     Set Location to 5 5
-    Set Size to 333 650
+    Set Size to 372 650
     Set Label to "Export/Import"
     Set Border_Style to Border_Thick
     Set pbAutoActivate to True   
@@ -63,7 +63,7 @@ Object oFunctionsExportImport is a dbView
     End_Object
 
     Object oExport_grp is a cRDCDbHeaderGroup
-        Set Size to 122 637
+        Set Size to 150 637
         Set Location to 131 8
         Set Label to "Export"
         Set psImage to "Export.ico"
@@ -294,10 +294,11 @@ Object oFunctionsExportImport is a dbView
                 End
                 Send SelectAll of hoGrid   
                 Get SelectedItems of hoGrid to asFunctions
-                Move (SortArray(asFunctions)) to asFunctions
+                Move (SortArray(asFunctions)) to asFunctions             
+                Get psExpFileJson of ghoApplication to sFileName
                 
                 // Main Export function:
-                Get ExportFile of ghoImportExportFunctions asFunctions (&sFileName) to bOK
+                Get ExportFile of ghoImportExportFunctions asFunctions sFileName to bOK
 
                 If (bOK = True) Begin
                     Send Info_Box (String(iSize) * "selected function(s) was successfully exported to the Export/Import file:\n" + sFileName)
@@ -413,11 +414,79 @@ Object oFunctionsExportImport is a dbView
 
         End_Object
 
+        Object oExportFileName_fm is a Form
+            Set Size to 14 360
+            Set Location to 127 59
+            Set Label to "Json import file:"
+            Set Label_Col_Offset to 0
+            Set Label_Justification_Mode to JMode_Top
+            Set psToolTip to "Press [F4] to display the Open dialog to select an export file."
+            Set Label_Row_Offset to 1 
+            Set Prompt_Button_Mode to PB_PromptOn
+            
+            Procedure Prompt
+                String sPath sFileName
+                String[] asSelectedFiles
+                Handle hoOpen 
+                Integer iSize 
+                Boolean bOpen bExists
+                
+                Get Create (RefClass(OpenDialog)) to hoOpen
+                Get psHome of (phoWorkspace(ghoApplication)) to sPath
+                Set Initial_Folder of hoOpen to sPath       
+                Set MultiSelect_State of hoOpen to False   
+                Set Dialog_Caption of hoOpen to "Select a refactor export file:"
+                Set Filter_String of hoOpen to "DFRefactor Export Files|*.json;|All Files|*.*" 
+                Set ShowFileTitle_State of hoOpen to True
+                Set File_Title of hoOpen to CS_ImpExpFileJson 
+                Set FileMustExist_State of hoOpen to True
+                Get Show_Dialog of hoOpen to bOpen
+                If (bOpen = True) Begin 
+                    Get Selected_Files of hoOpen to asSelectedFiles
+                End
+                Send Destroy of hoOpen  
+                Move (SizeOfArray(asSelectedFiles)) to iSize 
+                If (iSize = 0) Begin
+                    Function_Return False
+                End                      
+                Move asSelectedFiles[0] to sFileName
+                Set Value to sFileName
+                Set psExpFileJson of ghoApplication to sFileName
+            End_Procedure
+            
+            Procedure Activating 
+                String sPath sFileName
+                Boolean bExists
+
+                Get psExpFileJson of ghoApplication to sFileName  
+                Get ExtractFilePath sFileName to sPath
+                If (sPath = "") Begin
+                    Get psHome of (phoWorkspace(ghoApplication)) to sPath
+                    Get vFolderFormat sPath to sPath   
+                    Move (CS_ExportJsonFile + ".json") to sFileName
+                    Move (sPath + String(sFileName)) to sFileName  
+                End
+                Set Value to sFileName
+            End_Procedure
+
+            Procedure Exiting Handle hoDestination Returns Integer
+                Integer iRetVal
+                String sFileName
+                
+                Forward Get msg_Exiting hoDestination to iRetVal
+                Get Value to sFileName
+                Set psExpFileJson of ghoApplication to sFileName
+                Procedure_Return iRetVal
+            End_Procedure
+            
+            On_Key kPrompt Send Prompt
+        End_Object
+
     End_Object
 
     Object oImport_grp is a cRDCDbHeaderGroup
         Set Size to 65 637
-        Set Location to 263 8
+        Set Location to 297 8
         Set Label to "Import" 
         Set psNote to "Import Functions from Json."
         Set psToolTip to ("Import function data to the Functions table, function code to:" * String(CS_FunctionLibraryFile) * "and Unit testing to:" * String(CS_UnitTestsFile) + ", from Json file:" * String(CS_ImpExpFileJson))
@@ -447,7 +516,7 @@ Object oFunctionsExportImport is a dbView
                 Set Dialog_Caption of hoOpen to "Select a DFRefactor export/import file:"
                 Set Filter_String of hoOpen to "DFRefactor Import Files|*.json;|All Files|*.*" 
                 Set ShowFileTitle_State of hoOpen to True
-                Set File_Title of hoOpen to CS_ImpExpFileJson 
+//                Set File_Title of hoOpen to CS_ImpExpFileJson 
                 Set FileMustExist_State of hoOpen to True
                 Get Show_Dialog of hoOpen to bOpen
                 If (bOpen = True) Begin 
@@ -461,15 +530,29 @@ Object oFunctionsExportImport is a dbView
                 Set Value to asSelectedFiles[0]
             End_Procedure
             
-            Procedure Activating
-                String sPath 
+            Procedure Activating 
+                String sPath sFileName
                 Boolean bExists
-                Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                Get vFolderFormat sPath to sPath
-                File_Exist (sPath + CS_ImpExpFileJson) bExists
-                If (bExists = True) Begin
-                    Set Value to (sPath + CS_ImpExpFileJson)
+
+                Get psImpFileJson of ghoApplication to sFileName  
+                Get ExtractFilePath sFileName to sPath
+                If (sPath = "") Begin
+                    Get psHome of (phoWorkspace(ghoApplication)) to sPath
+                    Get vFolderFormat sPath to sPath
+                    Move (CS_ImportJsonFile + ".json") to sFileName
+                    Move (sPath + String(sFileName)) to sFileName  
                 End
+                Set Value to sFileName
+            End_Procedure
+
+            Procedure Exiting Handle hoDestination Returns Integer
+                Integer iRetVal
+                String sFileName
+                
+                Forward Get msg_Exiting hoDestination to iRetVal
+                Get Value to sFileName
+                Set psImpFileJson of ghoApplication to sFileName
+                Procedure_Return iRetVal
             End_Procedure
             
             On_Key kPrompt Send Prompt

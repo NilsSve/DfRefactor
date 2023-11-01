@@ -514,7 +514,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Move asLegacyCode[iCount] to sLine
                 Send InitializeTokenizer of ghoRefactorFunctionLibrary sLine
                 
-                // eRemove_Functions
+                // eRemove_Functions - Line-by-line
                 // These are functions that may potentially remove the line (Sets bWriteLIne to False),
                 // so we execute them first.
                 Move True to bWriteLine
