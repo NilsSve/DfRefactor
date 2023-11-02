@@ -252,23 +252,14 @@ Object oFunctionMaintenance_vw is a dbView
         Send Find of oFunctions_DD GT 1   
     End_Procedure
                                                                    
-//    Procedure OnSetFocus
-//        Set pbVisible of (oFindToolBar(ghoCommandBars)) to True
-//        Send ComRecalcLayout of ghoCommandBars
-//    End_Procedure
-//                                                                   
-//    Procedure Exiting_Scope Handle hoNewScope
-//        Forward Send Exiting_Scope hoNewScope
-//        Set pbVisible of (oFindToolBar(ghoCommandBars)) to False
-//        Send ComRecalcLayout of ghoCommandBars
-//    End_Procedure        
-
     On_Key Key_Escape Send None
     On_Key Key_Ctrl+Key_S  Send Request_Save
     On_Key Key_Ctrl+Key_F2 Send Request_Save
     On_Key Key_Ctrl+Key_F4 Send None
 End_Object 
 
+// Public access method for this view. Pass it a Functions.ID,
+// that the view should latch on to.
 Procedure ActivateFunctionsView Integer iFunctionID
     Handle ho hoDD  
     Boolean bDone
