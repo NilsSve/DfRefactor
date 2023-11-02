@@ -139,7 +139,7 @@ Object oFunctionsExportImport is a dbView
                 If (SizeOfArray(asDataArray) > 0) Begin
                     Move sFunctionName to FunctionData.sFolderName
                     Move (SearchArray(FunctionData, asDataArray)) to iItem 
-                    // This is strange, but the following line always returns = 0(!)
+                    // This is weird, but the following line always returns = 0(!)
                     // That doesn't matter to us in this case as the casing should always be the same.
                     // Move (SearchArray(FunctionData, asDataArray, Desktop, RefFunc(DFSTRICMP))) to iItem
                 End
@@ -230,6 +230,7 @@ Object oFunctionsExportImport is a dbView
             Object oFunctionID_Col is a cCJGridColumn
                 Set piWidth to 30
                 Set psCaption to "ID"    
+                Set peDataType to Mask_Numeric_Window
             End_Object
 
             Object oFunctionName_Col is a cCJGridColumn
