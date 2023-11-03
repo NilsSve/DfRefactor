@@ -169,7 +169,6 @@ Register_Procedure RefreshSelectionUpdate
                         Set piWidth to 154
                         Set psCaption to "Type"
                         Set peHeaderAlignment to xtpAlignmentCenter  
-                        Set pbComboButton to True
                         Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
             
                         Function OnGetTooltip Integer iRow String sValue String sText Returns String
@@ -183,7 +182,31 @@ Register_Procedure RefreshSelectionUpdate
                         Entry_Item Functions.Parameter
                         Set piWidth to 74
                         Set psCaption to "Option"
+                        Set pbComboButton to True  
+                        Set pbComboEntryState to False
                         Set psToolTip to "For some functions an extra parameter can be passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
+            
+                        Procedure OnEntry
+                            Send ComboFillList
+                        End_Procedure
+                        
+                        Procedure ComboFillList
+                            String sParameterList
+                            String[] asParameters
+                            Integer iSize iCount
+                            
+                            Send ComboDeleteData
+                            Get Field_Current_Value of (Server(Self)) Field Functions.ParameterValidation to sParameterList
+                            If (sParameterList <> "") Begin
+                                Set pbComboEntryState to False
+                                Get StrSplitToArray  sParameterList "," to asParameters
+                                Move (SizeOfArray(asParameters)) to iSize
+                                Decrement iSize
+                                For iCount from 0 to iSize
+                                    Send ComboAddItem asParameters[iCount] iCount
+                                Loop
+                            End
+                        End_Procedure
             
                         Function OnGetTooltip Integer iRow String sValue String sText Returns String
                             Get RowValue of oFunctions_ParameterHelp iRow to sText
