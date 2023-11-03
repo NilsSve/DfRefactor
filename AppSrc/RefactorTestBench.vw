@@ -355,10 +355,10 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     End_Procedure 
                     
                     Function IsEnabled Returns Boolean   
-                        Boolean bChecked
+                        Boolean bUseConstraints
                         Integer iFunctions
-                        Get Checked_State of oUseConstraints_cb to bChecked
-                        Function_Return (SysFile.SelectedFunctionTotal > 0 or bChecked = False)
+                        Get Checked_State of (phoUseConstraints_cb(ghoApplication)) to bUseConstraints
+                        Function_Return (SysFile.SelectedFunctionTotal > 0 or bUseConstraints = False)
                     End_Function
                 
                 End_Object

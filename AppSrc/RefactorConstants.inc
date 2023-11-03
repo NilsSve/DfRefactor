@@ -194,7 +194,7 @@ Struct tTokenizer
     String sEndComment                  // Move x to y *// This is a right side comment.*
     String sIndentation                 // Line start indentation, one or more tabs or spaces.
     Boolean bHasOverstrikeChars         // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
-    String sOverstrikeLine              // Source line without indentation and string literals overstriked with "_" or "+".
+    String sOverstrikeLine              // Source line without indentation and string literals overstriked with "_" or '+'.
 // ToDo: Finish tQuotedString function. Needed?
 //    tQuotedString[] aStringContent      // Struct string array with original text string constants for the sLine content.
 
