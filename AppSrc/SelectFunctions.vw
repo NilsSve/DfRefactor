@@ -102,9 +102,32 @@ Object oMaintainFunctions is a dbView
             Entry_Item Functions.Parameter
             Set piWidth to 65
             Set psCaption to "Option"  
+            Set pbComboButton to True  
+            Set pbComboEntryState to False
             Set psToolTip to "For some functions an extra parameter setting can be passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
-//            Set pbEditable to False
 
+            Procedure OnEntry
+                Send ComboFillList
+            End_Procedure
+            
+            Procedure ComboFillList
+                String sParameterList
+                String[] asParameters
+                Integer iSize iCount
+                
+                Send ComboDeleteData
+                Get Field_Current_Value of (Server(Self)) Field Functions.ParameterValidation to sParameterList
+                If (sParameterList <> "") Begin
+                    Set pbComboEntryState to False
+                    Get StrSplitToArray  sParameterList "," to asParameters
+                    Move (SizeOfArray(asParameters)) to iSize
+                    Decrement iSize
+                    For iCount from 0 to iSize
+                        Send ComboAddItem asParameters[iCount] iCount
+                    Loop
+                End
+            End_Procedure
+            
             Function OnGetTooltip Integer iRow String sValue String sText Returns String
                 Get RowValue of oFunctions_ParameterHelp iRow to sText
                 Move (Replaces("\n", sText, CS_CRLF)) to sText
