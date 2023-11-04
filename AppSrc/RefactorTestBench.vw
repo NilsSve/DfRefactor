@@ -721,7 +721,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     End_Procedure
 
     Procedure Activating
-//        Send Refresh of oNoOfSelectedFunctions2_fm  Mode_Find_or_Clear_Set
         Send Request_Assign of oSysFile_DD
     End_Procedure
 End_Object
