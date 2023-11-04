@@ -31,9 +31,9 @@ Enum_List
 End_Enum_List
 
 Enum_List
-    Define CI_SplitWithSpaceAndSemicolon for 1
-    Define CI_SplitWithSemicolon         for 2
-    Define CI_SplitAddBeginEndBlock      for 3
+    Define CI_SplitBySpaceAndSemicolon for 1
+    Define CI_SplitBySemicolon         for 2
+    Define CI_SplitToBeginEndBlock     for 3
 End_Enum_List  
 
 { EnumList="CI_FirstCommand, CI_SecondCommand, CI_ThirdCommand"}
