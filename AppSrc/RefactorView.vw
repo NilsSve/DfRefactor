@@ -169,6 +169,9 @@ Register_Procedure RefreshSelectionUpdate
                         Set piWidth to 154
                         Set psCaption to "Type"
                         Set peHeaderAlignment to xtpAlignmentCenter  
+                        Set pbComboButton to True
+                        // pbEditable *must* be set after the pbComboButton setting.
+                        Set pbEditable to False
                         Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
             
                         Function OnGetTooltip Integer iRow String sValue String sText Returns String
@@ -198,7 +201,6 @@ Register_Procedure RefreshSelectionUpdate
                             Send ComboDeleteData
                             Get Field_Current_Value of (Server(Self)) Field Functions.ParameterValidation to sParameterList
                             If (sParameterList <> "") Begin
-                                Set pbComboEntryState to False
                                 Get StrSplitToArray  sParameterList "," to asParameters
                                 Move (SizeOfArray(asParameters)) to iSize
                                 Decrement iSize
