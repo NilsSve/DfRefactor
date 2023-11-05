@@ -262,7 +262,6 @@ End_Object
 // that the view should latch on to.
 Procedure ActivateFunctionsView Integer iFunctionID
     Handle ho hoDD  
-    Boolean bDone
     
     Move (oFunctionMaintenance_vw(Self)) to ho
     Get Main_DD of ho to hoDD

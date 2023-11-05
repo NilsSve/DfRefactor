@@ -29,8 +29,8 @@ Object oEditorView_vw is a cRefactorDbView
         Property Boolean piInSetFocus False
 
         Function RefactorSourceFileInEditor  String[] ByRef asSourceFile Returns Boolean
-            Integer iFunctionsSelected iFunctionID
-            Boolean bFound bChanged bOK
+            Integer iFunctionID
+            Boolean bChanged bOK
             String sFunctionName sParameter 
             String[] asSourceFileNew 
                                                                   

@@ -166,7 +166,7 @@ Object oFunctionsExportImport is a dbView
             
             Procedure DeleteSelectedItem    
                 Handle hoGrid 
-                Integer iItem iCount
+                Integer iCount
                 
                 Delegate Get phoSelection_grd to hoGrid
                 Get ItemCount of hoGrid to iCount
@@ -186,7 +186,6 @@ Object oFunctionsExportImport is a dbView
             
             Procedure OnClick
                 Handle hoGrid 
-                Integer iID
                 
                 Delegate Get phoSelection_grd to hoGrid
                 Send Request_Clear_All of hoGrid
@@ -300,7 +299,7 @@ Object oFunctionsExportImport is a dbView
         
             Procedure OnClick
                 Handle hoGrid 
-                Integer iItem iSize iCount iID iRetval
+                Integer iSize iRetval
                 String[] asFunctions 
                 Boolean bOK  
                 String sFileName
@@ -448,7 +447,7 @@ Object oFunctionsExportImport is a dbView
                 String[] asSelectedFiles
                 Handle hoOpen 
                 Integer iSize 
-                Boolean bOpen bExists
+                Boolean bOpen
                 
                 Get Create (RefClass(OpenDialog)) to hoOpen
                 Get psHome of (phoWorkspace(ghoApplication)) to sPath
@@ -475,7 +474,6 @@ Object oFunctionsExportImport is a dbView
             
             Procedure Activating 
                 String sPath sFileName
-                Boolean bExists
 
                 Get psExpFileJson of ghoApplication to sFileName  
                 Get ExtractFilePath sFileName to sPath
@@ -551,7 +549,6 @@ Object oFunctionsExportImport is a dbView
             
             Procedure Activating 
                 String sPath sFileName
-                Boolean bExists
 
                 Get psImpFileJson of ghoApplication to sFileName  
                 Get ExtractFilePath sFileName to sPath
