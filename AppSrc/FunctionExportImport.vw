@@ -4,15 +4,15 @@
 
 Use DFClient.pkg
 Use DFEntry.pkg
-Use cRDCDbHeaderGroup.pkg
-Use oExportImportFunctions.pkg
 Use File_dlg.pkg
-
-Use cFunctionsDataDictionary.dd
-Use Windows.pkg
-Use cRDCCJSelectionGrid.pkg
 Use cDbTextEdit.pkg
 Use cCJGridColumn.pkg
+Use cRDCCJSelectionGrid.pkg
+Use cRDCDbHeaderGroup.pkg
+Use cRDCButton.pkg                             
+Use oExportImportFunctions.pkg
+
+Use cFunctionsDataDictionary.dd
 
 ACTIVATE_VIEW Activate_oFunctionsExportImport FOR oFunctionsExportImport
 Object oFunctionsExportImport is a dbView
@@ -114,8 +114,8 @@ Object oFunctionsExportImport is a dbView
             Set Read_Only_State to True
             Set Border_Style to Border_WindowEdge
         End_Object 
-        
-        Object oCopyToRight_btn is a Button
+
+        Object oCopyToRight_btn is a cRDCButton
             Set Size to 12 55
             Set Location to 46 317
             Set Label to "Add >>"
@@ -155,7 +155,7 @@ Object oFunctionsExportImport is a dbView
         
         End_Object
         
-        Object oRemoveFromList_btn is a Button
+        Object oRemoveFromList_btn is a cRDCButton
             Set Size to 12 55
             Set Location to 61 316
             Set Label to "<< Remove"
@@ -179,7 +179,7 @@ Object oFunctionsExportImport is a dbView
             
         End_Object
 
-        Object oAddAll_btn is a Button
+        Object oAddAll_btn is a cRDCButton
             Set Size to 14 55
             Set Location to 83 317
             Set Label to "Add All >>"
@@ -201,7 +201,7 @@ Object oFunctionsExportImport is a dbView
         
         End_Object
 
-        Object oRemoveAll_btn is a Button
+        Object oRemoveAll_btn is a cRDCButton
             Set Size to 14 55
             Set Location to 98 316
             Set Label to "<< Remove All"
@@ -287,7 +287,7 @@ Object oFunctionsExportImport is a dbView
             
         End_Object
         
-        Object oExport_btn is a Button
+        Object oExport_btn is a cRDCButton
             Set Size to 24 66
             Set Location to 33 564
             Set Label to "Export Data to Json"
@@ -326,29 +326,17 @@ Object oFunctionsExportImport is a dbView
                 End
             End_Procedure
     
-            Object oExportIdleHandler is a cIdleHandler
-                Procedure OnIdle
-                    Handle hoGrid           
-                    Integer iSize
-                    Delegate Get phoSelection_grd to hoGrid
-                    Get ItemCount of hoGrid to iSize
-                    Delegate Set Enabled_State to (iSize <> 0)
-                End_Procedure
-            End_Object
-        
-            Procedure Page Integer iPageObject
-               Forward Send Page iPageObject
-               Set pbEnabled of oExportIdleHandler to True
-            End_Procedure
-        
-            Procedure Deactivating
-               Set pbEnabled of oExportIdleHandler to False
-               Forward Send DeActivating 
-            End_Procedure    
+            Function IsEnabled Returns Boolean
+                Integer iSize
+                Handle hoGrid
+                Delegate Get phoSelection_grd to hoGrid
+                Get ItemCount of hoGrid to iSize
+                Function_Return (iSize <> 0)
+            End_Function
         
         End_Object   
 
-        Object oViewExportFile_btn is a Button
+        Object oViewExportFile_btn is a cRDCButton
             Set Size to 24 66
             Set Location to 58 564
             Set Label to "View Json File"
@@ -361,9 +349,6 @@ Object oFunctionsExportImport is a dbView
                 Boolean bExists
                 String sFileName sPath
 
-//                Get psHome of (phoWorkspace(ghoApplication)) to sPath
-//                Get vFolderFormat sPath to sPath
-//                Move CS_ImpExpFileJson to sFileName
                 Get Value of oExportFileName_fm to sFileName
                 Get ParseFolderName sFileName   to sPath
                 Get ParseFileName sFileName     to sFileName
@@ -377,30 +362,17 @@ Object oFunctionsExportImport is a dbView
                 End                   
             End_Procedure
     
-            Object oExportIdleHandler is a cIdleHandler
-                Procedure OnIdle
-                    String sPath sFileName 
-                    Boolean bExists
-                    Get Value of oExportFileName_fm to sFileName
-                    File_Exist sFileName bExists
-                    Delegate Set Enabled_State to (bExists = True)
-                End_Procedure                                    
-                
-            End_Object
-        
-            Procedure Page Integer iPageObject
-               Forward Send Page iPageObject
-               Set pbEnabled of oExportIdleHandler to True
-            End_Procedure
-        
-            Procedure Deactivating
-               Set pbEnabled of oExportIdleHandler to False
-               Forward Send DeActivating 
-            End_Procedure    
+            Function IsEnabled Returns Boolean
+                String sPath sFileName 
+                Boolean bExists
+                Get Value of oExportFileName_fm to sFileName
+                File_Exist sFileName bExists
+                Function_Return  (bExists = True)
+            End_Function
         
         End_Object 
 
-        Object oOpenContainingFolder_btn is a Button
+        Object oOpenContainingFolder_btn is a cRDCButton
             Set Size to 24 66
             Set Location to 88 564
             Set Label to "Containing Folder"
@@ -535,7 +507,6 @@ Object oFunctionsExportImport is a dbView
                 Set Dialog_Caption of hoOpen to "Select a DFRefactor export/import file:"
                 Set Filter_String of hoOpen to "DFRefactor Import Files|*.json;|All Files|*.*" 
                 Set ShowFileTitle_State of hoOpen to True
-//                Set File_Title of hoOpen to CS_ImpExpFileJson 
                 Set FileMustExist_State of hoOpen to True
                 Get Show_Dialog of hoOpen to bOpen
                 If (bOpen = True) Begin 
@@ -576,7 +547,7 @@ Object oFunctionsExportImport is a dbView
             On_Key kPrompt Send Prompt
         End_Object
 
-        Object oSelectFile_btn is a Button
+        Object oSelectFile_btn is a cRDCButton
             Set Size to 24 66
             Set Location to 32 425
             Set Label to "Select File"  
@@ -591,7 +562,7 @@ Object oFunctionsExportImport is a dbView
         
         End_Object
 
-        Object oImport_btn is a Button
+        Object oImport_btn is a cRDCButton
             Set Size to 24 66
             Set Location to 32 564
             Set Label to "Import Json Data"
@@ -620,33 +591,18 @@ Object oFunctionsExportImport is a dbView
                 End
             End_Procedure
     
-            Object oImportIdleHandler is a cIdleHandler
-                Procedure OnIdle
-                    Handle hoForm            
-                    String sFileName 
-                    Boolean bExists
-                    
-                    Move oImportFileName_fm to hoForm
-                    Get Value of hoForm to sFileName
-                    File_Exist sFileName bExists
-                    Delegate Set Enabled_State to (bExists = True)
-                End_Procedure                                    
+            Function IsEnabled Returns Boolean
+                String sFileName 
+                Boolean bExists
                 
-            End_Object
-        
-            Procedure Page Integer iPageObject
-               Forward Send Page iPageObject
-               Set pbEnabled of oImportIdleHandler to True
-            End_Procedure
-        
-            Procedure Deactivating
-               Set pbEnabled of oImportIdleHandler to False
-               Forward Send DeActivating 
-            End_Procedure    
+                Get Value of oImportFileName_fm to sFileName
+                File_Exist sFileName bExists
+                Function_Return (bExists = True)
+            End_Function
         
         End_Object 
 
-        Object oViewImportFile_btn is a Button
+        Object oViewImportFile_btn is a cRDCButton
             Set Size to 24 66
             Set Location to 32 493
             Set Label to "View Json File"
@@ -654,6 +610,7 @@ Object oFunctionsExportImport is a dbView
             Set psImage to "View.ico"
             Set piImageSize to 32
             Set MultiLineState to True
+//            Set pbAutoEnable to True
         
             Procedure OnClick
                 String sPath sFileName
@@ -663,30 +620,15 @@ Object oFunctionsExportImport is a dbView
                 Send vShellExecute "open" sFileName sPath ""
             End_Procedure
     
-            Object oImportIdleHandler is a cIdleHandler
-                Procedure OnIdle
-                    Handle hoForm            
-                    String sFileName 
-                    Boolean bExists
-                    
-                    Move oImportFileName_fm to hoForm
-                    Get Value of hoForm to sFileName
-                    File_Exist sFileName bExists
-                    Delegate Set Enabled_State to (bExists = True)
-                End_Procedure                                    
+            Function IsEnabled Returns Boolean
+                String sFileName 
+                Boolean bExists
                 
-            End_Object
-        
-            Procedure Page Integer iPageObject
-               Forward Send Page iPageObject
-               Set pbEnabled of oImportIdleHandler to True
-            End_Procedure
-        
-            Procedure Deactivating
-               Set pbEnabled of oImportIdleHandler to False
-               Forward Send DeActivating 
-            End_Procedure    
-        
+                Get Value of oImportFileName_fm to sFileName
+                File_Exist sFileName bExists
+                Function_Return (bExists = True)
+            End_Function
+                
         End_Object 
         
     End_Object
