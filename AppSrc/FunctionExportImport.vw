@@ -361,9 +361,13 @@ Object oFunctionsExportImport is a dbView
                 Boolean bExists
                 String sFileName sPath
 
-                Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                Get vFolderFormat sPath to sPath
-                Move CS_ImpExpFileJson to sFileName
+//                Get psHome of (phoWorkspace(ghoApplication)) to sPath
+//                Get vFolderFormat sPath to sPath
+//                Move CS_ImpExpFileJson to sFileName
+                Get Value of oExportFileName_fm to sFileName
+                Get ParseFolderName sFileName   to sPath
+                Get ParseFileName sFileName     to sFileName
+                
                 File_Exist (sPath + sFileName) bExists
                 If (bExists = True) Begin
                     Send vShellExecute "open" sFileName sPath ""
@@ -377,9 +381,7 @@ Object oFunctionsExportImport is a dbView
                 Procedure OnIdle
                     String sPath sFileName 
                     Boolean bExists
-                    Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                    Get vFolderFormat sPath to sPath
-                    Move (sPath + CS_ImpExpFileJson) to sFileName
+                    Get Value of oExportFileName_fm to sFileName
                     File_Exist sFileName bExists
                     Delegate Set Enabled_State to (bExists = True)
                 End_Procedure                                    
@@ -435,7 +437,7 @@ Object oFunctionsExportImport is a dbView
         Object oExportFileName_fm is a Form
             Set Size to 14 360
             Set Location to 127 59
-            Set Label to "Json import file:"
+            Set Label to "Json export file:"
             Set Label_Col_Offset to 0
             Set Label_Justification_Mode to JMode_Top
             Set psToolTip to "Press [F4] to display the Open dialog to select an export file."
