@@ -610,7 +610,6 @@ Object oFunctionsExportImport is a dbView
             Set psImage to "View.ico"
             Set piImageSize to 32
             Set MultiLineState to True
-//            Set pbAutoEnable to True
         
             Procedure OnClick
                 String sPath sFileName

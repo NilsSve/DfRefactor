@@ -10,8 +10,6 @@ Use cRDCDbForm.pkg
 Use cRDCDbHeaderGroup.pkg
 Use cFileNameForm.pkg
 Use cScintillaRefactorEditor.pkg
-Use oEditorProperties.pkg
-//Use mfiletime.pkg
 Use vwin32fh.pkg
 
 Use LogFileDialog.dg
@@ -454,7 +452,11 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Send OnChange of oUseConstraints_cb 
     End_Procedure
 
+
     // *** MAIN REFACTORING ROUTINE ***  
+    Procedure MAIN_REFACORING_ROUTINE
+        // Dummy procedure for the Studio's Code Explorer
+    End_Procedure
     //
     // Testing of refactor functions.
     // Can be all or a selection of functions.
@@ -577,7 +579,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Move asLegacyCode to asRefactoredCode
             Send LoadFile of hoRefactoredEditor sLegacyFileName  
             Set psCodeFile of hoRefactoredEditor to sRefactoredFileName
-            Get WriteToDisk of hoRefactoredEditor to bOK
+//            Get WriteToDisk of hoRefactoredEditor to bOK
         End
         Move False to bChanged
         Constraint_Set (Self + 3) Clear  
