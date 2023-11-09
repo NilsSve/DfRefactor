@@ -22,6 +22,37 @@ Use Windows.pkg
 Use DFClient.pkg
 Use cFilesystem.pkg
 
+Struct tFunctionTypes
+    Integer iAll_Functions
+    Integer iStandard_Function
+    Integer iRemove_Function
+    Integer iEditor_Function
+    Integer iReport_Function   
+    Integer iReport_FunctionAll
+    Integer iOther_Function
+    Integer iOther_FunctionAll
+End_Struct
+
+Enum_List
+    Define eAll_Functions         for 0 
+    Define eStandard_Function     for 1   // One source line at a time will be passed for these functions.
+    Define eRemove_Function       for 2   // One source line at a time will be passed for these functions.
+    Define eEditor_Function       for 3   // A source file as a string array will be passed
+    Define eReport_Function       for 4   // A source file as a string array. Makes no source changes.
+    Define eReport_FunctionAll    for 5   // Makes no source changes.
+    Define eOther_Function        for 6   // A source file as a string array will be passed.
+    Define eOther_FunctionAll     for 7   // All selected files as a string array will be passed. 
+End_Enum_List
+
+Define CS_All_Functions             for "No Constrains - Show All"
+Define CS_Standard_Function         for "Standard - Line-by-line"
+Define CS_Remove_Function           for "Remove   - Line-by-line"
+Define CS_Editor_Function           for "Editor   - One File"
+Define CS_Report_Function           for "Report   - One File"   // Makes no source changes.
+Define CS_Report_FunctionAll        for "Report   - All Files"  // Makes no source changes.
+Define CS_Other_Function            for "Other    - One File"
+Define CS_Other_FunctionAll         for "Other    - All Files"
+
 Enum_List
     Define cx_RegKeyAlreadyExist
     Define cx_RegKeyCreated
