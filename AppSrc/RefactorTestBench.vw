@@ -465,7 +465,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         String sLine sLegacyFileName sRefactoredFileName sFunctionName sParameter
         Handle hoLegacyEditor hoRefactoredEditor ho
         Integer iSize iCount iTabSize iRetval iFunctionID eSplitMode
-        Boolean bChanged bLoopFound bisCOMProcxy bWriteLine bOK
+        Boolean bChanged bLoopFound bisCOMProcxy bWriteLine bOK bSave
         DateTime dtStart dtEnd
 
         Get Checked_State of oUseConstraints_cb to bOK
@@ -479,8 +479,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move False to bLoopFound
         Send Activate_oRefactorTestBench
         
-        Get phoEditorLegacy of ghoApplication to hoLegacyEditor
-        Get psCodeFile      of hoLegacyEditor to sLegacyFileName
+        Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
+        Get psCodeFile          of hoLegacyEditor     to sLegacyFileName
         Get _IsDataFlexCOMProxyClassesFile of ghoRefactorFunctionLibrary sLegacyFileName to bisCOMProcxy
         If (bisCOMProcxy = True) Begin
             Send Info_Box "This file is marked as a Studio COM Proxy classes auto generated file and will _not_ be refactored!"
@@ -488,20 +488,18 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         End
 
         Send UpdateStatusBar of hoLegacyEditor "" True
+        Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor        
+        Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
         Get EditorDataAsStringArray of hoLegacyEditor to asLegacyCode
+        Get WriteDataToEditor       of hoRefactoredEditor asLegacyCode to bOK
         Move (SizeOfArray(asLegacyCode)) to iSize
         Decrement iSize  
-
-        Get phoEditorRefactored of ghoApplication to hoRefactoredEditor        
-        Get psCodeFile of hoRefactoredEditor      to sRefactoredFileName
-        If (iSize > 0) Begin
-            Send Delete_Data of hoRefactoredEditor
-        End        
-        Else Begin
+        If (iSize = 0) Begin
             Send Info_Box "No Legacy code found."
             Procedure_Return
         End
         
+        Move False to bSave
         Send InitializeInterface of ghoRefactorFunctionLibrary
         // Suspend all timers while we work.
         Send SuspendGUI of Desktop True
@@ -509,6 +507,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Send Cursor_Wait of Cursor_Control
 
         If (SysFile.SelectedStandardFunctions > 0 or bUseConstraints = False) Begin
+            Send UpdateStatusBar of hoLegacyEditor "Executing Line-by-Line type functions..." True
             For iCount from 0 to iSize
                 // Need this to show "Number of lines:" changes
                 Send PumpMsgQueue of Desktop   
@@ -516,8 +515,9 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Move asLegacyCode[iCount] to sLine
                 Send InitializeTokenizer of ghoRefactorFunctionLibrary sLine
                 
-                // eRemove_Functions - Line-by-line
-                // These are functions that may potentially remove the line (Sets bWriteLIne to False),
+                // *** Type: eRemove_Function ***
+                //          Line-by-line
+                // These are functions that may potentially remove the line (Sets bWriteLine to False),
                 // so we execute them first.
                 Move True to bWriteLine
                 Constraint_Set (Self + 1) Clear  
@@ -533,12 +533,14 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Move (Eval("get_" - (sFunctionName))) to iFunctionID
                     Get iFunctionID of ghoRefactorFunctionLibrary (&sLine) sParameter to bChanged
                     If (bChanged = True) Begin
-                        Move False to bWriteLine
+                        Move False to bWriteLine 
+                        Move True to bSave
                     End
                     Constrained_Find Next
                 Loop
                 
-                // eStandard_Function - Line-by-line
+                // *** Type: eStandard_Function ***
+                //          Line-by-line
                 If (bWriteLine = True) Begin
                     Constraint_Set (Self + 2) Clear  
                     Constrained_Clear eq FunctionsA by Index.4
@@ -552,36 +554,29 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                         Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
                         Move (Eval("get_" - (sFunctionName))) to iFunctionID
                         Get iFunctionID of ghoRefactorFunctionLibrary (&sLine) sParameter to bChanged
+                        If (bChanged = True) Begin
+                            Move True to bSave
+                        End
                         Constrained_Find Next
                     Loop
-                    
+                    // Save to refactored string array
                     Move sLine to asRefactoredCode[iCount]
                 End
             Loop  
-            
-            If (SizeOfArray(asRefactoredCode) <> 0) Begin
-                Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
-                If (bOK = True) Begin
-                    Send LoadFile of hoRefactoredEditor sRefactoredFileName
-                End
-            End
-            Send PumpMsgQueue of Desktop  
-            If (SysFile.SelectedEditorFunctions <> 0) Begin
-                Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
-            End
         End
-
-        // eEditor_Function
+         
+        // *** Type eEditor_Function ***
         Send UpdateStatusBar of hoRefactoredEditor "Executing Editor functions..." True  
-        // If no "eStandard_Function" calls were made, we need to load the source file
-        // into the refactor editor.
-        If (SizeOfArray(asRefactoredCode) = 0) Begin
-            Move asLegacyCode to asRefactoredCode
-            Send LoadFile of hoRefactoredEditor sLegacyFileName  
-            Set psCodeFile of hoRefactoredEditor to sRefactoredFileName
-//            Get WriteToDisk of hoRefactoredEditor to bOK
+        If (bSave = True) Begin
+            Get WriteDataToEditor of hoRefactoredEditor asRefactoredCode to bOK
         End
-        Move False to bChanged
+        // If no functions calls has been made yet, we need to load the legacy source
+        // in the refactor editor.
+        Else If (SizeOfArray(asRefactoredCode) = 0) Begin
+            Move asLegacyCode to asRefactoredCode
+        End
+                
+        Move False to bSave
         Constraint_Set (Self + 3) Clear  
         Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
@@ -596,22 +591,22 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Move (Eval("get_" - (sFunctionName))) to iFunctionID
                 Get iFunctionID of ghoRefactorFunctionLibrary (&asRefactoredCode) sParameter to bOK
                 If (bOK = True) Begin
-                    Move True to bChanged
+                    Move True to bSave
                 End
             End
             Constrained_Find Next
         Loop
-        If (bChanged = True) Begin
-            Get EditorDataAsStringArray of hoRefactoredEditor to asRefactoredCode
-            Get WriteStringArrayToDisk  of hoRefactoredEditor asRefactoredCode to bOK
-            If (bOK = True) Begin
-                Send LoadFile of hoRefactoredEditor sRefactoredFileName
-            End
+        
+        // Save the refactored editor content before we call the type eOther_Function, 
+        // as it reads the sRefactoredFileName file from disk.
+        If (IsSameArray(asLegacyCode, asRefactoredCode) = False) Begin
+            Send SaveFile of hoRefactoredEditor
         End
-        Send UpdateStatusBar of hoRefactoredEditor "" True
 
-        // eOther_Function - One source file as a string array is passed.
-        Move False to bChanged
+        // *** Type eOther_Function ***
+        //          A source file as a String array is passed.
+        Send UpdateStatusBar of hoRefactoredEditor "Executing eOther_Function type..." True
+        Move False to bSave
         Constraint_Set (Self + 4) Clear  
         Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
@@ -625,20 +620,24 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
             Get iFunctionID of ghoRefactorFunctionLibrary (&asRefactoredCode) sParameter to bOK
             If (bOK = True) Begin
-                Move True to bChanged
+                Move True to bSave
             End
             Constrained_Find Next
-        Loop
-        If (bChanged = True) Begin
-            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
-            If (bOK = True) Begin
-                Send LoadFile of hoRefactoredEditor sRefactoredFileName
-            End
-        End
+        Loop 
         
-        // eOther_FunctionAll - All source files with full pathing is passed to these functions as a string array.
-        Move sRefactoredFileName to asSourceFiles[0]
-        Move False to bChanged
+        // Save the refactored editor content before we call the type eOther_FunctionAll, 
+        // as it reads the sRefactoredFileName file from disk.
+        If (bSave = True) Begin
+            Get WriteDataToEditor of hoRefactoredEditor asRefactoredCode to bOK
+            Send SaveFile of hoRefactoredEditor
+        End
+
+        // *** Type eOther_FunctionAll ***
+        //          All source files with full pathing is passed to these functions as a string array.
+        //          In this test-bench we only fill the file array with one file.
+        Move sRefactoredFileName to asSourceFiles[0]                             
+        
+        Move False to bSave
         Constraint_Set (Self + 4) Clear  
         Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
@@ -652,20 +651,19 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
             Get iFunctionID of ghoRefactorFunctionLibrary (&asSourceFiles) sParameter to bOK
             If (bOK = True) Begin
-                Move True to bChanged
+                Move True to bSave
             End
             Constrained_Find Next
         Loop
-        If (bChanged = True) Begin
-            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
-            If (bOK = True) Begin
-                Send LoadFile of hoRefactoredEditor sRefactoredFileName
-            End
+        
+        If (bSave = True) Begin
+            Send LoadFile of hoRefactoredEditor sRefactoredFileName
         End
         
-        // eReport_Function - A source file as a string array is passed.
-        // Makes no source code changes
-        Move False to bChanged
+        // *** Type: eReport_Function ***
+        //           One source file as a string array is passed.
+        //           Makes no source code changes
+        Move False to bSave
         Constraint_Set (Self + 4) Clear  
         Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
@@ -679,15 +677,18 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
             Get iFunctionID of ghoRefactorFunctionLibrary (&asRefactoredCode) sParameter to bOK
             If (bOK = True) Begin
-                Move True to bChanged
+                Move True to bSave
             End            
             Constrained_Find Next
         Loop
+        // There should not be anything to save here, as it is only functions of type: Report - line-by-line
         
-        // eReport_FunctionAll - All source files with full pathing is passed to these functions as an array.
-        // Makes no source code changes
+        
+        // ***Type: eReport_FunctionAll ***
+        //          Pass *all* source files with full pathing as a string array.
+        //          Makes no source code changes
         Move sLegacyFileName to asSourceFiles[0]
-        Move False to bChanged
+        Move False to bSave
         Constraint_Set (Self + 4) Clear  
         Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
@@ -701,16 +702,18 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
             Get iFunctionID of ghoRefactorFunctionLibrary (&asSourceFiles) sParameter to bOK
             If (bOK = True) Begin
-                Move True to bChanged
+                Move True to bSave
             End
             Constrained_Find Next
         Loop
         
-        If (bChanged = True) Begin
-//            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
-//            If (bOK = True) Begin
-                Send LoadFile of hoRefactoredEditor sRefactoredFileName
-//            End
+        // After all refactoring; write changes back to the refactor editor
+        // and save changes.
+        If (IsSameArray(asLegacyCode, asRefactoredCode) = False) Begin
+            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
+            If (bOK = True) Begin
+                Send SaveFile of hoRefactoredEditor sRefactoredFileName
+            End
         End
 
         Move (CurrentDateTime()) to dtEnd
