@@ -211,8 +211,11 @@ Class cSciLexer is a DFControl // cUIObject  cObject
     //
     // These properties used with CodeList (SVN)
     Property Integer phoCodeListHandler                0
-    Property Boolean pbOemToAnsiMode                   True    // If true translate text to ANSI on open and back to OEM on save
-    Property Boolean pbUtf8Support                     False
+    Property Boolean pbOemToAnsiMode                   True    // If true translate text to ANSI on open and back to OEM on save (NOT TRUE ANYMORE in Hammer4)
+    Property Boolean pbUtf8Mode                        False   // Set this to true when editing in UTF8
+    Property Boolean pbHasUtf8BOM                      False   // File has Utf8BOM
+    Property Boolean pbNormalizeLineEndings            False   // If set to true it will change non CRLF line endings into CRLF on loading of the document.
+    
     Property Boolean pbReindentStudioCommentOut        False   // If true, do not reindent comment lines starting at line 0, to keep studio comment out feature via ctrl+/
     //
     // I want to have a client border as default
@@ -257,7 +260,7 @@ Class cSciLexer is a DFControl // cUIObject  cObject
       Move (DragQueryFile(hDrop,iC,AddressOf(sFile),iSize+1))    to iRet
       If iRet Begin
         Move (CString(sFile))                   to sFile
-        Send OnFileDropped sFile True
+        Send onFileDropped sFile
       End
     Loop
     Move (DragFinish(hDrop))                        to iRet
@@ -861,7 +864,7 @@ Class cSciLexer is a DFControl // cUIObject  cObject
     Integer iFileExists
     String  sLine
     String  sTextData
-    Address aTextData
+    Pointer aTextData
     UChar[] TextData
 
     Send Cursor_Wait of Cursor_Control
@@ -904,32 +907,26 @@ Class cSciLexer is a DFControl // cUIObject  cObject
       Read_Block Channel iChannel TextData -1
       Close_Input channel iChannel
       
-      Move 0 To TextData[SizeOfArray(TextData)]  // add a zero at the end
-#IF (!@ < 200)
-      If (pbOemToAnsiMode(Self)) Begin
-        // move to a string so we can ToANSI the contents THEN move it back to the uchar array
-        CompilerWarnings Off  // One of the few areas where you want ToANSI regardless of DF version
-        Get_Argument_Size to iArgSize
-        Move (SizeOfArray(TextData)+10) To iNewArgSize
-        If (iNewArgSize>iArgSize) Begin
-          Set_Argument_Size iNewArgSize
+      // Checking if the file has a BOM, because if it does then we should change to UTF8 mode
+      // regardless of what was set globally.
+      Move (SizeOfArray(TextData) >= 3 and ( ;
+            (TextData[0] = C_BOM_UTF8c1    and TextData[1] = C_BOM_UTF8c2 and TextData[2] = C_BOM_UTF8c3) or ;
+            (TextData[0] = C_BOM_UTF16LEc1 and TextData[1] = C_BOM_UTF16LEc2))) to bHasBom
+      If (bHasBom) Begin
+        Set pbHasUtf8BOM To True
+        If (pbUtf8Mode(Self)=false) Begin
+          Set pbUtf8Mode      To True
+          Set pbOemToAnsiMode To False
+          Send EditorMessage SCI_SETCODEPAGE SC_CP_UTF8
+          Send EditorMessage SCI_STYLESETCHARACTERSET STYLE_DEFAULT SC_CHARSET_ANSI
         End
-        Move (UCharArrayToString(TextData,SizeOfArray(TextData))) To sTextData
-        Move (ToANSI(sTextData)) To sTextData
-        Move (StringToUCharArray(sTextData)) To TextData
-        Move "" To sTextData
-        If (iNewArgSize>iArgSize) Begin
-          Set_Argument_Size iArgSize
-        End
-        CompilerWarnings On
       End
-#ELSE
-      // Not using this line yet, need to think about how-to use that.. it's certainly interesting to 
-      // detect that the file has a BOM.
-      Move (SizeOfArray(TextData) >= 2 and TextData[0] = C_BOM_UTF16LEc1 and TextData[1] = C_BOM_UTF16LEc2) to bHasBom
-#ENDIF
 
-      Move (AddressOf(TextData)) to aTextData
+      Move 0 To TextData[SizeOfArray(TextData)]  // add a zero at the end
+      Move (AddressOf(TextData)) To aTextData
+      If (bHasBom) Begin  // don't load the BOM in the editor control itself.
+        Move (aTextData+3) To aTextData
+      End
       Send Seq_Release_Channel iChannel
 
       // SCI_SETTEXT(<unused>, const char *text)
@@ -958,7 +955,10 @@ Class cSciLexer is a DFControl // cUIObject  cObject
     Integer iRet
     String  sBuffer
     //
-    Move (szText+Character(0)) To sBuffer
+    If (pbUtf8Mode(Self)=False) Begin
+      Get Utf8ToEditorFormat szText to szText
+    End
+    Move (szText+Character(0)) to sBuffer
     Get EditorMessage SCI_FINDCOLUMN iLine iCol to iStartPos
     Get EditorMessage SCI_INSERTTEXT iStartPos (AddressOf(sBuffer)) to iRet
     Move CME_SUCCESS To iRet
@@ -973,7 +973,10 @@ Class cSciLexer is a DFControl // cUIObject  cObject
     String  sBuffer
     Get Window_Handle to hoWnd
     If (hoWnd) Begin
-      Move (szText+Character(0)) To sBuffer
+      If (pbUtf8Mode(Self)=False) Begin
+        Get Utf8ToEditorFormat szText to szText
+      End
+      Move (szText+Character(0)) to sBuffer
       Get EditorMessage SCI_SETTEXT 0 (AddressOf(sBuffer)) to iRetVal
       Move CME_SUCCESS To iRetVal
     End
@@ -1210,26 +1213,32 @@ Class cSciLexer is a DFControl // cUIObject  cObject
     Function_Return bEnabled
   End_Function
 
-  Procedure WriteBlock Integer iChannel Address aTextData Integer iPosition Integer iBlockSize
+  Procedure WriteBlock Integer iChannel Pointer aTextData Integer iPosition Integer iBlockSize
     Boolean bOk
     String  sBlock
 
     Move ""   To sBlock
     Move (ZeroString(iBlockSize)) To sBlock
     Move (memcopy(AddressOf(sBlock), aTextData+iPosition, iBlockSize)) To bOk
-#IF (!@ < 200)
-    If (pbOemToAnsiMode(Self)) Begin
-CompilerWarnings Off  // One of the few areas where you want ToANSI regardless of DF version
-      // By SVN on 23/05/2017 -- National Languages support
-      Write Channel iChannel (ToOEM(sBlock))
-CompilerWarnings On
-    End
-    Else Begin
-      Write Channel iChannel sBlock
-    End
-#ElSE
     Write channel iChannel sBlock
-#ENDIF    
+  End_Procedure
+  
+  Procedure WriteBOM Integer iChannel
+    Boolean bIsUtf8
+    Boolean bHasBOM
+    UChar[] ucBOM
+    
+    Get pbUtf8Mode   To bIsUtf8
+    Get pbHasUtf8BOM To bHasBOM
+    If (bIsUtf8) Begin
+      If (bHasBOM) Begin
+        Move (ResizeArray(ucBOM,3)) To ucBOM
+        Move C_BOM_UTF8c1 To ucBOM[0]
+        Move C_BOM_UTF8c2 To ucBOM[1]
+        Move C_BOM_UTF8c3 To ucBOM[2]
+        Write Channel iChannel ucBOM
+      End  
+    End
   End_Procedure
 
   // An application sends CMM_SAVEFILE to save the buffer contents to a specific file.
@@ -1242,20 +1251,19 @@ CompilerWarnings On
     Integer iChannel
     Integer iPosition
     Integer iResult
-    Address aTextData
+    Pointer aTextData
     Integer iTextLength
 
-    Send Cursor_Wait of Cursor_Control
+    Send Cursor_Wait Of Cursor_Control
+    If (pbNormalizeLineEndings(Self)) Begin
+      Send EditorMessage SCI_CONVERTEOLS SC_EOL_CRLF
+    End
     Move 0    To iPosition
     Move 1024 To iBlockSize
     Move True To bClearUndo // looks like this was ignored by codemax and always true
     Send EditorMessage SCI_SETREADONLY 1
     Get EditorMessage SCI_GETCHARACTERPOINTER to aTextData
-#IF (!@ < 200)
-    Move (CStringLength(aTextData)) to iTextLength
-#ELSE    
     Move (CStringSize(aTextData)) to iTextLength
-#ENDIF    
     If (iTextLength>=0) Begin
 
       Get Seq_New_Channel to iChannel
@@ -1265,7 +1273,8 @@ CompilerWarnings On
         function_return CME_FAILURE
       End
 
-      Direct_Output channel iChannel szFileName
+      Direct_Output Channel iChannel szFileName
+      Send WriteBOM iChannel
       While ((iPosition+iBlockSize)<iTextLength)
         Send WriteBlock iChannel aTextData iPosition iBlockSize
 
@@ -1342,7 +1351,10 @@ CompilerWarnings On
         Move (ZeroString(iLineLength+1)) To sBuffer
         Move (AddressOf(sBuffer)) To Sel.lpstrText
         Get EditorMessage SCI_GETTEXTRANGE 0 (AddressOf(Sel)) to iRet
-        Move (CString(sBuffer)) To sBuffer
+        Move (CString(sBuffer)) to sBuffer
+        If (pbUtf8Mode(Self)=False) Begin
+          Get EditorFormatToUtf8 sBuffer to sBuffer
+        End
       End
     End
     Function_Return sBuffer
@@ -1362,10 +1374,13 @@ CompilerWarnings On
     Move (ZeroString(iLineLength)) To szText
     Get EditorMessage SCI_GETLINE iLine (AddressOf(szText)) To iRet
     Move (CString(szText)) To sLine
+    If (pbUtf8Mode(Self)=False) Begin
+      Get EditorFormatToUtf8 sLine to sLine
+    End
     Function_Return sLine
   End_Function
-
-//
+  
+  //
   // In our functions we always use utf8 as that's now DataFlex's native string format.
   // This means we have to convert text from/to utf8 if it isn't utf8 already.
   //
@@ -1391,7 +1406,7 @@ CompilerWarnings On
     Boolean bIsOem
     
     Get pbUtf8Mode      to bIsUtf8
-    If (bIsUtf8=False) Begin  // DataFlex works with utf8 strings now, so use that in our functions to avoid 
+    If (bIsUtf8=false) Begin  // DataFlex works with utf8 strings now, so use that in our functions to avoid 
                               // too much confusion.
       Get pbOemToAnsiMode to bIsOem
       If (bIsOem) Begin
@@ -1404,7 +1419,8 @@ CompilerWarnings On
     Function_Return sText
   End_Function
   
- //
+
+  //
   // An application sends CMM_GETWORDLENGTH to calculate the length of the word at a specific position in the buffer.
   // pPos
   // Pointer to a CM_POSITION structure that contains the buffer position of the word to be retrieved.
@@ -1434,6 +1450,9 @@ CompilerWarnings On
       Move (AddressOf(sBuffer)) To Sel.lpstrText
       Get EditorMessage SCI_GETTEXTRANGE 0 (AddressOf(Sel)) to iRet
       Move (CString(sBuffer)) To sBuffer
+      If (pbUtf8Mode(Self)=False) Begin
+        Get EditorFormatToUtf8 sBuffer to sBuffer
+      End
     End
     Else Begin
       Move "" To sBuffer
@@ -1570,12 +1589,18 @@ CompilerWarnings On
   // An application sends the CMM_ADDTEXT message to add the specified text to the end of the edit buffer.
   //
   Function CM_AddText String szText Returns Integer
-    Integer iRet
-    #IF (!@ > 200) 
-        Get EditorMessage SCI_APPENDTEXT (SizeOfString(szText)) (AddressOf(szText)) to iRet
-    #ELSE
-        Get EditorMessage SCI_APPENDTEXT (Length(szText)) (AddressOf(szText)) to iRet
-    #ENDIF
+    Boolean bIsUtf8
+    Integer iLen
+    
+    Get pbUtf8Mode      to bIsUtf8
+    If (bIsUtf8) Begin
+      Move (SizeOfString(szText)) to iLen
+    End
+    Else Begin
+      Move (Length(szText)) to iLen // length only works with utf8
+      Get Utf8ToEditorFormat szText to szText
+    End
+    Send EditorMessage SCI_APPENDTEXT iLen (AddressOf(szText))
     Function_Return CME_SUCCESS
   End_Function
 
@@ -2701,6 +2726,7 @@ CompilerWarnings On
 
   // Find...
   Procedure Find
+    Boolean bIsUtf8
     Integer iFlags
     Integer iCaretPos
     Integer iPos
@@ -2721,12 +2747,20 @@ CompilerWarnings On
       Get SetSearchOptions FindOptions to iFlags
       Move FindOptions.sSearchText To sSearchText
       Set psSearchText to sSearchText
-      Move (Length(sSearchText)) To iLen
+      Get pbUtf8Mode      to bIsUtf8
+      If (bIsUtf8) Begin
+        Move (SizeOfString(sSearchText)) to iLen
+      End
+      Else Begin
+        Move (Length(sSearchText)) to iLen // length is utf8 only!
+        Get Utf8ToEditorFormat sSearchText to sSearchText
+      End  
       If (iLen>0) Begin
         If (FindOptions.bDocumentStart=False) Begin
           Get EditorMessage SCI_GETCURRENTPOS To iCaretPos
           Send EditorMessage SCI_SETTARGETSTART iCaretPos
         End
+
         Get EditorMessage SCI_SEARCHINTARGET iLen (AddressOf(sSearchText)) to iPos
         If (iPos > -1) Begin
           If (FindOptions.bMarkAll=false) Begin
@@ -2775,6 +2809,7 @@ CompilerWarnings On
 
   // Find First
   Procedure FindFirst
+    Boolean bIsUtf8
     Integer iCaretPos
     Integer iLen
     Integer iPos
@@ -2783,12 +2818,19 @@ CompilerWarnings On
     Send EditorMessage SCI_TARGETWHOLEDOCUMENT
 
     Get psSearchText to sSearchText
-    Move (Length(sSearchText)) To iLen
+    Get pbUtf8Mode      to bIsUtf8
+    If (bIsUtf8) Begin
+      Move (SizeOfString(sSearchText)) to iLen
+    End
+    Else Begin
+      Move (Length(sSearchText)) to iLen // length is utf8 only!
+      Get Utf8ToEditorFormat sSearchText to sSearchText
+    End  
     If (iLen>0) Begin
       Move (sSearchText+character(0)) To sSearchText
       Get  EditorMessage SCI_GETCURRENTPOS to iCaretPos
       Send EditorMessage SCI_SETTARGETSTART 0
-
+      
       Get EditorMessage SCI_SEARCHINTARGET iLen (AddressOf(sSearchText)) to iPos
       If (iPos>-1) Begin
         Send EditorMessage SCI_SETSEL (iPos+iLen) iPos
@@ -2803,6 +2845,7 @@ CompilerWarnings On
 
   // Find next
   Procedure FindNext
+    Boolean bIsUtf8
     Integer iCaretPos
     Integer iFlags
     Integer iLen
@@ -2811,7 +2854,14 @@ CompilerWarnings On
     String  sSearchText
 
     Get psSearchText to sSearchText
-    Move (Length(sSearchText)) To iLen
+    Get pbUtf8Mode      to bIsUtf8
+    If (bIsUtf8) Begin
+      Move (SizeOfString(sSearchText)) to iLen
+    End
+    Else Begin
+      Move (Length(sSearchText)) to iLen // length is utf8 only!
+      Get Utf8ToEditorFormat sSearchText to sSearchText
+    End  
     If (iLen>0) Begin
       Move (sSearchText+character(0)) To sSearchText
       Get  EditorMessage SCI_GETCURRENTPOS 0 0 to iCaretPos
@@ -2820,6 +2870,7 @@ CompilerWarnings On
 
       Send EditorMessage SCI_SEARCHANCHOR
       Get  EditorMessage SCI_GETSEARCHFLAGS 0 0 to iFlags
+
       Get  EditorMessage SCI_SEARCHNEXT iFlags (AddressOf(sSearchText)) to iPos
       If (iPos>-1) Begin
         Send EditorMessage SCI_SETSEL (iPos+iLen) iPos
@@ -2833,18 +2884,27 @@ CompilerWarnings On
   End_Procedure
 
   Procedure FindPrevious
+    Boolean bIsUtf8
     Integer iFlags
     Integer iLen
     Integer iPos
     String  sSearchText
 
     Get psSearchText to sSearchText
-    Move (Length(sSearchText)) To iLen
+    Get pbUtf8Mode      to bIsUtf8
+    If (bIsUtf8) Begin
+      Move (SizeOfString(sSearchText)) to iLen
+    End
+    Else Begin
+      Move (Length(sSearchText)) to iLen // length is utf8 only!
+      Get Utf8ToEditorFormat sSearchText to sSearchText
+    End  
     If (iLen>0) Begin
       Move (sSearchText+character(0)) To sSearchText
 
       Send EditorMessage SCI_SEARCHANCHOR
-      Get  EditorMessage SCI_GETSEARCHFLAGS 0 0 to iFlags
+      Get  EditorMessage SCI_GETSEARCHFLAGS 0 0 To iFlags
+      
       Get  EditorMessage SCI_SEARCHPREV iFlags (AddressOf(sSearchText)) to iPos
       If (iPos>-1) Begin
         Send EditorMessage SCI_SETSEL (iPos+iLen) iPos
@@ -2857,6 +2917,7 @@ CompilerWarnings On
   End_Procedure
 
   Procedure Replace
+    Boolean bIsUtf8
     Integer iCaretPos
     Integer iPos
     Integer iStartPos
@@ -2878,7 +2939,14 @@ CompilerWarnings On
       Get SetSearchOptions ReplaceOptions to iFlags
       Move ReplaceOptions.sSearchText To sSearchText
       Set psSearchText to sSearchText
-      Move (Length(sSearchText)) To iLen
+      Get pbUtf8Mode      to bIsUtf8
+      If (bIsUtf8) Begin
+        Move (SizeOfString(sSearchText)) to iLen
+      End
+      Else Begin
+        Move (Length(sSearchText)) to iLen // length is utf8 only!
+        Get Utf8ToEditorFormat sSearchText to sSearchText
+      End  
       If (iLen>0) Begin
         Move 0 To iStartPos
         If (ReplaceOptions.bDocumentStart=False) Begin
@@ -2886,6 +2954,7 @@ CompilerWarnings On
           Move iCaretPos To iStartPos
         End
         Send EditorMessage SCI_SETTARGETSTART iStartPos
+
         Get EditorMessage SCI_SEARCHINTARGET iLen (AddressOf(sSearchText)) to iPos
         If (iPos > -1) Begin
           Move iPos To iCaretPos
@@ -4497,7 +4566,7 @@ CompilerWarnings On
   // DoCodelistSelMade
   // Notification that a item was selected within the listview
   // Originally called DoCodelistSelMade, renamed as we have different parameters
-  Procedure DoAutoCompleteSelection Address aText
+  Procedure DoAutoCompleteSelection Pointer aText
     String sItem sText
     Integer iRet iItem iRefVal iRetVal
 
@@ -4506,11 +4575,7 @@ CompilerWarnings On
     End
 
     If (aText<>0) Begin
-#IF (!@ < 200)
-      Move aText To sText
-#ELSE
       Move (PointerToString(aText)) To sText
-#ENDIF
     End
     Else Begin
       Move "" to sText
@@ -4539,7 +4604,7 @@ CompilerWarnings On
   End_Function
 
 
-  Procedure doCharacterTranslation Address aText Integer iLength
+  Procedure doCharacterTranslation Pointer aText Integer iLength
     Boolean bTranslateChar
     Integer iKey
     Integer iNewKey
@@ -4548,11 +4613,7 @@ CompilerWarnings On
 
     If (pbFileLoading(Self)=false) Begin // don't translate text when loading from disk
       If (aText<>0) Begin
-#IF (!@ < 200)
-        Move aText To sText
-#ELSE
         Move (PointerToString(aText)) To sText
-#ENDIF
       End
       Else Begin
         Move "" to sText
@@ -5349,4 +5410,4 @@ CompilerWarnings On
 
 End_Class
 
-Define CM_NewFileName   for "Untitled"  // sometimes ver useful.
+Define CM_NewFileName   For "Untitled"  // sometimes ver useful.

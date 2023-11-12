@@ -27,7 +27,7 @@ Define WM_RBUTTONUP             For |CI$0205 // 0x0205
   External_Function CreateWindowEx     'CreateWindowExA'      User32.dll  DWord e Pointer c Pointer v DWord w DWord x DWord y DWord wi DWord he Handle hP Handle hm Handle hi Pointer cs Returns Handle
 #ENDIF
 #IFNDEF GET_GetObject
-External_Function GetObject          'GetObjectA'           Gdi32.dll   Handle hGdi Integer iSize Pointer pBuff Returns Integer
+	External_Function GetObject          'GetObjectA'           Gdi32.dll   Handle hGdi Integer iSize Pointer pBuff Returns Integer
 #ENDIF
 #IFNDEF GET_CREATEFONTINDIRECT
   External_Function CreateFontIndirect 'CreateFontIndirectA'  Gdi32.dll   Pointer pLogfont Returns Integer
@@ -71,15 +71,6 @@ Define RDW_NOFRAME             For |CI$0800
 
 Define COLORREF For DWord
 
-
-// Is a command that allows to put a string into a structure
-// Usage: PUT_POINTER sName  pName  "String..."  to sBuff at TYPE.FIELD
-#COMMAND PUT_POINTER R R R "TO" R "AT" R
-    Local_Buffer !1 !2
-    Move !3 To !1
-    GetAddress Of !1    To !2
-    Put !2  To !5 At !7 !8
-#ENDCOMMAND
 
 
 //
