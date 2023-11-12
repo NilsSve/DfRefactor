@@ -4,9 +4,6 @@ Use mPointer.pkg
 Use tWinStructs.pkg
 Use cScintilla.h
 
-#IFNDEF ghoEditorProperties
-Global_Variable Integer ghoEditorProperties
-#ENDIF
 
 Define CS_CR   For (Character(13))
 Define CS_CRLF For (Character(13)+Character(10))
@@ -77,12 +74,12 @@ Define COLORREF For DWord
 
 // Is a command that allows to put a string into a structure
 // Usage: PUT_POINTER sName  pName  "String..."  to sBuff at TYPE.FIELD
-//#COMMAND PUT_POINTER R R R "TO" R "AT" R
-//    Local_Buffer !1 !2
-//    Move !3 To !1
-//    GetAddress Of !1    To !2
-//    Put !2  To !5 At !7 !8
-//#ENDCOMMAND
+#COMMAND PUT_POINTER R R R "TO" R "AT" R
+    Local_Buffer !1 !2
+    Move !3 To !1
+    GetAddress Of !1    To !2
+    Put !2  To !5 At !7 !8
+#ENDCOMMAND
 
 
 //
