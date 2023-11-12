@@ -12,7 +12,6 @@ Use cFileNameForm.pkg
 Use cScintillaRefactorEditor.pkg
 Use vwin32fh.pkg
 
-Use LogFileDialog.dg
 Use cSysFileDataDictionary.dd
 Use cFunctionsDataDictionary.dd  
 Use cFunctionsADataDictionary.dd

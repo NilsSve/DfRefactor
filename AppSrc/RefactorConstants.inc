@@ -22,6 +22,30 @@ Use Windows.pkg
 Use DFClient.pkg
 Use cFilesystem.pkg
 
+Enum_List
+    Define eSplitUnknown              for 0 
+    Define eSplitBySpaceSemiColumn    for 1
+    Define eSplitBySemiColumn         for 2
+    Define eSplitByBeginEnd           for 3
+End_Enum_List
+
+Define CS_SplitBySpaceSemiColumn    for "Split line space and semicolon"
+Define CS_SplitBySemiColumn         for "Split line with semicolon"
+Define CS_SplitByBeginEnd           for "Add a Begin/End block"
+
+// ToDo: These doesn't feel right! Ask Wil about them
+// Aren't modern DD classes named o<tablename>_DataDictionary ?
+Enum_List
+    Define eDDUnknown       for 0 // style unknown or not yet classified
+    Define eDDOldStyle      for 1 // <tablename>_DD
+    Define eDDStudioStyle   for 2 // o<tablename>_DD
+    Define eDDNewStyle      for 3 // o<tablename>_dd
+End_Enum_List
+
+Define CS_DDOldStyle      for "<tablename>_DD"
+Define CS_DDLegacyStyle   for "o<tablename>_DD"
+Define CS_DDNewStyle      for "o<tablename>_dd"
+
 Struct tFunctionTypes
     Integer iAll_Functions
     Integer iStandard_Function

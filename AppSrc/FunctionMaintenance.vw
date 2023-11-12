@@ -1,17 +1,17 @@
 // C:\Projects\DF18\DfRefactor\AppSrc\FunctionMaintenance.vw
 // Functions Maintenance
 //
-Use cRefactorDbView.pkg
 Use DFEntry.pkg
 Use cDbScrollingContainer.pkg
 Use Dfenrad.pkg
+Use dfEnRad.pkg
+Use DFEnChk.pkg
 Use cRDCDbHeaderGroup.pkg
 Use cRDCDbForm.pkg
 Use cRDCDbComboForm.pkg
 Use cRDCDbCheckbox.pkg
+//Use cRefactorDbView.pkg
 Use cFunctionsDataDictionary.dd
-Use dfEnRad.pkg
-Use DFEnChk.pkg
 
 ACTIVATE_VIEW Activate_oFunctionMaintenance_vw FOR oFunctionMaintenance_vw
 Object oFunctionMaintenance_vw is a dbView
