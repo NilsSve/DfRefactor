@@ -326,7 +326,7 @@ Define CS_CreateBackupFiles         for "CreateBackupFiles"
 Define CS_SummaryLogfileName        for "DFRefactoringLogFile.txt"
 
 // Careful, these cannot end on a semicolumn as you will introduce variable type equal to ""
-Define CS_VarTypes                  for "STRING;INTEGER;NUMBER;DATE;DATETIME;BOOLEAN;HANDLE;REAL;VARIANT;TIMESPAN;ROWID;DECIMAL;BIGINT;REAL;UCHAR;ADDRESS;CHAR;CURRENCY;DWORD;FLOAT;POINTER;SHORT;TIME;UBIGINT;USHORT;WSTRING;LONGPTR;ULONGPTR;UINTEGER" 
+Define CS_VarTypes                  for "INDICATOR;STRING;INTEGER;NUMBER;DATE;DATETIME;BOOLEAN;HANDLE;REAL;VARIANT;TIMESPAN;ROWID;DECIMAL;BIGINT;REAL;UCHAR;ADDRESS;CHAR;CURRENCY;DWORD;FLOAT;POINTER;SHORT;TIME;UBIGINT;USHORT;WSTRING;LONGPTR;ULONGPTR;UINTEGER"
 
 Define CS_ValidLeftCharacters       for ("()[];,&+-*<>= " + Character(9)) // Character 9=tab char //"()[];,.&+-*<>= "
 Define CS_UnusedSourceLogFile       for "UnusedSourceFiles.txt"

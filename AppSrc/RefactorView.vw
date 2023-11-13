@@ -939,7 +939,7 @@ Register_Procedure RefreshSelectionUpdate
 
     Procedure InitializeCounters
         Send ResetLineCounters of (Main_DD(Self))
-        Set piNoOfUnusedLocalVariables of (phoRemoveUnusedLocals(ghoRefactorFunctionLibrary)) to 0
+        Set piNoOfUnusedLocalVariables of (phoRemoveUnusedLocals(ghoRefactorFuncLib)) to 0
     End_Procedure
 
     // Collect all settings to one common struct to be passed amongst the main operating procedures.
@@ -974,7 +974,7 @@ Register_Procedure RefreshSelectionUpdate
         Move SysFile.bCountSourceLines            to RefactorSettings.bCountSourceLines
         Move SysFile.bEditorDropSelf              to RefactorSettings.bEditorDropSelf
 
-        Set pRefactorSettings of ghoRefactorFunctionLibrary to RefactorSettings
+        Set pRefactorSettings of ghoRefactorFuncLib to RefactorSettings
     End_Procedure
 
     // At least one action should have been selected, unless we're counting source lines.
@@ -987,7 +987,7 @@ Register_Procedure RefreshSelectionUpdate
         tRefactorSettings RefactorSettings
         
         Move (Main_DD(Self)) to hoDD
-        Get pRefactorSettings of ghoRefactorFunctionLibrary to RefactorSettings
+        Get pRefactorSettings of ghoRefactorFuncLib to RefactorSettings
         
         If (RefactorSettings.bCountSourceLines = True) Begin
             Get YesNo_Box "The Function 'Count number of source lines' needs to be run in solitude! All other functions will be ignored. Continue?" to iRetval
@@ -1062,10 +1062,10 @@ Register_Procedure RefreshSelectionUpdate
             Procedure_Return
         End
 
-        Send InitializeInterface    of ghoRefactorFunctionLibrary
+        Send InitializeInterface    of ghoRefactorFuncLib
         Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
         Get psCurrentSourceFileName of ghoApplication to sFileName
-        Get pRefactorSettings       of ghoRefactorFunctionLibrary to RefactorSettings
+        Get pRefactorSettings       of ghoRefactorFuncLib to RefactorSettings
 
         If (RefactorSettings.bCountSourceLines = False) Begin
             Get StartWarning bWorkspaceMode sFileName to eResponse
@@ -1141,7 +1141,7 @@ Register_Procedure RefreshSelectionUpdate
         
         Move SysFile.iCountNumberOfChangedFiles to iChangedFiles
         Move SysFile.iCountNumberOfFiles        to iFileCount
-        Get pRefactorSettings  of ghoRefactorFunctionLibrary to RefactorSettings             
+        Get pRefactorSettings  of ghoRefactorFuncLib to RefactorSettings             
         Get psSWSFile of ghoApplication to sSWSFile
         Append sText ("  SWS File:  " * Trim(sSWSFile) + "\n")
         Append sText ("  File Filter:  " * Trim(RefactorSettings.sFileFilter) + "\n")

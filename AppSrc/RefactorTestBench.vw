@@ -38,10 +38,13 @@ Object oRefactorTestBench is a cRefactorDbView
 
     End_Object
 
-    Object oFunctions_DD is a cFunctionsDataDictionary
+    Object oFunctions_DD is a cFunctionsADataDictionary
+        // We are actually just interested in saving the SysFile,
+        // as the checkbox "Use selected Functions Only" may have been changed.
+        // A Request_Save is send automatically when a new refactoring process starts.
         Procedure Request_Save
             Send Request_Save of oSysFile_DD
-            Forward Send Request_Save
+//            Forward Send Request_Save
         End_Procedure
     End_Object     
     
@@ -312,15 +315,16 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Procedure OnChange
                         Boolean bState  
                         Integer iFunctions    
-                        Send Request_Save
-                        Get Checked_State to bState
+
+                        Get Checked_State to bState           
                         If (bState = False) Begin                                
                             Get_Attribute DF_FILE_RECORDS_USED of Functions.File_Number to iFunctions
                         End
                         Else Begin
                             Move SysFile.SelectedFunctionTotal to iFunctions
                         End
-                        Set Value of oNoOfSelectedFunctions2_fm to iFunctions 
+                        Set Value of oNoOfSelectedFunctions2_fm to iFunctions
+                        Send Request_Save
                     End_Procedure 
                     
                 End_Object
@@ -480,26 +484,28 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
         Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
         Get psCodeFile          of hoLegacyEditor     to sLegacyFileName
-        Get _IsDataFlexCOMProxyClassesFile of ghoRefactorFunctionLibrary sLegacyFileName to bisCOMProcxy
-        If (bisCOMProcxy = True) Begin
-            Send Info_Box "This file is marked as a Studio COM Proxy classes auto generated file and will _not_ be refactored!"
-            Procedure_Return
-        End
-
-        Send UpdateStatusBar of hoLegacyEditor "" True
-        Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor        
-        Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
-        Get EditorDataAsStringArray of hoLegacyEditor to asLegacyCode
-        Get WriteDataToEditor       of hoRefactoredEditor asLegacyCode to bOK
+        Get EditorDataAsStringArray of hoLegacyEditor to asLegacyCode 
         Move (SizeOfArray(asLegacyCode)) to iSize
         Decrement iSize  
         If (iSize = 0) Begin
             Send Info_Box "No Legacy code found."
             Procedure_Return
         End
+        Get _IsDataFlexCOMProxyClassesFile of ghoRefactorFuncLib sLegacyFileName to bisCOMProcxy
+        If (bisCOMProcxy = True) Begin
+            Send Info_Box "This file is marked as a Studio COM Proxy classes auto generated file and will _not_ be refactored!"
+            Procedure_Return
+        End
+
+        Send UpdateStatusBar of hoLegacyEditor "" True
+        // Start by making the two arrays and editors the same:
+        Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor        
+        Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
+        Move asLegacyCode                             to asRefactoredCode
+        Get WriteDataToEditor   of hoRefactoredEditor    asRefactoredCode to bOK
         
         Move False to bSave
-        Send InitializeInterface of ghoRefactorFunctionLibrary
+        Send InitializeInterface of ghoRefactorFuncLib
         // Suspend all timers while we work.
         Send SuspendGUI of Desktop True
         Set pbIsRefactoring of ghoApplication to True   
@@ -512,25 +518,28 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Send PumpMsgQueue of Desktop   
                 // Read next source line
                 Move asLegacyCode[iCount] to sLine
-                Send InitializeTokenizer of ghoRefactorFunctionLibrary sLine
+                Send InitializeTokenizer of ghoRefactorFuncLib sLine
                 
                 // *** Type: eRemove_Function ***
                 //          Line-by-line
                 // These are functions that may potentially remove the line (Sets bWriteLine to False),
                 // so we execute them first.
                 Move True to bWriteLine
-                Constraint_Set 1 Clear  
+                Constraint_Set 1 Clear
                 Constrained_Clear eq FunctionsA by Index.4   
+                Constrain FunctionsA.Type eq eRemove_Function
                 If (bUseConstraints = True) Begin
                     Constrain FunctionsA.Selected eq True
+                    Constrained_Find First FunctionsA by Index.4
                 End
-                Constrain FunctionsA.Type eq eRemove_Function
-                Constrained_Find First FunctionsA by Index.4
+                Else Begin
+                    Constrained_Find First FunctionsA by Index.5
+                End
                 While (Found)                          
                     Move (Trim(FunctionsA.Parameter)) to sParameter
                     Move (Trim(FunctionsA.Function_Name)) to sFunctionName
                     Move (Eval("get_" - (sFunctionName))) to iFunctionID
-                    Get iFunctionID of ghoRefactorFunctionLibrary (&sLine) sParameter to bChanged
+                    Get iFunctionID of ghoRefactorFuncLib (&sLine) sParameter to bChanged
                     If (bChanged = True) Begin
                         Move False to bWriteLine 
                         Move True to bSave
@@ -541,18 +550,21 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 // *** Type: eStandard_Function ***
                 //          Line-by-line
                 If (bWriteLine = True) Begin
-                    Constraint_Set 2 Clear  
+                    Constraint_Set 2 Clear
                     Constrained_Clear eq FunctionsA by Index.4
+                    Constrain FunctionsA.Type eq eStandard_Function
                     If (bUseConstraints = True) Begin
                         Constrain FunctionsA.Selected eq True
+                        Constrained_Find First FunctionsA by Index.4
                     End
-                    Constrain FunctionsA.Type eq eStandard_Function
-                    Constrained_Find First FunctionsA by Index.4
+                    Else Begin
+                        Constrained_Find First FunctionsA by Index.5
+                    End
                     While (Found)
                         Move (Trim(FunctionsA.Parameter)) to sParameter
                         Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
                         Move (Eval("get_" - (sFunctionName))) to iFunctionID
-                        Get iFunctionID of ghoRefactorFunctionLibrary (&sLine) sParameter to bChanged
+                        Get iFunctionID of ghoRefactorFuncLib (&sLine) sParameter to bChanged
                         If (bChanged = True) Begin
                             Move True to bSave
                         End
@@ -569,26 +581,23 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         If (bSave = True) Begin
             Get WriteDataToEditor of hoRefactoredEditor asRefactoredCode to bOK
         End
-        // If no functions calls has been made yet, we need to load the legacy source
-        // in the refactor editor.
-        Else If (SizeOfArray(asRefactoredCode) = 0) Begin
-            Move asLegacyCode to asRefactoredCode
-        End
                 
         Move False to bSave
         Constraint_Set 3 Clear  
-        Constrained_Clear eq FunctionsA by Index.4
+        Constrain FunctionsA.Type eq eEditor_Function
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
+            Constrained_Find First FunctionsA by Index.4
         End
-        Constrain FunctionsA.Type eq eEditor_Function
-        Constrained_Find First FunctionsA by Index.4
+        Else Begin
+            Constrained_Find First FunctionsA by Index.5
+        End
         While (Found)
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
             If (Lowercase(sFunctionName) <> Lowercase(CS_EditorDropSelf)) Begin
                 Move (Eval("get_" - (sFunctionName))) to iFunctionID
-                Get iFunctionID of ghoRefactorFunctionLibrary (&asRefactoredCode) sParameter to bOK
+                Get iFunctionID of ghoRefactorFuncLib (&asRefactoredCode) sParameter to bOK
                 If (bOK = True) Begin
                     Move True to bSave
                 End
@@ -607,17 +616,19 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Send UpdateStatusBar of hoRefactoredEditor "Executing eOther_Function type..." True
         Move False to bSave
         Constraint_Set 4 Clear  
-        Constrained_Clear eq FunctionsA by Index.4
+        Constrain FunctionsA.Type eq eOther_Function
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
+            Constrained_Find First FunctionsA by Index.4
         End
-        Constrain FunctionsA.Type eq eOther_Function
-        Constrained_Find First FunctionsA by Index.4
+        Else Begin
+            Constrained_Find First FunctionsA by Index.5
+        End
         While (Found)
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
-            Get iFunctionID of ghoRefactorFunctionLibrary (&asRefactoredCode) sParameter to bOK
+            Get iFunctionID of ghoRefactorFuncLib (&asRefactoredCode) sParameter to bOK
             If (bOK = True) Begin
                 Move True to bSave
             End
@@ -638,17 +649,19 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
         Move False to bSave
         Constraint_Set 5 Clear  
-        Constrained_Clear eq FunctionsA by Index.4
+        Constrain FunctionsA.Type eq eOther_FunctionAll
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
+            Constrained_Find First FunctionsA by Index.4
         End
-        Constrain FunctionsA.Type eq eOther_FunctionAll
-        Constrained_Find First FunctionsA by Index.4
+        Else Begin
+            Constrained_Find First FunctionsA by Index.5
+        End
         While (Found)
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
-            Get iFunctionID of ghoRefactorFunctionLibrary (&asSourceFiles) sParameter to bOK
+            Get iFunctionID of ghoRefactorFuncLib (&asSourceFiles) sParameter to bOK
             If (bOK = True) Begin
                 Move True to bSave
             End
@@ -664,17 +677,19 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         //           Makes no source code changes
         Move False to bSave
         Constraint_Set 6 Clear  
-        Constrained_Clear eq FunctionsA by Index.4
+        Constrain FunctionsA.Type eq eReport_Function
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
+            Constrained_Find First FunctionsA by Index.4
         End
-        Constrain FunctionsA.Type eq eReport_Function
-        Constrained_Find First FunctionsA by Index.4
+        Else Begin
+            Constrained_Find First FunctionsA by Index.5
+        End
         While (Found)
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
-            Get iFunctionID of ghoRefactorFunctionLibrary (&asRefactoredCode) sParameter to bOK
+            Get iFunctionID of ghoRefactorFuncLib (&asRefactoredCode) sParameter to bOK
             If (bOK = True) Begin
                 Move True to bSave
             End            
@@ -689,17 +704,19 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move sLegacyFileName to asSourceFiles[0]
         Move False to bSave
         Constraint_Set 7 Clear  
-        Constrained_Clear eq FunctionsA by Index.4
+        Constrain FunctionsA.Type eq eReport_FunctionAll
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
+            Constrained_Find First FunctionsA by Index.4
         End
-        Constrain FunctionsA.Type eq eReport_FunctionAll
-        Constrained_Find First FunctionsA by Index.4
+        Else Begin
+            Constrained_Find First FunctionsA by Index.5
+        End
         While (Found)
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
-            Get iFunctionID of ghoRefactorFunctionLibrary (&asSourceFiles) sParameter to bOK
+            Get iFunctionID of ghoRefactorFuncLib (&asSourceFiles) sParameter to bOK
             If (bOK = True) Begin
                 Move True to bSave
             End
@@ -726,6 +743,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
     Procedure Activating
         Send Request_Assign of oSysFile_DD
+        Send Refind_Records of oSysFile_DD
     End_Procedure
 End_Object
 

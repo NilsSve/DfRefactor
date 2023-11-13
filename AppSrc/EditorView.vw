@@ -55,7 +55,7 @@ Object oEditorView_vw is a cRefactorDbView
                 If (sFunctionName = CS_EditorDropSelf) Begin
                     Send Stop_StatusPanel of ghoStatusPanel
                 End
-                Get iFunctionID of ghoRefactorFunctionLibrary asSourceFile sParameter to bChanged
+                Get iFunctionID of ghoRefactorFuncLib asSourceFile sParameter to bChanged
                 If (sFunctionName = CS_EditorDropSelf) Begin
                     Send Start_StatusPanel of ghoStatusPanel
                 End

@@ -104,7 +104,7 @@ Object DFUnitTestRunner_vw is a View
         Set Location to 290 12
         Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
         Set peAnchors to anBottomLeftRight
-        Set phoEditor of ghoRefactorFunctionLibrary to Self
+        Set phoEditor of ghoRefactorFuncLib to Self
     End_Object
 
     Procedure ScaleFont Integer iDirection 
