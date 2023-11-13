@@ -519,7 +519,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 // These are functions that may potentially remove the line (Sets bWriteLine to False),
                 // so we execute them first.
                 Move True to bWriteLine
-                Constraint_Set (Self + 1) Clear  
+                Constraint_Set 1 Clear  
                 Constrained_Clear eq FunctionsA by Index.4   
                 If (bUseConstraints = True) Begin
                     Constrain FunctionsA.Selected eq True
@@ -541,7 +541,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 // *** Type: eStandard_Function ***
                 //          Line-by-line
                 If (bWriteLine = True) Begin
-                    Constraint_Set (Self + 2) Clear  
+                    Constraint_Set 2 Clear  
                     Constrained_Clear eq FunctionsA by Index.4
                     If (bUseConstraints = True) Begin
                         Constrain FunctionsA.Selected eq True
@@ -576,7 +576,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         End
                 
         Move False to bSave
-        Constraint_Set (Self + 3) Clear  
+        Constraint_Set 3 Clear  
         Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
@@ -606,7 +606,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         //          A source file as a String array is passed.
         Send UpdateStatusBar of hoRefactoredEditor "Executing eOther_Function type..." True
         Move False to bSave
-        Constraint_Set (Self + 4) Clear  
+        Constraint_Set 4 Clear  
         Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
@@ -637,7 +637,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move sRefactoredFileName to asSourceFiles[0]                             
         
         Move False to bSave
-        Constraint_Set (Self + 4) Clear  
+        Constraint_Set 5 Clear  
         Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
@@ -663,7 +663,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         //           One source file as a string array is passed.
         //           Makes no source code changes
         Move False to bSave
-        Constraint_Set (Self + 4) Clear  
+        Constraint_Set 6 Clear  
         Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
@@ -688,7 +688,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         //          Makes no source code changes
         Move sLegacyFileName to asSourceFiles[0]
         Move False to bSave
-        Constraint_Set (Self + 4) Clear  
+        Constraint_Set 7 Clear  
         Constrained_Clear eq FunctionsA by Index.4
         If (bUseConstraints = True) Begin
             Constrain FunctionsA.Selected eq True
