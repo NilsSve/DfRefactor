@@ -40,7 +40,7 @@ Activate_View Activate_oRefactorView for oRefactorView
 Object oRefactorView is a cRefactorDbView
     Set Location to 1 0
     Set Size to 315 642
-    Set Label to "Refactoring Selections"
+    Set Label to "Selections"
     Set Icon to "DFRefactor.ico"
     Set pbAcceptDropFiles to True
     Set Auto_Clear_DEO_State to False  
@@ -761,6 +761,55 @@ Register_Procedure RefreshSelectionUpdate
                 Function_Return bExists
             End_Function
 
+            Function IsEnabled Returns Boolean
+                Boolean bEnabled bWorkspaceMode
+                String sFileName sSWSFile sHomePath
+                Integer iSelectedFunctions iFolders 
+                Handle hoFolderSelHeaDD
+                Boolean bExists bUseDDO  
+                tFolderData[] asSavedFolders
+
+                Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
+                If (bWorkspaceMode = False) Begin
+                    Function_Return False
+                End
+                Get psSWSFile               of ghoApplication to sSWSFile
+                Get psCurrentSourceFileName of ghoApplication to sFileName
+
+                If (bWorkspaceMode = True) Begin
+                    Move (sSWSFile <> "") to bEnabled
+                End
+                Else Begin
+                    Move (sFileName <> "") to bEnabled
+                End
+
+                If (bEnabled = True) Begin
+                    Move (SysFile.SelectedFunctionTotal > 0) to bEnabled
+                End
+
+                If (bEnabled = True) Begin
+                    Get CheckedItems of oFolders_grd to iFolders
+                    If (iFolders = 0) Begin
+                        Get private.phoFolderSelHeaDD of ghoApplication to hoFolderSelHeaDD
+                        Move (hoFolderSelHeaDD <> 0) to bUseDDO
+                        If (bUseDDO = True) Begin
+                            Get psHomePath of ghoApplication to sHomePath 
+                            Get IsSavedFolders of hoFolderSelHeaDD sHomePath to bExists
+                            If (bExists = True) Begin
+                                Get FindSavedFolders of hoFolderSelHeaDD sHomePath to asSavedFolders
+                            End
+                            Move (SizeOfArray(asSavedFolders)) to iFolders
+                        End
+                    End
+                    Move (iFolders <> 0) to bEnabled
+                End          
+                If (bEnabled = False) Begin
+                    Get Field_Current_Value of oSysFile_DD Field SysFile.bCountSourceLines to bEnabled
+                End
+
+                Function_Return bEnabled
+            End_Function
+
         End_Object
 
     End_Object
@@ -840,7 +889,7 @@ Register_Procedure RefreshSelectionUpdate
             End_Procedure
 
             Procedure OnClick  
-                Send START_MAIN_PROCESS
+                Send RefactoreCode
             End_Procedure
 
             Function IsEnabled Returns Boolean
@@ -937,46 +986,49 @@ Register_Procedure RefreshSelectionUpdate
 
     End_Object
 
-    Procedure InitializeCounters
-        Send ResetLineCounters of (Main_DD(Self))
-        Set piNoOfUnusedLocalVariables of (phoRemoveUnusedLocals(ghoRefactorFuncLib)) to 0
-    End_Procedure
-
-    // Collect all settings to one common struct to be passed amongst the main operating procedures.
-    Procedure CollectSettings
-        tRefactorSettings RefactorSettings                   
-        String sPath sFileName 
-        Boolean bWorkspaceMode
-                                                                                
-        Get SelectedItems of oFolders_grd         to RefactorSettings.asFolderNames
-        Move (Trim(SysFile.FileExtensionFilter))  to RefactorSettings.sFileFilter
-                                                
-        Move SysFile.SelectedStandardFunctions    to RefactorSettings.iSelectedStandardFunctions
-        Move SysFile.SelectedRemoveFunctions      to RefactorSettings.iSelectedRemoveFunctions
-        Move SysFile.SelectedEditorFunctions      to RefactorSettings.iSelectedEditorFunctions
-        Move SysFile.SelectedReportFunctions      to RefactorSettings.iSelectedReportFunctions
-        Move SysFile.SelectedReportAllFunctions   to RefactorSettings.iSelectedReportAllFunctions
-        Move SysFile.SelectedOtherFunctions       to RefactorSettings.iSelectedOtherFunctions
-        Move SysFile.SelectedOtherAllFunctions    to RefactorSettings.iSelectedOtherAllFunctions
-        
-        // All functions that work on a line-by-line basis.
-        Move (SysFile.SelectedStandardFunctions + SysFile.SelectedRemoveFunctions) ;
-            to RefactorSettings.iSelectedLineByLineFunctions
-        
-        // All functions that are feed with a full source file as a string array:
-        Move (SysFile.SelectedEditorFunctions + SysFile.SelectedReportFunctions + SysFile.SelectedOtherFunctions) ;
-            to RefactorSettings.iSelectedFullFileFunctions
-
-        // All functions that are feed with a string array containing all selected files (including path):
-        Move (SysFile.SelectedReportAllFunctions + SysFile.SelectedOtherAllFunctions) ;
-            to RefactorSettings.iSelectedAllFilesFunctions
-
-        Move SysFile.bCountSourceLines            to RefactorSettings.bCountSourceLines
-        Move SysFile.bEditorDropSelf              to RefactorSettings.bEditorDropSelf
-
-        Set pRefactorSettings of ghoRefactorFuncLib to RefactorSettings
-    End_Procedure
-
+//    Procedure InitializeDFRefactor Handle hoFolders Handle hoDD
+//        Send InitializeInterface of ghoRefactorFuncLib
+//        Send ResetLineCounters of hoDD
+//        Send CollectSettings hoFolders
+//    End_Procedure
+//
+//    // Collect all settings to one common struct to be passed amongst the main operating procedures.
+//    Procedure CollectSettings Handle hoFolders
+//        tRefactorSettings RefactorSettings                   
+//        String sPath sFileName 
+//        Boolean bWorkspaceMode
+//                                                                                
+//        If (hoFolders <> 0) Begin
+//            Get SelectedItems of hoFolders        to RefactorSettings.asFolderNames
+//        End
+//        Move (Trim(SysFile.FileExtensionFilter))  to RefactorSettings.sFileFilter
+//                                                
+//        Move SysFile.SelectedStandardFunctions    to RefactorSettings.iSelectedStandardFunctions
+//        Move SysFile.SelectedRemoveFunctions      to RefactorSettings.iSelectedRemoveFunctions
+//        Move SysFile.SelectedEditorFunctions      to RefactorSettings.iSelectedEditorFunctions
+//        Move SysFile.SelectedReportFunctions      to RefactorSettings.iSelectedReportFunctions
+//        Move SysFile.SelectedReportAllFunctions   to RefactorSettings.iSelectedReportAllFunctions
+//        Move SysFile.SelectedOtherFunctions       to RefactorSettings.iSelectedOtherFunctions
+//        Move SysFile.SelectedOtherAllFunctions    to RefactorSettings.iSelectedOtherAllFunctions
+//        
+//        // All functions that work on a line-by-line basis.
+//        Move (SysFile.SelectedStandardFunctions + SysFile.SelectedRemoveFunctions) ;
+//            to RefactorSettings.iSelectedLineByLineFunctions
+//        
+//        // All functions that are feed with a full source file as a string array:
+//        Move (SysFile.SelectedEditorFunctions + SysFile.SelectedReportFunctions + SysFile.SelectedOtherFunctions) ;
+//            to RefactorSettings.iSelectedFullFileFunctions
+//
+//        // All functions that are feed with a string array containing all selected files (including path):
+//        Move (SysFile.SelectedReportAllFunctions + SysFile.SelectedOtherAllFunctions) ;
+//            to RefactorSettings.iSelectedAllFilesFunctions
+//
+//        Move SysFile.bCountSourceLines            to RefactorSettings.bCountSourceLines
+//        Move SysFile.bEditorDropSelf              to RefactorSettings.bEditorDropSelf
+//
+//        Set pRefactorSettings of ghoRefactorFuncLib to RefactorSettings
+//    End_Procedure
+//
     // At least one action should have been selected, unless we're counting source lines.
     // Also checks that spinform values are correct.
     Function IsValidActions Returns Boolean
@@ -1011,7 +1063,7 @@ Register_Procedure RefreshSelectionUpdate
 //            Send Info_Box ("The number of blank lines needs to be between" * String(iMinLines) * String("and") * String(iMaxLines))
 //            Move False to bOK
 //        End
-
+ 
         Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
         If (bWorkspaceMode = True) Begin
             Move RefactorSettings.sFileFilter to sFileFilter
@@ -1020,7 +1072,7 @@ Register_Procedure RefreshSelectionUpdate
                 Move False to bOK
             End
         End
-        Else Begin
+        Else If (SysFile.bCountSourceLines = False) Begin
             Get psCurrentSourceFileName of ghoApplication to sFileName
             Get FileExists of ghoFileSystem sFileName DIRMODE_FILES_ONLY to bFileExists
             If (bFileExists = False) Begin
@@ -1035,7 +1087,7 @@ Register_Procedure RefreshSelectionUpdate
     //
     // ToDo: *** MAIN REFACTORING ROUTINE ***
     //
-    Procedure START_MAIN_PROCESS
+    Procedure RefactoreCode
         String[] asFolderNames
         String sFileFilter sPath sFileName sText sTotalTime sFolderName
         Handle hoBPO
@@ -1046,7 +1098,6 @@ Register_Procedure RefreshSelectionUpdate
         tRefactorSettings RefactorSettings 
 
         Send Request_Save
-        Send CollectSettings
         Get IsValidActions to bOk
         If (bOk = False) Begin
             Procedure_Return
@@ -1062,7 +1113,8 @@ Register_Procedure RefreshSelectionUpdate
             Procedure_Return
         End
 
-        Send InitializeInterface    of ghoRefactorFuncLib
+        Send InitializeDFRefactor (oFolders_grd(Self)) (Main_DD(Self))
+        
         Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
         Get psCurrentSourceFileName of ghoApplication to sFileName
         Get pRefactorSettings       of ghoRefactorFuncLib to RefactorSettings
@@ -1076,7 +1128,6 @@ Register_Procedure RefreshSelectionUpdate
 
         Move False to Err
         Move 0 to LastErr
-        Send InitializeCounters
         Move (CurrentDateTime()) to dtExecStart
         
         // *** Business Process where the calls to selected refactoring functions are made ***
@@ -1132,27 +1183,35 @@ Register_Procedure RefreshSelectionUpdate
     End_Function
 
     Function SummaryText Boolean bWriteLogFile Returns String
-        String sText sLogText sLogFile sPath sTimeText sProgram sFormatString sValue sSWSFile
+        String sText sLogText sLogFile sPath sTimeText sProgram sFormatString sValue sSWSFile sFileName
         Integer iChangedFiles iCount iSize
         Integer iFileCount iChannel
         tRefactorSettings RefactorSettings
         DateTime dtToday
-        Boolean bExists
+        Boolean bExists bWorkspaceMode
         
         Move SysFile.iCountNumberOfChangedFiles to iChangedFiles
         Move SysFile.iCountNumberOfFiles        to iFileCount
         Get pRefactorSettings  of ghoRefactorFuncLib to RefactorSettings             
         Get psSWSFile of ghoApplication to sSWSFile
         Append sText ("  SWS File:  " * Trim(sSWSFile) + "\n")
-        Append sText ("  File Filter:  " * Trim(RefactorSettings.sFileFilter) + "\n")
-        Move (SizeOfArray(RefactorSettings.asFolderNames)) to iSize
-        Append sText ("Number of Folders:" * String(iSize) + "\n")
-        Decrement iSize
-        For iCount from 0  to iSize
-            Append sText "  " RefactorSettings.asFolderNames[iCount] "\n"
-        Loop
 
-        Append sText "\nStatistics:\n==========="
+        Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
+        If (bWorkspaceMode = True) Begin
+            Append sText ("  File Filter:  " * Trim(RefactorSettings.sFileFilter) + "\n")
+            Move (SizeOfArray(RefactorSettings.asFolderNames)) to iSize
+            Append sText ("Number of Folders:" * String(iSize) + "\n")
+            Decrement iSize
+            For iCount from 0  to iSize
+                Append sText "  " RefactorSettings.asFolderNames[iCount] "\n"
+            Loop
+        End 
+        Else Begin
+                Get psCurrentSourceFileName of ghoApplication to sFileName
+                Append sText "  " "Mode: Single file" " " sFileName  "\n"
+        End
+
+        Append sText "\n  Statistics:\n  ==========="
         
         // If source line counting this will be the only action for this run:
         If (RefactorSettings.bCountSourceLines = True) Begin
@@ -1163,12 +1222,11 @@ Register_Procedure RefreshSelectionUpdate
         End
 
         Else Begin
-            
-            // Remove functions:
-            // One source line at a time was passed to these fucntions.
+            // *** Type: eRemove_Function ***
+            //          Line-by-line
             If (RefactorSettings.iSelectedRemoveFunctions <> 0) Begin
-                Append sText ("\n\n" + CS_Remove_Function +"(s):")
-                Constraint_Set (Self + 1) Clear
+                Append sText ("\n\nFunction Type:" * CS_Remove_Function +"(s):")
+                Constraint_Set eRemove_Function Clear
                 Constrained_Clear eq FunctionsA by Index.4  
                 Constrain FunctionsA.Selected eq True
                 Constrain FunctionsA.Type eq eRemove_Function
@@ -1179,11 +1237,11 @@ Register_Procedure RefreshSelectionUpdate
                 Loop
             End
             
-            // Standard functions:
-            // One source line at a time was passed to these fucntions.
+            // *** Type: eStandard_Function ***
+            //          Line-by-line
             If (RefactorSettings.iSelectedStandardFunctions <> 0) Begin
-                Append sText ("\n\n" + CS_Standard_Function +"(s):")
-                Constraint_Set (Self) Clear
+                Append sText ("\n\nFunction Type:" * CS_Standard_Function +"(s):")
+                Constraint_Set eStandard_Function Clear
                 Constrained_Clear eq FunctionsA by Index.4  
                 Constrain FunctionsA.Selected eq True
                 Constrain FunctionsA.Type eq eStandard_Function        
@@ -1197,8 +1255,8 @@ Register_Procedure RefreshSelectionUpdate
             // Editor functions:
             // One source file at a time was passed as a string array.
             If (RefactorSettings.iSelectedEditorFunctions <> 0) Begin
-                Append sText ("\n\n" + CS_Editor_Function +"(s):")
-                Constraint_Set (Self + 2) Clear
+                Append sText ("\n\nFunction Type:" * CS_Editor_Function +"(s):")
+                Constraint_Set eEditor_Function Clear
                 Constrained_Clear eq FunctionsA by Index.4  
                 Constrain FunctionsA.Selected eq True
                 Constrain FunctionsA.Type eq eEditor_Function
@@ -1212,8 +1270,8 @@ Register_Procedure RefreshSelectionUpdate
             // Other functions:
             // One source file at a time was passed as a string array.
             If (RefactorSettings.iSelectedOtherFunctions <> 0) Begin
-                Append sText ("\n\n" + CS_Other_Function +"(s):")
-                Constraint_Set (Self + 5) Clear
+                Append sText ("\n\nFunction Type:" * CS_Other_Function +"(s):")
+                Constraint_Set eOther_Function Clear
                 Constrained_Clear eq FunctionsA by Index.4  
                 Constrain FunctionsA.Selected eq True
                 Constrain FunctionsA.Type eq eOther_Function
@@ -1227,8 +1285,8 @@ Register_Procedure RefreshSelectionUpdate
             // OthertAll functions:
             // All selected files were passed as a string array (with full path)
             If (RefactorSettings.iSelectedOtherAllFunctions <> 0) Begin
-                Append sText ("\n\n" + CS_Other_FunctionAll +"(s):")
-                Constraint_Set (Self + 6) Clear
+                Append sText ("\n\nFunction Type:" * CS_Other_FunctionAll +"(s):")
+                Constraint_Set eOther_FunctionAll Clear
                 Constrained_Clear eq FunctionsA by Index.4  
                 Constrain FunctionsA.Selected eq True
                 Constrain FunctionsA.Type eq eOther_FunctionAll
@@ -1242,8 +1300,8 @@ Register_Procedure RefreshSelectionUpdate
             // Report functions: These makes no code changes.
             // One source file at a time was passed as a string array.
             If (RefactorSettings.iSelectedReportFunctions <> 0) Begin
-                Append sText ("\n\n" + CS_Report_Function +"(s):")
-                Constraint_Set (Self + 3) Clear
+                Append sText ("\n\nFunction Type:" * CS_Report_Function +"(s):")
+                Constraint_Set eReport_Function Clear
                 Constrained_Clear eq FunctionsA by Index.4  
                 Constrain FunctionsA.Selected eq True
                 Constrain FunctionsA.Type eq eReport_Function
@@ -1257,8 +1315,8 @@ Register_Procedure RefreshSelectionUpdate
             // ReportAll functions: These makes no code changes.
             // All selected files were passed as a string array (with full path)
             If (RefactorSettings.iSelectedReportAllFunctions <> 0) Begin
-                Append sText ("\n\n" + CS_Report_FunctionAll +"(s):")
-                Constraint_Set (Self + 4) Clear
+                Append sText ("\n\nFunction Type:" * CS_Report_FunctionAll +"(s):")
+                Constraint_Set eReport_FunctionAll Clear
                 Constrained_Clear eq FunctionsA by Index.4  
                 Constrain FunctionsA.Selected eq True
                 Constrain FunctionsA.Type eq eReport_FunctionAll
@@ -1296,7 +1354,7 @@ Register_Procedure RefreshSelectionUpdate
             Get psProduct of ghoApplication to sProgram
             Move (CurrentDateTime()) to dtToday
             Writeln channel iChannel "====================================================================================="
-            Writeln channel iChannel "CREATED BY: " sProgram " -- " dtToday
+            Writeln channel iChannel "*** CREATED BY: " sProgram " -- " dtToday " " "***"
             Writeln channel iChannel sLogText
             Writeln channel iChannel
             Writeln channel iChannel ("Total number of files changed:" * String(iChangedFiles) * "out of" * String(iFileCount) * "Files.")

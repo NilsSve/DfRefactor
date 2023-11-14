@@ -15,12 +15,20 @@ Object oEditorView_vw is a cRefactorDbView
     Set pbAutoActivate to True
     Set pbAcceptDropFiles to True
     Set Icon to "Editor.ico"
-    Set Label to "Editor used by 'Editor Function' types"
+    Set Label to "Editor for 'Editor Functions'"
+
     Set phoEditorView of ghoApplication to Self
 
+    Object oEditorInfo_tb is a TextBox
+        Set Size to 10 351
+        Set Location to 4 20
+        Set Label to "Editor for functions of type: 'Editor - One File'. Those functions must have an active editor object to work."
+        Set FontWeight to fw_Bold
+    End_Object
+
     Object oEditor_edt is a cScintillaRefactorEditor
-        Set Size to 246 473
-        Set Location to 13 10
+        Set Size to 244 473
+        Set Location to 16 10
         Set peAnchors to anAll
         Set Enabled_State to False
 
@@ -163,12 +171,6 @@ Object oEditorView_vw is a cRefactorDbView
             Get psSWSFile of ghoApplication to sSWSFile
             Set Enabled_State to (sSWSFile <> "")
         End_Procedure
-    End_Object
-
-    Object oEditorInfo_tb is a TextBox
-        Set Size to 10 132
-        Set Location to 2 20
-        Set Label to "Editor object used by Scintilla Editor's build in refactoring functions"
     End_Object
 
     Procedure Activate_View Returns Integer
