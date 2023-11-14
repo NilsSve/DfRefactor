@@ -111,24 +111,28 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
                 Property Boolean pbIsFileDropped False
                 
-                Procedure OnFileDropped String sFileName Boolean bLast
+                Procedure OnFileDropped String sFileName Boolean bLst
                     Integer iChannel iCount
                     String sTextValue sLine
-                    Boolean bSeqEof
+                    Boolean bSeqEof bLast
                     String[] asLegacyCode    
                     Handle ho
                     
-                    If (bLast = True) Begin
-                        Set pbIsFileDropped to False 
+//                    Move False to bLast
+//                    If (num_arguments > 1) Begin
+//                        Move bLst to bLast
+//                    End
+//                    If (bLast = True) Begin
+//                        Set pbIsFileDropped to False 
                         Set Value of oLegacyCodeFilename_fm to sFileName 
                         Send LoadFile sFileName 
                         Send Activate
-                    End 
+//                    End 
                     // We use a property to only show info_box once if multiple files are dropped.
-                    Else If (pbIsFileDropped(Self) = False) Begin
-                        Send Info_Box "Only one source file can be dropped at a time. The last file will be used."
-                        Set pbIsFileDropped to True
-                    End
+//                    Else If (pbIsFileDropped(Self) = False) Begin
+//                        Send Info_Box "Only one source file can be dropped at a time. The last file will be used."
+//                        Set pbIsFileDropped to True
+//                    End
                 End_Procedure
                 
                 // Important: Must be after the object has been paged, else the text won't show
@@ -470,9 +474,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Integer iSize iCount iTabSize iRetval iFunctionID eSplitMode
         Boolean bChanged bLoopFound bisCOMProcxy bWriteLine bOK bSave
         DateTime dtStart dtEnd
-
+        tRefactorSettings RefactorSettings
+        
         Get Checked_State of oUseConstraints_cb to bOK
-        If (SysFile.SelectedFunctionTotal = 0 and bOK = True) Begin
+        Send InitializeDFRefactor 0 (Main_DD(Self))
+        Get pRefactorSettings of ghoRefactorFuncLib to RefactorSettings
+        If (RefactorSettings.iSelectedFunctionTotal = 0 and bOK = True) Begin
             Send Info_Box "You need to select at least one function first. Or unselect the checkbox 'Use selected Functions only'"
             Procedure_Return
         End
@@ -480,7 +487,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Move (CurrentDateTime()) to dtStart
         Set Value of (oRefactoredCode_Time_fm(Self)) to ""
         Move False to bLoopFound
-        Send Activate_oRefactorTestBench
+//        Send Activate_oRefactorTestBench
         
         Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
         Get psCodeFile          of hoLegacyEditor     to sLegacyFileName
@@ -501,17 +508,15 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         // Start by making the two arrays and editors the same:
         Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor        
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
-        Move asLegacyCode                             to asRefactoredCode
-        Get WriteDataToEditor   of hoRefactoredEditor    asRefactoredCode to bOK
+        Get WriteDataToEditor   of hoRefactoredEditor    asLegacyCode to bOK //asRefactoredCode to bOK
         
         Move False to bSave
-        Send InitializeInterface of ghoRefactorFuncLib
         // Suspend all timers while we work.
         Send SuspendGUI of Desktop True
         Set pbIsRefactoring of ghoApplication to True   
         Send Cursor_Wait of Cursor_Control
 
-        If (SysFile.SelectedStandardFunctions > 0 or bUseConstraints = False) Begin
+        If (RefactorSettings.iSelectedLineByLineFunctions > 0 or bUseConstraints = False) Begin
             Send UpdateStatusBar of hoLegacyEditor "Executing Line-by-Line type functions..." True
             For iCount from 0 to iSize
                 // Need this to show "Number of lines:" changes
@@ -608,9 +613,9 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
         // Save the refactored editor content before we call the type eOther_Function, 
         // as it reads the sRefactoredFileName file from disk.
-        If (IsSameArray(asLegacyCode, asRefactoredCode) = False) Begin
-            Send SaveFile of hoRefactoredEditor
-        End
+//        If (IsSameArray(asLegacyCode, asRefactoredCode) = False) Begin
+//            Send SaveFile of hoRefactoredEditor
+//        End
 
         // *** Type eOther_Function ***
         //          A source file as a String array is passed.

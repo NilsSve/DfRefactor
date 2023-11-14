@@ -125,6 +125,7 @@ Struct tRefactorSettings
     Integer iSelectedLineByLineFunctions  // Sum of all line-by-line action functions (not full file or report functions).
     Integer iSelectedFullFileFunctions  // Sum of all functions that should be feed with a string array of _one_ source file.
     Integer iSelectedAllFilesFunctions  // All functions that should be feed with a string array with all selected files (including path).
+    Integer iSelectedFunctionTotal      // Number of selections
     //
     Boolean bCountSourceLines           // If we should only count source lines (all other functions will be ignored).
     Boolean bEditorDropSelf             // Scintilla Editor special function that pops up a dialog before each change(!).
