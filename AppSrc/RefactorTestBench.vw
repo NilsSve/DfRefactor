@@ -617,7 +617,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 //            Send SaveFile of hoRefactoredEditor
 //        End
 
-        // *** Type eOther_Function ***
+        // *** Type: eOther_Function ***
         //          A source file as a String array is passed.
         Send UpdateStatusBar of hoRefactoredEditor "Executing eOther_Function type..." True
         Move False to bSave
@@ -649,7 +649,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Send SaveFile of hoRefactoredEditor
         End
 
-        // *** Type eOther_FunctionAll ***
+        // *** Type: eOther_FunctionAll ***
         //          All source files with full pathing is passed to these functions as a string array.
         //          In this test-bench we only fill the file array with one file.
         Move sRefactoredFileName to asSourceFiles[0]                             

@@ -50,7 +50,7 @@ Object oEditorView_vw is a cRefactorDbView
             Get WriteDataToEditor asSourceFile to bOK
             Send Activate
             
-            Constraint_Set Self Clear  
+            Constraint_Set eEditor_Function Clear  
             Constrained_Clear eq FunctionsA by Index.4
             Constrain FunctionsA.Selected eq True
             Constrain FunctionsA.Type eq eEditor_Function

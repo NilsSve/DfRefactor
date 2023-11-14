@@ -1085,7 +1085,7 @@ Register_Procedure RefreshSelectionUpdate
     End_Function
     
     //
-    // ToDo: *** MAIN REFACTORING ROUTINE ***
+    // ToDo: *** START REFACTORING ***
     //
     Procedure RefactoreCode
         String[] asFolderNames
