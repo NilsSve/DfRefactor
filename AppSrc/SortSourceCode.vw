@@ -16,6 +16,7 @@ Object oSortSourceCode_vw is a dbView
     Set Location to 2 2
     Set Label to "Sort Class Code"
     Set Border_Style to Border_Thick
+    Set Icon to "ActionSort.ico"
     Set pbAutoActivate to True
 
     Object oSortSourceCode is a cSortSourceCode

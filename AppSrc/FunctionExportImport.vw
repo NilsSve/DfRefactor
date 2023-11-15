@@ -20,6 +20,7 @@ Object oFunctionsExportImport is a dbView
     Set Size to 372 650
     Set Label to "Export/Import"
     Set Border_Style to Border_Thick
+    Set Icon to "Export.ico"
     Set pbAutoActivate to True   
     
     Property Handle phoSelection_lst

@@ -21,6 +21,7 @@ Object oFunctionMaintenance_vw is a dbView
     Set Label to "Function Maintenance"
     Set Auto_Clear_DEO_State to False
     Set pbAutoActivate to True
+    Set Icon to "FunctionLibrary.ico"
     Set Verify_Save_msg to (RefFunc(No_Confirmation))
 
     Procedure Log_Status String sMsg
@@ -40,9 +41,9 @@ Object oFunctionMaintenance_vw is a dbView
                 Set Size to 243 471
                 Set Location to 17 6
                 Set piMinSize to 134 248
-                Set Label to "Functions Maintenance"             
+                Set Label to "Function Maintenance"             
                 Set psImage to "FunctionLibrary.ico"
-                Set psNote to "Edit functions properties."
+                Set psNote to "Edit refactoring functions properties."
                 Set psToolTip to "To add a function, the name entered must be EXACTLY the same as the function name itself. Then the code must be added to the cRefactorDbView class (cRefactorDbView.pkg). See class code for standard function parameters."
                 Set Border_Style to Border_Normal
                 Set peAnchors to anNone

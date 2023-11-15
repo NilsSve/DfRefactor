@@ -14,9 +14,10 @@ ACTIVATE_VIEW Activate_oMaintainFunctions FOR oMaintainFunctions
 Object oMaintainFunctions is a dbView
     Set Location to 2 4
     Set Size to 140 589
-    Set Label to "Functions List"
+    Set Label to "Function List"
     Set Border_Style to Border_Thick
-    Set pbAutoActivate to True
+    Set pbAutoActivate to True   
+    Set Icon to "FunctionLookup.ico"
     Set Maximize_Icon to True
 
     Object oSysFile_DD is a cSysFileDataDictionary
