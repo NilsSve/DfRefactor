@@ -1098,6 +1098,7 @@ Register_Procedure RefreshSelectionUpdate
         tRefactorSettings RefactorSettings 
 
         Send Request_Save
+        Send InitializeDFRefactor (oFolders_grd(Self)) (Main_DD(Self))
         Get IsValidActions to bOk
         If (bOk = False) Begin
             Procedure_Return
@@ -1113,7 +1114,6 @@ Register_Procedure RefreshSelectionUpdate
             Procedure_Return
         End
 
-        Send InitializeDFRefactor (oFolders_grd(Self)) (Main_DD(Self))
         
         Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
         Get psCurrentSourceFileName of ghoApplication to sFileName
