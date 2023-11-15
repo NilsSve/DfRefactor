@@ -79,8 +79,8 @@ Object oRefactorView is a cRefactorDbView
     Set Main_DD to oFunctions_DD
     Set Server to oFunctions_DD
                                     
-    // *** BPO Object ***
-    #Include oBPO.pkg
+    // *** MAIN Refactoring Business Process Object ***
+    #Include oRefactorBusinessProcess.pkg
                                     
     Object oMain_TabDialog is a dbTabDialog
         Set Size to 258 642
@@ -1090,7 +1090,7 @@ Register_Procedure RefreshSelectionUpdate
     Procedure RefactoreCode
         String[] asFolderNames
         String sFileFilter sPath sFileName sText sTotalTime sFolderName
-        Handle hoBPO
+        Handle hoRefactorBusinessProcess
         Boolean bOK bWorkspaceMode bEditorFunctions bExists
         Integer eResponse iErrors
         DateTime dtExecStart dtExecEnd
@@ -1130,11 +1130,12 @@ Register_Procedure RefreshSelectionUpdate
         Move 0 to LastErr
         Move (CurrentDateTime()) to dtExecStart
         
-        // *** Business Process where the calls to selected refactoring functions are made ***
-        Get phoBPO to hoBPO
-        Send DoProcess of hoBPO
+        // *** Main Refactoring process call ***
+        // *** Business process where calls to the selected refactoring functions are made ***
+        Get phoRefactorBusinessProcess to hoRefactorBusinessProcess
+        Send DoProcess of hoRefactorBusinessProcess
 
-        Get Error_Count of hoBPO to iErrors
+        Get Error_Count of hoRefactorBusinessProcess  to iErrors
         If (iErrors = 0) Begin
             Move (CurrentDateTime()) to dtExecEnd
             Move (dtExecEnd - dtExecStart) to tsTotalTime
