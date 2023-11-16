@@ -1,10 +1,10 @@
-Use cRefactorDbView.pkg
 Use Cursor.pkg
 Use dfLine.pkg
 Use cCJCommandBarSystem.pkg
 Use DFEnChk.pkg
 Use dfTabDlg.pkg
 
+Use cRefactorDbView.pkg
 Use cRDCDbCJGrid.pkg  
 Use cRDCDbCJGridColumn.pkg
 Use cRDCCJSelectionGrid.pkg
@@ -34,7 +34,9 @@ Object oImageList is a cImageList32
         Get AddImage "Folder.ico"          to Ico_Folders
         Get AddImage "FunctionLibrary.ico" to Ico_Functions
     End_Procedure
-End_Object
+End_Object                                 
+
+Register_Procedure RefreshSelectionUpdate
 
 Activate_View Activate_oRefactorView for oRefactorView
 Object oRefactorView is a cRefactorDbView
@@ -79,7 +81,7 @@ Object oRefactorView is a cRefactorDbView
     Set Main_DD to oFunctions_DD
     Set Server to oFunctions_DD
                                     
-    // *** MAIN Refactoring Business Process Object ***
+    // ToDo: *** MAIN Refactoring BPO ***
     #Include oRefactorBusinessProcess.pkg
                                     
     Object oMain_TabDialog is a dbTabDialog
@@ -107,8 +109,6 @@ Object oRefactorView is a cRefactorDbView
                 Set Border_Style to Border_None
                 Set peAnchors to anAll
                 Set piImageIndex to Ico_Functions
-
-Register_Procedure RefreshSelectionUpdate
 
                 Object oFunctionSelection_grd is a cRDCDbCJGrid
                     Set Size to 211 621
@@ -986,49 +986,6 @@ Register_Procedure RefreshSelectionUpdate
 
     End_Object
 
-//    Procedure InitializeDFRefactor Handle hoFolders Handle hoDD
-//        Send InitializeInterface of ghoRefactorFuncLib
-//        Send ResetLineCounters of hoDD
-//        Send CollectSettings hoFolders
-//    End_Procedure
-//
-//    // Collect all settings to one common struct to be passed amongst the main operating procedures.
-//    Procedure CollectSettings Handle hoFolders
-//        tRefactorSettings RefactorSettings                   
-//        String sPath sFileName 
-//        Boolean bWorkspaceMode
-//                                                                                
-//        If (hoFolders <> 0) Begin
-//            Get SelectedItems of hoFolders        to RefactorSettings.asFolderNames
-//        End
-//        Move (Trim(SysFile.FileExtensionFilter))  to RefactorSettings.sFileFilter
-//                                                
-//        Move SysFile.SelectedStandardFunctions    to RefactorSettings.iSelectedStandardFunctions
-//        Move SysFile.SelectedRemoveFunctions      to RefactorSettings.iSelectedRemoveFunctions
-//        Move SysFile.SelectedEditorFunctions      to RefactorSettings.iSelectedEditorFunctions
-//        Move SysFile.SelectedReportFunctions      to RefactorSettings.iSelectedReportFunctions
-//        Move SysFile.SelectedReportAllFunctions   to RefactorSettings.iSelectedReportAllFunctions
-//        Move SysFile.SelectedOtherFunctions       to RefactorSettings.iSelectedOtherFunctions
-//        Move SysFile.SelectedOtherAllFunctions    to RefactorSettings.iSelectedOtherAllFunctions
-//        
-//        // All functions that work on a line-by-line basis.
-//        Move (SysFile.SelectedStandardFunctions + SysFile.SelectedRemoveFunctions) ;
-//            to RefactorSettings.iSelectedLineByLineFunctions
-//        
-//        // All functions that are feed with a full source file as a string array:
-//        Move (SysFile.SelectedEditorFunctions + SysFile.SelectedReportFunctions + SysFile.SelectedOtherFunctions) ;
-//            to RefactorSettings.iSelectedFullFileFunctions
-//
-//        // All functions that are feed with a string array containing all selected files (including path):
-//        Move (SysFile.SelectedReportAllFunctions + SysFile.SelectedOtherAllFunctions) ;
-//            to RefactorSettings.iSelectedAllFilesFunctions
-//
-//        Move SysFile.bCountSourceLines            to RefactorSettings.bCountSourceLines
-//        Move SysFile.bEditorDropSelf              to RefactorSettings.bEditorDropSelf
-//
-//        Set pRefactorSettings of ghoRefactorFuncLib to RefactorSettings
-//    End_Procedure
-//
     // At least one action should have been selected, unless we're counting source lines.
     // Also checks that spinform values are correct.
     Function IsValidActions Returns Boolean
@@ -1056,14 +1013,6 @@ Register_Procedure RefreshSelectionUpdate
             Function_Return False
         End
 
-//        Get Minimum_Position of oMaxBlankLines_sf to iMinLines
-//        Get Maximum_Position of oMaxBlankLines_sf to iMaxLines
-//
-//        If (RefactorSettings.iMaxBlankLines < iMinLines or SysFile.MaxBlankLines > iMaxLines) Begin
-//            Send Info_Box ("The number of blank lines needs to be between" * String(iMinLines) * String("and") * String(iMaxLines))
-//            Move False to bOK
-//        End
- 
         Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
         If (bWorkspaceMode = True) Begin
             Move RefactorSettings.sFileFilter to sFileFilter
@@ -1114,7 +1063,7 @@ Register_Procedure RefreshSelectionUpdate
             Procedure_Return
         End
 
-        
+        // bWorkspaceMode = "All files in selected folders", else only a single file will be processed.
         Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
         Get psCurrentSourceFileName of ghoApplication to sFileName
         Get pRefactorSettings       of ghoRefactorFuncLib to RefactorSettings
@@ -1130,9 +1079,8 @@ Register_Procedure RefreshSelectionUpdate
         Move 0 to LastErr
         Move (CurrentDateTime()) to dtExecStart
         
-        // *** Main Refactoring process call ***
-        // *** Business process where calls to the selected refactoring functions are made ***
         Get phoRefactorBusinessProcess to hoRefactorBusinessProcess
+        // *** Call to Business process where the selected refactoring functions are executed ***
         Send DoProcess of hoRefactorBusinessProcess
 
         Get Error_Count of hoRefactorBusinessProcess  to iErrors
@@ -1152,13 +1100,13 @@ Register_Procedure RefreshSelectionUpdate
             End
         End
         Else Begin
-            Send Info_Box "The Process was unsuccessful." (psProduct(ghoApplication))
+            Send Info_Box "The process ended but with errors." (psProduct(ghoApplication))
             Send Popup of (oStatusLog_dg(Client_Id(phoMainPanel(ghoApplication))))
         End
 
     End_Procedure
 
-    // ToDo: *** Text Messages ***
+    // ToDo: *** Summaries ***
     //
     Function StartWarning Boolean bWorkspaceMode String sFileName Returns Integer
         Boolean bSaveBak

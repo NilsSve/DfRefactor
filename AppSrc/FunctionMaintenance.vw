@@ -154,7 +154,7 @@ Object oFunctionMaintenance_vw is a dbView
                     Entry_Item Functions.Parameter
                     Set Location to 167 112
                     Set Size to 12 132
-                    Set Label to "Optional Parameter"
+                    Set Label to "Default Optional Parameter"
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
                     Set psToolTip to "Optional parameter to be passed to the function, in addition to the source code line/file(s). Enter the default value here, that later can be changed by the user in the DFRefactor program's Function Selection grid."

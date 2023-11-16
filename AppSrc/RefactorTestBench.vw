@@ -469,7 +469,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     // Can be all or a selection of functions.
     Procedure RefactoreCode Boolean bUseConstraints
         String[] asLegacyCode asRefactoredCode asSourceFiles
-        String sLine sLegacyFileName sRefactoredFileName sFunctionName sParameter
+        String sLine sLegacyFileName sRefactoredFileName sFunctionName sParameter sPath
         Handle hoLegacyEditor hoRefactoredEditor ho
         Integer iSize iCount iTabSize iRetval iFunctionID eSplitMode
         Boolean bChanged bLoopFound bisCOMProcxy bWriteLine bOK bSave
@@ -613,9 +613,9 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
         // Save the refactored editor content before we call the type eOther_Function, 
         // as it reads the sRefactoredFileName file from disk.
-//        If (IsSameArray(asLegacyCode, asRefactoredCode) = False) Begin
-//            Send SaveFile of hoRefactoredEditor
-//        End
+        If (bSave = True) Begin
+            Send SaveFile of hoRefactoredEditor
+        End
 
         // *** Type: eOther_Function ***
         //          A source file as a String array is passed.
@@ -710,8 +710,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         // ***Type: eReport_FunctionAll ***
         //          Pass *all* source files with full pathing as a string array.
         //          Makes no source code changes
-        Move sLegacyFileName to asSourceFiles[0]
-        Move False to bSave
+        Move sLegacyFileName to asSourceFiles[0] 
+        Get ParseFolderName sLegacyFileName to RefactorSettings.asFolderNames[0]
         Constraint_Set eReport_FunctionAll Clear  
         Constrained_Clear eq FunctionsA by Index.4   
         Constrain FunctionsA.Type eq eReport_FunctionAll
@@ -732,16 +732,8 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End
             Constrained_Find Next
         Loop
+        // There should not be anything to save here, as it is only functions of type: Report - line-by-line
         
-        // After all refactoring; write changes back to the refactor editor
-        // and save changes.
-        If (IsSameArray(asLegacyCode, asRefactoredCode) = False) Begin
-            Get WriteStringArrayToDisk of hoRefactoredEditor asRefactoredCode to bOK
-            If (bOK = True) Begin
-                Send SaveFile of hoRefactoredEditor sRefactoredFileName
-            End
-        End
-
         Move (CurrentDateTime()) to dtEnd
         Set Value of (oRefactoredCode_Time_fm(Self)) to (dtEnd - dtStart)
         Set pbIsRefactoring of ghoApplication to False
@@ -749,6 +741,10 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Send Cursor_Ready of Cursor_Control
         // Re-enable timers:
         Send SuspendGUI of Desktop False
+
+        If (SysFile.iCountUnusedSourceFiles <> 0) Begin
+            Send DisplayUnusedSourceFilesDialog of (Client_Id(ghoCommandBars))
+        End
     End_Procedure
 
     Procedure Activating

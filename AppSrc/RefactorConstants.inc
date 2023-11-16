@@ -132,7 +132,6 @@ Struct tRefactorSettings
     //
     String  sFileFilter                 // File selection filter.
     String[] asFolderNames              // String array with full path to all selected folders.
-    Integer eDDOStyle
 #IFDEF IS$WIN64
     Integer iMissingAlignment1
 #ENDIF
