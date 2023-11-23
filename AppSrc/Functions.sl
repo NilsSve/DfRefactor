@@ -47,10 +47,17 @@ CD_Popup_Object oFunctions_sl is a dbModalPanel
             Set psCaption to "Function Name"
         End_Object 
 
-        Object oFunctions_Function_Description is a cDbCJGridColumn
-            Entry_Item Functions.Function_Description
+//        Object oFunctions_Function_Description is a cDbCJGridColumn
+//            Entry_Item Functions.Function_Description
+//            Set piWidth to 200
+//            Set psCaption to "Function Description"
+//        End_Object
+
+        Object oFunctions_Type is a cDbCJGridColumn
+            Entry_Item Functions.Type
             Set piWidth to 200
-            Set psCaption to "Function Description"
+            Set psCaption to "Type"
+            Set pbComboButton to True
         End_Object
 
     End_Object 

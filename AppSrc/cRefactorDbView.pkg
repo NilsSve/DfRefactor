@@ -21,55 +21,24 @@
 // Nils 2018-08-21
 // Various source code refactoring functions/procedures
 // for the DFRefactor project.
-// Was lifted from the CleanMarkers.vw  business process object (oRefactorBusinessProcess)
-// to here to make it easier to replace/add to this logic.
-// Wil 2018-09-03
-// Moved code into a dbView subclass instead.
 //
 Use Dfclient.pkg
-Use StatFLog.pkg
 Use RefactorConstants.inc
-Use cRegex.pkg
-Use ScintillaParameters.dg
-//Use cSysFileDataDictionary.dd      
-//Use cFunctionsDataDictionary.dd
-//Use cFolderSelHeaADataDictionary.dd
+
 Declare_Datafile SysFile
 Declare_Datafile Functions
 Declare_Datafile FolderSelHeaA
-
-#IFNDEF ghoStatusLog
-Global_Variable Handle ghoStatusLog
-#ENDIF
-
-Class cRefactorStatusLog is a StatusDbLog
-    Procedure Construct_Object
-        Forward Send Construct_Object
-        Move Self to ghoStatusLog
-        Open StatLog
-    End_Procedure                    
-    
-    Procedure OnNewRecord
-        String sFunctionName  
-        Integer iDateFormat
-        Move (Trim(FunctionsA.Function_Name)) to sFunctionName
-        If (sFunctionName = "") Begin
-            Move (Trim(Functions.Function_Name)) to sFunctionName
-        End
-        Move sFunctionName to StatLog.FunctionName
-        Get_Attribute DF_DATE_FORMAT to iDateFormat
-        Set_Attribute DF_DATE_FORMAT to DF_DATE_MILITARY
-        Move (CurrentDateTime()) to StatLog.Time
-        Set_Attribute DF_DATE_FORMAT to iDateFormat
-    End_Procedure
-    
-End_Class
+Register_Function SelectedItems Returns Integer
+Register_Function SelectedFunctions Returns Integer
+Register_Procedure ResetLineCounters           
+Register_Procedure DisplayUnusedSourceFilesDialog
 
 Class cRefactorDbView is a dbView
 
     Procedure Construct_Object
         Forward Send Construct_Object
 
+        Set phoRefactorView of ghoApplication to Self
         Set Border_Style to Border_Thick
         Set pbAutoActivate to True
 
@@ -78,13 +47,8 @@ Class cRefactorDbView is a dbView
         
         // Object handles:
         Property Handle private.phoEditor
-        Property Handle phoRefactorBusinessProcess 
+        Property Handle phoRefactorEngine 
         
-        Object Status_Log is a cRefactorStatusLog
-            Move Self to ghoStatusLog
-        End_Object
-
-        Set pbAutoActivate to True
         Set Verify_Save_msg to (RefFunc(No_Confirmation))
 
         On_Key Key_Ctrl+Key_S Send Request_Save
@@ -103,53 +67,6 @@ Class cRefactorDbView is a dbView
     End_Function
         
     Procedure RefactorCheckboxChanged Boolean bState Handle hObject Boolean bReportFunction
-    End_Procedure
-
-    Procedure InitializeDFRefactor Handle hoFolders Handle hoDD
-        Send InitializeInterface of ghoRefactorFuncLib
-        Send ResetLineCounters of hoDD
-        Send CollectSettings hoFolders
-    End_Procedure
-
-    // Collect all settings to one common struct to be passed amongst the main operating procedures.
-    Procedure CollectSettings Handle hoFolders
-        tRefactorSettings RefactorSettings                   
-        String sPath 
-        Boolean bWorkspaceMode
-                                                                                
-        If (hoFolders <> 0) Begin
-            Get SelectedItems of hoFolders        to RefactorSettings.asFolderNames
-        End
-        Move (Trim(SysFile.FileExtensionFilter))  to RefactorSettings.sFileFilter
-                                                
-        Move SysFile.SelectedStandardFunctions    to RefactorSettings.iSelectedStandardFunctions
-        Move SysFile.SelectedRemoveFunctions      to RefactorSettings.iSelectedRemoveFunctions
-        Move SysFile.SelectedEditorFunctions      to RefactorSettings.iSelectedEditorFunctions
-        Move SysFile.SelectedReportFunctions      to RefactorSettings.iSelectedReportFunctions
-        Move SysFile.SelectedReportAllFunctions   to RefactorSettings.iSelectedReportAllFunctions
-        Move SysFile.SelectedOtherFunctions       to RefactorSettings.iSelectedOtherFunctions
-        Move SysFile.SelectedOtherAllFunctions    to RefactorSettings.iSelectedOtherAllFunctions
-        
-        // All functions that work on a line-by-line basis.
-        Move (SysFile.SelectedStandardFunctions + SysFile.SelectedRemoveFunctions) ;
-            to RefactorSettings.iSelectedLineByLineFunctions
-        
-        // All functions that are feed with a full source file as a string array:
-        Move (SysFile.SelectedEditorFunctions + SysFile.SelectedReportFunctions + SysFile.SelectedOtherFunctions) ;
-            to RefactorSettings.iSelectedFullFileFunctions
-
-        // All functions that are feed with a string array containing all selected files (including path):
-        Move (SysFile.SelectedReportAllFunctions + SysFile.SelectedOtherAllFunctions) ;
-            to RefactorSettings.iSelectedAllFilesFunctions
-
-        Move (RefactorSettings.iSelectedLineByLineFunctions + ;
-              RefactorSettings.iSelectedFullFileFunctions + ;
-              RefactorSettings.iSelectedAllFilesFunctions) to RefactorSettings.iSelectedFunctionTotal
-              
-        Move SysFile.bCountSourceLines            to RefactorSettings.bCountSourceLines
-        Move SysFile.bEditorDropSelf              to RefactorSettings.bEditorDropSelf
-
-        Set pRefactorSettings of ghoRefactorFuncLib to RefactorSettings
     End_Procedure
 
     Procedure WaitForFileToGetWritten String sFile
@@ -188,151 +105,6 @@ Class cRefactorDbView is a dbView
         Close_Input channel iCh
         Send Seq_Release_Channel iCh
     End_Procedure
-
-    Function ReadFileToStringArray String sSourceFile Returns String[]
-        Boolean bLastLineBreak bEndOfFile bFirstLine
-        Integer iLine iChannel iFileSize
-        String sLine sLastLine sLineBreak sFileNameOnly
-        String[] asSourceFile
-
-        Move 0 to iLine
-        Move True  to bFirstLine
-        Move False to bEndOfFile
-        Move False to bLastLineBreak
-        Move ""    to sLastLine
-
-        Get Seq_New_Channel to iChannel
-        If (iChannel = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
-            Error "No Channel Available for Process: Function 'ReadFileToStringArray'"
-            Function_Return asSourceFile
-        End
-
-        Get ParseFileName sSourceFile to sFileNameOnly
-        Set Message_Text of ghoStatusPanel to ("Reading:" * String(sFileNameOnly))
-        Get vWin32_APIFileSize sSourceFile to iFileSize
-        Move (ResizeArray(asSourceFile, iFileSize)) to asSourceFile
-
-        // Need to use binary read mode if we want to preserve tab characters and not have automatic tab replacement
-        // filemode options don't seem to work as documented, not sure why.
-        // Direct_Input channel iInChannel ("binary: "+"cr: 13: "+"eof: 26: "+sSourceFile)
-        // Direct_Input channel iInChannel ("binary: "+"cr: 13:"+"eof: 26:"+sSourceFile)
-        Direct_Input channel iChannel ("binary:" + sSourceFile)
-
-        While (bEndOfFile = False)
-            Readln channel iChannel sLine
-            Move (SeqEof) to bEndOfFile
-            If (bEndOfFile and Length(sLastLine) > 0) Begin
-                If (Right(sLastLine, 1) = CS_CR) Begin
-                    Move True to bLastLineBreak
-                End
-            End
-            Move sLine to sLastLine
-            If (bFirstLine = True) Begin
-                Move False to bFirstLine
-                // Determine the linebreak character to use for the file based on what is in the first line
-                // The readline automatically reads Until LF, but does not report LF back in the string
-                If (Length(sLine) > 0 and Right(sLine, 1) = CS_CR) Begin
-                    Move CS_CRLF to sLineBreak
-                End
-                Else Begin
-                    Move CS_LF to sLineBreak
-                End
-                Set psLineBreak to sLineBreak
-            End
-            If (sLineBreak = CS_CRLF) Begin
-                If (Right(sLine, 1) = CS_CR) Begin
-                    Move (Left(sLine, Length(sLine) - 1)) to sLine
-                End
-            End
-            If (bEndOfFile = False) Begin
-                Move sLine to asSourceFile[iLine]
-                Increment iLine
-            End
-        Loop
-
-        Move (ResizeArray(asSourceFile, iLine)) to asSourceFile
-        Set pbLastLineBreak to bLastLineBreak
-        Close_Input channel iChannel
-        Send Seq_Release_Channel iChannel
-
-        Function_Return asSourceFile
-    End_Function
-
-    Function WriteStringArrayToFile String[] asNewSourceFile String sSourceFile Returns Boolean
-        Boolean bLastLineBreak
-        Integer iOutChannel iSize iCount
-        String  sLineBreak
-
-        Move False to Err
-        Get psLineBreak     to sLineBreak
-        Get pbLastLineBreak to bLastLineBreak
-        Get Seq_New_Channel to iOutChannel
-        If (iOutChannel = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
-            Error "No Channel Available for Process: Procedure 'WriteArrayToSourceFile'"
-            Function_Return False
-        End
-
-        Direct_Output channel iOutChannel sSourceFile
-        Move (SizeOfArray(asNewSourceFile)) to iSize
-        Decrement iSize   
-        If (iSize >= 0) Begin
-            For iCount from 0 to (iSize-1)
-                Write channel iOutChannel asNewSourceFile[iCount] sLineBreak
-            Loop
-            If (bLastLineBreak=True) Begin
-                Write channel iOutChannel asNewSourceFile[iSize] sLineBreak
-            End
-            Else Begin
-                Write channel iOutChannel asNewSourceFile[iSize]
-            End
-        End
-
-        Close_Output channel iOutChannel
-        Send Seq_Release_Channel iOutChannel
-        Function_Return (Err = False)
-    End_Function  
-    
-    Function TimeSpanToString TimeSpan tsTime Returns String
-        Integer iDays iHours iMinutes iSeconds iMilliseconds
-        String  sTime
-
-        Move "" to sTime
-        Move (SpanDays(tsTime))    to iDays
-        Move (SpanHours(tsTime))   to iHours
-        Move (SpanMinutes(tsTime)) to iMinutes
-        Move (SpanSeconds(tsTime)) to iSeconds
-        Move (SpanMilliSeconds(tsTime)) to iMilliSeconds
-        If (iDays > 0) Begin   // Don't show days if it is zero
-            Move (String(iDays) + ":") to sTime
-        End
-        If (iHours < 10) Begin
-            Move (sTime+"0") to sTime
-        End
-        Move (sTime + String(iHours) + ":") to sTime
-        If (iMinutes < 10) Begin
-            Move (sTime + "0") to sTime
-        End
-        Move (sTime + String(iMinutes) + ":") to sTime
-        If (iSeconds < 10) Begin
-            Move (sTime + "0") to sTime
-        End
-        Move (sTime + String(iSeconds) + "." + String(iMilliSeconds)) to sTime
-
-        Function_Return sTime
-    End_Function
-
-    // ToDo: Should probably be done by the function in the library.
-//    Procedure RemoveReportLogFiles String sPath
-//        Boolean bOK
-//        tRefactorSettings RefactorSettings
-//
-//        Get pRefactorSettings of ghoRefactorFuncLib to RefactorSettings
-//        Get vFolderFormat sPath to sPath
-//        Send Info_Box "To be done! (RemoveReportLogFiles)"
-//        If (RefactorSettings.bUnusedSourceFiles = True) Begin
-//            Get vDeleteFile (sPath + CS_BackupFolder + CS_DirSeparator + CS_UnusedSourceLogFile) to bOK
-//        End
-//    End_Procedure
 
     Function pbShouldSave Returns Boolean
         Boolean bChanged bIsReadOnly
@@ -430,40 +202,4 @@ Class cRefactorDbView is a dbView
        Set Windows_Override_State to True    
     End_Procedure
         
-    Procedure ScaleFont Integer iDirection    // from control + mouse wheel in container object
-        Integer iSize jSize kSize iSup iInf iDef
-        Handle hoPaintManager hoFont
-        Variant vFont
-        
-        Move 3 to iInf      //max size
-        Move 18 to iSup     //min size
-        Move 8 to iDef      //default
-        Boolean blimite
-        Get phoReportPaintManager to hoPaintManager
-        If (IsComObjectCreated (hoPaintManager) = False) Begin
-            Procedure_Return
-        End
-        Get Create (RefClass(cComStdFont)) to hoFont
-        Get ComTextFont of hoPaintManager to vFont
-        Set pvComObject of hoFont to vFont
-        If (iDirection = 0) Begin
-            Set ComSize of hoFont to iDef
-        End
-        Else Begin
-           Get ComSize of hoFont to iSize
-           Move iSize to jSize
-           Repeat
-                Move (If(iDirection > 0, jSize + 1, jSize - 1)) to jSize
-                Move (If(iDirection > 0, If(jSize > iSup, True, False), If(jSize < iInf, True, False))) to blimite
-                If (not(blimite)) Begin       
-                   Set ComSize of hoFont to jSize
-                   Get ComSize of hoFont to kSize
-                End
-            Until (iSize <> kSize or blimite)
-        End
-        Send Destroy to hoFont 
-        Send ComRedraw  
-        Send WriteString of ghoApplication CS_Settings CS_GridFontSize iSize
-    End_Procedure 
-
 End_Class

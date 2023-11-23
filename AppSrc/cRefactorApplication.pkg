@@ -17,7 +17,15 @@
 // LIABILITY, WHETHER IN an ACTION of CONTRACT, TORT or OTHERWISE, ARISING from,
 // OUT of or IN CONNECTION WITH THE SOFTWARE or THE Use OR OTHER DEALINGS IN THE
 // SOFTWARE.
-
+//
+// *** Important about this class: *********************************************** 
+//     - It creates a cRefactorFuncLib object and moves the object ID to the
+//     global variable ghoRefactorFuncLib, for easy access .
+//     - It also creates a cRefactorEngine object to the ghoRefactorEngine handle
+//     See: End_Construct_Object
+//     - It creates a cFilesystem object for file manipulation functions
+// *******************************************************************************
+//
 Use cApplication.pkg
 Use cCJCommandBarSystem.pkg
 Use cIniFile.pkg
@@ -25,8 +33,8 @@ Use gFormatNumbers.pkg
 Use vwin32fh.pkg          
 Use cFilesystem.pkg
 Use cSCWsGrid.pkg
-Use DeleteWorkspaceHistory.dg    
 Use cRefactorFuncLib.pkg
+Use cRefactorEngine.pkg
 
 #IFNDEF ghoFileSystem
     Global_Variable Integer ghoFileSystem
@@ -34,6 +42,9 @@ Use cRefactorFuncLib.pkg
 #IFNDEF ghoRefactorFuncLib
     Global_Variable Handle ghoRefactorFuncLib
 #ENDIF
+
+Register_Procedure ActivateLogFileDialog
+Register_Procedure ShowOtherLogFilesDialog
 
 Class cRefactorApplication is a cApplication
     
@@ -117,7 +128,8 @@ Class cRefactorApplication is a cApplication
         Open FunctionsA
         Set private.psStarZenSourceExplorer to (Trim(SysFile.PathStarZen)) 
         Set piBackupDaysOverwriteCycle      to SysFile.iBackupDaysOverwriteCycle
-
+        
+        // These needs to be here; can't be in OnWorkspaceOpened (to early)
         // *** MAIN FUNCTION LIBRARY ***
         // We only need one copy of it per application.
         If (ghoRefactorFuncLib = 0) Begin
@@ -126,8 +138,13 @@ Class cRefactorApplication is a cApplication
             End_Object
         End
         
-    End_Procedure
-
+        If (ghoRefactorEngine = 0) Begin
+            Object oRefactorEngine is a cRefactorEngine
+                Move Self to ghoRefactorEngine
+            End_Object
+        End
+    End_Procedure  
+    
     Function SourceFilePath Returns String
         String sFileName sPath
 
@@ -320,12 +337,12 @@ Class cRefactorApplication is a cApplication
         Function_Return sWorkspaceFileName
     End_Function
 
-    Procedure ToggleWorkspaceAndFileMode
+    Procedure ToggleWorkspaceMode
     End_Procedure
 
     Procedure Set pbWorkspaceMode Boolean bState
         Set private.pbWorkspaceMode to bState
-        Send ToggleWorkspaceAndFileMode
+        Send ToggleWorkspaceMode
     End_Procedure
 
     Function pbWorkspaceMode Returns Boolean
@@ -353,7 +370,7 @@ Class cRefactorApplication is a cApplication
         Integer iRetval iPos
 
         Move "" to sPath
-        Get psHomePath            to sHomePath
+        Get psHomePath to sHomePath
         If (sFile <> "") Begin
         Get ParseFolderName sFile to sPath
         Move (Replace(Lowercase(sHomePath), Lowercase(sPath), "")) to sPath // Only want the subfolder structure
@@ -569,22 +586,30 @@ Class cRefactorApplication is a cApplication
         Function_Return asAllSourceFolders
     End_Function
 
-    Function AllSourceFiles String[] asSelectedFolders String sFileFilter Returns tsSearchResult[]
+    Function AllSourceFiles String[] asFolders String sFileFilter Returns tRefactorFiles
         Boolean bIsFileInFilter
-        String sSourceFolder sFileMask sFileName
-        String[] asAllSourceFolders
-        tsSearchResult[] asSourceFilesEmpty asSourceFiles asSourceFilesTotal
+        String sFolderName sFileMask sFileName
+        tsSearchResult[] asSourceFiles asSourceFilesTotal
         Integer iFolder iFolders iFile iFiles
+        tRefactorFiles FileData
+        
+        Move (SizeOfArray(asFolders)) to iFolders  
+        // There is a special function (SingleSourceFile) for a single file,
+        // but in case this function is called make it work the same.
+        If (iFolder = 0) Begin
+            Get psCurrentSourceFileName to sFileName
+            Get ParseFolderName sFileName to FileData.asFolders[0]
+            Get ParseFileName   sFileName to FileData.asFileNames[0]
+            Move                sFileName to FileData.asFullFileNames[0] 
+            Function_Return FileData
+        End
 
-        Move asSelectedFolders to asAllSourceFolders
-        Move (SizeOfArray(asAllSourceFolders)) to iFolders
         Decrement iFolders
-
         // Folder loop:
         For iFolder from 0 to iFolders
-            Move asAllSourceFolders[iFolder] to sSourceFolder
-            Get vFolderFormat sSourceFolder to sSourceFolder
-            Move (sSourceFolder + "*.*") to sFileMask
+            Move asFolders[iFolder] to sFolderName
+            Get vFolderFormat sFolderName to sFolderName
+            Move (sFolderName + "*.*") to sFileMask
 
             Get FileSearch of ghoFileSystem sFileMask DIRMODE_FILES_ONLY False to asSourceFiles
             Move (SizeOfArray(asSourceFiles)) to iFiles
@@ -595,8 +620,9 @@ Class cRefactorApplication is a cApplication
                 Move asSourceFiles[iFile].sFilename to sFileName
                 Get IsFileInFilter sFileName sFileFilter to bIsFileInFilter
                 If (bIsFileInFilter = True) Begin
-                    // Store the path in the sAlternateFileName struct item
-                    Move sSourceFolder to asSourceFiles[iFile].sAlternateFileName
+                    Move sFolderName to FileData.asFolders[iFile]
+                    Move sFileName   to FileData.asFileNames[iFile] 
+                    Move (sFolderName + String(sFileName)) to FileData.asFullFileNames[iFile]
                 End
                 Else Begin
                     Move (RemoveFromArray(asSourceFiles, iFile)) to asSourceFiles
@@ -604,10 +630,48 @@ Class cRefactorApplication is a cApplication
                     Decrement iFiles
                 End
             Loop
-            Move (AppendArray(asSourceFilesTotal, asSourceFiles)) to asSourceFilesTotal
         Loop
 
-        Function_Return asSourceFilesTotal
+        Function_Return FileData
+    End_Function    
+    
+    Function SingleSourceFile String sFullFileName Returns tRefactorFiles
+        String sFolder sFileName
+        Integer iItem
+        tRefactorFiles RefactorFiles
+        
+        Move 0 to iItem
+        Get ParseFolderName sFullFileName to sFolder
+        Get ParseFileName   sFullFileName to sFileName
+        
+        Move sFolder       to RefactorFiles.asFolders[iItem]
+        Move sFileName     to RefactorFiles.asFileNames[iItem]
+        Move sFullFileName to RefactorFiles.asFullFileNames[iItem]
+        
+        Function_Return RefactorFiles
+    End_Function  
+    
+    // Pass a handle to a folders object *or* a sFileName (for single file mode)
+    Function CollectFileData Handle hoFolders String sFileName Returns tRefactorFiles
+        tRefactorFiles RefactorFiles RefactorFilesEmpty
+        String[] asFolders
+        
+        If (hoFolders = 0 and sFileName <> "") Begin
+            Get SingleSourceFile sFileName to RefactorFiles
+        End                                                
+        Else If (hoFolders <> 0) Begin
+            If (SysFile.FileExtensionFilter = "") Begin
+                Send UserError "SysFile.FileExtensionFilter is blank! (Function CollectAllFiles)"
+                Function_Return RefactorFilesEmpty
+            End
+            Get SelectedItems of hoFolders to asFolders
+            Get AllSourceFiles asFolders SysFile.FileExtensionFilter to RefactorFiles
+        End
+        Else Begin
+            Send UserError "Wrong parameters send to function CollectAllFiles"
+        End
+    
+        Function_Return RefactorFiles    
     End_Function
 
     Function IsFileInFilter String sFileName String sFileFilter Returns Boolean
@@ -628,20 +692,20 @@ Class cRefactorApplication is a cApplication
         Function_Return (iSearchIndex <> -1)
     End_Function
 
-    Function RecursiveSearchFolders String sSourceFolder String[] asNoFolderList Returns String[]
+    Function RecursiveSearchFolders String sFolderName String[] asNoFolderList Returns String[]
         Boolean bFound
         Integer iCount iSize iItem
         String sMask sPrevFolderName sHomePath
         tsSearchResult[] asSearchResult
         String[] saSearchFolders
 
-        If (not(sSourceFolder contains ":")) Begin
+        If (not(sFolderName contains ":")) Begin
             Get psHomePath to sHomePath
             Get vFolderFormat sHomePath to sHomePath
-            Move (sHomePath + sSourceFolder) to sSourceFolder
+            Move (sHomePath + sFolderName) to sFolderName
         End
-        Get vFolderFormat sSourceFolder to sSourceFolder
-        Move (sSourceFolder + "*") to sMask
+        Get vFolderFormat sFolderName to sFolderName
+        Move (sFolderName + "*") to sMask
 
         Move 0 to iItem
 
@@ -663,7 +727,7 @@ Class cRefactorApplication is a cApplication
             Move asSearchResult[iCount].sFilename to sPrevFolderName
         Loop
 
-        Move sSourceFolder to saSearchFolders[SizeOfArray(saSearchFolders)]
+        Move sFolderName to saSearchFolders[SizeOfArray(saSearchFolders)]
         // Sort the folder array to get the top one first.
         Move (SortArray(saSearchFolders)) to saSearchFolders
 
@@ -853,5 +917,31 @@ Class cRefactorApplication is a cApplication
 
         Function_Return bOK
     End_Function
+    
+    // Event for updating file name display.
+    Procedure OnFileNameUpdate String sFileName
+    End_Procedure
+    
+    Procedure ShowLogFile
+        String sPath sLogFile
+        Boolean bLogFileExists
 
+        Get psHomePath of ghoApplication to sPath
+        Get vFolderFormat sPath to sPath
+        Move (sPath + CS_BackupFolder + CS_DirSeparator + CS_SummaryLogfileName) to sLogFile
+        Get vFilePathExists sLogFile to bLogFileExists
+        If (bLogFileExists = False) Begin
+            Send Info_Box "Can't find the log file"
+            Procedure_Return
+        End
+
+        Send ActivateLogFileDialog of (Client_Id(phoMainPanel(Self))) sLogFile
+    End_Procedure
+
+    Procedure ShowOtherLogFiles
+        String[] asOtherLogFiles
+        Get pasOtherLogFiles of ghoRefactorFuncLib to asOtherLogFiles 
+        Send ShowOtherLogFilesDialog of (Client_Id(ghoCommandBars)) asOtherLogFiles
+    End_Procedure
+    
 End_Class

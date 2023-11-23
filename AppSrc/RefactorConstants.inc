@@ -70,12 +70,12 @@ End_Enum_List
 
 Define CS_All_Functions             for "No Constrains - Show All"
 Define CS_Standard_Function         for "Standard - Line-by-line"
-Define CS_Remove_Function           for "Remove   - Line-by-line"
-Define CS_Editor_Function           for "Editor   - One File"
-Define CS_Report_Function           for "Report   - One File"   // Makes no source changes.
-Define CS_Report_FunctionAll        for "Report   - All Files"  // Makes no source changes.
-Define CS_Other_Function            for "Other    - One File"
-Define CS_Other_FunctionAll         for "Other    - All Files"
+Define CS_Remove_Function           for "Remove - Line-by-line"
+Define CS_Editor_Function           for "Editor - One File"
+Define CS_Report_Function           for "Report - One File"   // Makes no source changes.
+Define CS_Report_FunctionAll        for "Report - All Files"  // Makes no source changes.
+Define CS_Other_Function            for "Other - One File"
+Define CS_Other_FunctionAll         for "Other - All Files"
 
 Enum_List
     Define cx_RegKeyAlreadyExist
@@ -108,9 +108,13 @@ Struct tRefactorCheckbox
     Boolean bChecked
     Boolean bReportFunction
     Integer iRefactorFunction
-#IFDEF IS$WIN64
     Integer iMissingAlignment1
-#ENDIF
+End_Struct
+
+Struct tRefactorFiles
+    String[] asFolders                  // Path and folder name
+    String[] asFileNames                // File name only
+    String[] asFullFileNames            // Folder + file name
 End_Struct
 
 Struct tRefactorSettings
@@ -128,13 +132,11 @@ Struct tRefactorSettings
     Integer iSelectedFunctionTotal      // Number of selections
     //
     Boolean bCountSourceLines           // If we should only count source lines (all other functions will be ignored).
-    Boolean bEditorDropSelf             // Scintilla Editor special function that pops up a dialog before each change(!).
+    Boolean bReadOnly                   // Run through the selected refactor functions but *do not* make changes to any source file.
+    Boolean bWorkspaceMode              // If true all files that matches the selected file filter and selected folders will be affected by refactoring functions.
     //
     String  sFileFilter                 // File selection filter.
-    String[] asFolderNames              // String array with full path to all selected folders.
-#IFDEF IS$WIN64
-    Integer iMissingAlignment1
-#ENDIF
+    tRefactorFiles FileData             // Contains three arrays; Paths, FileNames & Path+FileNames
 End_Struct
 
 Struct tParseObject
@@ -323,7 +325,7 @@ Define CS_OpenFileStdFilter         for "All files *.*|*.*|Programs *.src|*.src|
 Define CS_SourceCodeFilters         for "DataFlex Source *.src;*.vw;*.sl;*.dg;*.rv;*.pkg;*.cl;*.wo;*.dd;*.bp;*.inc;*.nui;*.utl;*.mn;*.mnu|*.src;*.vw;*.sl;*.dg;*.rv;*.pkg;*.cl;*.wo;*.dd;*.bp;*.inc;*.nui;*.utl;*.mn;*.mnu"
 Define CS_SourceFileFilters         for "Programs|*.src|Views|*.vw|Dialogs|*.dg|Data Dictionaries|*.dd|Include files|*.inc|Report Views|*.rv|Selection Lists|*.sl|Packages|*.pkg|Business Processes|*.bp|Menus|*.mn|Header Files|*.h|Sture's Files|*.nui;*.utl|Any file|*.*"
 Define CS_CreateBackupFiles         for "CreateBackupFiles"
-Define CS_SummaryLogfileName        for "DFRefactoringLogFile.txt"
+Define CS_SummaryLogfileName        for "DFRefactorLogFile.txt"
 
 // Careful, these cannot end on a semicolumn as you will introduce variable type equal to ""
 Define CS_VarTypes                  for "INDICATOR;STRING;INTEGER;NUMBER;DATE;DATETIME;BOOLEAN;HANDLE;REAL;VARIANT;TIMESPAN;ROWID;DECIMAL;BIGINT;REAL;UCHAR;ADDRESS;CHAR;CURRENCY;DWORD;FLOAT;POINTER;SHORT;TIME;UBIGINT;USHORT;WSTRING;LONGPTR;ULONGPTR;UINTEGER"

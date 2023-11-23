@@ -20,5 +20,5 @@ iCountRemoveBlankLines
 iCountUnusedSourceFiles
 iCountUnusedLocals
 Next_FolderSel_ID
-bConstrainFunctionCalls
+bReadOnly
 iBackupDaysOverwriteCycle

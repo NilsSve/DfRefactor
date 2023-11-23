@@ -15,18 +15,18 @@ Use vwin32fh.pkg
 Use cSysFileDataDictionary.dd
 Use cFunctionsDataDictionary.dd  
 Use cFunctionsADataDictionary.dd
+Use cRefactorEngine.pkg
 
 Activate_View Activate_oRefactorTestBench for oRefactorTestBench
 Object oRefactorTestBench is a cRefactorDbView
     Set Border_Style to Border_Thick
-    Set Size to 282 886
+    Set Size to 282 929
     Set Location to 2 7
     Set Label to "Test Bench"
     Set pbAutoActivate to True
     Set Maximize_Icon to True 
     Set pbAcceptDropFiles to True
-    Set phoTestView of ghoApplication to Self
-
+    
     Object oSysFile_DD is a cSysFileDataDictionary
         // We don't care about data-loss in this view.
         // Note that it won't help to try to set the Data_Loss & Exit_Loss
@@ -44,7 +44,6 @@ Object oRefactorTestBench is a cRefactorDbView
         // A Request_Save is send automatically when a new refactoring process starts.
         Procedure Request_Save
             Send Request_Save of oSysFile_DD
-//            Forward Send Request_Save
         End_Procedure
     End_Object     
     
@@ -175,7 +174,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Label_Justification_Mode to JMode_Right
                 Set Form_Datatype to 0 
                 Set Label_FontWeight to fw_Bold
-                Set Label_Row_Offset to 2
+                Set Label_Row_Offset to 1
                 Set FontWeight to fw_Bold
                 Set peAnchors to anBottomRight
                 
@@ -232,7 +231,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
     
             Object oRefactoredCode_edt is a cScintillaRefactorEditor
-                Set Size to 176 377
+                Set Size to 176 418
                 Set Location to 17 6
                 Delegate Set phoEditor to (Self)
                 Set phoEditorRefactored of ghoApplication to (Self)
@@ -254,6 +253,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Value to "0"
                 Set Form_Datatype to 0 
                 Set FontWeight to fw_Bold
+                Set Label_Row_Offset to 1
                 Set peAnchors to anBottomLeft
                 
                 Procedure Set Value Integer iItem String sValue
@@ -268,26 +268,26 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End_Object
 
             Object oRefactoredCode_Time_fm is a Form
-                Set Size to 10 33
-                Set Location to 197 72
+                Set Size to 10 55
+                Set Location to 197 90
                 Set Enabled_State to False
-                Set Label to "Elapsed:"
+                Set Label to "Elapsed Time:"
                 Set Label_Col_Offset to 0    
                 Set Label_Justification_Mode to JMode_Right
                 Set Form_Datatype to Mask_Clock_Window
                 Set Label_FontWeight to fw_Bold
-                Set Label_Row_Offset to 2
                 Set FontWeight to fw_Bold
+                Set Label_Row_Offset to 1
                 Set peAnchors to anBottomLeft
             End_Object
 
             Object oAction_grp is a cRDCDbHeaderGroup
-                Set Size to 66 374
+                Set Size to 66 418
                 Set Location to 210 6
                 Set Label to "Refactor Code"
                 Set psImage to "DFRefactor.ico"
-                Set psNote to "Select actions"
-                Set psToolTip to "Click buttons to perform various refactoring actions."
+                Set psNote to "Call selected functions"
+                Set psToolTip to "Click the 'Start Refactoring!' button to execute selected refactoring functions."
                 Set pbUseLargeFontHeight to True
                 Set peAnchors to anBottomLeftRight
 
@@ -295,7 +295,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Entry_Item SysFile.SelectedFunctionTotal
                     Set Server to oSysFile_DD
                     Set Size to 13 13
-                    Set Location to 30 141
+                    Set Location to 36 188
                     Set Label_Justification_Mode to JMode_Right
                     Set Label to "Number of Selected Functions:"
                     Set psToolTip to "Total number of functions selected."
@@ -305,72 +305,91 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set Label_FontWeight to fw_Bold
                     Set FontWeight to fw_Bold 
                 End_Object
-    
-                Object oUseConstraints_cb is a dbCheckbox
-                    Entry_Item SysFile.bConstrainFunctionCalls
-                    Set Server to oSysFile_DD
-                    Set Location to 44 40
-                    Set Size to 8 109
-                    Set Label to "Use selected Functions only"
-                    Set peAnchors to anBottomLeft
-                    Set psToolTip to "If checked only Functions selected for the 'Function List' tab-page will be called."
-                    Set phoUseConstraints_cb of ghoApplication to Self
-                    
-                    Procedure OnChange
-                        Boolean bState  
-                        Integer iFunctions    
 
-                        Get Checked_State to bState           
-                        If (bState = False) Begin                                
-                            Get_Attribute DF_FILE_RECORDS_USED of Functions.File_Number to iFunctions
+                Object oSysFile_CountSourceLines_cb is a dbCheckBox
+                    Entry_Item SysFile.bCountSourceLines
+                    Set Server to oSysFile_DD
+                    Set Location to 13 203
+                    Set Size to 8 109
+                    Set Label to "Count Source Lines (only)"   
+//                    Set FontWeight to fw_Bold
+//                    Set peAnchors to anBottomRight 
+                    Set psToolTip to (String("This function will tell you how large your workspace is by counting the number of 'real' source lines for all selected folders and file extensions.") + String(CS_CR) + String("Note: It will skip blank or comments lines, and it will not count files generated by the Studio from COM components.") + String(CS_CR) + String(CS_CR) + String("This function needs be run in solitude, all other functions will be ignored."))
+                    
+                    // Weird voodoo(1) for db-controls connected to system files.
+                    // They simply does not work the way you would suppose (as they do with other tables)
+                    // This is a work-around for having the control auto-save on a change.  
+                    // We need this as the "Start refactoring" button relies on properly updated 
+                    // values of the Sysfile.
+                    // The problem is that the checked_state and DDO field value is "out of sync".
+                    // This fixes it:
+                    Procedure OnChange
+                        Boolean bSelected
+                        Get Checked_State to bSelected
+                        Set Field_Changed_Value of oSysFile_DD Field SysFile.bCountSourceLines to bSelected
+                        Send Request_Save  of oSysFile_DD 
+                    End_Procedure    
+                    
+                    Procedure Refresh Integer iNotifyMode
+                        Boolean bSelected
+                        Integer iSelectedFunctions
+                        
+                        Forward Send Refresh iNotifyMode
+                        Get Checked_State to bSelected
+                        If (bSelected = True) Begin
+                            Move 1 to iSelectedFunctions
                         End
                         Else Begin
-                            Move SysFile.SelectedFunctionTotal to iFunctions
+                            Get Field_Current_Value of oSysFile_DD Field SysFile.SelectedFunctionTotal to iSelectedFunctions
                         End
-                        Set Value of oNoOfSelectedFunctions2_fm to iFunctions
-                        Send Request_Save
-                    End_Procedure 
-                    
+                        Set Value of oNoOfSelectedFunctions2_fm to iSelectedFunctions
+                    End_Procedure
+        
+                End_Object
+    
+                Object oReadOnly_cb is a dbCheckbox
+                    Entry_Item SysFile.bReadOnly
+                    Set Server to oSysFile_DD
+                    Set Location to 13 303
+                    Set Size to 8 109
+                    Set Label to "Read Only"
+                    Set peAnchors to anBottomLeft
+                    Set psToolTip to "If checked, no changes to the source code will be made - only shows statistics."
                 End_Object
     
                 Object oRefactor_btn is a cRDCButton
                     Set Size to 30 98
-                    Set Location to 27 156
+                    Set Location to 27 203
                     Set Label to "Start &Refactoring!"
-                    Set peAnchors to anBottomLeft
                     Set Default_State to True
+                    Set psToolTip to "Refactors the legacy code from the left editor, then saves it to disk. (Ctrl+F5)"
                     // Note: We use Form_FontWeight instead of FontWeight to _not_ make the object larger
                     // because of the bold font.
                     Set Form_FontWeight to FW_BOLD
                     Set psImage to "Start.ico"
-                    Set psToolTip to "Refactors the legacy code from the left editor, then saves it to disk. (Ctrl+F5)"
+                    Set piImageMarginLeft to 7
                     Set piImageSize to 32
+                    Set peAnchors to anBottomLeft
                     
                     Procedure OnClick   
-                        String sPath sErrFile                               
-                        Integer iRetval
-                        Boolean bUseConstraints
-                        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
-                        Get vFolderFormat sPath to sPath
-                        Move CS_TestProgram to sErrFile
-                        Move (Replace(".src", sErrFile, ".err")) to sErrFile
-                        Get vDeleteFile (sPath + sErrFile) to iRetval
-                        Get Checked_State of (phoUseConstraints_cb(ghoApplication)) to bUseConstraints
-                        Delegate Send RefactoreCode bUseConstraints
+//                        Boolean bUseConstraints
+//                        Get Checked_State of (phoUseConstraints_cb(ghoApplication)) to bUseConstraints
+//                        Delegate Send RefactoreCode bUseConstraints
+                        Delegate Send RefactoreCode
                     End_Procedure 
                     
                     Function IsEnabled Returns Boolean   
-                        Boolean bUseConstraints
-                        Integer iFunctions
-                        Get Checked_State of (phoUseConstraints_cb(ghoApplication)) to bUseConstraints
-                        Function_Return (SysFile.SelectedFunctionTotal > 0 or bUseConstraints = False)
+//                        Integer iFunctions
+//                        Boolean bUseConstraints
+//                        Get Checked_State of (phoUseConstraints_cb(ghoApplication)) to bUseConstraints
+                        Function_Return (SysFile.SelectedFunctionTotal > 0 or SysFile.bCountSourceLines = True)
                     End_Function
                 
                 End_Object
 
                 Object oCompileRefactoredCode_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 29 256
+                    Set Location to 29 303
                     Set Label to "Compile"
                     Set peAnchors to anBottomLeft
                     Set psImage to "CompileProject.ico"
@@ -390,7 +409,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
                 Object oShowCompileErrors_btn is a cRDCButton
                     Set Size to 14 53
-                    Set Location to 43 256
+                    Set Location to 43 303
                     Set Label to "&Errors"
                     Set peAnchors to anBottomLeft
                     Set psImage to "CompileErrors.ico"
@@ -425,7 +444,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
                 Object oStartCompareProgram_btn is a cRDCButton
                     Set Size to 23 53
-                    Set Location to 32 316
+                    Set Location to 32 363
                     Set Label to "Co&mpare Code"
                     Set peAnchors to anBottomLeft
                     Set psImage to "Compare.ico"
@@ -455,298 +474,71 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
     Procedure OnSetFocus
         Set Value of (oLegacyCodeFilename_fm(Self))     to (psCodeFile(phoEditorLegacy(ghoApplication)))
-        Set Value of (oRefactoredCodeFilename_fm(Self)) to (psCodeFile(phoEditorRefactored(ghoApplication)))
-        Send OnChange of oUseConstraints_cb 
+        Set Value of (oRefactoredCodeFilename_fm(Self)) to (psCodeFile(phoEditorRefactored(ghoApplication))) 
+//        Set Value of oNoOfSelectedFunctions2_fm         to SysFile.SelectedFunctionTotal
+        Send Request_Save_No_Clear of oSysFile_DD
     End_Procedure
-
-
-    // *** MAIN REFACTORING ROUTINE ***  
-    Procedure MAIN_REFACORING_ROUTINE
-        // Dummy procedure for the Studio's Code Explorer
-    End_Procedure
+    
     //
-    // Testing of refactor functions.
-    // Can be all or a selection of functions.
-    Procedure RefactoreCode Boolean bUseConstraints
-        String[] asLegacyCode asRefactoredCode asSourceFiles
-        String sLine sLegacyFileName sRefactoredFileName sFunctionName sParameter sPath
-        Handle hoLegacyEditor hoRefactoredEditor ho
-        Integer iSize iCount iTabSize iRetval iFunctionID eSplitMode
-        Boolean bChanged bLoopFound bisCOMProcxy bWriteLine bOK bSave
-        DateTime dtStart dtEnd
-        tRefactorSettings RefactorSettings
+    // ToDo: *** MAIN FUNCTION CALL ***
+    //
+    Procedure RefactoreCode //Boolean bUseConstraints
+        String[] asLegacyCode
+        String sLegacyFileName sRefactoredFileName
+        Handle hoLegacyEditor hoRefactoredEditor
+        Integer iRetval
+        Boolean bOK
+        tRefactorFiles RefactorFiles
         
-        Get Checked_State of oUseConstraints_cb to bOK
-        Send InitializeDFRefactor 0 (Main_DD(Self))
-        Get pRefactorSettings of ghoRefactorFuncLib to RefactorSettings
-        If (RefactorSettings.iSelectedFunctionTotal = 0 and bOK = True) Begin
-            Send Info_Box "You need to select at least one function first. Or unselect the checkbox 'Use selected Functions only'"
-            Procedure_Return
-        End
+//        Get Checked_State of oUseConstraints_cb to bOK   
+        Move False to Err
+        Send Request_Save_No_Clear of oSysFile_DD
+        Get DeleteCompileErrorsFile to iRetval
+        If (iRetval <> 0) Begin
+            Get YesNo_Box "Could not delete the compiler's error file. Continue?" to iRetval
+            If (iRetval <> MBR_Yes) Begin
+                Procedure_Return
+            End
+        End 
         
-        Move (CurrentDateTime()) to dtStart
-        Set Value of (oRefactoredCode_Time_fm(Self)) to ""
-        Move False to bLoopFound
-//        Send Activate_oRefactorTestBench
+        Set Value of oRefactoredCode_Time_fm to ""
+        Get phoEditorLegacy of ghoApplication to hoLegacyEditor
+        Get psCodeFile      of hoLegacyEditor to sLegacyFileName
+        Set psCurrentSourceFileName of ghoApplication to sLegacyFileName
         
-        Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
-        Get psCodeFile          of hoLegacyEditor     to sLegacyFileName
-        Get EditorDataAsStringArray of hoLegacyEditor to asLegacyCode 
-        Move (SizeOfArray(asLegacyCode)) to iSize
-        Decrement iSize  
-        If (iSize = 0) Begin
-            Send Info_Box "No Legacy code found."
-            Procedure_Return
-        End
-        Get _IsDataFlexCOMProxyClassesFile of ghoRefactorFuncLib sLegacyFileName to bisCOMProcxy
-        If (bisCOMProcxy = True) Begin
-            Send Info_Box "This file is marked as a Studio COM Proxy classes auto generated file and will _not_ be refactored!"
-            Procedure_Return
-        End
-
-        Send UpdateStatusBar of hoLegacyEditor "" True
-        // Start by making the two arrays and editors the same:
+        // Start by making the two string arrays and editors the same:
         Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor        
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
-        Get WriteDataToEditor   of hoRefactoredEditor    asLegacyCode to bOK //asRefactoredCode to bOK
-        
-        Move False to bSave
-        // Suspend all timers while we work.
-        Send SuspendGUI of Desktop True
-        Set pbIsRefactoring of ghoApplication to True   
-        Send Cursor_Wait of Cursor_Control
-
-        If (RefactorSettings.iSelectedLineByLineFunctions > 0 or bUseConstraints = False) Begin
-            Send UpdateStatusBar of hoLegacyEditor "Executing Line-by-Line type functions..." True
-            For iCount from 0 to iSize
-                // Need this to show "Number of lines:" changes
-                Send PumpMsgQueue of Desktop   
-                // Read next source line
-                Move asLegacyCode[iCount] to sLine
-                Send InitializeTokenizer of ghoRefactorFuncLib sLine
-                
-                // *** Type: eRemove_Function ***
-                //          Line-by-line
-                // These are functions that may potentially remove the line (Sets bWriteLine to False),
-                // so we execute them first.
-                Move True to bWriteLine
-                Constraint_Set eRemove_Function Clear
-                Constrained_Clear eq FunctionsA by Index.4   
-                Constrain FunctionsA.Type eq eRemove_Function
-                If (bUseConstraints = True) Begin
-                    Constrain FunctionsA.Selected eq True
-                    Constrained_Find First FunctionsA by Index.4
-                End
-                Else Begin
-                    Constrained_Find First FunctionsA by Index.5
-                End
-                While (Found)                          
-                    Move (Trim(FunctionsA.Parameter)) to sParameter
-                    Move (Trim(FunctionsA.Function_Name)) to sFunctionName
-                    Move (Eval("get_" - (sFunctionName))) to iFunctionID
-                    Get iFunctionID of ghoRefactorFuncLib (&sLine) sParameter to bChanged
-                    If (bChanged = True) Begin
-                        Move False to bWriteLine 
-                        Move True to bSave
-                    End
-                    Constrained_Find Next
-                Loop
-                
-                // *** Type: eStandard_Function ***
-                //          Line-by-line
-                If (bWriteLine = True) Begin
-                    Constraint_Set eStandard_Function Clear
-                    Constrained_Clear eq FunctionsA by Index.4
-                    Constrain FunctionsA.Type eq eStandard_Function
-                    If (bUseConstraints = True) Begin
-                        Constrain FunctionsA.Selected eq True
-                        Constrained_Find First FunctionsA by Index.4
-                    End
-                    Else Begin
-                        Constrained_Find First FunctionsA by Index.5
-                    End
-                    While (Found)
-                        Move (Trim(FunctionsA.Parameter)) to sParameter
-                        Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
-                        Move (Eval("get_" - (sFunctionName))) to iFunctionID
-                        Get iFunctionID of ghoRefactorFuncLib (&sLine) sParameter to bChanged
-                        If (bChanged = True) Begin
-                            Move True to bSave
-                        End
-                        Constrained_Find Next
-                    Loop
-                    // Save to refactored string array
-                    Move sLine to asRefactoredCode[iCount]
-                End
-            Loop  
-        End
-         
-        // *** Type eEditor_Function ***
-        Send UpdateStatusBar of hoRefactoredEditor "Executing Editor functions..." True  
-        If (bSave = True) Begin
-            Get WriteDataToEditor of hoRefactoredEditor asRefactoredCode to bOK
-        End
-                
-        Move False to bSave
-        Constraint_Set eEditor_Function Clear  
-        Constrained_Clear eq FunctionsA by Index.4   
-        Constrain FunctionsA.Type eq eEditor_Function
-        If (bUseConstraints = True) Begin
-            Constrain FunctionsA.Selected eq True
-            Constrained_Find First FunctionsA by Index.4
-        End
-        Else Begin
-            Constrained_Find First FunctionsA by Index.5
-        End
-        While (Found)
-            Move (Trim(FunctionsA.Parameter)) to sParameter
-            Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
-            If (Lowercase(sFunctionName) <> Lowercase(CS_EditorDropSelf)) Begin
-                Move (Eval("get_" - (sFunctionName))) to iFunctionID
-                Get iFunctionID of ghoRefactorFuncLib (&asRefactoredCode) sParameter to bOK
-                If (bOK = True) Begin
-                    Move True to bSave
-                End
-            End
-            Constrained_Find Next
-        Loop
-        
-        // Save the refactored editor content before we call the type eOther_Function, 
-        // as it reads the sRefactoredFileName file from disk.
-        If (bSave = True) Begin
-            Send SaveFile of hoRefactoredEditor
+        Get WriteDataToEditor   of hoRefactoredEditor    asLegacyCode to bOK 
+        Get CollectFileData of ghoApplication 0 sLegacyFileName to RefactorFiles
+        If (Err = True) Begin
+            Procedure_Return
         End
 
-        // *** Type: eOther_Function ***
-        //          A source file as a String array is passed.
-        Send UpdateStatusBar of hoRefactoredEditor "Executing eOther_Function type..." True
-        Move False to bSave
-        Constraint_Set eOther_Function Clear  
-        Constrained_Clear eq FunctionsA by Index.4   
-        Constrain FunctionsA.Type eq eOther_Function
-        If (bUseConstraints = True) Begin
-            Constrain FunctionsA.Selected eq True
-            Constrained_Find First FunctionsA by Index.4
-        End
-        Else Begin
-            Constrained_Find First FunctionsA by Index.5
-        End
-        While (Found)
-            Move (Trim(FunctionsA.Parameter)) to sParameter
-            Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
-            Move (Eval("get_" - (sFunctionName))) to iFunctionID
-            Get iFunctionID of ghoRefactorFuncLib (&asRefactoredCode) sParameter to bOK
-            If (bOK = True) Begin
-                Move True to bSave
-            End
-            Constrained_Find Next
-        Loop 
-        
-        // Save the refactored editor content before we call the type eOther_FunctionAll, 
-        // as it reads the sRefactoredFileName file from disk.
-        If (bSave = True) Begin
-            Get WriteDataToEditor of hoRefactoredEditor asRefactoredCode to bOK
-            Send SaveFile of hoRefactoredEditor
-        End
+        // Start the Engine!
+        Send StartRefactoringEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor (Main_DD(Self)) False
 
-        // *** Type: eOther_FunctionAll ***
-        //          All source files with full pathing is passed to these functions as a string array.
-        //          In this test-bench we only fill the file array with one file.
-        Move sRefactoredFileName to asSourceFiles[0]                             
-        
-        Move False to bSave
-        Constraint_Set eOther_FunctionAll Clear  
-        Constrained_Clear eq FunctionsA by Index.4   
-        Constrain FunctionsA.Type eq eOther_FunctionAll
-        If (bUseConstraints = True) Begin
-            Constrain FunctionsA.Selected eq True
-            Constrained_Find First FunctionsA by Index.4
-        End
-        Else Begin
-            Constrained_Find First FunctionsA by Index.5
-        End
-        While (Found)
-            Move (Trim(FunctionsA.Parameter)) to sParameter
-            Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
-            Move (Eval("get_" - (sFunctionName))) to iFunctionID
-            Get iFunctionID of ghoRefactorFuncLib (&asSourceFiles) sParameter to bOK
-            If (bOK = True) Begin
-                Move True to bSave
-            End
-            Constrained_Find Next
-        Loop
-        
-        If (bSave = True) Begin
-            Send LoadFile of hoRefactoredEditor sRefactoredFileName
-        End
-        
-        // *** Type: eReport_Function ***
-        //           One source file as a string array is passed.
-        //           Makes no source code changes
-        Move False to bSave
-        Constraint_Set eReport_Function Clear  
-        Constrained_Clear eq FunctionsA by Index.4   
-        Constrain FunctionsA.Type eq eReport_Function
-        If (bUseConstraints = True) Begin
-            Constrain FunctionsA.Selected eq True
-            Constrained_Find First FunctionsA by Index.4
-        End
-        Else Begin
-            Constrained_Find First FunctionsA by Index.5
-        End
-        While (Found)
-            Move (Trim(FunctionsA.Parameter)) to sParameter
-            Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
-            Move (Eval("get_" - (sFunctionName))) to iFunctionID
-            Get iFunctionID of ghoRefactorFuncLib (&asRefactoredCode) sParameter to bOK
-            If (bOK = True) Begin
-                Move True to bSave
-            End            
-            Constrained_Find Next
-        Loop
-        // There should not be anything to save here, as it is only functions of type: Report - line-by-line
-        
-        
-        // ***Type: eReport_FunctionAll ***
-        //          Pass *all* source files with full pathing as a string array.
-        //          Makes no source code changes
-        Move sLegacyFileName to asSourceFiles[0] 
-        Get ParseFolderName sLegacyFileName to RefactorSettings.asFolderNames[0]
-        Constraint_Set eReport_FunctionAll Clear  
-        Constrained_Clear eq FunctionsA by Index.4   
-        Constrain FunctionsA.Type eq eReport_FunctionAll
-        If (bUseConstraints = True) Begin
-            Constrain FunctionsA.Selected eq True
-            Constrained_Find First FunctionsA by Index.4
-        End
-        Else Begin
-            Constrained_Find First FunctionsA by Index.5
-        End
-        While (Found)
-            Move (Trim(FunctionsA.Parameter)) to sParameter
-            Move (Trim(FunctionsA.Function_Name)) to sFunctionName 
-            Move (Eval("get_" - (sFunctionName))) to iFunctionID
-            Get iFunctionID of ghoRefactorFuncLib (&asSourceFiles) sParameter to bOK
-            If (bOK = True) Begin
-                Move True to bSave
-            End
-            Constrained_Find Next
-        Loop
-        // There should not be anything to save here, as it is only functions of type: Report - line-by-line
-        
-        Move (CurrentDateTime()) to dtEnd
-        Set Value of (oRefactoredCode_Time_fm(Self)) to (dtEnd - dtStart)
-        Set pbIsRefactoring of ghoApplication to False
-        Send UpdateStatusBar of hoRefactoredEditor "Ready!" True
-        Send Cursor_Ready of Cursor_Control
-        // Re-enable timers:
-        Send SuspendGUI of Desktop False
-
-        If (SysFile.iCountUnusedSourceFiles <> 0) Begin
-            Send DisplayUnusedSourceFilesDialog of (Client_Id(ghoCommandBars))
-        End
+        Set Value of oRefactoredCode_Time_fm to (psTotalTime(ghoRefactorEngine))
     End_Procedure
 
+    // Delete the .err file if exists.
+    Function DeleteCompileErrorsFile Returns Integer
+        String sPath sErrFile
+        Integer iRetval  
+        Boolean bExists
+        
+        Move 0 to iRetval
+        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
+        Get vFolderFormat sPath to sPath
+        Move CS_TestProgram to sErrFile
+        Move (Replace(".src", sErrFile, ".err")) to sErrFile
+        File_Exist  (sPath + sErrFile) bExists
+        If (bExists = True) Begin
+            Get vDeleteFile (sPath + sErrFile) to iRetval
+        End            
+        Function_Return iRetval
+    End_Function
+        
     Procedure Activating
         Send Request_Assign of oSysFile_DD
         Send Refind_Records of oSysFile_DD

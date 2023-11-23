@@ -4,7 +4,6 @@ Use DFUnit\Reporting\ReporterManager.pkg
 Use DFUnit\Reporting\Reporters\UIListReporter.pkg
 Use cRDCButtonDPI.pkg
 Use cScintillaRefactorEditor.pkg
-Use Windows.pkg
 Use cRefactorFuncLib.pkg
 
 Activate_View Activate_DFUnitTestRunner_vw for DFUnitTestRunner_vw

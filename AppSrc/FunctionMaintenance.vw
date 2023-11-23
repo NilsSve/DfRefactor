@@ -16,8 +16,8 @@ Use cFunctionsDataDictionary.dd
 ACTIVATE_VIEW Activate_oFunctionMaintenance_vw FOR oFunctionMaintenance_vw
 Object oFunctionMaintenance_vw is a dbView
     Set Location to 5 5
-    Set Size to 265 483
-    Set piMaxSize to 273 602
+    Set Size to 308 483
+    Set piMaxSize to 336 602
     Set Label to "Function Maintenance"
     Set Auto_Clear_DEO_State to False
     Set pbAutoActivate to True
@@ -38,7 +38,7 @@ Object oFunctionMaintenance_vw is a dbView
 //        Object oScrollingClientArea is a cDbScrollingClientArea
 
             Object oStandardFunctions_grp is a cRDCDbHeaderGroup
-                Set Size to 243 471
+                Set Size to 289 471
                 Set Location to 17 6
                 Set piMinSize to 134 248
                 Set Label to "Function Maintenance"             
@@ -89,10 +89,10 @@ Object oFunctionMaintenance_vw is a dbView
                 End_Object 
             
                 Object oFunctionsFunction_Summary is a cRDCDbForm
-                    Entry_Item Functions.Function_Summary
+                    Entry_Item Functions.SummaryText
                     Set Size to 12 321
                     Set Location to 124 112
-                    Set Label to "Function Summary"
+                    Set Label to "Summary Text"
                     Set Label_Justification_mode to jMode_right
                     Set Label_Col_Offset to 2
                     Set Label_Row_Offset to 0
@@ -118,8 +118,8 @@ Object oFunctionMaintenance_vw is a dbView
                                       "Report All - All source files as a string array with full path.")
                 End_Object 
 
-                Object oFunctions_bPrivateFunction is a cRDCDbCheckBox
-                    Entry_Item Functions.bPrivateFunction
+                Object oFunctions_bPrivate is a cRDCDbCheckBox
+                    Entry_Item Functions.bPrivate
                     Set Location to 142 267
                     Set Size to 10 60
                     Set Label to "Private Function"
@@ -135,7 +135,7 @@ Object oFunctionMaintenance_vw is a dbView
 
                 Object oFunctions_bHasParameter is a cRDCDbCheckBox
                     Entry_Item Functions.bHasParameter
-                    Set Location to 155 112
+                    Set Location to 177 112
                     Set Size to 10 60
                     Set Label to "bHasParameter" 
                     Set psToolTip to "If an extra parameter in addition to the source line/file needs to be passed to the function you can enter details about it by selecting this checkbox." 
@@ -152,7 +152,7 @@ Object oFunctionMaintenance_vw is a dbView
 
                 Object oFunctions_Parameter is a dbForm
                     Entry_Item Functions.Parameter
-                    Set Location to 167 112
+                    Set Location to 189 112
                     Set Size to 12 132
                     Set Label to "Default Optional Parameter"
                     Set Label_Col_Offset to 2
@@ -162,9 +162,9 @@ Object oFunctionMaintenance_vw is a dbView
 
                 Object oFunctions_ParameterValidation is a dbForm
                     Entry_Item Functions.ParameterValidation
-                    Set Location to 181 111
+                    Set Location to 203 111
                     Set Size to 12 321
-                    Set Label to "Validation"
+                    Set Label to "Simple Validation"
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
                     Set psToolTip to "Comma separated list of valid parameter values. When a parameter gets changed by the user in the DFRefactor function selection grid, it will be validated against this list."
@@ -172,8 +172,8 @@ Object oFunctionMaintenance_vw is a dbView
 
                 Object oFunctions_ParameterHelp is a cDbTextEdit
                     Entry_Item Functions.ParameterHelp
-                    Set Location to 195 112
-                    Set Size to 35 321
+                    Set Location to 217 111
+                    Set Size to 62 321
                     Set Label to "Parameter Help"
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
@@ -181,11 +181,10 @@ Object oFunctionMaintenance_vw is a dbView
                 End_Object
 
                 Object oCheckAllFunctions_btn is a Button
-                    Set Size to 14 101
-                    Set Location to 41 332
+                    Set Size to 14 77
+                    Set Location to 41 354
                     Set Label to "Check all functions"  
                     Set psToolTip to "Makes a call to all functions that has been added to the database. If e.g. a spelling error of the function name has been made, an error message will be shown."
-//                    Set peAnchors to anTopRight
                 
                     Procedure OnClick
                         Integer iFunctionID iRetval

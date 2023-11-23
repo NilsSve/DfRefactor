@@ -36,57 +36,6 @@ Object oEditorView_vw is a cRefactorDbView
         Set phoEditor of ghoApplication to (Self) 
         Property Boolean piInSetFocus False
 
-        Function RefactorSourceFileInEditor  String[] ByRef asSourceFile Returns Boolean
-            Integer iFunctionID
-            Boolean bChanged bOK
-            String sFunctionName sParameter 
-            String[] asSourceFileNew 
-                                                                  
-            Move False to Err
-            Move 0 to LastErr
-            Move False to bChanged
-            
-            Send UpdateStatusBar "Updating source code in editor..." False
-            Get WriteDataToEditor asSourceFile to bOK
-            Send Activate
-            
-            Constraint_Set eEditor_Function Clear  
-            Constrained_Clear eq FunctionsA by Index.4
-            Constrain FunctionsA.Selected eq True
-            Constrain FunctionsA.Type eq eEditor_Function
-            Constrained_Find First FunctionsA by Index.4
-            
-            While (Found = True)
-                Move (Trim(FunctionsA.Parameter)) to sParameter
-                Move (Lowercase(Trim(FunctionsA.Function_Name))) to sFunctionName 
-                Move (Eval("get_" - (sFunctionName))) to iFunctionID             
-                If (sFunctionName = CS_EditorDropSelf) Begin
-                    Send Stop_StatusPanel of ghoStatusPanel
-                End
-                Get iFunctionID of ghoRefactorFuncLib asSourceFile sParameter to bChanged
-                If (sFunctionName = CS_EditorDropSelf) Begin
-                    Send Start_StatusPanel of ghoStatusPanel
-                End
-                If (bChanged = True) Begin                        
-                    Reread FunctionsA
-                        Add 1 to FunctionsA.Count  
-                        SaveRecord FunctionsA
-                    Unlock
-                End
-                Constrained_Find Next
-            Loop
-
-            Get EditorDataAsStringArray to asSourceFileNew
-            Move (not(IsSameArray(asSourceFileNew, asSourceFile))) to bChanged
-            If (bChanged = True) Begin
-                Move asSourceFileNew to asSourceFile
-            End
-            
-            // To not get an "Editor change" data loss message when exiting program.
-            Set Changed_State to False
-            Function_Return bChanged
-        End_Function
-
         // We con't care about potential data loss here.
         Function pbShouldSave Returns Boolean
             Function_Return False
@@ -122,43 +71,44 @@ Object oEditorView_vw is a cRefactorDbView
         On_Key Key_Ctrl+Key_S   Send Request_Save
     End_Object
 
+    // Done in the Scintilla edtior.
     // Allow a .sws file, source file or folder to be dropped on the view:
-    Procedure OnFileDropped String sFilename Boolean bLast
-        String sFileExt sSWSFile
-        Boolean bFile bFolder bSWSFile
-        Handle hoEditor
-
-        Get phoEditor of ghoApplication to hoEditor
-        Forward Send OnFileDropped sFilename bLast
-
-        // Try to find out if a file or a folder name
-        // was dropped on the view:
-        If (bLast = True) Begin
-            Get ParseFileExtension sFilename to sFileExt
-            Move (Lowercase(sFileExt)) to sFileExt
-            Move (sFileExt = "")    to bFolder
-            Move (sFileExt = "sws") to bSWSFile
-            Move (bSWSFile = False and bFolder = False) to bFile
-            If (bFile = True) Begin
-                Get psSWSFile of ghoApplication to sSWSFile
-                If (sSWSFile = "") Begin
-                    Send Info_Box "You need to select a workspace first."
-                    Procedure_Return
-                End
-                Send UpdateSourceFileNameDisplay of ghoApplication sFileName
-                Send LoadFile of hoEditor sFilename
-                Send Activate_oEditorView_vw
-                Set pbWorkspaceMode of ghoApplication to False
-            End
-            Else Begin
-                Send UpdateWorkspaceSelectorDisplay of ghoApplication sFilename
-                Set pbWorkspaceMode of ghoApplication to True
-            End
-        End
-        Else Begin
-            Send Info_Box "Only one file can be dropped on the view. The last file will be used."
-        End
-    End_Procedure
+//    Procedure OnFileDropped String sFilename Boolean bLast
+//        String sFileExt sSWSFile
+//        Boolean bFile bFolder bSWSFile
+//        Handle hoEditor
+//
+//        Get phoEditor of ghoApplication to hoEditor
+//        Forward Send OnFileDropped sFilename bLast
+//
+//        // Try to find out if a file or a folder name
+//        // was dropped on the view:
+//        If (bLast = True) Begin
+//            Get ParseFileExtension sFilename to sFileExt
+//            Move (Lowercase(sFileExt)) to sFileExt
+//            Move (sFileExt = "")    to bFolder
+//            Move (sFileExt = "sws") to bSWSFile
+//            Move (bSWSFile = False and bFolder = False) to bFile
+//            If (bFile = True) Begin
+//                Get psSWSFile of ghoApplication to sSWSFile
+//                If (sSWSFile = "") Begin
+//                    Send Info_Box "You need to select a workspace first."
+//                    Procedure_Return
+//                End
+//                Send OnFileNameUpdate of ghoApplication sFileName
+//                Send LoadFile of hoEditor sFilename
+//                Send Activate_oEditorView_vw
+//                Set pbWorkspaceMode of ghoApplication to False
+//            End
+//            Else Begin
+//                Send UpdateWorkspaceSelectorDisplay of ghoApplication sFilename
+//                Set pbWorkspaceMode of ghoApplication to True
+//            End
+//        End
+//        Else Begin
+//            Send Info_Box "Only one file can be dropped on the view. The last file will be used."
+//        End
+//    End_Procedure
 
     Procedure OnSetFocus
         Set piActiveView of ghoApplication to CI_CodeIndenter Self
@@ -180,7 +130,7 @@ Object oEditorView_vw is a cRefactorDbView
 
         Get psCurrentSourceFileName of ghoApplication to sSourceFilename
         If (sSourceFilename <> "") Begin
-            Send UpdateSourceFileNameDisplay of ghoApplication sSourceFilename
+            Send OnFileNameUpdate of ghoApplication sSourceFilename
             Send Top_of_Panel
         End
 
