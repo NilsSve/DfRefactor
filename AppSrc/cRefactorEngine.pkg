@@ -6,6 +6,8 @@ Use cRefactorStatusLog.pkg
 Use cRefactorDbView.pkg
 Use cRefactorFuncLib.pkg
 
+Use cFunctionsDataDictionary.dd
+
 Global_Variable Handle ghoRefactorEngine
 
 Declare_Datafile SysFile
@@ -51,13 +53,15 @@ Class cRefactorEngine is a BusinessProcess
     End_Procedure
 
     // Collect all settings to one common struct to be passed amongst the main operating procedures.
-    Procedure CollectSettings tRefactorFiles RefactorFiles
+    Function CollectSettings tRefactorFiles RefactorFiles Returns tRefactorSettings
         tRefactorSettings RefactorSettings     
         String sPath sFullFileName sFileFilter
         String[] asFolders
         
         Move RefactorFiles                       to RefactorSettings.FileData
-        Set psCurrentSourceFileName              to RefactorSettings.FileData.asFullFileNames[0]
+        Set psCurrentSourceFileName              to RefactorSettings.FileData.asFullFileNames[0] 
+        Move SysFile.FileExtensionFilter         to RefactorSettings.sFileFilter
+        Move SysFile.SelectedFunctionTotal       to RefactorSettings.iSelectedFunctionTotal
         Move SysFile.SelectedStandardFunctions   to RefactorSettings.iSelectedStandardFunctions
         Move SysFile.SelectedRemoveFunctions     to RefactorSettings.iSelectedRemoveFunctions
         Move SysFile.SelectedEditorFunctions     to RefactorSettings.iSelectedEditorFunctions
@@ -78,9 +82,6 @@ Class cRefactorEngine is a BusinessProcess
         Move (SysFile.SelectedReportAllFunctions + SysFile.SelectedOtherAllFunctions) ;
             to RefactorSettings.iSelectedAllFilesFunctions
 
-        Move (RefactorSettings.iSelectedLineByLineFunctions + ;
-              RefactorSettings.iSelectedFullFileFunctions + ;
-              RefactorSettings.iSelectedAllFilesFunctions) to RefactorSettings.iSelectedFunctionTotal
               
         Move SysFile.bCountSourceLines          to RefactorSettings.bCountSourceLines
         Move SysFile.bReadOnly                  to RefactorSettings.bReadOnly 
@@ -88,7 +89,8 @@ Class cRefactorEngine is a BusinessProcess
 
         Set pRefactorSettings                       to RefactorSettings
         Set pRefactorSettings of ghoRefactorFuncLib to RefactorSettings
-    End_Procedure
+        Function_Return RefactorSettings
+    End_Function
 
     // Initializes the refactoring engine and make validations of the setup.
     Function InitializeEngine tRefactorFiles RefactorFiles Returns Boolean
@@ -98,11 +100,10 @@ Class cRefactorEngine is a BusinessProcess
 
         // bWorkspaceMode = "All files in selected folders", else only a single file will be processed.
         Send InitializeFuncLib of ghoRefactorFuncLib
-        Send ResetLineCounters of (phoDD(Self))
+        Send ResetFunctionsCounters of (phoDD(Self))
 
-        // The CollectSettings message also sets the property pRefactorSettings
-        Send CollectSettings RefactorFiles
-        Get pRefactorSettings to RefactorSettings
+        // The CollectSettings message also sets the class property pRefactorSettings
+        Get CollectSettings RefactorFiles to RefactorSettings
         Get IsValidActions RefactorSettings to bOk
         If (bOk = False) Begin
             Function_Return False
@@ -127,23 +128,25 @@ Class cRefactorEngine is a BusinessProcess
     // Parameters: A struct array with all source code folders & files.
     //             a handle to a Scintilla editor object (for eEditor_Function type functions)
     //             a boolean that indicates the mode (All files (WorkspaceMode = True), else Single file)
-    Procedure StartRefactoringEngine tRefactorFiles RefactorFiles Handle hoEditor Handle hoDD
+    Procedure StartRefactoringEngine tRefactorFiles RefactorFiles Handle hoEditor 
         Boolean bOK 
-        String sFileName
-        Integer eResponse
+        Integer eResponse                                                         
         Handle hoView hoStatusBarID
         tRefactorSettings RefactorSettings 
+        Handle hoDD
         
+        Get Create (RefClass(cFunctionsDataDictionary)) to hoDD
+        Set phoDD to hoDD
         // A little bit silly but it is how the error logging system works:
         Move "StartRefactoringEngine" to FunctionsA.Function_Name   
         Get StatusBar_Id of (phoMainPanel(ghoApplication)) to hoStatusBarID
         Set StatusBar_Id  to hoStatusBarID
-        Set phoDD      to hoDD
         Set phoEditor  to hoEditor
         
         // Initializes the engine and makes validations.
         Get InitializeEngine RefactorFiles to bOK
         If (bOK = False) Begin
+            Send Destroy of (phoDD(Self))
             Procedure_Return
         End
 
@@ -153,6 +156,7 @@ Class cRefactorEngine is a BusinessProcess
         If (RefactorSettings.bCountSourceLines = False) Begin
             Get StartWarning RefactorSettings (psCurrentSourceFileName(Self)) to eResponse
             If (eResponse <> MBR_Yes) Begin
+                Send Destroy of (phoDD(Self))
                 Procedure_Return
             End
         End
@@ -161,46 +165,77 @@ Class cRefactorEngine is a BusinessProcess
         Send DoProcess
     End_Procedure
     
-    // Do *not* call this, instead call StartRefactoringEngine. 
-    // Called from OnProcess.
-    // This is were the actual refactoring takes place.        
+    // Do *not* call this message! Instead call StartRefactoringEngine. 
+    //
+    // This is called by OnProcess.
+    // This is were the actual refactoring takes place in a business process.
     {Visibility = Private}
     Procedure RunRefactoringEngine
-        String[] asFolders asFiles asFilesOrg asCode asCodeOrg  
-        String sFileFilter sPath sFileName sText sFolderName sFileShort sLine
+        tRefactorSettings RefactorSettings  
+        String sText
         Handle hoEditor
-        Boolean bOK bEditorFunctions bExists bWriteLine bChanged bIsStudioGenerated bStop
-        Integer eResponse iErrors iFile iSize iFolders iNoOfLines iTotNoOfLines iTotNoOfFiles 
-        tRefactorSettings RefactorSettings 
         DateTime dtExecStart
+        Integer eResponse
     
-        // A bit silly but it is how the error logging system works:
+        // A bit silly but it is how our error logging system works:
         Move "RunRefactoringEngine" to FunctionsA.Function_Name
         Move False to Err
         Move 0 to LastErr     
+        
+        Get phoEditor to hoEditor
+        Move (CurrentDateTime()) to dtExecStart
+        Get pRefactorSettings to RefactorSettings   
+        
+        Get GetTheWorkDone RefactorSettings hoEditor to eResponse
+        
+        // A bit silly but it is how our error logging system works:
+        Move "RunRefactoringEngine" to FunctionsA.Function_Name
+
+        // And we're done. Clean up and show summary.  
+        Send Stop_StatusPanel of ghoStatusPanel
+        Send Destroy of (phoDD(Self))
+        Get SummaryText eResponse RefactorSettings dtExecStart hoEditor to sText
+        
+        If (eResponse = eEngineOK) Begin
+            Send ShowLogFile of ghoApplication
+        End 
+        Else Begin
+            Send Info_Box sText (psProduct(ghoApplication))
+            If (eResponse = eEngineError) Begin
+                Send Popup of (oErrorLog_dg(Client_Id(phoMainPanel(ghoApplication))))
+            End
+        End
+    End_Procedure 
+    
+    Function GetTheWorkDone tRefactorSettings RefactorSettings Handle hoEditor Returns Integer
+        String[] asFiles asFilesOrg asCode asCodeOrg 
+        Boolean bOK bEditorFunctions bExists bWriteLine bChanged bIsStudioGenerated bStop
+        String sFileName sPath sText sFolderName sFileShort sLine
+        Integer eResponse iRetval iErrors iFile iSize iFolders iNoOfLines iTotNoOfLines iTotNoOfFiles 
+        Handle hoView hoStatusBarID
+        
         Move 0 to iTotNoOfFiles
         Move 0 to iTotNoOfLines
-        Move (CurrentDateTime()) to dtExecStart
-        
-        // bWorkspaceMode = "All files in selected folders", else only a single file will be processed.
-        Get phoEditor               to hoEditor
-        Get psCurrentSourceFileName to sFileName
-        Get pRefactorSettings       to RefactorSettings
-        
+        Move 0 to iRetval
+
         If (RefactorSettings.iSelectedLineByLineFunctions or RefactorSettings.iSelectedFullFileFunctions) Begin
-            Move RefactorSettings.FileData.asFolders        to asFolders
+            Move (SizeOfArray(RefactorSettings.FileData.asFolders)) to iFolders
             Move RefactorSettings.FileData.asFullFileNames  to asFiles
             Move asFiles to asFilesOrg
-            Move (SizeOfArray(asFolders)) to iFolders
             Move (SizeOfArray(asFiles)) to iSize
-            Decrement iSize
+            Decrement iSize 
+            Move False to bOK
+            Move False to bStop
                 
             // Loop through all selected files:
             For iFile from 0 to iSize
                 Move asFiles[iFile] to sFileName
+                If (sFileName = "") Begin
+                    Error "Filen name in array is blank, cannot continue. (GetTheWorkDone)" 
+                    Function_Return eEngineSelError
+                End
                 Get ParseFolderName sFileName to sFolderName
                 Get ParseFileName   sFileName to sFileShort
-                Send OnFileNameUpdate of ghoApplication sFileName
                 Get ReadFileToStringArray sFileName to asCode 
                 Move asCode to asCodeOrg
                 Send ResetFuncLibProperties of ghoRefactorFuncLib
@@ -208,10 +243,10 @@ Class cRefactorEngine is a BusinessProcess
                 // We do _not_ refactor files generated by the Studio for COM components (.ocx files et al)
                 Get _IsDataFlexCOMProxyClassesFile of ghoRefactorFuncLib sFileName to bIsStudioGenerated
                 If (bIsStudioGenerated = False) Begin
-                    Set Caption_text of ghoStatusPanel to ("Refactoring" * String(iFolders) * "folders and" * String(iSize +1) * "files")
+//                    Set Caption_text of ghoStatusPanel to ("Refactoring" * String(iSize +1) * "files in" * String(iFolders) * "folders")
+                    Set Caption_text of ghoStatusPanel to ("Refactoring File No:" * String(iFile + 1) * "of:" * String(iSize + 1))
                     Set Title_Text of ghoStatusPanel to ("Folder:" * String(sFolderName))
                     Set Message_Text of ghoStatusPanel to ("File:" * String(sFileShort))
-                    Send Update_status ("File No:" * String(iFile + 1) * "of:" * String(iSize + 1))
 
                     // *** Count source lines: (Only) ***
                     If (RefactorSettings.bCountSourceLines = True) Begin
@@ -224,8 +259,8 @@ Class cRefactorEngine is a BusinessProcess
                         If (RefactorSettings.bReadOnly = False) Begin
                             Get SaveBackupFile of ghoApplication sFileName to bOK
                             If (bOK = False) Begin
-                                Send UserError ("The file could not be copied to the backup area and no attempt was made to change it.\n" * String(sFileName))
-                                Procedure_Return
+                                Error ("The file could not be copied to the backup area and no attempt was made to change it.\n" * String(sFileName))
+                                Function_Return eEngineBackupErr
                             End
                         End
 
@@ -273,11 +308,11 @@ Class cRefactorEngine is a BusinessProcess
 
                 // We only check for "Cancel" once every new file.
                 Get Cancel_Check to bStop
-                If (bStop = True) Begin  
-                    Procedure_Return
+                If (bStop = True) Begin
+                    Function_Return eEngineUserCancel
                 End
             Loop
-            
+
             If (RefactorSettings.bCountSourceLines = True) Begin   
                 Reread SysFile
                     Move iTotNoOfLines to SysFile.iCountNumberOfLines 
@@ -310,7 +345,7 @@ Class cRefactorEngine is a BusinessProcess
             End
         End
 
-        // A little bit silly but it is how the error logging system works:
+        // A bit silly but it is how our error logging system works:
         Move "RunRefactoringEngine" to FunctionsA.Function_Name
 
         If (RefactorSettings.bWorkspaceMode = False and RefactorSettings.bReadOnly = False) Begin
@@ -318,9 +353,16 @@ Class cRefactorEngine is a BusinessProcess
             Send SaveFile of hoEditor
         End
         
-        // And we're done. Show summary etc.
-        Send ShowSummary RefactorSettings dtExecStart hoEditor sPath
-    End_Procedure    
+        Get Error_Count to iErrors
+        If (Err = True or iErrors <> 0) Begin
+            Move eEngineError to iRetval
+        End
+        Else Begin
+            Move eEngineOK to iRetval
+        End
+             
+        Function_Return iRetval
+    End_Function
 
     Function LineByLineFunctions String[] ByRef asCode tRefactorSettings RefactorSettings Returns Boolean
         Integer iLine iSize iItem
@@ -332,7 +374,8 @@ Class cRefactorEngine is a BusinessProcess
         Get pRefactorSettings to RefactorSettings
         Move (SizeOfArray(asCode)) to iSize
         Decrement iSize          
-        Move 0 to iItem
+        Move 0 to iItem  
+        Move True to bOK
                
         For iLine from 0 to iSize
             Send UpdateStatusBar ("Refactoring line:" * String(iLine) * "of:" * String(iSize + 1)) True
@@ -364,6 +407,7 @@ Class cRefactorEngine is a BusinessProcess
         
         If (IsSameArray(asCode, asCodeNew) = False and RefactorSettings.bReadOnly = False) Begin
             Move asCodeNew to asCode
+            Move True to bOK
         End
         Function_Return bOK    
     End_Function
@@ -448,7 +492,6 @@ Class cRefactorEngine is a BusinessProcess
         Send SaveErrorState of ghoRefactorFuncLib
         
         // This will display the file name in the toolbar.
-        Send OnFileNameUpdate of ghoApplication sFileName
         Send UpdateStatusBar "Editor Refactoring Functions..." False
         Get WriteDataToEditor of hoEditor asCode to bOK
         If (bOK = False) Begin
@@ -660,7 +703,7 @@ Class cRefactorEngine is a BusinessProcess
 
         File_Exist sFullSourceFileName bExists
         If (bExists = False) Begin
-            Send UserError ("Couldn't find file:" * String(sFullSourceFileName) * "No source lines added to counter for this file.")
+            Error ("Couldn't find file:" * String(sFullSourceFileName) * "No source lines added to counter for this file.")
             Function_Return 0
         End
 
@@ -736,58 +779,62 @@ Class cRefactorEngine is a BusinessProcess
 
     // ToDo: *** Summaries ***
     //
-    Procedure ShowSummary tRefactorSettings RefactorSettings DateTime dtExecStart Handle hoEditor String sPath
+    Function SummaryText Integer eResponse tRefactorSettings RefactorSettings DateTime dtExecStart Handle hoEditor Returns String
         Integer iErrors
         DateTime dtExecEnd
         TimeSpan tsTotalTime
         String sTotalTime sText
         String[] asOtherLogFiles
         
-        // A little bit silly but it is how the error logging system works:
-        Move "ShowSummary" to FunctionsA.Function_Name
+        // A bit silly but it is how our error logging system works:
+        Move "SummaryText" to FunctionsA.Function_Name
         
-        Get Error_Count to iErrors
-        If (iErrors = 0) Begin
+        If (eResponse = eEngineOK) Begin
             Move (CurrentDateTime()) to dtExecEnd
             Move (dtExecEnd - dtExecStart) to tsTotalTime
             Get TimeSpanToString tsTotalTime to sTotalTime
             Set psTotalTime to sTotalTime
             Send UpdateStatusBar (CS_CRLF + "Process completed. Elapsed Time:" * sTotalTime) True
-            Get vFolderFormat sPath to sPath
 
             Set Changed_State of hoEditor to False
-            Get SummaryText RefactorSettings True to sText
-            Send ShowLogFile of ghoApplication
-
-            If (SysFile.iCountUnusedSourceFiles <> 0) Begin
-                Send DisplayUnusedSourceFilesDialog of (Client_Id(ghoCommandBars))
-                Get pasOtherLogFiles of ghoRefactorFuncLib to asOtherLogFiles
-                If (SizeOfArray(asOtherLogFiles) <> 0) Begin
-                    // ToDo: How should these log files be presented?
-                    // Probably do nothing. A toolbar icon is enough(?)
-                End
-            End
+            Get CollectSummary RefactorSettings True to sText
+        End                              
+        Else If (eResponse = eEngineUserCancel) Begin
+            Move "The process was cancelled by the user" to sText
         End
-        Else Begin
-            Send Info_Box "The process ended but with errors." (psProduct(ghoApplication))
-            Send Popup of (oErrorLog_dg(Client_Id(phoMainPanel(ghoApplication))))
+        Else If (eResponse = eEngineError) Begin
+            Move "The process ended but with errors. The Refactoring Engine Error dialog will now be displayed." to sText
+        End     
+        Else If (eResponse = eEngineSelError) Begin
+            Move "Name in File array is blank, cannot continue. (GetTheWorkDone)\nProcess interrupted." to sText
+        End  
+        Else If (eResponse = eEngineBackupErr) Begin
+            Move "A file could not be copied to the backup area and no attempt was made to change it.\nProcess interrupted." to sText
         End
-    End_Procedure
+        
+        Function_Return sText
+    End_Function
     
     Function StartWarning tRefactorSettings RefactorSettings String sFileName Returns Integer
         Boolean bSaveBak bReadOnly
-        Integer eResponse iSelectedFunctionsCount
+        Integer eResponse 
         String  sMessage sReadOnlyMessage
-
+        
+        If (RefactorSettings.FileData.asFullFileNames[0] = "") Begin
+            Move "No files found that matches the selected folders and file filter. Please adjust and try again." to sMessage
+            Send Info_Box sMessage
+            Function_Return MBR_No
+        End
         Move ("\n\nYou have also selected ReadOnly mode, which means that statistics will be shown but no actual changes to the source code will be made.") to sReadOnlyMessage
         
-        Get SelectedFunctions of (phoDD(Self)) to iSelectedFunctionsCount
-        If (RefactorSettings.bWorkspaceMode) Begin
-            Append sMessage ("You have selected" * String(iSelectedFunctionsCount) * "refactoring functions.\n" + "They will be applied to ")
-            Append sMessage ("files and selected folders that matches these extensions:" * Trim(SysFile.FileExtensionFilter))  
+        If (RefactorSettings.bWorkspaceMode) Begin    
+            If (RefactorSettings.bCountSourceLines = False) Begin
+                Append sMessage ("You have selected" * String(RefactorSettings.iSelectedFunctionTotal) * "refactoring functions.\n" + "They will be applied to:\n") 
+            End
+            Append sMessage (SizeOfArray(RefactorSettings.FileData.asFullFileNames)) " Files in " (SizeOfArray(RefactorSettings.FileData.asFolders)) " selected Folders" 
             If (RefactorSettings.bReadOnly = False) Begin
-                Append sMessage "\n\nPrior running these routines you should ALWAYS have checked in the source code with a version control system and/or "
-                Append sMessage "made a backup of the source code!"
+                Append sMessage "\n\nYou should ALWAYS have checked in your source code with a version control system and/or "
+                Append sMessage "made a backup of the source code, before you continue!"
             End
             Else Begin
                 Append sMessage sReadOnlyMessage
@@ -795,7 +842,9 @@ Class cRefactorEngine is a BusinessProcess
             Append sMessage "\n\nContinue?"
         End
         Else Begin
-            Append sMessage ("You have selected" * String(iSelectedFunctionsCount) * "refactoring functions.\n" + "They will be applied to this source file:\n")
+            If (RefactorSettings.bCountSourceLines = False) Begin
+                Append sMessage ("You have selected" * String(RefactorSettings.iSelectedFunctionTotal) * "refactoring functions.\n" + "They will be applied to a sinlge source file:\n")
+            End
             Append sMessage sFileName
             If (RefactorSettings.bReadOnly = True) Begin
                 Append sMessage sReadOnlyMessage
@@ -807,7 +856,7 @@ Class cRefactorEngine is a BusinessProcess
         Function_Return eResponse
     End_Function
 
-    Function SummaryText tRefactorSettings RefactorSettings Boolean bWriteLogFile Returns String
+    Function CollectSummary tRefactorSettings RefactorSettings Boolean bWriteLogFile Returns String
         String sText sLogText sLogFile sPath sTimeText sProgram sFormatString sValue sSWSFile sFileName sReadOnlyTxt
         Integer iChangedFiles iCount iSize
         Integer iFileCount iChannel
@@ -825,10 +874,10 @@ Class cRefactorEngine is a BusinessProcess
 
         Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
         If (bWorkspaceMode = True) Begin
-            Append sText ("  File Filter:  " * Trim(RefactorSettings.sFileFilter) + "\n")
-            Move (SizeOfArray(RefactorSettings.FileData.asFileNames)) to iSize
-            Append sText ("Number of Files:" * String(iSize) + "\n")
+            Append sText ("  File Filter:" * Trim(RefactorSettings.sFileFilter) + "\n") 
+            Append sText ("  Files:" * String(SizeOfArray(RefactorSettings.FileData.asFullFileNames)) + "\n")
             Move (SizeOfArray(RefactorSettings.FileData.asFolders)) to iSize
+            Append sText ("  Folders:" * String(iSize) + "\n")
             Decrement iSize
             For iCount from 0  to iSize
                 Append sText "  " RefactorSettings.FileData.asFolders[iCount] "\n"
@@ -842,7 +891,12 @@ Class cRefactorEngine is a BusinessProcess
             End
         End
 
-        Append sText "  " ("Functions selected:" * String(SysFile.SelectedFunctionTotal))
+        If (RefactorSettings.bCountSourceLines = False) Begin
+            Append sText "  " ("Functions:" * String(SysFile.SelectedFunctionTotal))
+        End
+        Else Begin
+            Append sText "  'Count of Source Lines' selected.  *All other functions were ignored*"
+        End
         
         // If source line counting this will be the only action for this run:
         If (RefactorSettings.bCountSourceLines = True) Begin
