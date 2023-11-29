@@ -427,7 +427,6 @@ Object oRefactorView is a cRefactorDbView
                     Set pbAllowAppendRow to False
                     Set pbAllowDeleteRow to True
                     Set pbAllowInsertRow to True
-                    Set pbAutoAppend to True
                     Set pbDbShowAddFolderMenuItem to True
                     Set pbDbShowRemoveFolderMenuItem to True  
                     Set pbDbShowInvertSelectionsMenuItem to True
@@ -580,6 +579,11 @@ Object oRefactorView is a cRefactorDbView
                 End_Procedure
 
             End_Object
+
+            Procedure OnFileDropped String sFilename Boolean bLast
+                Forward Send OnFileDropped sFilename bLast
+                Delegate Send OnFileDropped sFilename bLast
+            End_Procedure
 
         End_Object
     
