@@ -1,4 +1,5 @@
 Next_Functions_ID
+Next_FolderSel_ID
 SelectedFunctionTotal
 SelectedStandardFunctions
 SelectedEditorFunctions
@@ -11,14 +12,8 @@ PathStarZen
 PathSourceCompareTool
 FileExtensionFilter
 bCountSourceLines
-bEditorDropSelf
 iCountNumberOfFiles
 iCountNumberOfChangedFiles
 iCountNumberOfLines
-iCountProjectObjectStructures
-iCountRemoveBlankLines
-iCountUnusedSourceFiles
-iCountUnusedLocals
-Next_FolderSel_ID
 bReadOnly
 iBackupDaysOverwriteCycle
