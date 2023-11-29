@@ -22,6 +22,19 @@ Use Windows.pkg
 Use DFClient.pkg
 Use cFilesystem.pkg
 
+#COMMAND CONSOLE_TYPEFACE _RDN
+!A [] $156 !1
+#ENDCOMMAND
+
+#COMMAND CONSOLE_FONTSIZE _RD _RD
+!A [] $157 !1 !2
+#ENDCOMMAND
+
+// change the terminal fonts.
+
+CONSOLE_TYPEFACE "Times New Roman"
+CONSOLE_FONTSIZE 12 8
+
 Enum_List
     Define eSplitUnknown              for 0 
     Define eSplitBySpaceSemiColumn    for 1

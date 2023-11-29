@@ -196,6 +196,12 @@ Object oFunctionMaintenance_vw is a dbView
                         Send SuspendGUI of Desktop True
                         Move False to Err  
                         Move False to bChanged
+
+                        Showln
+                        // Sets the output window's font (but setting the size seems weird)
+                        CONSOLE_TYPEFACE "Consolas"
+                        //CONSOLE_FONTSIZE 6 0
+
                         Move "    [Found] Reread // End comment" to sLine
                         Move sLine to asSource[0]                   
                         Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
