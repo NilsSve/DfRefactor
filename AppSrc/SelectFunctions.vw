@@ -16,7 +16,7 @@ Register_Function MyDelete_Confirmation Returns Integer
 ACTIVATE_VIEW Activate_oMaintainFunctions FOR oMaintainFunctions
 Object oMaintainFunctions is a cRefactorDbView
     Set Location to 2 4
-    Set Size to 110 602
+    Set Size to 110 635
     Set Label to "Select Functions"
     Set Border_Style to Border_Thick
     Set pbAutoActivate to True   
@@ -49,7 +49,7 @@ Object oMaintainFunctions is a cRefactorDbView
     Set Server  To oFunctions_DD
 
     Object oSelectFunctions_grp is a cRDCDbHeaderGroup
-        Set Size to 107 600
+        Set Size to 107 637
         Set piMinSize to 107 490
         Set Location to 4 0
         Set Label to "Function List"             
@@ -60,20 +60,23 @@ Object oMaintainFunctions is a cRefactorDbView
         Set peAnchors to anTopBottom
 
         Object oFunctionSelection_grd is a cRDCDbCJGrid
-            Set Size to 76 589
+            Set Size to 76 620
             Set Location to 27 10
             Set Ordering to 5
+            Set pbStaticData to True
+            Set pbDbShowInvertSelectionsMenuItem to True
                 
             Object oFunctions_ID is a cRDCDbCJGridColumn
                 Entry_Item Functions.ID
-                Set piWidth to 32
+                Set piWidth to 30
                 Set psCaption to "ID"
                 Set pbEditable to False
+                Set peTextAlignment to xtpAlignmentCenter
             End_Object
 
             Object oFunctions_Function_Name is a cDbCJGridColumnSuggestion
                 Entry_Item Functions.Function_Name
-                Set piWidth to 291
+                Set piWidth to 285
                 Set psCaption to "Function Name (Suggestion list)"    
                 Set phoData_Col to Self   
                 Set pbFullText to True    
@@ -89,7 +92,7 @@ Object oMaintainFunctions is a cRefactorDbView
 
             Object oFunctions_Function_Description is a cRDCDbCJGridColumn
                 Entry_Item Functions.Function_Description
-                Set piWidth to 397
+                Set piWidth to 340
                 Set psCaption to "Description"
                 Set pbEditable to False
                 Set psToolTip to "A short description of whate the refactoring function does. Hover the mouse over a function row to see more help on what it does."
@@ -103,7 +106,7 @@ Object oMaintainFunctions is a cRefactorDbView
 
             Object oFunctions_Type is a cRDCDbCJGridColumn
                 Entry_Item Functions.Type
-                Set piWidth to 154
+                Set piWidth to 170
                 Set psCaption to "Type"
                 Set peHeaderAlignment to xtpAlignmentCenter  
                 Set pbComboButton to True
@@ -121,7 +124,7 @@ Object oMaintainFunctions is a cRefactorDbView
 
             Object oFunctions_Parameter is a cDbCJGridColumn
                 Entry_Item Functions.Parameter
-                Set piWidth to 74
+                Set piWidth to 100
                 Set psCaption to "Parameter" "Option"
                 Set pbComboButton to True  
                 Set pbComboEntryState to False
@@ -178,7 +181,7 @@ Object oMaintainFunctions is a cRefactorDbView
     
             Object oFunctions_Selected is a cRDCDbCJGridColumn
                 Entry_Item Functions.Selected
-                Set piWidth to 87
+                Set piWidth to 39
                 Set psCaption to "Select"
                 Set pbCheckbox to True
                 Set peHeaderAlignment to xtpAlignmentCenter  
@@ -192,14 +195,6 @@ Object oMaintainFunctions is a cRefactorDbView
     
             End_Object
 
-            Procedure Refresh Integer eMode
-                Integer iChecked iSelectedFolders
-                Forward Send Refresh eMode
-//                Set Value of oNoOfSelectedFunctions2_fm to SysFile.SelectedFunctionTotal
-//                Get CheckedItems of oFolders_grd to iSelectedFolders
-//                Set Value of oNoOfSelectedFolders_fm to iSelectedFolders
-            End_Procedure
-                        
             // The Functions.Function_Name column is a cDbCJGridColumnSuggestion
             // That class has a bug were it is possible to enter something in
             // the suggestion form that is not in the list, click outside the
@@ -235,47 +230,56 @@ Object oMaintainFunctions is a cRefactorDbView
 
         Object oSelectAll_btn is a Button
             Set Size to 14 62
-            Set Location to 10 472
+            Set Location to 10 255
             Set Label to "Select All"
             Set psImage to "SelectAll.ico"
             Set peAnchors to anTopRight
             Procedure OnClick
-                Send SelectAll of (Main_DD(Self))
-                Send RefreshSelectionUpdate of oFunctionSelection_grd
+                Send SelectAll of oFunctionSelection_grd
             End_Procedure
         End_Object
 
-        Object oDeselectAll_btn is a Button
+        Object oSelectNone_btn is a Button
             Set Size to 14 62
-            Set Location to 10 538
+            Set Location to 10 321
             Set Label to "Select None"
             Set psImage to "SelectNone.ico"
             Set peAnchors to anTopRight
             Procedure OnClick
-                Send DeSelectAll of (Main_DD(Self))
-                Send RefreshSelectionUpdate of oFunctionSelection_grd
+                Send SelectNone of oFunctionSelection_grd
+            End_Procedure
+        End_Object
+
+        Object oSelectInvert_btn is a Button
+            Set Size to 14 74
+            Set Location to 10 387
+            Set Label to "Invert Selections"
+            Set psImage to "SelectInvert.ico"
+            Set peAnchors to anTopRight
+            Procedure OnClick
+                Send SelectInvert of oFunctionSelection_grd
             End_Procedure
         End_Object
 
         Object oConstrainByType_cf is a ComboForm
             Set Size to 14 99
-            Set Location to 10 363
+            Set Location to 10 531
+            Set peAnchors to anTopRight
             Set Label_Col_Offset to 2
             Set Label_Justification_Mode to JMode_Right
             Set Label to "Constrain by Type:"
             Set Entry_State to False
             Set Combo_Sort_State to False
-            Set peAnchors to anTopRight
           
             Procedure Combo_Fill_List
                 Send Combo_Add_Item CS_All_Functions
                 Send Combo_Add_Item CS_Standard_Function
                 Send Combo_Add_Item CS_Remove_Function
                 Send Combo_Add_Item CS_Editor_Function
-                Send Combo_Add_Item CS_Other_Function   
-                Send Combo_Add_Item CS_Other_FunctionAll
                 Send Combo_Add_Item CS_Report_Function   
                 Send Combo_Add_Item CS_Report_FunctionAll
+                Send Combo_Add_Item CS_Other_Function   
+                Send Combo_Add_Item CS_Other_FunctionAll
             End_Procedure
           
             Procedure OnChange

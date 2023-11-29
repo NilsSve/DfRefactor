@@ -55,7 +55,15 @@ Struct tFunctionTypes
     Integer iReport_FunctionAll
     Integer iOther_Function
     Integer iOther_FunctionAll
-End_Struct
+End_Struct   
+
+Enum_List 
+   Define eEngineOK         for 0
+   Define eEngineUserCancel for 1
+   Define eEngineError      for 2  
+   Define eEngineSelError   for 3 
+   Define eEngineBackupErr  for 4
+End_Enum_List
 
 Enum_List
     Define eAll_Functions         for 0 
@@ -103,6 +111,12 @@ Struct tWorkspace
     String sWorkspaceFull    
 End_Struct
 
+Enum_List
+    Define cx_DbSelect_All
+    Define cx_DbSelect_None
+    Define cx_DbSelect_Invert
+End_Enum_List
+
 Struct tRefactorCheckbox
     Handle hObject
     Boolean bChecked
@@ -113,7 +127,6 @@ End_Struct
 
 Struct tRefactorFiles
     String[] asFolders                  // Path and folder name
-    String[] asFileNames                // File name only
     String[] asFullFileNames            // Folder + file name
 End_Struct
 
@@ -315,12 +328,12 @@ Define CS_OpenWorkspace             for "Select &Workspace"
 //Define CS_OpenWorkspace             for "Open &Workspace"
 Define CS_CurrentWorkspace          for "Current &Workspace:"
 Define CS_NoActiveWorkspaceText     for ""
-Define CS_SelectWorkspaceFile       for "Select a DataFlex workspace project file (*.sws)"
+Define CS_SelectWorkspaceFile       for "Select a DataFlex workspace project (*.sws) or (*.ws) file"
 Define CS_BrowseSourceFileTxt       for "Select File:"
 Define CS_CurrentSourceFileTxt      for "Current File:"
 Define CS_NoActiveSourceFileText    for "" 
 Define CS_NoWorkspaceSelected       for "- Recent Workspaces"
-Define CS_WorkspaceFilterString     for "DataFlex Workspace Files (*.sws)|*.sws|Any file (*.*)|*.*"
+Define CS_WorkspaceFilterString     for "DataFlex Workspace Files (*.sws)|*.sws|(*.ws)|*.ws|Any file (*.*)|*.*"
 Define CS_OpenFileStdFilter         for "All files *.*|*.*|Programs *.src|*.src|Views *.vw|*.vw|Report Views *.rv|*.rv|Selection Lists *.sl|*.sl|Packages *.pkg|*.pkg"
 Define CS_SourceCodeFilters         for "DataFlex Source *.src;*.vw;*.sl;*.dg;*.rv;*.pkg;*.cl;*.wo;*.dd;*.bp;*.inc;*.nui;*.utl;*.mn;*.mnu|*.src;*.vw;*.sl;*.dg;*.rv;*.pkg;*.cl;*.wo;*.dd;*.bp;*.inc;*.nui;*.utl;*.mn;*.mnu"
 Define CS_SourceFileFilters         for "Programs|*.src|Views|*.vw|Dialogs|*.dg|Data Dictionaries|*.dd|Include files|*.inc|Report Views|*.rv|Selection Lists|*.sl|Packages|*.pkg|Business Processes|*.bp|Menus|*.mn|Header Files|*.h|Sture's Files|*.nui;*.utl|Any file|*.*"
@@ -357,7 +370,7 @@ Define CS_Folder_Dialog_Caption     for "Select a Filename - Only the foldername
 Define CS_Default_Filter_String     for "All Files *.*|*.*|Programs *.src|*.src|Views *.vw|*.vw|Report Views *.rv|*.rv|Selection Lists *.sl|*.sl|Packages *.pkg|*.pkg"
 Define CS_Folder_Filter_String      for "All files|*.*"
 
-Define CS_BackupFolder              for "DFRefactor Backup"
+Define CS_BackupFolder              for "DFRefactor_Backup"
 Define CS_NoFolderList              for (".|..|.svn|.git|.hg|apphtml|data|bitmaps|help|idesrc|programs|.cab|install")
 //Define CS_NoFolderList              for (".|..|.svn|.git|.hg|apphtml|data|bitmaps|help|idesrc|programs|.cab|install" + "|" + CS_BackupFolder)
 Define CS_DefaultSourceFolders      for "appsrc|ddsrc|libraries|pkg"

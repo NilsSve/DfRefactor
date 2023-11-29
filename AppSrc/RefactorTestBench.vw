@@ -26,6 +26,7 @@ Object oRefactorTestBench is a cRefactorDbView
     Set pbAutoActivate to True
     Set Maximize_Icon to True 
     Set pbAcceptDropFiles to True
+    Set phoRefactorView of ghoApplication to Self
     
     Object oSysFile_DD is a cSysFileDataDictionary
         // We don't care about data-loss in this view.
@@ -291,19 +292,29 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set pbUseLargeFontHeight to True
                 Set peAnchors to anBottomLeftRight
 
-                Object oNoOfSelectedFunctions2_fm is a cRDCDbForm
-                    Entry_Item SysFile.SelectedFunctionTotal
-                    Set Server to oSysFile_DD
-                    Set Size to 13 13
-                    Set Location to 36 188
+                Object oNoOfSelectedFunctions_fm is a cRDCDbForm
+                    Set Size to 13 30
+                    Set Location to 36 170
                     Set Label_Justification_Mode to JMode_Right
-                    Set Label to "Number of Selected Functions:"
+                    Set Label to "Selected Functions:"
                     Set psToolTip to "Total number of functions selected."
-                    Set Enabled_State to False
-                    Set peAnchors to anBottomLeft
                     Set Label_Col_Offset to 1
                     Set Label_FontWeight to fw_Bold
                     Set FontWeight to fw_Bold 
+                    Set Form_Justification_Mode to Form_DisplayRight
+                    Set Enabled_State to False
+                    Set peAnchors to anBottomLeft
+
+                    Object oSelectedFunctionsIdleHandler is a cIdleHandler
+                        Set pbEnabled to True
+                        Procedure OnIdle
+                            Integer iSelectedFuncs iTotalFuncs
+                            Move SysFile.SelectedFunctionTotal to iSelectedFuncs
+                            Get TotalNoOfFunctions of (Main_DD(Self)) to iTotalFuncs
+                            Set Value of oNoOfSelectedFunctions_fm to (String(iSelectedFuncs) * "(" + String(iTotalFuncs) + ")")
+                        End_Procedure
+                    End_Object
+
                 End_Object
 
                 Object oSysFile_CountSourceLines_cb is a dbCheckBox
@@ -330,20 +341,20 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                         Send Request_Save  of oSysFile_DD 
                     End_Procedure    
                     
-                    Procedure Refresh Integer iNotifyMode
-                        Boolean bSelected
-                        Integer iSelectedFunctions
-                        
-                        Forward Send Refresh iNotifyMode
-                        Get Checked_State to bSelected
-                        If (bSelected = True) Begin
-                            Move 1 to iSelectedFunctions
-                        End
-                        Else Begin
-                            Get Field_Current_Value of oSysFile_DD Field SysFile.SelectedFunctionTotal to iSelectedFunctions
-                        End
-                        Set Value of oNoOfSelectedFunctions2_fm to iSelectedFunctions
-                    End_Procedure
+//                    Procedure Refresh Integer iNotifyMode
+//                        Boolean bSelected
+//                        Integer iSelectedFunctions
+//                        
+//                        Forward Send Refresh iNotifyMode
+//                        Get Checked_State to bSelected
+//                        If (bSelected = True) Begin
+//                            Move 1 to iSelectedFunctions
+//                        End
+//                        Else Begin
+//                            Get Field_Current_Value of oSysFile_DD Field SysFile.SelectedFunctionTotal to iSelectedFunctions
+//                        End
+//                        Set Value of oNoOfSelectedFunctions2_fm to iSelectedFunctions
+//                    End_Procedure
         
                 End_Object
     
@@ -476,7 +487,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Set Value of (oLegacyCodeFilename_fm(Self))     to (psCodeFile(phoEditorLegacy(ghoApplication)))
         Set Value of (oRefactoredCodeFilename_fm(Self)) to (psCodeFile(phoEditorRefactored(ghoApplication))) 
 //        Set Value of oNoOfSelectedFunctions2_fm         to SysFile.SelectedFunctionTotal
-        Send Request_Save_No_Clear of oSysFile_DD
     End_Procedure
     
     //
@@ -492,7 +502,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         
 //        Get Checked_State of oUseConstraints_cb to bOK   
         Move False to Err
-        Send Request_Save_No_Clear of oSysFile_DD
+//        Send Request_Save_No_Clear of oSysFile_DD
         Get DeleteCompileErrorsFile to iRetval
         If (iRetval <> 0) Begin
             Get YesNo_Box "Could not delete the compiler's error file. Continue?" to iRetval
@@ -510,13 +520,13 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor        
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
         Get WriteDataToEditor   of hoRefactoredEditor    asLegacyCode to bOK 
-        Get CollectFileData of ghoApplication 0 sLegacyFileName to RefactorFiles
+        Get CollectFileData of ghoApplication to RefactorFiles
         If (Err = True) Begin
             Procedure_Return
         End
 
         // Start the Engine!
-        Send StartRefactoringEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor (Main_DD(Self)) False
+        Send StartRefactoringEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor
 
         Set Value of oRefactoredCode_Time_fm to (psTotalTime(ghoRefactorEngine))
     End_Procedure

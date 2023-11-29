@@ -16,9 +16,8 @@ Object DFUnitTestRunner_vw is a View
     Set Border_Style to Border_None
     Set piMinSize to 250 235 
     Set pbAutoActivate to True
+    Set phoRefactorView of ghoApplication to Self   
 
-    Delegate Set phoTestView to Self
-        
     Object oRefactorFunctionLibrary is a cRefactorFuncLib
     End_Object
 
