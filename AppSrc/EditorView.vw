@@ -5,6 +5,7 @@ Use oEditorProperties.pkg
 //Use mfiletime.pkg
 Use vWin32fh.pkg
 Use cFunctionsDataDictionary.dd
+Use dfClient.pkg
 
 Activate_View Activate_oEditorView_vw For oEditorView_vw
 Object oEditorView_vw is a cRefactorDbView
@@ -26,14 +27,22 @@ Object oEditorView_vw is a cRefactorDbView
         Set FontWeight to fw_Bold
     End_Object
 
+    // Just so the cursor has a focusable object to go to.
+    Object oDbInvisible_fm is a Form
+        Set Size to 13 25
+        Set Location to 3 388
+        Set Visible_State to False
+    End_Object
+
     Object oEditor_edt is a cScintillaRefactorEditor
         Set Size to 244 473
         Set Location to 16 10
         Set peAnchors to anAll
         Set Enabled_State to False
 
-        Delegate Set phoEditor to (Self)
-        Set phoEditor of ghoApplication to (Self) 
+        Set phoEditor of (phoEditorView(ghoApplication)) to (Self)
+        Set phoEditor of ghoApplication to (Self)
+         
         Property Boolean piInSetFocus False
 
         // We con't care about potential data loss here.
@@ -51,7 +60,11 @@ Object oEditorView_vw is a cRefactorDbView
             Procedure OnIdle
                 String sSWSFile
                 Get psSWSFile of ghoApplication to sSWSFile
-                Set Enabled_State to (sSWSFile <> "")
+                Set Enabled_State to (sSWSFile <> "")   
+                // Make the editor not visible, because else it is possible to click inside it
+                // even when no workspace has been selected.
+                // The oDbInvisible_fm object above takes care of the focusable necessity.
+                Set Visible_State to (sSWSFile <> "")
             End_Procedure
         End_Object
 
@@ -117,9 +130,12 @@ Object oEditorView_vw is a cRefactorDbView
     Object oView_IdleHandler is a cIdleHandler
         Set pbEnabled to True
         Procedure OnIdle
-            String sSWSFile
+            String sSWSFile  
+            Boolean bEnabled
             Get psSWSFile of ghoApplication to sSWSFile
-            Set Enabled_State to (sSWSFile <> "")
+            Move (sSWSFile <> "") to bEnabled
+            Set Enabled_State to bEnabled
+            Broadcast Recursive Set Enabled_State of (Parent(Self)) to bEnabled
         End_Procedure
     End_Object
 
@@ -133,7 +149,6 @@ Object oEditorView_vw is a cRefactorDbView
             Send OnFileNameUpdate of ghoApplication sSourceFilename
             Send Top_of_Panel
         End
-
     End_Procedure
 
     Procedure End_Construct_Object
@@ -142,7 +157,7 @@ Object oEditorView_vw is a cRefactorDbView
         Send DefineOnKey of (phoEditor(ghoApplication)) CMD_FileSaveAll msg_Request_Save
     End_Procedure
     
-    // We con't care about potential data loss here.
+    // We con't care about potential data loss here, it is more annoying to be reminded of it...
     Function pbShouldSave Returns Boolean
         Function_Return False
     End_Function
