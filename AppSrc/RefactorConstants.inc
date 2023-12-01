@@ -421,9 +421,9 @@ Define CS_UnusedSourceFiles             for "ReportUnusedSourceFiles"
 
 // Refactor Testing program:
 Define CS_Compiler       for "DFComp.exe"
+Define CS_CompOptions    for "-e0fv2i0"     
 Define CS_TestProgram    for "CompiledRefactoredCode.src"
 Define CS_TestErrFile    for "CompiledRefactoredCode.err"
-Define CS_CompOptions    for "-e0fv2i0"     
 
 #IF (!@ = 190)
     Define CS_SWSFile        for "DFRefactor19.0.sws"
