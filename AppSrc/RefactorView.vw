@@ -428,7 +428,7 @@ Object oRefactorView is a cRefactorDbView
                     Set pbAllowDeleteRow to True
                     Set pbAllowInsertRow to True
                     Set pbDbShowAddFolderMenuItem to True
-                    Set pbDbShowRemoveFolderMenuItem to True  
+                    Set pbDbShowRemoveItemMenuItem to True  
                     Set pbDbShowInvertSelectionsMenuItem to True
                     
                     Set Verify_Delete_msg to (RefFunc(No_Confirmation))
