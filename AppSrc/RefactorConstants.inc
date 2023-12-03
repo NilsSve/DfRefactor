@@ -357,7 +357,6 @@ Define CS_SummaryLogfileName        for "DFRefactorLogFile.txt"
 Define CS_VarTypes                  for "INDICATOR;STRING;INTEGER;NUMBER;DATE;DATETIME;BOOLEAN;HANDLE;REAL;VARIANT;TIMESPAN;ROWID;DECIMAL;BIGINT;REAL;UCHAR;ADDRESS;CHAR;CURRENCY;DWORD;FLOAT;POINTER;SHORT;TIME;UBIGINT;USHORT;WSTRING;LONGPTR;ULONGPTR;UINTEGER"
 
 Define CS_ValidLeftCharacters       for ("()[];,&+-*<>= " + Character(9)) // Character 9=tab char //"()[];,.&+-*<>= "
-Define CS_UnusedSourceLogFile       for "UnusedSourceFiles.txt"
 Define CS_CommentSymbol             for ("//")
 Define CS_ImageNameStart            for "/"
 Define CS_ImageNameEnd              for "/*"
