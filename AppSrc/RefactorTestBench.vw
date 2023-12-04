@@ -486,23 +486,19 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     Procedure OnSetFocus
         Set Value of (oLegacyCodeFilename_fm(Self))     to (psCodeFile(phoEditorLegacy(ghoApplication)))
         Set Value of (oRefactoredCodeFilename_fm(Self)) to (psCodeFile(phoEditorRefactored(ghoApplication))) 
-//        Set Value of oNoOfSelectedFunctions2_fm         to SysFile.SelectedFunctionTotal
     End_Procedure
     
     //
     // ToDo: *** MAIN FUNCTION CALL ***
     //
     Procedure RefactoreCode //Boolean bUseConstraints
-        String[] asLegacyCode
         String sLegacyFileName sRefactoredFileName
         Handle hoLegacyEditor hoRefactoredEditor
         Integer iRetval
         Boolean bOK
         tRefactorFiles RefactorFiles
         
-//        Get Checked_State of oUseConstraints_cb to bOK   
         Move False to Err
-//        Send Request_Save_No_Clear of oSysFile_DD
         Get DeleteCompileErrorsFile to iRetval
         If (iRetval <> 0) Begin
             Get YesNo_Box "Could not delete the compiler's error file. Continue?" to iRetval
@@ -512,14 +508,18 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         End 
         
         Set Value of oRefactoredCode_Time_fm to ""
-        Get phoEditorLegacy of ghoApplication to hoLegacyEditor
-        Get psCodeFile      of hoLegacyEditor to sLegacyFileName
-        Set psCurrentSourceFileName of ghoApplication to sLegacyFileName
-        
-        // Start by making the two string arrays and editors the same:
+        Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
+        Get psCodeFile          of hoLegacyEditor     to sLegacyFileName
         Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor        
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
-        Get WriteDataToEditor   of hoRefactoredEditor    asLegacyCode to bOK 
+        // We need to copy the legacy file to the refactor file before we start our work,
+        // because else the ghoRefactorEngine would overwrite the sLegacyFileName with
+        // the changes:
+        Get vCopyFile sLegacyFileName sRefactoredFileName to bOK
+        Set psCurrentSourceFileName of ghoApplication to sRefactoredFileName //sLegacyFileName
+        
+        // Start by making the two editor contents the same:
+//        Send LoadFile of hoRefactoredEditor sRefactoredFileName
         Get CollectFileData of ghoApplication to RefactorFiles
         If (Err = True) Begin
             Procedure_Return
