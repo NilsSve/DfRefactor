@@ -1,0 +1,254 @@
+Use cScintillaEdit.pkg
+Use Text_Win.pkg
+Use DFNav_mx.pkg      // Navigation changes for DF DEOs
+Use DFCdDeo.pkg      // DEO Code message support
+Use DD_Deomx.pkg // mixin support for dd classes
+
+// Create class that understands single item "dfentry" logic
+{ ClassType=Abstract }
+Class cdbScintillaEdit_ is a cScintillaEdit
+    
+    Import_Class_Protocol Text_Window_mixin
+    
+    //
+    // created for EntItem simulation and Server support:
+    //  if file# = 0, display only if Data_File is in Done-array
+    //  else display only if file# = Data_File
+    //
+    { Visibility=Private }
+    Procedure Entry_Display Integer iFile Integer iFlag
+        Boolean bUpdate bOld
+        Integer iDataFile
+        Get data_file to iDataFile
+        If (iDataFile) Begin // if not data file, we have nothing to update
+            If (iFile=0) Begin
+                is_file_included iDataFile 1
+                Move (Found) to bUpdate
+            End
+            Else Begin
+                Move (iFile=iDataFile or iFlag) to bUpdate
+            End
+            
+            If bUpdate Begin
+                Get dynamic_update_state to bOld
+                Set dynamic_update_state to False
+                Send Delete_Data   // init buffer
+                Send DisplayData   // read buffer from file
+                //Send beginning_of_data
+                Set dynamic_update_state to bOld
+            End
+        End
+    End_Procedure
+    
+    { Visibility=Private }
+    Procedure DisplayData
+        Integer iFile iField iFldLen
+        Address aTextData
+        Integer iTextLength
+        Boolean bOk bOld
+        Get Data_File to iFile
+        Get Data_Field to iField
+        If (iFile>0 and iField>0) Begin
+            Get Change_Disabled_State to bOld
+            Set Change_Disabled_State to True
+            Get_Attribute DF_FIELD_LENGTH of iFile iField to iTextLength
+            // when allocating field lengths for get_field_value you *must* always add one
+            // extra character for a terminating 0.
+            Move (Alloc(iTextLength+1)) to aTextData
+            Get_Field_Value iFile iField To aTextData
+            If (aTextData<>0) Begin
+              Send EditorMessage SCI_SETTEXT 0 aTextData
+              Send EditorMessage SCI_EMPTYUNDOBUFFER
+            End
+            Move (Free(aTextData)) to bOk
+            Set Change_Disabled_State To bOld
+            Send onModifiedChange False
+        End
+    End_Procedure
+    
+    //
+    // This is designed onlt to work with DDs. With DDs, this is called under
+    // two conditons.
+    // 1. Update for find (passes iFile and Flag=1). We never want to update for finds. Text is not indexed
+    // 2. Update for save (passes iFile=0 and Flag=3).
+    // Thus we update if a ddo save (iFlag=3) the field is changed, and the file is in done array
+    //
+    { Visibility=Private }
+    Procedure Entry_Update Integer iFile Integer iFlag
+        Integer iDataFile
+        Boolean bUpdate
+        If (iFlag=3 and changed_State(Self)) Begin
+            Get Data_File to iDataFile
+            If (iDataFile) Begin
+                is_file_included iDataFile 1 // is file in done array (will it get saved)?
+                Move (Found) to bUpdate
+            End
+            If bUpdate Begin
+                Send UpdateData
+            End
+        End
+    End_Procedure
+    
+    Function Changed_State Returns Boolean
+      Boolean bChanged
+      Integer iChanged
+      Move False To bChanged
+      Get CM_IsModified To iChanged
+      If (iChanged<>0) Begin
+        Move True To bChanged
+      End
+      Function_Return bChanged
+    End_Function
+    
+    Procedure onModifiedChange Integer bModified
+        Handle hoServer
+        Get Server To hoServer
+        If (hoServer) Begin
+          Set Changed_State of hoServer to bModified
+        End
+    End_Procedure
+    
+    // Move data from Text Control to the File/field buffer
+    { Visibility=Private }
+    Procedure UpdateData
+        Integer iFile iField iFldLen
+        Address aTextData
+        Integer iTextLength
+        Get Data_File  to iFile
+        Get Data_Field to iField
+        If (iFile>0 and iField>0) Begin
+
+            Send Cursor_Wait of Cursor_Control
+            Send EditorMessage SCI_SETREADONLY 1
+            Get EditorMessage SCI_GETCHARACTERPOINTER 0 0 to aTextData
+            Move (CStringLength(aTextData)) To iTextLength
+            If (iTextLength>=0) Begin
+              Set_Field_Value iFile iField To aTextData Length iTextLength
+            End
+            Send EditorMessage SCI_SETREADONLY 0
+            Send Cursor_Ready Of Cursor_Control
+            Send onModifiedChange False
+        End
+    End_Procedure
+      
+
+    //
+    Function SelText Returns String
+      Integer iLength
+      String  sBuffer
+
+      Move "" To sBuffer
+      Get EditorMessage SCI_GETSELTEXT 0 0 To iLength
+      If (iLength>0) Begin
+        Move (Zerostring(iLength+1)) To sBuffer
+        Get EditorMessage SCI_GETSELTEXT 0 (AddressOf(sBuffer)) To iLength
+      End
+      Function_Return sBuffer
+    End_Function
+    
+End_Class
+
+// Mixes in the Entry_Form DEO logic to control
+{ ClassType=Abstract }
+Class cdbScintillaEditDS_ is a cdbScintillaEdit_
+    
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Send Define_DFNavigation  // GUI navigate changes
+        // restore standard begin/end of text window behavior (which
+        // is altered by CM packages
+        On_Key kBegin_of_data Send default_key
+        On_Key kEnd_of_data Send default_key
+
+        { Visibility=Private }
+        Property Integer ReadOnlyColor     clBtnFace // needed for db enablement (not actually used)
+        { Visibility=Private }
+        Property Boolean Read_Only_State   False     //  ""  ""
+        { Visibility=Private }
+        Property Boolean Shadow_State      False     //  ""  ""
+        
+        { Visibility=Private }
+        Property Integer piMaxStreamLength 0
+    End_Procedure
+    
+    Import_Class_Protocol DFNavigate_Mixin
+    Import_Class_Protocol DFCode_DEO_Mixin
+    Import_Class_Protocol DataFile_Help_Mixin
+    
+    // these should be in text_win.pkg All DEOs shoudld understand this
+    // message. Needed for smart pulldown shadowing of these items
+    //
+    { MethodType=Property  NoDoc=True }
+    Function Prompt_Object Integer item# Returns Integer
+    End_Function
+    
+    { MethodType=Property  NoDoc=True }
+    Function Zoom_Object Integer item# Returns Integer
+    End_Function
+    
+    { Visibility=Private }
+    Procedure Bind_Data Integer File# Integer Field#
+        Set Data_File  to File#
+        Set Data_Field to Field#
+    End_Procedure
+    
+End_Class
+
+// Adds VDF logic and DEO DD support.
+{ DataBindable=True }
+Class cdbScintillaEdit is a cdbScintillaEditDS_
+    
+    // augmented to respect DD dynamic noput conditions
+    { NoDoc=True }
+    Procedure UpdateData
+        Boolean bNoPut
+        Get item_NoPut 0 to bNoPut
+        If not bNoPut Begin
+            Forward Send UpdateData
+        End
+    End_Procedure
+    
+    // Extended to get all if no iItem is passed
+    Function Value Integer iItem Returns String
+      Integer iLength
+      String  sBuffer
+      String  sValue
+      
+      If (iItem = -99) Begin
+        // get all
+        Move "" To sBuffer
+        Get EditorMessage SCI_GETLENGTH 0 0 To iLength
+        If (iLength>0) Begin
+          Move (Zerostring(iLength+1)) To sBuffer
+          Get EditorMessage SCI_GETTEXT (iLength+1) (AddressOf(sBuffer)) To iLength
+          Move (CString(sBuffer)) To sValue
+        End
+      End
+      Else Begin
+        Forward Get Value iItem To sValue
+      End
+      Function_Return sValue
+    End_Function
+
+    // Extended to set all if no iItem is passed
+    Procedure Set Value Integer iItem String sValue
+      If (iItem = -99) Begin
+        Send EditorMessage SCI_SETTEXT 0 (AddressOf(sValue))
+      End
+      Else Begin
+        Forward Set Value iItem To sValue
+      End
+    End_Procedure
+    
+    Function SelStart Returns Integer
+      Integer iPos
+      Get EditorMessage SCI_GETSELECTIONSTART 0 0 to iPos
+      Function_Return iPos
+    End_Function
+    
+    Procedure SetSel Integer iPosStart Integer iPosEnd
+      Send EditorMessage SCI_SETSELECTIONSTART iPosStart 0
+      Send EditorMessage SCI_SETSELECTIONEND   iPosEnd 0
+    End_Procedure
+End_Class
+
