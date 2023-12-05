@@ -793,8 +793,8 @@ Object oRefactorView is a cRefactorDbView
         Set pbUseLargeFontHeight to True
 
         Object oNoOfSelectedFunctions_fm is a cRDCDbForm
-            Set Size to 13 30
-            Set Location to 32 181
+            Set Size to 13 40
+            Set Location to 32 171
             Set Label_Justification_Mode to JMode_Right
             Set Label to "Selected Functions:"
             Set psToolTip to "Total number of functions selected."
@@ -808,8 +808,8 @@ Object oRefactorView is a cRefactorDbView
         End_Object
 
         Object oNoOfSelectedFolders_fm is a cRDCDbForm
-            Set Size to 13 30
-            Set Location to 45 181
+            Set Size to 13 40
+            Set Location to 45 171
             Set Label_Justification_Mode to JMode_Right
             Set Label to "Selected Folders:"
             Set psToolTip to "Total number of folders selected."
