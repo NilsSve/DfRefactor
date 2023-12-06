@@ -396,8 +396,16 @@ Object oRefactorView is a cRefactorDbView
 //            
 //                End_Object
                 
+                Procedure OnFileDropped String sFilename Boolean bLast
+                    Delegate Send OnFileDropped sFilename bLast
+                End_Procedure
+
             End_Object
                     
+            Procedure OnFileDropped String sFilename Boolean bLast
+                Delegate Send OnFileDropped sFilename bLast
+            End_Procedure
+
         End_Object
         
         Object oDbFolders_tp is a dbTabPage
@@ -578,10 +586,13 @@ Object oRefactorView is a cRefactorDbView
                     Set Enabled_State to (bWorkspaceMode = True and sSWSFile <> "")
                 End_Procedure
 
+                Procedure OnFileDropped String sFilename Boolean bLast
+                    Delegate Send OnFileDropped sFilename bLast
+                End_Procedure
+
             End_Object
 
             Procedure OnFileDropped String sFilename Boolean bLast
-                Forward Send OnFileDropped sFilename bLast
                 Delegate Send OnFileDropped sFilename bLast
             End_Procedure
 
@@ -593,6 +604,10 @@ Object oRefactorView is a cRefactorDbView
             Set Enabled_State to (sSWSFile <> "")  
         End_Procedure   
         
+        Procedure OnFileDropped String sFilename Boolean bLast
+            Delegate Send OnFileDropped sFilename bLast
+        End_Procedure
+
     End_Object
                 
     Procedure UpdateEnabledState
@@ -1041,7 +1056,11 @@ Object oRefactorView is a cRefactorDbView
         Boolean bFile bFolder bSWSFile
 
         Forward Send OnFileDropped sFileFolderName bLast
-
+        // We only deal with the last dropped file/folder if more than one was dropped.
+        If (bLast = False) Begin
+            Procedure_Return
+        End
+        
         // Try to find out if a file or a folder name was dropped on the view:
         Get ParseFileExtension sFileFolderName to sFileExt
         Move (Lowercase(sFileExt)) to sFileExt
@@ -1049,8 +1068,13 @@ Object oRefactorView is a cRefactorDbView
         Move (sFileExt = "sws") to bSWSFile
         Move (bSWSFile = False and bFolder = False) to bFile
         
-        If (bFolder = True) Begin
+        If (bFolder = True) Begin  
+            If (Focus(Desktop) <> oDbFolders_grd) Begin
+                Send Request_Next_Tab of oMain_TabDialog 1
+            End
+            Send Activate of oDbFolders_grd
             Send AddItem of oDbFolders_grd sFileFolderName
+            Procedure_Return
         End
         Else If (bLast = True) Begin
             If (bFile = True) Begin
@@ -1058,8 +1082,11 @@ Object oRefactorView is a cRefactorDbView
                 Set pbWorkspaceMode of ghoApplication to False
             End
             If (bSWSFile = True) Begin
+//                Send UpdateWorkspaceSelectorDisplay of ghoApplication sFileFolderName
+//                Set pbWorkspaceMode of ghoApplication to True
+                Send AddWorkSpaceFileToRegistry of ghoApplication sFileFolderName
                 Send UpdateWorkspaceSelectorDisplay of ghoApplication sFileFolderName
-                Set pbWorkspaceMode of ghoApplication to True
+                Send DisplayWorkspaceItem of (oWorkspaceSelector_Menuitem(ghoCommandBars)) sFileFolderName
             End
         End
         Else Begin
