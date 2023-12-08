@@ -52,7 +52,7 @@ Object oFunctionsExportImport is a dbView
                 String sVal
                 Append sVal "This view is designed to enable you to Export/Import refactoring data and source code from one machine to another."
                 Append sVal "\n\nSelect the functions to be exported. The data from the Functions table together with the corresponding function code text "
-                Append sVal "from the cRefactorFuncLib class and oRefactor_Unit_Tests.pkg will be exported to a Json file that can be copied/send to another machine for import, in alphabetical order by function name."
+                Append sVal "from the cRefactorFuncLib class and oRefactor_Unit_Tests.pkg will be exported to a Json file that can be copied/sent to another machine for import, in alphabetical order by function name."
                 Append sVal "\n\nNote that each function that has code in the cRefactorFuncLib class *must* also have been registrered under the 'Function Maintenance' tab-page."
                 Move (Replaces("\n", sVal, (CS_CR))) to sVal
                 Set Label to sVal
@@ -302,8 +302,8 @@ Object oFunctionsExportImport is a dbView
                 Handle hoGrid 
                 Integer iSize iRetval
                 String[] asFunctions 
-                Boolean bOK  
-                String sFileName
+                Boolean bOK bExists
+                String sFileName sFolder
                 
                 Delegate Get phoSelection_grd to hoGrid
                 Get ItemCount of hoGrid to iSize
@@ -315,6 +315,12 @@ Object oFunctionsExportImport is a dbView
                 Get SelectedItems of hoGrid to asFunctions
                 Move (SortArray(asFunctions)) to asFunctions             
                 Get psExpFileJson of ghoApplication to sFileName
+                Get ParseFolderName sFileName to sFolder
+                Get vFolderExists sFolder to bExists
+                If (bExists = False) Begin
+                    Send Info_Box ("The folder:\n" * String(sFolder) * "\ndoesn't exist. Please adjust and try again.")
+                    Procedure_Return
+                End
                 
                 // Main Export function:
                 Get ExportFile of ghoImportExportFunctions asFunctions sFileName to bOK
@@ -415,7 +421,6 @@ Object oFunctionsExportImport is a dbView
             Set Label_Justification_Mode to JMode_Top
             Set psToolTip to "Press [F4] to display the Open dialog to select an export file."
             Set Label_Row_Offset to 1 
-            Set Prompt_Button_Mode to PB_PromptOn
             
             Procedure Prompt
                 String sPath sFileName
@@ -429,7 +434,7 @@ Object oFunctionsExportImport is a dbView
                 Set Initial_Folder of hoOpen to sPath       
                 Set MultiSelect_State of hoOpen to False   
                 Set Dialog_Caption of hoOpen to "Select a refactor export file:"
-                Set Filter_String of hoOpen to "DFRefactor Export Files|*.json;|All Files|*.*" 
+                Set Filter_String of hoOpen to "DFRefactor Export Files (.json)|*.json;|All Files|*.*" 
                 Set ShowFileTitle_State of hoOpen to True
                 Set File_Title of hoOpen to CS_ImpExpFileJson 
                 Set FileMustExist_State of hoOpen to True
@@ -474,6 +479,21 @@ Object oFunctionsExportImport is a dbView
             On_Key kPrompt Send Prompt
         End_Object
 
+        Object oSelectExportFile_btn is a cRDCButton
+            Set Size to 24 66
+            Set Location to 122 425
+            Set Label to "Select File"  
+            Set psToolTip to "Select Json file to export"
+            Set psImage to "ActionOpen.ico"
+            Set piImageSize to 32
+            Set MultiLineState to True
+        
+            Procedure OnClick
+                Send Prompt of oExportFileName_fm    
+            End_Procedure
+        
+        End_Object
+
     End_Object
 
     Object oImport_grp is a cRDCDbHeaderGroup
@@ -506,7 +526,7 @@ Object oFunctionsExportImport is a dbView
                 Set Initial_Folder of hoOpen to sPath       
                 Set MultiSelect_State of hoOpen to False   
                 Set Dialog_Caption of hoOpen to "Select a DFRefactor export/import file:"
-                Set Filter_String of hoOpen to "DFRefactor Import Files|*.json;|All Files|*.*" 
+                Set Filter_String of hoOpen to "DFRefactor Import Files (.json)|*.json;|All Files|*.*" 
                 Set ShowFileTitle_State of hoOpen to True
                 Set FileMustExist_State of hoOpen to True
                 Get Show_Dialog of hoOpen to bOpen
@@ -574,13 +594,20 @@ Object oFunctionsExportImport is a dbView
         
             Procedure OnClick
                 String sFileName
-                Integer iSize iErrors iRetval
+                Integer iSize iErrors iRetval 
+                Boolean bExists
                 
                 Get YesNo_Box ("The Json import will make changes to your" * CS_FunctionLibraryFile * "and" * CS_UnitTestsFile * "files.\n\nBe sure to Save any changes in the Studio before you commence!\nContinue?") to iRetval
                 If (iRetval <> MBR_Yes) Begin
                     Procedure_Return
                 End
                 Get Value of oImportFileName_fm to sFileName
+                Get vFilePathExists sFileName to bExists
+                If (bExists = False) Begin
+                    Send Info_Box ("The file:\n" * String(sFileName) * "\ndoesn't exist. Please adjust and try again.")
+                    Procedure_Return    
+                End 
+                
                 // Main Import function:
                 Get ImportFile of ghoImportExportFunctions sFileName (&iSize) to iErrors
     
