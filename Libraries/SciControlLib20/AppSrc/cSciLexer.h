@@ -8,6 +8,13 @@ Use cScintilla.h
 Define CS_CR   For (Character(13))
 Define CS_CRLF For (Character(13)+Character(10))
 Define CS_LF   For (Character(10))
+// Text Encoding
+Enum_List
+  Define eTE_Unknown for 0
+  Define eTE_UTF8    for 1
+  Define eTE_OEM     for 2
+  Define eTE_ANSI    for 3
+End_Enum_List
 
 
 #IFDEF IS$WIN64
