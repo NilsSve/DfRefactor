@@ -25,8 +25,8 @@ Class cRefactorEngine is a BusinessProcess
     
     Procedure Construct_Object
         tRefactorSettings RefactorSettings 
-        Forward Send Construct_Object
 
+        Forward Send Construct_Object
         Move Self to ghoRefactorEngine  
         
         Set Allow_Cancel_State to True 
@@ -45,7 +45,6 @@ Class cRefactorEngine is a BusinessProcess
         Property Boolean pbLastLineBreak
 
         Get Create (RefClass(cRefactorStatusLog)) to ghoStatusLog
-
     End_Procedure
 
     Procedure End_Construct_Object
@@ -78,7 +77,7 @@ Class cRefactorEngine is a BusinessProcess
         Move (SysFile.SelectedEditorFunctions + SysFile.SelectedReportFunctions + SysFile.SelectedOtherFunctions) ;
             to RefactorSettings.iSelectedFullFileFunctions
 
-        // All functions that are feed with a string array containing all selected files (including path):
+        // All functions that are feed with a string array with all selected files (including path):
         Move (SysFile.SelectedReportAllFunctions + SysFile.SelectedOtherAllFunctions) ;
             to RefactorSettings.iSelectedAllFilesFunctions
 
@@ -207,7 +206,7 @@ Class cRefactorEngine is a BusinessProcess
         End
     End_Procedure 
     
-    // This is were the actual refactoring takes place in a business process.
+    // This is were the actual refactoring takes place (in a business process).
     Function GetTheWorkDone tRefactorSettings RefactorSettings Handle hoEditor Returns Integer
         String[] asFiles asFilesOrg asCode asCodeOrg 
         Boolean bOK bEditorFunctions bExists bWriteLine bChanged bIsStudioGenerated bStop
@@ -1092,11 +1091,12 @@ Class cRefactorEngine is a BusinessProcess
     End_Function
 
     Function ReadFileToStringArray String sSourceFile Returns String[]
-        Boolean bLastLineBreak bEndOfFile bFirstLine
+        Boolean bLastLineBreak bEndOfFile bFirstLine bHasBom bIsUtf8
         Integer iLine iChannel iFileSize
         String sLine sLastLine sLineBreak sFileNameOnly
         String[] asSourceFile
-
+        Handle hoEditor
+        
         Move 0 to iLine
         Move True  to bFirstLine
         Move False to bEndOfFile
@@ -1108,7 +1108,7 @@ Class cRefactorEngine is a BusinessProcess
             Error DFErr_Program "No Channel Available for Process: Function 'ReadFileToStringArray'"
             Function_Return asSourceFile
         End
-
+        Get phoEditor to hoEditor
         Get ParseFileName sSourceFile to sFileNameOnly
         Set Message_Text of ghoStatusPanel to ("Reading:" * String(sFileNameOnly))
         Get vWin32_APIFileSize sSourceFile to iFileSize
@@ -1130,7 +1130,7 @@ Class cRefactorEngine is a BusinessProcess
             End
             Move sLine to sLastLine
             If (bFirstLine = True) Begin
-                Move False to bFirstLine
+                Get DetectBOMCharacter sLine to bHasBom
                 // Determine the linebreak character to use for the file based on what is in the first line
                 // The readline automatically reads Until LF, but does not report LF back in the string
                 If (Length(sLine) > 0 and Right(sLine, 1) = CS_CR) Begin
@@ -1140,12 +1140,20 @@ Class cRefactorEngine is a BusinessProcess
                     Move CS_LF to sLineBreak
                 End
                 Set psLineBreak to sLineBreak
+                Move False to bFirstLine
             End
             If (sLineBreak = CS_CRLF) Begin
                 If (Right(sLine, 1) = CS_CR) Begin
                     Move (Left(sLine, Length(sLine) - 1)) to sLine
                 End
-            End
+            End   
+            // We should not convert here as DF 23 converts all input to UTF8 strings automatically.
+//            #IF (!@ > 200)                      
+//                Get pbUtf8Mode of hoEditor to bIsUtf8
+//                If (bIsUtf8 = False) Begin
+//                   Get Utf8ToEditorFormat of hoEditor sLine to sLine
+//                End
+//            #ENDIF         
             If (bEndOfFile = False) Begin
                 Move sLine to asSourceFile[iLine]
                 Increment iLine
@@ -1156,15 +1164,47 @@ Class cRefactorEngine is a BusinessProcess
         Set pbLastLineBreak to bLastLineBreak
         Close_Input channel iChannel
         Send Seq_Release_Channel iChannel
+        Set UTF8Text of (StatusBar_Id(ghoCommandBars))  to (If(bHasBom = True, "UTF8", "OEM"))
 
         Function_Return asSourceFile
+    End_Function  
+    
+    // Detects if a sLine has an UTF8 "BOM" file start.
+    // If true it sets three properties of the phoEditor object.
+    // Returns true if the line has BOM characters.
+    Function DetectBOMCharacter String sLine Returns Boolean
+        Boolean bHasBom bUtf8Mode
+        UChar[] uaLine
+        Handle hoEditor
+        
+        Get phoEditor to hoEditor
+        Move (StringToUCharArray(sLine)) to uaLine
+        Move (SizeOfArray(uaLine) >= 3 and ( ;
+            (uaLine[0] = C_BOM_UTF8c1    and uaLine[1] = C_BOM_UTF8c2 and uaLine[2] = C_BOM_UTF8c3) or ;
+            (uaLine[0] = C_BOM_UTF16LEc1 and uaLine[1] = C_BOM_UTF16LEc2))) to bHasBom
+
+        If (bHasBom) Begin
+            Set pbHasUtf8BOM of hoEditor to True
+            Get pbUtf8Mode   of hoEditor to bUtf8Mode
+            If (bUtf8Mode = False) Begin
+                Set pbUtf8Mode of hoEditor to True
+                Set pbOemMode  of hoEditor to False
+            End
+        End 
+        Else Begin
+            Set pbOemMode    of hoEditor to True
+            Set pbUtf8Mode   of hoEditor to False
+            Set pbHasUtf8BOM of hoEditor to False
+        End
+        Function_Return bHasBom    
     End_Function
 
     Function WriteStringArrayToFile String[] asCode String sSourceFile Returns Boolean
-        Boolean bLastLineBreak
+        Boolean bLastLineBreak bIsUtf8
         Integer iOutChannel iSize iCount
-        String  sLineBreak
-
+        String  sLineBreak sLine
+        Handle hoEditor
+        
         Move False to Err
         Move CS_CRLF to sLineBreak
         Get Seq_New_Channel to iOutChannel
@@ -1172,18 +1212,30 @@ Class cRefactorEngine is a BusinessProcess
             Error DFErr_Program "No Channel Available for Process: Procedure 'WriteArrayToSourceFile'"
             Function_Return False
         End
-
+        Get phoEditor to hoEditor
+        Get pbUtf8Mode of hoEditor to bIsUtf8
+        
         Direct_Output channel iOutChannel sSourceFile
         Move (SizeOfArray(asCode)) to iSize
         Decrement iSize   
         If (iSize >= 0) Begin
             For iCount from 0 to (iSize-1)
+                Move asCode[iCount] to sLine 
+                If (bIsUtf8 = False) Begin
+                    Get Utf8ToEditorFormat of hoEditor sLine to sLine
+                End
                 Write channel iOutChannel asCode[iCount] sLineBreak
             Loop
             If (bLastLineBreak=True) Begin
+                If (bIsUtf8 = False) Begin
+                    Get Utf8ToEditorFormat of hoEditor sLine to sLine
+                End
                 Write channel iOutChannel asCode[iSize] sLineBreak
             End
             Else Begin
+                If (bIsUtf8 = False) Begin
+                    Get Utf8ToEditorFormat of hoEditor sLine to sLine
+                End
                 Write channel iOutChannel asCode[iSize]
             End
         End
