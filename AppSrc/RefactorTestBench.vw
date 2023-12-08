@@ -236,6 +236,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Location to 17 6
                 Delegate Set phoEditor to (Self)
                 Set phoEditorRefactored of ghoApplication to (Self)
+                Set phoEditor of ghoApplication to (Self)
                 Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_RefactoredCode)
         
                 Procedure OnModified
