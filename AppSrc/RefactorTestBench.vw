@@ -515,9 +515,9 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
         // We need to copy the legacy file to the refactor file before we start our work,
         // because else the ghoRefactorEngine would overwrite the sLegacyFileName with
-        // the changes:
+        // changes:
         Get vCopyFile sLegacyFileName sRefactoredFileName to bOK
-        Set psCurrentSourceFileName of ghoApplication to sRefactoredFileName //sLegacyFileName
+        Set psCurrentSourceFileName of ghoApplication to sRefactoredFileName
         
         Get CollectFileData of ghoApplication to RefactorFiles
         If (Err = True) Begin
@@ -526,6 +526,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
         // Start the Engine!
         Send StartRefactoringEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor
+        // Save the result
         Send SaveFile of hoRefactoredEditor
         Set Value of oRefactoredCode_Time_fm to (psTotalTime(ghoRefactorEngine))
     End_Procedure
