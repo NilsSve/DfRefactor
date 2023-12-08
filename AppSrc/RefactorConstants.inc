@@ -424,18 +424,18 @@ Define CS_CompOptions    for "-e0fv2i0"
 Define CS_TestProgram    for "CompiledRefactoredCode.src"
 Define CS_TestErrFile    for "CompiledRefactoredCode.err"
 
-#IF (!@ = 190)
-    Define CS_SWSFile        for "DFRefactor19.0.sws"
-#ENDIF
-#IF (!@ = 191)
-    Define CS_SWSFile        for "DFRefactor19.1.sws"
-#ENDIF
-#IF (!@ = 200)
-    Define CS_SWSFile        for "DFRefactor20.0.sws"
-#ENDIF
-#IF (!@ = 201)
-    Define CS_SWSFile        for "DFRefactor20.1.sws"
-#ENDIF
+//#IF (!@ = 190)
+//    Define CS_SWSFile        for "DFRefactor19.0.sws"
+//#ENDIF
+//#IF (!@ = 191)
+//    Define CS_SWSFile        for "DFRefactor19.1.sws"
+//#ENDIF
+//#IF (!@ = 200)
+//    Define CS_SWSFile        for "DFRefactor20.0.sws"
+//#ENDIF
+//#IF (!@ = 201)
+//    Define CS_SWSFile        for "DFRefactor20.1.sws"
+//#ENDIF
 #IF (!@ = 230)
     Define CS_SWSFile        for "DFRefactor23.0.sws"
 #ENDIF
