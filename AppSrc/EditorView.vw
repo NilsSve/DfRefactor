@@ -1,6 +1,6 @@
 Use Windows.pkg
 Use cRefactorDbView.pkg
-Use cScintillaRefactorEditor.pkg
+Use cRefactorScintillaEditor.pkg
 Use oEditorProperties.pkg
 //Use mfiletime.pkg
 Use vWin32fh.pkg
@@ -34,7 +34,7 @@ Object oEditorView_vw is a cRefactorDbView
         Set Visible_State to False
     End_Object
 
-    Object oEditor_edt is a cScintillaRefactorEditor
+    Object oEditor_edt is a cRefactorScintillaEditor
         Set Size to 244 473
         Set Location to 16 10
         Set peAnchors to anAll

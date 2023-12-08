@@ -9,7 +9,7 @@ Use cRDCDbSpinForm.pkg
 Use cRDCDbForm.pkg
 Use cRDCDbHeaderGroup.pkg
 Use cFileNameForm.pkg
-Use cScintillaRefactorEditor.pkg
+Use cRefactorScintillaEditor.pkg
 Use vwin32fh.pkg
 
 Use cSysFileDataDictionary.dd
@@ -103,7 +103,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Label to "- You can drag && drop a source file from Windows Explorer to this editor object"
             End_Object
         
-            Object oLegacyCode_edt is a cScintillaRefactorEditor
+            Object oLegacyCode_edt is a cRefactorScintillaEditor
                 Set Size to 176 484
                 Set Location to 17 6
                 Set phoEditorLegacy of ghoApplication to (Self)
@@ -231,7 +231,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set FontWeight to fw_Bold
             End_Object
     
-            Object oRefactoredCode_edt is a cScintillaRefactorEditor
+            Object oRefactoredCode_edt is a cRefactorScintillaEditor
                 Set Size to 176 418
                 Set Location to 17 6
                 Delegate Set phoEditor to (Self)

@@ -3,7 +3,7 @@ Use cUnitCommandBar.pkg
 Use DFUnit\Reporting\ReporterManager.pkg
 Use DFUnit\Reporting\Reporters\UIListReporter.pkg
 Use cRDCButtonDPI.pkg
-Use cScintillaRefactorEditor.pkg
+Use cRefactorScintillaEditor.pkg
 Use cRefactorFuncLib.pkg
 
 Activate_View Activate_DFUnitTestRunner_vw for DFUnitTestRunner_vw
@@ -97,7 +97,7 @@ Object DFUnitTestRunner_vw is a View
         Set peAnchors to anBottomLeft
     End_Object
 
-    Object oTestCode_edt is a cScintillaRefactorEditor
+    Object oTestCode_edt is a cRefactorScintillaEditor
         Set Size to 30 227
         Set Location to 290 12
         Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
