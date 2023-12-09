@@ -7,7 +7,8 @@ Use cScintilla.h
 
 Define CS_CR   For (Character(13))
 Define CS_CRLF For (Character(13)+Character(10))
-Define CS_LF   For (Character(10))
+Define CS_LF   for (Character(10))
+
 // Text Encoding
 Enum_List
   Define eTE_Unknown for 0
@@ -33,9 +34,7 @@ Define WM_RBUTTONUP             For |CI$0205 // 0x0205
 #IFNDEF GET_CREATEWINDOWEX
   External_Function CreateWindowEx     'CreateWindowExA'      User32.dll  DWord e Pointer c Pointer v DWord w DWord x DWord y DWord wi DWord he Handle hP Handle hm Handle hi Pointer cs Returns Handle
 #ENDIF
-#IFNDEF GET_GetObject
-	External_Function GetObject          'GetObjectA'           Gdi32.dll   Handle hGdi Integer iSize Pointer pBuff Returns Integer
-#ENDIF
+External_Function GetObject          'GetObjectA'           Gdi32.dll   Handle hGdi Integer iSize Pointer pBuff Returns Integer
 #IFNDEF GET_CREATEFONTINDIRECT
   External_Function CreateFontIndirect 'CreateFontIndirectA'  Gdi32.dll   Pointer pLogfont Returns Integer
 #ENDIF
