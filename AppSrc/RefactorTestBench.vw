@@ -118,14 +118,14 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Procedure
                 
                 // Important: Must be after the object has been paged, else the text won't show
-                Procedure Page Integer iPageObject
+                Procedure Page_Object Boolean bPage
                     String[] asLegacyCode
                     String sFileName                         
                     Handle ho   
                     Integer iLines
                     
-                    Forward Send Page iPageObject
-                    If (iPageObject) Begin
+                    Forward Send Page_Object bPage
+                    If (bPage = True) Begin
                         Get Line_Count to iLines
                         If (iLines > 1) Begin
                             Procedure_Return
