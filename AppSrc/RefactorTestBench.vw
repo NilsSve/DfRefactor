@@ -111,28 +111,10 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
 
                 Property Boolean pbIsFileDropped False
                 
-                Procedure OnFileDropped String sFileName Boolean bLst
-                    Integer iChannel iCount
-                    String sTextValue sLine
-                    Boolean bSeqEof bLast
-                    String[] asLegacyCode    
-                    Handle ho
-                    
-//                    Move False to bLast
-//                    If (num_arguments > 1) Begin
-//                        Move bLst to bLast
-//                    End
-//                    If (bLast = True) Begin
-//                        Set pbIsFileDropped to False 
-                        Set Value of oLegacyCodeFilename_fm to sFileName 
-                        Send LoadFile sFileName 
-                        Send Activate
-//                    End 
-                    // We use a property to only show info_box once if multiple files are dropped.
-//                    Else If (pbIsFileDropped(Self) = False) Begin
-//                        Send Info_Box "Only one source file can be dropped at a time. The last file will be used."
-//                        Set pbIsFileDropped to True
-//                    End
+                Procedure OnFileDropped String sFileName Boolean bLast
+                    Set Value of oLegacyCodeFilename_fm to sFileName 
+                    Send LoadFile sFileName 
+                    Send Activate
                 End_Procedure
                 
                 // Important: Must be after the object has been paged, else the text won't show
