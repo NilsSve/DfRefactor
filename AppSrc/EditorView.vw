@@ -1,4 +1,5 @@
 Use Windows.pkg
+Use cRefactorApplication.pkg
 Use cRefactorDbView.pkg
 Use cRefactorScintillaEditor.pkg
 Use oEditorProperties.pkg
@@ -40,8 +41,9 @@ Object oEditorView_vw is a cRefactorDbView
         Set peAnchors to anAll
         Set Enabled_State to False
 
-        Set phoEditor of (phoEditorView(ghoApplication)) to (Self)
-        Set phoEditor of ghoApplication to (Self)
+        // View property.
+        Delegate Set phoEditor to Self
+        Set phoEditor of ghoApplication to Self
          
         Property Boolean piInSetFocus False
 
@@ -83,45 +85,6 @@ Object oEditorView_vw is a cRefactorDbView
         On_Key Key_Ctrl+Key_Tab Send SwitchNextView
         On_Key Key_Ctrl+Key_S   Send Request_Save
     End_Object
-
-    // Done in the Scintilla edtior.
-    // Allow a .sws file, source file or folder to be dropped on the view:
-//    Procedure OnFileDropped String sFilename Boolean bLast
-//        String sFileExt sSWSFile
-//        Boolean bFile bFolder bSWSFile
-//        Handle hoEditor
-//
-//        Get phoEditor of ghoApplication to hoEditor
-//        Forward Send OnFileDropped sFilename bLast
-//
-//        // Try to find out if a file or a folder name
-//        // was dropped on the view:
-//        If (bLast = True) Begin
-//            Get ParseFileExtension sFilename to sFileExt
-//            Move (Lowercase(sFileExt)) to sFileExt
-//            Move (sFileExt = "")    to bFolder
-//            Move (sFileExt = "sws") to bSWSFile
-//            Move (bSWSFile = False and bFolder = False) to bFile
-//            If (bFile = True) Begin
-//                Get psSWSFile of ghoApplication to sSWSFile
-//                If (sSWSFile = "") Begin
-//                    Send Info_Box "You need to select a workspace first."
-//                    Procedure_Return
-//                End
-//                Send OnFileNameUpdate of ghoApplication sFileName
-//                Send LoadFile of hoEditor sFilename
-//                Send Activate_oEditorView_vw
-//                Set pbWorkspaceMode of ghoApplication to False
-//            End
-//            Else Begin
-//                Send UpdateWorkspaceSelectorDisplay of ghoApplication sFilename
-//                Set pbWorkspaceMode of ghoApplication to True
-//            End
-//        End
-//        Else Begin
-//            Send Info_Box "Only one file can be dropped on the view. The last file will be used."
-//        End
-//    End_Procedure
 
     Procedure OnSetFocus
         Set piActiveView of ghoApplication to CI_CodeIndenter Self
