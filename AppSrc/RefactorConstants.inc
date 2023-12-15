@@ -216,10 +216,11 @@ Struct tExpression
 End_Struct   
 
 Struct tQuotedString
+    String sOverwrite
+    String sContent
     Integer iStartPos
     Integer iEndPos
     Integer iLength
-    String sStringContent
 End_Struct
 
 Struct tOperatorsInfo
@@ -278,8 +279,6 @@ Struct tTokenizer
     String sIndentation                 // Line start indentation, one or more tabs or spaces.
     Boolean bHasOverstrikeChars         // True if the sOverstrikeLine has overstriked content. Set by the _OverstrikeStrings function.
     String sOverstrikeLine              // Source line without indentation and string literals overstriked with "_" or '+'.
-// ToDo: Finish tQuotedString function. Needed?
-//    tQuotedString[] aStringContent      // Struct string array with original text string constants for the sLine content.
 
     tToken LeftStatement                // *Get MyFunction* of oSomeObject. Part before the "of" and "to" keywords.
     tToken OfStatement                  // Get "Function" of *oMyObject*
@@ -293,7 +292,7 @@ Struct tTokenizer
     String sOfExpression                // Get psAppSrcPath of *(phoWorkspace(ghoApplication))* to
     String sToExpression                // Move (True = False) to *(asMyArray[SizeOfArray(asMyArray)]*
     tExpression[] aExpressions          // Struct array with all expressions within "()" and their position on the source line.
-
+    tQuotedString[] asStringConstant    // Struct string array with original text string constants for the sLine content.
     String[] asLineTokens               // The sOverstrikeLine is broken up by spaces to a string array, but expressions are kept together on one array line even if it contains spaces.
     // The lowercase string array was removed as it was not needed. Instead the build in
     // case insensitive help search function DFSTRICMP is used whenever needed.
@@ -354,7 +353,7 @@ Define CS_CreateBackupFiles         for "CreateBackupFiles"
 Define CS_SummaryLogfileName        for "DFRefactorLogFile.txt"
 
 // Careful, these cannot end on a semicolumn as you will introduce variable type equal to ""
-Define CS_VarTypes                  for "INDICATOR;STRING;INTEGER;NUMBER;DATE;DATETIME;BOOLEAN;HANDLE;REAL;VARIANT;TIMESPAN;ROWID;DECIMAL;BIGINT;REAL;UCHAR;ADDRESS;CHAR;CURRENCY;DWORD;FLOAT;POINTER;SHORT;TIME;UBIGINT;USHORT;WSTRING;LONGPTR;ULONGPTR;UINTEGER"
+Define CS_VarTypes                  for "INDICATOR;STRING;INTEGER;NUMBER;DATE;DATETIME;BOOLEAN;HANDLE;REAL;VARIANT;TIMESPAN;ROWID;DECIMAL;BIGINT;REAL;UCHAR;ADDRESS;CHAR;CURRENCY;DWORD;FLOAT;POINTER;SHORT;TIME;UBIGINT;USHORT;WSTRING;LONGPTR;ULONGPTR;UINTEGER;XMLHANDLE"
 
 Define CS_ValidLeftCharacters       for ("()[];,&+-*<>= " + Character(9)) // Character 9=tab char //"()[];,.&+-*<>= "
 Define CS_CommentSymbol             for ("//")
@@ -424,18 +423,6 @@ Define CS_CompOptions    for "-e0fv2i0"
 Define CS_TestProgram    for "CompiledRefactoredCode.src"
 Define CS_TestErrFile    for "CompiledRefactoredCode.err"
 
-//#IF (!@ = 190)
-//    Define CS_SWSFile        for "DFRefactor19.0.sws"
-//#ENDIF
-//#IF (!@ = 191)
-//    Define CS_SWSFile        for "DFRefactor19.1.sws"
-//#ENDIF
-//#IF (!@ = 200)
-//    Define CS_SWSFile        for "DFRefactor20.0.sws"
-//#ENDIF
-//#IF (!@ = 201)
-//    Define CS_SWSFile        for "DFRefactor20.1.sws"
-//#ENDIF
 #IF (!@ = 230)
     Define CS_SWSFile        for "DFRefactor23.0.sws"
 #ENDIF
