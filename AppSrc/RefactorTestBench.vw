@@ -220,6 +220,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set phoEditorRefactored of ghoApplication to (Self)
                 Set phoEditor of ghoApplication to (Self)
                 Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_RefactoredCode)
+                Set phoCodeMaxEditor to Self
         
                 Procedure OnModified
                     Integer iLines
