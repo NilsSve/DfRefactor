@@ -192,6 +192,11 @@ Object oFunctionMaintenance_vw is a dbView
                         Boolean bChanged
                         String[] asSource asSourceFiles
                         
+                        Get YesNo_Box "Makes a call to all functions that has been added to the database. If e.g. a spelling error of the function name has been made, an error message will be shown. Each successful function call should return a zero (0). Continue?" to iRetval
+                        If (iRetval <> MBR_Yes) Begin
+                            Procedure_Return
+                        End
+
                         // Suspend all timers while we are working:
                         Send SuspendGUI of Desktop True
                         Move False to Err  
@@ -253,10 +258,20 @@ Object oFunctionMaintenance_vw is a dbView
 //    
 //    End_Object        
     
+    Procedure OnEnterArea Handle hoFrom
+        Boolean bChecked
+        Forward Send OnEnterArea hoFrom
+        Get Checked_State of oFunctions_bHasParameter to bChecked
+        Set Enabled_State of oFunctions_Parameter           to bChecked
+        Set Enabled_State of oFunctions_ParameterValidation to bChecked
+        Set Enabled_State of oFunctions_ParameterHelp       to bChecked
+    End_Procedure
+
     Procedure Activating            
         Send Clear of oFunctions_DD
         Send Find of oFunctions_DD GT 1   
     End_Procedure
+
                                                                    
     On_Key Key_Escape Send None
     On_Key Key_Ctrl+Key_S  Send Request_Save
