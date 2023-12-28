@@ -19,9 +19,11 @@
 // SOFTWARE.
 
 Use Windows.pkg
+Use seq_chnl.pkg
 Use cSCWsGrid.pkg
 Use cRegex.pkg
-Use RefactorConstants.inc
+Use RefactorConstants.inc 
+Use RefactorStatusPanel.pkg
 
 Global_Variable Handle ghoRefactorFuncLib
 Move 0 to ghoRefactorFuncLib
@@ -69,12 +71,13 @@ Class cBaseFuncLib is a cObject
 
         // All commands from the manual list in this class.
         Property String[] pasCommands
+        // These are commands that has been depriated (removed) since DF 18.1
+        Property String[] pasRemovedCommands
         // Commands that also exists as functions.
         Property String[] pasCommandFunctions
         Property String[] pasLocalVariableTypes
         Property String[] pasLocalVariableArrayTypes
         Property String[] pasSystemBooleans
-        
         // Data from the Scintilla editor. See ScintillaParameters.dg
         // Scoped words are; Begin/End While/Loop, Procedure/End_Procedure etc.
         Property String[] pasScopeStart
@@ -96,25 +99,33 @@ Class cBaseFuncLib is a cObject
 
     Procedure End_Construct_Object
         Forward Send End_Construct_Object
+        Send _AddAllKeyWords
         // Although this is done automatically here,
         // it should also be send before each refactoring starts,
         // in case e.g. the tab-size has been changed.
         // This has been put here for the DFUnit_Testrunner.
-        Send InitializeFuncLib
+        Send _InitializeFuncLib
     End_Procedure
 
+    // As this is an array compare function it needs to be on top (double underscores in name)
+    // It returns true if there is an equal value to sSearchText in the string array.
+    Function __FindStringArraContent tQuotedString QuotedOverwrite tQuotedString QuotedSearch Returns Integer  
+        If (Lowercase(QuotedOverwrite.sOverwrite) = Lowercase(QuotedSearch.sOverwrite)) ;
+            Function_Return (EQ)
+    End_Function
+    
     // Takes a "sOverstrikeLine" param *must* have been
     // "cleaned" with the _OverstrikeStrings function so string constant content
     // cannot interfere while scanning the source line for expressions.
     // Returns a struct array with the start, length & expression(s).
     // Returns an empty struct array if no opening parenthesis was found aka "(".
     // Note: This is a recursive message, if needed it calls itself.  
-    //       The sOrg is the same as the sOverstrikeLine value when calling this message.
+    //       The sOrg is the same as the sOverstrikeLine value when calling this message the first time (before any recursion).
     //       However, the sOverStrikeLine will get shorter and shorter for each recursive call
     //       and thus we also need the "sOrg" value as a reference to get the iStart value correctly.
-    Procedure _ExtractExpressions String sOverStrikeLine String sOrg tExpression[] ByRef aExpressions
-        String sExpression sChar sTest
-        Integer iSize iCount iStart iStop iItem iClauseOpen iClauseClosed iLength iPos iPosLeft iPosRight 
+    Procedure _ExtractExpressions String sOverStrikeLine String sOrg tTokenizer ByRef TokenizerData tExpression[] ByRef aExpressions
+        String sExpression sExpressionOS sChar sTest sContent
+        Integer iSize iSizeSC iCount iStart iStop iItem iClauseOpen iClauseClosed iLength iPos iPosLeft iPosRight iString 
         Boolean bParanthesis bHasLegacyOperators
         tExpression[] aExpressionsEmpty
 
@@ -175,7 +186,7 @@ Class cBaseFuncLib is a cObject
             End
             // Then nothing to save
             Else Begin         
-                Move 2 to iStart // Just to jump past the next If statement.
+                Move 2 to iStart // Lets jump past the next If statement.
                 Move 1 to iStop        
                 Move "" to sOverstrikeLine
             End
@@ -183,8 +194,31 @@ Class cBaseFuncLib is a cObject
 
         // If found, extract the expression and move info to struct array:
         If (iStart < iStop and sExpression <> "") Begin
-            Move (SizeOfArray(aExpressions)) to iSize   
-            Move (Pos(sExpression, sOrg)) to iStart
+            Move sExpression to sExpressionOS
+            Move (SizeOfArray(aExpressions)) to iSize
+            If (iSize = 0) Begin
+                // If we previously have replaced string content with "++++" or "____",
+                // find the original text and insert in expression.
+                Move (SizeOfArray(TokenizerData.asStringConstant)) to iSizeSC
+                Decrement iSizeSC
+                Move (Pos(sExpression, sOverStrikeLine)) to iPos
+                If (iPos = 0) Begin
+                    Get _ReplaceParanthesis sExpression to sTest
+                    Move (Pos(sTest, sOverStrikeLine)) to iPos
+                End
+                For iCount from 0 to iSizeSC
+                    Move TokenizerData.asStringConstant[iCount].sContent  to sContent   
+                    Move TokenizerData.asStringConstant[iCount].iStartPos to iStart
+                    If (iStart > iPos and iStart < iStop) Begin
+                        Move (Overstrike(sContent, sExpression, iStart - iPos +1)) to sExpression
+                    End
+                Loop
+            End
+            Move (Pos(sExpressionOS, sOrg)) to iStart
+            If (iStart = 0) Begin
+                Get _ReplaceParanthesis sExpressionOS to sExpressionOS
+                Move (Pos(sExpressionOS, sOrg)) to iStart
+            End
             Move (Length(sExpression)) to iLength
             Move iStart      to aExpressions[iSize].iStartPos
             Move iLength     to aExpressions[iSize].iLength
@@ -192,6 +226,10 @@ Class cBaseFuncLib is a cObject
                 Move ("(" + sExpression + ")") to sExpression
             End
             Move sExpression to aExpressions[iSize].sExpression
+            If (Pos(")", sExpressionOS) = 0) Begin
+                Move ("(" + sExpressionOS + ")") to sExpressionOS
+            End
+            Move sExpressionOS to aExpressions[iSize].sExpressionOS
 
             // Finally set the expression mode:
             { EnumList="{CI_LeftExpression, CI_LeftExpression2, CI_OfExpression, CI_ToTexpression}" }
@@ -219,7 +257,7 @@ Class cBaseFuncLib is a cObject
         Move (Pos("(", sTest)) to iItem
         If (iItem <> 0) Begin
             Move sTest to sOverstrikeLine
-            Send _ExtractExpressions sOverstrikeLine sOrg (&aExpressions)
+            Send _ExtractExpressions sOverstrikeLine sOrg (&TokenizerData) (&aExpressions)
         End
     End_Procedure 
     
@@ -234,42 +272,12 @@ Class cBaseFuncLib is a cObject
         End
     End_Procedure
 
-    // Commands that also exists as DataFlex functions;
-    Procedure AddAllCommandFunctions
-        String[] Empty
-
-        Set pasCommandFunctions to Empty
-
-        Send AddCommandFunction "Append"
-        Send AddCommandFunction "Ascii"
-        Send AddCommandFunction "Character"
-        Send AddCommandFunction "Else"
-        Send AddCommandFunction "If"
-        Send AddCommandFunction "Insert"
-        Send AddCommandFunction "Left"
-        Send AddCommandFunction "Length"
-        Send AddCommandFunction "Mid"
-        Send AddCommandFunction "Pad"
-        Send AddCommandFunction "Pos"
-        Send AddCommandFunction "Repeat"
-        Send AddCommandFunction "Replace"
-        Send AddCommandFunction "Right"
-        Send AddCommandFunction "Trim"
-        Send AddCommandFunction "Uppercase"
-    End_Procedure
-
-    // This is called from InitializeFuncLib and fills some keyword string array properties.
-    Procedure AddAllKeyWords
-        String[] Empty asScopeStart asScopeEnd asKeywords asOperators asCommands asSystemBooleans
-        String[] asLocalVariableTypes
+    // *** System (private) Messages ***
+    //
+    // This is called from _InitializeFuncLib and fills some keyword string array properties.
+    Procedure _AddAllKeyWords
+        String[] Empty asScopeStart asScopeEnd asKeywords asOperators asCommands asOther
         tSCLanguage SCLanguage
-
-        // Local variable declarations
-        Get StrSplitToArray CS_VarTypes ";" to asLocalVariableTypes
-        Get _LowercaseArrayValues asLocalVariableTypes to asLocalVariableTypes
-        Move (SortArray(asLocalVariableTypes)) to asLocalVariableTypes
-        Set pasLocalVariableTypes to asLocalVariableTypes
-        Set LocalVariableArrayTypes to asLocalVariableTypes
 
         Get pSCLanguage of ghoApplication to SCLanguage
 
@@ -307,235 +315,284 @@ Class cBaseFuncLib is a cObject
         // by adding a space character.
         //
         // Start by resetting array property to "blank", in case it was called before.
-        Set pasCommands to Empty
-        Send AddCommand "Abort"
-        Send AddCommand "Abort_Transaction"
-        Send AddCommand "Activate_View "
-        Send AddCommand "Add "
-        Send AddCommand "Address "
-        Send AddCommand "Append "
-        Send AddCommand "Append_Output "
-        Send AddCommand "Ascii"
-        Send AddCommand "Attach "
-        Send AddCommand "Begin_Constraints"
-        Send AddCommand "Begin_Transaction"
-        Send AddCommand "Broadcast "
-        Send AddCommand "Broadcast_Focus "
-        Send AddCommand "Calc "
-        Send AddCommand "Calculate "
-        Send AddCommand "Call_Driver "
-        Send AddCommand "CallStackDump "
-        Send AddCommand "Character"
-        Send AddCommand "Case "
-        Send AddCommand "Clear "
-        Send AddCommand "Close "
-        Send AddCommand "Close_Input"
-        Send AddCommand "Close_Output"
-        Send AddCommand "Constrain "
-        Send AddCommand "Constrained_Clear "
-        Send AddCommand "Constrained_Find "
-        Send AddCommand "Constraint_Set"
-        Send AddCommand "Constraint_Validate"
-        Send AddCommand "Copy_db "
-        Send AddCommand "Copy_Records "
-        Send AddCommand "Copyfile "
-        Send AddCommand "Create_Field "
-        Send AddCommand "Create_Index "
-        Send AddCommand "Declare_DataFile "
-        Send AddCommand "Decrement "
-        Send AddCommand "Delegate "
-        Send AddCommand "Delete "
-        Send AddCommand "Delete_db "
-        Send AddCommand "Delete_Field "
-        Send AddCommand "Delete_Index "
-        Send AddCommand "Direct_Input "
-        Send AddCommand "Direct_Output "
-        Send AddCommand "DiskFree "
-        Send AddCommand "EraseFile "
-        Send AddCommand "Error "
-        Send AddCommand "Field_Map "
-        Send AddCommand "File_Exist "
-        Send AddCommand "Fill_Field "
-        Send AddCommand "Find "
-        Send AddCommand "For "
-        Send AddCommand "For_All "
-        Send AddCommand "Forward "
-        Send AddCommand "Function"
-        Send AddCommand "Function_Return " // you might have code that does not return a value, I'd consider that a warning
-        Send AddCommand "Get "
-        Send AddCommand "Get_Argument_Size "
-        Send AddCommand "Get_Attribute "
-        Send AddCommand "Get_Channel_Position "
-        Send AddCommand "Get_Channel_Size "
-        Send AddCommand "Get_Current_Directory "
-        Send AddCommand "Get_Current_Input_Channel "
-        Send AddCommand "Get_Current_Output_Channel "
-        Send AddCommand "Get_Current_User_Count "
-        Send AddCommand "Get_Date_Attribute "
-        Send AddCommand "Get_Directory "
-        Send AddCommand "Get_Environment "
-        Send AddCommand "Get_Field_Value "
-        Send AddCommand "Get_FieldNumber "
-        Send AddCommand "Get_File_Mod_Time "
-        Send AddCommand "Get_File_Path "
-        Send AddCommand "Get_FileNumber "
-        Send AddCommand "Get_Licensed_Max_Users "
-        Send AddCommand "Get_StrictEval "
-        Send AddCommand "Get_Transaction_Retry "
-        Send AddCommand "Get_Windows_Directory "
-        Send AddCommand "GetAddress "
-        Send AddCommand "GetBuff "
-        Send AddCommand "GetBuff_String "
-        Send AddCommand "GetDskInfo "
-        Send AddCommand "Global_Variable "
-        Send AddCommand "Gosub"
-        Send AddCommand "Goto"
-        Send AddCommand "GotoXY"
-        Send AddCommand "Include_Resource "
-        Send AddCommand "Include_Text"
-        Send AddCommand "Increment "
-        Send AddCommand "Indicate "
-        Send AddCommand "Indicator "
-        Send AddCommand "Input"
-        Send AddCommand "Load_Def "
-        Send AddCommand "Left"
-        Send AddCommand "Length"
-        Send AddCommand "Load_Driver "
-        Send AddCommand "Lock"
-        Send AddCommand "Login "
-        Send AddCommand "Logout"
-        Send AddCommand "Make_Directory "
-        Send AddCommand "Make_File "
-        Send AddCommand "Make_Temp_File "
-        Send AddCommand "Mid"
-        Send AddCommand "Move "
-        Send AddCommand "Movedate "
-        Send AddCommand "Moveint "
-        Send AddCommand "Movenum "
-        Send AddCommand "Movereal "
-        Send AddCommand "Movestr "
-        Send AddCommand "MoveVar"
-        Send AddCommand "NewRecord "
-        Send AddCommand "On_Item"
-        Send AddCommand "On_key "
-        Send AddCommand "Open "
-        Send AddCommand "Output "
-        Send AddCommand "Output_Aux_File "
-        Send AddCommand "Output_Wrap"
-        Send AddCommand "Pad"
-        Send AddCommand "Pos"
-        Send AddCommand "Playwave "
-        Send AddCommand "Procedure"
-        Send AddCommand "Procedure_Return"
-        Send AddCommand "Property "
-        Send AddCommand "Put "
-        Send AddCommand "Read "
-        Send AddCommand "Read_Block "
-        Send AddCommand "Read_hex "
-        Send AddCommand "Readln "
-        Send AddCommand "Reg_Close_Key "
-        Send AddCommand "Reg_Enum_Key "
-        Send AddCommand "Reg_Enum_Key_Info "
-        Send AddCommand "Reg_Enum_Value "
-        Send AddCommand "Relate "
-        Send AddCommand "Remove_Directory "
-        Send AddCommand "Renamefile "
-        Send AddCommand "Repeat"
-        Send AddCommand "Replace"
-        Send AddCommand "Report_Breaks "
-        Send AddCommand "Reread"
-        Send AddCommand "Right"
-        Send AddCommand "RunProgram "
-        Send AddCommand "Save "
-        Send AddCommand "SaveRecord "
-        Send AddCommand "Send "
-        Send AddCommand "Set "
-        Send AddCommand "Set_Argument_Size "
-        Send AddCommand "Set_Attribute "
-        Send AddCommand "Set_Channel_Position "
-        Send AddCommand "Set_Date_Attribute "
-        Send AddCommand "Set_Directory "
-        Send AddCommand "Set_Field_Value "
-        Send AddCommand "Set_File_Mod_Time "
-        Send AddCommand "Set_Foreign_Profile_String "
-        Send AddCommand "set_registry_root "
-        Send AddCommand "Set_Relate "
-        Send AddCommand "Set_StrictEval "
-        Send AddCommand "Set_Transaction_Retry "
-        Send AddCommand "Shift_State "
-        Send AddCommand "Show "
-        Send AddCommand "Showln"
-        Send AddCommand "Sleep "
-        Send AddCommand "Sort "
-        Send AddCommand "Start_UI"
-        Send AddCommand "Structure_Abort "
-        Send AddCommand "Structure_Copy "
-        Send AddCommand "Structure_End "
-        Send AddCommand "Structure_Start "
-        Send AddCommand "Subtract "
-        Send AddCommand "Sysdate "
-        Send AddCommand "Sysdate4 "
-        Send AddCommand "Trim"
-        Send AddCommand "Unload_Driver "
-        Send AddCommand "Unlock"
-        Send AddCommand "Until"
-        Send AddCommand "Uppercase"
-        Send AddCommand "Valid_Drive "
-        Send AddCommand "ValueTreeDeserializeParameter "
-        Send AddCommand "ValueTreeSerializeParameter "
-        Send AddCommand "VConstrain "
-        Send AddCommand "Version_Information "
-        Send AddCommand "VFind "
-        Send AddCommand "Virtual_Key "
-        Send AddCommand "WebGet "
-        Send AddCommand "WebPublishFunction "
-        Send AddCommand "WebPublishProcedure "
-        Send AddCommand "WebSet "
-        Send AddCommand "WebSetResponsive "
-        Send AddCommand "While "
-        Send AddCommand "Write "
-        Send AddCommand "Write_Hex "
-        Send AddCommand "WriteLn"
-        Send AddCommand "ZeroFile "
-        Send AddCommand "ZeroString "
-        Send AddCommand "ZeroType "
+//        Set pasCommands to Empty   
+//        
+//        Send AddCommand "Abort"
+//        Send AddCommand "Abort_Transaction"
+//        Send AddCommand "Activate_View "
+//        Send AddCommand "Add "
+//        Send AddCommand "Address "
+//        Send AddCommand "Append "
+//        Send AddCommand "Append_Output "
+//        Send AddCommand "Ascii"
+//        Send AddCommand "Attach "
+//        Send AddCommand "Begin_Constraints"
+//        Send AddCommand "Begin_Transaction"  
+//        Send AddCommand "Blankform"
+//        Send AddCommand "Broadcast "
+//        Send AddCommand "Broadcast_Focus "
+//        Send AddCommand "Calc "
+//        Send AddCommand "Calculate "
+//        Send AddCommand "Call_Driver "
+//        Send AddCommand "CallStackDump "
+//        Send AddCommand "Character"
+//        Send AddCommand "Case "
+//        Send AddCommand "Clear "
+//        Send AddCommand "Close "
+//        Send AddCommand "Close_Input"
+//        Send AddCommand "Close_Output"
+//        Send AddCommand "Constrain "
+//        Send AddCommand "Constrained_Clear "
+//        Send AddCommand "Constrained_Find "
+//        Send AddCommand "Constraint_Set"
+//        Send AddCommand "Constraint_Validate"
+//        Send AddCommand "Copy_db "
+//        Send AddCommand "Copy_Records "
+//        Send AddCommand "Copyfile "
+//        Send AddCommand "Create_Field "
+//        Send AddCommand "Create_Index "
+//        Send AddCommand "Declare_DataFile "
+//        Send AddCommand "Decrement "
+//        Send AddCommand "Delegate "
+//        Send AddCommand "Delete "
+//        Send AddCommand "Delete_db "
+//        Send AddCommand "Delete_Field "
+//        Send AddCommand "Delete_Index "
+//        Send AddCommand "Direct_Input "
+//        Send AddCommand "Direct_Output "
+//        Send AddCommand "DiskFree " 
+//        Send AddCommand "Display "
+//        Send AddCommand "EraseFile "
+//        Send AddCommand "Error "
+//        Send AddCommand "Field_Map "
+//        Send AddCommand "File_Exist "
+//        Send AddCommand "Fill_Field "
+//        Send AddCommand "Find "
+//        Send AddCommand "For "
+//        Send AddCommand "For_All "
+//        Send AddCommand "Forward "
+//        Send AddCommand "Function"
+//        Send AddCommand "Function_Return " // you might have code that does not return a value, I'd consider that a warning
+//        Send AddCommand "Get "
+//        Send AddCommand "Get_Argument_Size "
+//        Send AddCommand "Get_Attribute "
+//        Send AddCommand "Get_Channel_Position "
+//        Send AddCommand "Get_Channel_Size "
+//        Send AddCommand "Get_Current_Directory "
+//        Send AddCommand "Get_Current_Input_Channel "
+//        Send AddCommand "Get_Current_Output_Channel "
+//        Send AddCommand "Get_Current_User_Count "
+//        Send AddCommand "Get_Date_Attribute "
+//        Send AddCommand "Get_Directory "
+//        Send AddCommand "Get_Environment "
+//        Send AddCommand "Get_Field_Value "
+//        Send AddCommand "Get_FieldNumber "
+//        Send AddCommand "Get_File_Mod_Time "
+//        Send AddCommand "Get_File_Path "
+//        Send AddCommand "Get_FileNumber "
+//        Send AddCommand "Get_Licensed_Max_Users "
+//        Send AddCommand "Get_StrictEval "
+//        Send AddCommand "Get_Transaction_Retry "
+//        Send AddCommand "Get_Windows_Directory "
+//        Send AddCommand "GetAddress "
+//        Send AddCommand "GetBuff "
+//        Send AddCommand "GetBuff_String "
+//        Send AddCommand "GetDskInfo "
+//        Send AddCommand "Global_Variable "
+//        Send AddCommand "Gosub"
+//        Send AddCommand "Goto"
+//        Send AddCommand "GotoXY"
+//        Send AddCommand "Include_Resource "
+//        Send AddCommand "Include_Text"
+//        Send AddCommand "Increment "
+//        Send AddCommand "Indicate "
+//        Send AddCommand "Indicator "
+//        Send AddCommand "Input"
+//        Send AddCommand "Load_Def "
+//        Send AddCommand "Left"
+//        Send AddCommand "Length"
+//        Send AddCommand "Load_Driver "
+//        Send AddCommand "Lock"
+//        Send AddCommand "Login "
+//        Send AddCommand "Logout"
+//        Send AddCommand "Make_Directory "
+//        Send AddCommand "Make_File "
+//        Send AddCommand "Make_Temp_File "
+//        Send AddCommand "Mid"
+//        Send AddCommand "Move "
+//        Send AddCommand "Movedate "
+//        Send AddCommand "Moveint "
+//        Send AddCommand "Movenum "
+//        Send AddCommand "Movereal "
+//        Send AddCommand "Movestr "
+//        Send AddCommand "MoveVar"
+//        Send AddCommand "NewRecord "
+//        Send AddCommand "On_Item"
+//        Send AddCommand "On_key "
+//        Send AddCommand "Open "
+//        Send AddCommand "Output "
+//        Send AddCommand "Output_Aux_File "
+//        Send AddCommand "Output_Wrap"
+//        Send AddCommand "Pad"
+//        Send AddCommand "Pos"
+//        Send AddCommand "Playwave "
+//        Send AddCommand "Procedure"
+//        Send AddCommand "Procedure_Return"
+//        Send AddCommand "Property "
+//        Send AddCommand "Put "
+//        Send AddCommand "Read "
+//        Send AddCommand "Read_Block "
+//        Send AddCommand "Read_hex "
+//        Send AddCommand "Readln "
+//        Send AddCommand "Reg_Close_Key "
+//        Send AddCommand "Reg_Enum_Key "
+//        Send AddCommand "Reg_Enum_Key_Info "
+//        Send AddCommand "Reg_Enum_Value "
+//        Send AddCommand "Relate "
+//        Send AddCommand "Remove_Directory "
+//        Send AddCommand "Renamefile "
+//        Send AddCommand "Repeat"
+//        Send AddCommand "Replace"
+//        Send AddCommand "Report_Breaks "
+//        Send AddCommand "Reread"
+//        Send AddCommand "Right"
+//        Send AddCommand "RunProgram "
+//        Send AddCommand "Save "
+//        Send AddCommand "SaveRecord "
+//        Send AddCommand "Send "
+//        Send AddCommand "Set "
+//        Send AddCommand "Set_Argument_Size "
+//        Send AddCommand "Set_Attribute "
+//        Send AddCommand "Set_Channel_Position "
+//        Send AddCommand "Set_Date_Attribute "
+//        Send AddCommand "Set_Directory "
+//        Send AddCommand "Set_Field_Value "
+//        Send AddCommand "Set_File_Mod_Time "
+//        Send AddCommand "Set_Foreign_Profile_String "
+//        Send AddCommand "set_registry_root "
+//        Send AddCommand "Set_Relate "
+//        Send AddCommand "Set_StrictEval "
+//        Send AddCommand "Set_Transaction_Retry "
+//        Send AddCommand "Shift_State "
+//        Send AddCommand "Show "
+//        Send AddCommand "Showln"
+//        Send AddCommand "Sleep "
+//        Send AddCommand "Sort "
+//        Send AddCommand "Start_UI"
+//        Send AddCommand "Structure_Abort "
+//        Send AddCommand "Structure_Copy "
+//        Send AddCommand "Structure_End "
+//        Send AddCommand "Structure_Start "
+//        Send AddCommand "Subtract "
+//        Send AddCommand "Sysdate "
+//        Send AddCommand "Sysdate4 "
+//        Send AddCommand "Trim"
+//        Send AddCommand "Unload_Driver "
+//        Send AddCommand "Unlock"
+//        Send AddCommand "Until"
+//        Send AddCommand "Uppercase"
+//        Send AddCommand "Valid_Drive "
+//        Send AddCommand "ValueTreeDeserializeParameter "
+//        Send AddCommand "ValueTreeSerializeParameter "
+//        Send AddCommand "VConstrain "
+//        Send AddCommand "Version_Information "
+//        Send AddCommand "VFind "
+//        Send AddCommand "Virtual_Key "
+//        Send AddCommand "WebGet "
+//        Send AddCommand "WebPublishFunction "
+//        Send AddCommand "WebPublishProcedure "
+//        Send AddCommand "WebSet "
+//        Send AddCommand "WebSetResponsive "
+//        Send AddCommand "While "
+//        Send AddCommand "Write "
+//        Send AddCommand "Write_Hex "
+//        Send AddCommand "WriteLn"
+//        Send AddCommand "ZeroFile "
+//        Send AddCommand "ZeroString "
+//        Send AddCommand "ZeroType "
 
-        Get pasCommands to asCommands
+        Send _CreateDecpreatedCommandsArray
+        Send _CreateLocalVariableTypes
+        Send _CreateCommandFunctionArray
+        Send _CreateSystemBooleansArray
+
+        // Using keywords from Scintilla instead of our own list (above).
+        Move asKeywords to asCommands
         Move (SortArray(asCommands)) to asCommands
-        Set pasCommands to asCommands
-
-        Move "found"    to asSystemBooleans[SizeOfArray(asSystemBooleans)]
-        Move "finderr"  to asSystemBooleans[SizeOfArray(asSystemBooleans)]
-        Move "err"      to asSystemBooleans[SizeOfArray(asSystemBooleans)]
-        Move "seqeof"   to asSystemBooleans[SizeOfArray(asSystemBooleans)]
-        Move "seqeol"   to asSystemBooleans[SizeOfArray(asSystemBooleans)]
-        Move "true"     to asSystemBooleans[SizeOfArray(asSystemBooleans)]
-        Move "false"    to asSystemBooleans[SizeOfArray(asSystemBooleans)]
-        Set pasSystemBooleans to asSystemBooleans
+        Get _RemoveCommandsArray to asOther
+        
+        // Remove commands that starts with a hash-mark: "#", from pasCommands,
+        // as we use the helper function - _IsCommandDeclaration.
+        Get _RemoveHashMarkCommands asCommands to asCommands
+        // Remove local variable types;
+        Get _RemoveKeyWordsFromArray asCommands (pasLocalVariableTypes(Self)) to asCommands
+        // Remove all functions that are also commands from pasCommands
+        Get _RemoveKeyWordsFromArray asCommands (pasCommandFunctions(Self)) to asCommands
+        // Remove "other" keywords from pasCommands
+        Get _RemoveKeyWordsFromArray asCommands asOther to asCommands
+        // Remove system booleans from pasCommands
+        Get _RemoveKeyWordsFromArray asCommands (pasSystemBooleans(Self)) to asCommands
+        
+        Set pasCommands to asCommands  
     End_Procedure
 
-    // *** System (private) Messages ***
-    //
-    Procedure AddCommand String sCommand
-        String[] asCommands
-
-        Get pasCommands to asCommands
-        // Note: The value is lowercased.
-        Move (Trim(Lowercase(sCommand))) to sCommand
-        Move sCommand to asCommands[SizeOfArray(asCommands)]
-        Set pasCommands   to asCommands
+    // Commands that were removed after DF 18.2:
+    Procedure _CreateDecpreatedCommandsArray
+        String sCommands
+        String[] asRemovedCommands
+        
+        Move (Lowercase("accept,backfield,clear_option,endgroup,entagain,entdisplay,enter, ;
+            enterend,entergroup,entermode,entfind,entsfind,entry,entupdate,file$mode,find$page,;
+            format,format$range,getxy,help,inherit_screen,inkey,inkey$,os$call, ;
+            outclose,outfile,page,report,reportend,section,set_option,setchange,sub_page, ;
+            screen_optimize,get_cursor_visible,set_cursor_visible,compute_screen_crc,set_video_mode,get_video_mode, ;
+            set_file_owner,get_file_owner,compiler_desktop_method_warnings")) to sCommands
+            Move (StrSplitToArray(sCommands, ",")) to asRemovedCommands
+            
+        Set pasRemovedCommands to asRemovedCommands
+    End_Procedure
+    
+    // Local variable declarations
+    Procedure _CreateLocalVariableTypes
+        String[] asLocalVariableTypes
+        Move (StrSplitToArray(CS_VarTypes, ";")) to asLocalVariableTypes
+        Get _LowercaseArrayValues asLocalVariableTypes to asLocalVariableTypes
+        Move (SortArray(asLocalVariableTypes)) to asLocalVariableTypes
+        Set pasLocalVariableTypes to asLocalVariableTypes
+        Set _LocalVariableArrayTypes to asLocalVariableTypes
     End_Procedure
 
-    Procedure AddCommandFunction String sCommand
+    // Commands that also exists as DataFlex functions;
+    Procedure _CreateCommandFunctionArray
         String[] asCommandFunctions
+        String sCommandFunctions
 
-        Get pasCommandFunctions to asCommandFunctions
-        Move (Trim(Lowercase(sCommand))) to sCommand
-        Move sCommand to asCommandFunctions[SizeOfArray(asCommandFunctions)]
+        Move (Lowercase("Append,Ascii,Character,Else,If,Insert,Left,Length,Mid,Pad,Pos,Repeat,Replace,Right,Trim,Uppercase")) to sCommandFunctions
+        Move (StrSplitToArray(sCommandFunctions, ",")) to asCommandFunctions
+        
         Set pasCommandFunctions to asCommandFunctions
     End_Procedure
 
-    Procedure InitTabSize
+    // DataFlex system booleans
+    Procedure _CreateSystemBooleansArray
+        String[] asSystemBooleans
+        String sSystemBooleans
+        
+        Move (Lowercase("err,false,finderr,found,is,local,seqeof,seqeol,true")) to sSystemBooleans
+        Move (StrSplitToArray(sSystemBooleans, ",")) to asSystemBooleans
+        Set pasSystemBooleans to asSystemBooleans
+    End_Procedure
+
+    // A list of items that should be removed from the pasCommands array
+    Function _RemoveCommandsArray Returns String[]
+        String sOtherCommands
+        String[] asOther
+        Move (Lowercase("byref,to,of,at,do,from,field,file_field,returns")) to sOtherCommands
+        Move (StrSplitToArray(sOtherCommands, ",")) to asOther
+        Function_Return asOther
+    End_Function
+
+    Procedure _InitTabSize
         Integer iID iTabSize
 
         Move FunctionsA.ID to iID
@@ -555,57 +612,63 @@ Class cBaseFuncLib is a cObject
         Set piTabSize to iTabSize
     End_Procedure
 
-    // Removes any keyword from the pasCommands array that also exists
-    // in the pasCommandFunctions array.
-    Procedure RemoveFunctionsFromCommandsArray
-        String[] asCommands
-        String[] asCommandFunctions
-        String sFunction sDeleteItem
+    Function _RemoveKeyWordsFromArray String[] asReduceArray String[] asRemoveItemsArray Returns String[]
+        String sValue
         Integer iSize iCount iItem
 
-        Get pasCommands to asCommands
-        Get pasCommandFunctions to asCommandFunctions
-        Move (SizeOfArray(asCommandFunctions)) to iSize
+        Move (SizeOfArray(asRemoveItemsArray)) to iSize
         Decrement iSize
-        Move "ZZZZZ" to sDeleteItem
 
         For iCount from 0 to iSize
-            Move asCommandFunctions[iCount] to sFunction
-            Move (SearchArray(sFunction, asCommands)) to iItem
-            If (iItem <> -1) Begin
-                Move sDeleteItem to asCommands[iItem]
+            Move asRemoveItemsArray[iCount] to sValue
+            Move (SearchArray(sValue, asReduceArray)) to iItem
+            If (iItem <> -1) Begin  
+                Move (RemoveFromArray(asReduceArray, iItem)) to asReduceArray
             End
         Loop
 
-        Move (SortArray(asCommands)) to asCommands
-        Move (SearchArray(sDeleteItem, asCommands)) to iItem
-        If (iItem <> -1) Begin
-            Move (ResizeArray(asCommands, (iSize - (iSize - iItem)))) to asCommands
-        End
+        Function_Return asReduceArray
+    End_Function
 
-        Set pasCommands to asCommands
-    End_Procedure
+    Function _RemoveHashMarkCommands String[] asCommands Returns String[]
+        
+        String sCommand sChar
+        Integer iSize iCount iItem
+
+        Move (SizeOfArray(asCommands)) to iSize
+        Decrement iSize
+
+        For iCount from 0 to iSize
+            Move asCommands[iCount] to sCommand
+            Move (Left(sCommand, 1)) to sChar
+            If (sChar = "#") Begin
+                Move (RemoveFromArray(asCommands, iCount)) to asCommands
+                Decrement iSize
+                Decrement iCount
+            End
+        Loop
+
+        Function_Return asCommands
+    End_Function
     
     // Must be send before the refactoring process is started
     // It initializes necessary parameters.
-    Procedure InitializeFuncLib
+    Procedure _InitializeFuncLib
         String[] asEmtpty
         Set pasOtherLogFiles to asEmtpty
-        Send AddAllCommandFunctions
-        Send AddAllKeyWords
         Send SaveErrorState
-        Send InitTabSize
-        Send ResetFuncLibProperties
+        Send _InitTabSize
+        Send _ResetFuncLibProperties
     End_Procedure
 
-    Procedure ResetFuncLibProperties
+    Procedure _ResetFuncLibProperties
         tTokenizer TokenizerDataEmpty
-        Send ResetRefactoringProperties
-        Send ResetProjectObjectStructureProperties
+        Send _ResetRefactoringProperties
+        Send _ResetProjectObjectStructureProperties
         Set pTokenizer to TokenizerDataEmpty
     End_Procedure
         
-    Procedure ResetRefactoringProperties
+    Procedure _ResetRefactoringProperties
         Set pbInRepeatLoop to False
         Set pbInProcedure to False
         Set pbInFunction to False
@@ -617,7 +680,7 @@ Class cBaseFuncLib is a cObject
         Set pbIsInSingleQuote to False
     End_Procedure
     
-    Procedure ResetProjectObjectStructureProperties
+    Procedure _ResetProjectObjectStructureProperties
         String[] asObjectNames
         Set pbProjectObjectStructureStart to False
         Set pbProjectObjectStructureEnd   to False
@@ -652,7 +715,7 @@ Class cBaseFuncLib is a cObject
     // from a pasLocalVariableTypes array.
     // The pasLocalVariableTypes array contains variable declarations like; string, integer...
     // The pasLocalVariableArrayTypes will be filled wtih declarations like; string[], string[][], integer[], integer[][] etc.
-    Procedure Set LocalVariableArrayTypes String[] asLocalVariableTypes
+    Procedure Set _LocalVariableArrayTypes String[] asLocalVariableTypes
         Integer iSize iCount
         String[] asLocalVariableArrayTypes
         String sVariable
@@ -853,7 +916,7 @@ Class cBaseFuncLib is a cObject
     // It does *not* count empty or commented lines.
     // it does *not* count COM proxy class files generated by the Studio for COM/ActiveX components.
     Function _CountNumberOfLines String sFullSourceFileName String sParameter Returns Integer
-        Integer iLines iChannel
+        Integer iLines iCh
         String sLine
         Boolean bExists bBlank bIsCOM
 
@@ -867,24 +930,19 @@ Class cBaseFuncLib is a cObject
         If (bIsCOM = True) Begin
             Function_Return 0
         End
-
-        Get Seq_New_Channel to iChannel
-        If (iChannel = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
-            Error DfErr_Program "No Channel Available for: 'Function _CountNumberOfLines'"
-            Function_Return 0
-        End
-
         Move 0 to iLines
-        Direct_Input channel iChannel sFullSourceFileName
-        While (SeqEof = False)
-            Readln channel iChannel sLine
-            Get _IsCommentLineOrBlank sLine to bBlank
-            If (bBlank = False) Begin
-                Increment iLines
-            End
-        Loop
-        Close_Input channel iChannel
-        Send Seq_Release_Channel iChannel
+
+        Get OpenInput sFullSourceFileName to iCh
+        If (iCh > 0) Begin
+            While (SeqEof = False)
+                Readln channel iCh sLine
+                Get _IsCommentLineOrBlank sLine to bBlank
+                If (bBlank = False) Begin
+                    Increment iLines
+                End
+            Loop
+            Send CloseInput iCh
+        End
 
         Function_Return iLines
     End_Function
@@ -952,7 +1010,7 @@ Class cBaseFuncLib is a cObject
         Move (Pos(Lowercase(" " + CS_As + " "), Lowercase(sText))) to iPos
         If (iPos <> 0) Begin
             Move (Mid(sText, Length(sText), (iPos + 3))) to sText
-            Move ("(" + sText + ")") to sExpression
+            Move ("(" + Trim(sText) + ")") to sExpression
             Function_Return sExpression
         End 
         
@@ -1333,7 +1391,7 @@ Class cBaseFuncLib is a cObject
     End_Function
 
     Function _FixExpressionParanthesis String sLine String sExpression tTokenizer TokenizerData Returns String
-        String sExpressionNo s
+        String sExpressionNo
         Boolean bFound
         Integer iPos iItem
         
@@ -1357,7 +1415,7 @@ Class cBaseFuncLib is a cObject
                 Get _HasTokenParanthesis sExpression to bFound
                 If (bFound = False) Begin   
                     Move sExpression to sExpressionNo
-                    Move ("(" + String(sExpression) + ")") to sExpression
+                    Move ("(" + Trim(sExpression) + ")") to sExpression
                 End
                 Else Begin
                     Get _ReplaceParanthesis sExpression to sExpressionNo    
@@ -1365,15 +1423,23 @@ Class cBaseFuncLib is a cObject
             End
         End
             
-        Move (Pos(sExpression, sLine)) to iPos
+        Move (Pos(sExpression, sLine)) to iPos 
+        // If the expression in sLine has one or many spaces between the "(" and the rest of the expression we
+        // won't find a match which can result in doulbe-parentesis. So we strip the sLine from such spaces.
         If (iPos = 0) Begin
+            Move ("(" + Trim(sExpressionNo) + ")") to sExpression
+            Get _StripConcatenatingSpaces sLine to sLine
+        End
+        Move (Pos(sExpression, sLine)) to iPos 
+        If (iPos = 0) Begin    
+            Move (Trim(sExpressionNo)) to sExpressionNo
             Move (Replace(sExpressionNo, sLine, sExpression)) to sLine
         End
         
         Function_Return sLine
     End_Function   
     
-    // We need this as we cannot changne the tExpression member order, as the first member
+    // We need this as we cannot change the tExpression member order, as the first member
     // is used ty the Tokenizer function.
     Function _FindExpressionArrayValue String sExpression tTokenizer TokenizerData Returns Integer
         Integer iItem iSize iCount
@@ -1754,19 +1820,16 @@ Class cBaseFuncLib is a cObject
         If (bExists = False) Begin
             Error DfErr_Program ("The file doesn't exist:" * String(sFileName))
             Function_Return False
-        End
-        Get Seq_New_Channel to iCh
-        If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
-            Error DfErr_Program "No Channel Available for: 'Function _IsDataFlexCOMProxyClassesFile'"
+        End  
+        Get OpenInput sFileName to iCh
+        If (iCh < 0) Begin
             Function_Return False
         End
         
         Direct_Input channel iCh ("binary:" + sFileName)
-        
-        // Read a line
         Readln channel iCh sLine
-        Close_Input channel ich
-        Send Seq_Release_Channel iCh
+        
+        Send CloseInput iCh
         Move (Trim(sLine)) to sLine
         Move (Pos(CS_CommentSymbol, sLine)) to iPos
         If (iPos <> 1) Begin
@@ -2602,34 +2665,74 @@ Class cBaseFuncLib is a cObject
         Function_Return Data
     End_Function
 
-    // Get the left part of the line up to but not including the "of or to" part..
+    // Get the left part of the line up to but not including the "of or to" part, and not any end comment.
     Function _LeftStatement tTokenizer ByRef TokenizerData Returns tToken
-        String sOverstrikeLine
-        Integer iPos
+        String sOverstrikeLine sOverWrite sLine
+        Integer iPos iSize iCount iStart iItem iEnd
+        Boolean bHasQuotedString
         tToken Data
-
-        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
-        // Start by assuming there is no "of" or "to" keyword;
-        Move 1 to Data.iStartPos
-        Move (Trim(sOverstrikeLine)) to Data.sCode
-
-        // Search for a "to" keyword;
-        Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sOverstrikeLine))) to iPos
-        If (iPos <> 0) Begin
-            Move (Left(sOverstrikeLine, (iPos - 1))) to sOverstrikeLine
-            Move (iPos + 4) to Data.iStartPos
-            Move (Trim(sOverstrikeLine)) to Data.sCode
+        
+        If (TokenizerData.bLineIsReady = True) Begin
+            Function_Return Data
         End
-
-        // Then search for a "of" keyword;
-        Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sOverstrikeLine))) to iPos
-        If (iPos <> 0) Begin
-            Move (Left(sOverstrikeLine, (iPos -1))) to sOverstrikeLine
-            Move (iPos + 4) to Data.iStartPos
-            Move (Trim(sOverstrikeLine)) to Data.sCode
+        Move (SizeOfArray(TokenizerData.asLineTokens)) to iSize
+        Decrement iSize     
+        Move iSize to iEnd
+        Move (SearchArray(CS_To, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+        If (iItem <> -1) Begin
+            Move iItem to iEnd
         End
+        Move (SearchArray(CS_Of, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+        If (iItem <> -1) Begin
+            Move iItem to iEnd
+        End
+        Decrement iEnd
+        
+        For iCount from 0 to iEnd
+            Append sLine TokenizerData.asLineTokens[iCount] " "
+        Loop           
+        Move 1              to Data.iStartPos
+        Move (Rtrim(sLine)) to Data.sCode
+        
+//        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+//        // Start by assuming there is no "of" or "to" keyword;
+//        Move 1 to Data.iStartPos
+//        Move (Trim(sOverstrikeLine)) to Data.sCode
+//
+//        // Search for a "to" keyword;
+//        Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sOverstrikeLine))) to iPos
+//        If (iPos <> 0) Begin
+//            Move (Left(sOverstrikeLine, (iPos - 1))) to sOverstrikeLine
+//            Move (iPos + 4) to Data.iStartPos
+//            Move (Trim(sOverstrikeLine)) to Data.sCode
+//        End
+//
+//        // Then search for a "of" keyword;
+//        Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sOverstrikeLine))) to iPos
+//        If (iPos <> 0) Begin
+//            Move (Left(sOverstrikeLine, (iPos -1))) to sOverstrikeLine
+//            Move (iPos + 4) to Data.iStartPos
+//            Move (Trim(sOverstrikeLine)) to Data.sCode
+//        End 
+//        Get _IsOverwriteValue Data.sCode to bHasQuotedString
+//        If (bHasQuotedString = True) Begin 
+//            Move (Mid(Data.sCode, TokenizerData.asStringConstant[0].iLength, TokenizerData.asStringConstant[0].iStartPos)) to sOverWrite
+//            Get _FindOverwriteToContent sOverWrite 1 TokenizerData.asStringConstant to Data.sCode    
+//        End
 
         Function_Return Data
+    End_Function  
+    
+    Function IsLineTokenStringConstant tTokenizer ByRef TokenizerData Returns Boolean
+        Integer iSize iCount
+        Boolean bFound
+        Move False to bFound
+        Move (SizeOfArray(TokenizerData.asLineTokens)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            
+        Loop
+        Function_Return bFound
     End_Function
 
     // Pass only the code part of a source line.
@@ -2815,29 +2918,118 @@ Class cBaseFuncLib is a cObject
 
     // Get the "of xxxx " part from a source line. But not the "to xxx" part and the "of" keyword.
     Function _OfStatement tTokenizer ByRef TokenizerData Returns tToken
-        String sOverstrikeLine sOfStatement
-        Integer iPos
+        String sOfStatement sOverWrite sLine
+        Integer iPos iCount iStart iItem iEnd
         tToken Data
-
-        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
-        Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sOverstrikeLine))) to iPos
-        If (iPos = 0) Begin
+        
+        If (TokenizerData.bLineIsReady = True) Begin
             Function_Return Data
         End
-
-        Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sOverstrikeLine))) to iPos
-        Move (iPos + 4) to Data.iStartPos
-        Move (Mid(sOverstrikeLine, (Length(sOverstrikeLine) -1), (iPos + Length(CS_Of) + 1))) to sOfStatement
-        Move (Left(sOverstrikeLine, (iPos - 1))) to sOverstrikeLine
-        // If an "to sVariable" expression exist, remove it.
-        Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sOfStatement))) to iPos
-        If (iPos <> 0) Begin
-            Move (Left(sOfStatement, (iPos - 1))) to sOfStatement
+        Move (SearchArray(CS_Of, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+        If (iItem = -1) Begin
+            Function_Return Data
         End
-        Move (Trim(sOfStatement)) to sOfStatement
+        Move (iItem + 1) to iStart
+        Move (SizeOfArray(TokenizerData.asLineTokens)) to iEnd
+        Decrement iEnd
+        Move (SearchArray(CS_To, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+        If (iItem <> -1) Begin
+            Move (iItem -1) to iEnd
+        End
 
-        Move sOfStatement to Data.sCode
+        For iCount from iStart to iEnd
+            Append sOfStatement TokenizerData.asLineTokens[iCount] " "
+        Loop           
+        Move (Rtrim(sOfStatement)) to Data.sCode 
+        Move (Pos(Lowercase(CS_Of * String(Data.sCode)), Trim(Lowercase(TokenizerData.sLine)))) to iStart
+        Move (iStart + 2)          to Data.iStartPos // "Of" = +2
+        
+//        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+//        Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sOverstrikeLine))) to iPos
+//        If (iPos = 0) Begin
+//            Function_Return Data
+//        End
+//
+//        Move (Pos((" " + Lowercase(CS_Of) + " "), Lowercase(sOverstrikeLine))) to iPos
+//        Move (iPos + 4) to Data.iStartPos
+//        Move (Mid(sOverstrikeLine, (Length(sOverstrikeLine) -1), (iPos + Length(CS_Of) + 1))) to sOfStatement
+//        Move (Left(sOverstrikeLine, (iPos - 1))) to sOverstrikeLine
+//        // If an "to sVariable" expression exist, remove it.
+//        Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sOfStatement))) to iPos
+//        If (iPos <> 0) Begin
+//            Move (Left(sOfStatement, (iPos - 1))) to sOfStatement
+//        End
+//        Move (Trim(sOfStatement)) to sOfStatement
+//
+//        Move iStart to Data.iStartPos
+//        Move sOfStatement to Data.sCode
         Function_Return Data
+    End_Function  
+    
+    Function _IsOverwriteValue String sOverwrite Returns Boolean
+        Boolean bFound
+        Move (sOverwrite contains "'++" or sOverwrite contains "'+'" or sOverwrite contains "'__" or sOverwrite contains "'_'") to bFound
+        If (bFound = False) Begin
+            Move (sOverwrite contains '"++' or sOverwrite contains '"+"' or sOverwrite contains '"__' or sOverwrite contains '"_"') to bFound
+        End
+//        Move (sOverwrite contains "'++" or sOverwrite contains "'+'" or sOverwrite contains "'__" or sOverwrite contains "'_'" or sOverwrite contains "'||" or sOverwrite contains "'|'") to bFound
+//        If (bFound = False) Begin
+//            Move (sOverwrite contains '"++' or sOverwrite contains '"+"' or sOverwrite contains '"__' or sOverwrite contains '"_"' or sOverwrite contains '"||' or sOverwrite contains '"|"') to bFound
+//        End
+        Function_Return bFound
+    End_Function
+    
+    // Tries to find the corresponding original string constant in a source line.
+    // Params: sOverwrite = the over written string constant from e.g. the Tokenizer's asLineTokens array.
+    //         asQuatedArray = tokenizer's asStringConstant array.
+    // Note:   It will return the "sOverwrite" value if no value found.
+    Function _FindOverwriteToContent String sOverwrite Integer iItem tQuotedString[] asQuatedArray Returns String
+        Boolean bFound
+        Integer iItemFound iSize iCount
+        String sValue sChar
+        tQuotedString QuotedString
+        
+        Get _IsOverwriteValue sOverwrite to bFound
+        If (bFound = False) Begin
+            Function_Return sOverwrite
+        End
+        
+        Move "" to sValue
+        Move False to bFound
+        Move (Left(sOverwrite, 1)) to sChar
+        If (Right(sOverwrite, 1) <> sChar) Begin
+            Append sOverwrite sChar
+        End
+        Move sOverwrite to QuotedString.sOverwrite
+        Move (SizeOfArray(asQuatedArray)) to iSize
+        Decrement iSize
+        For iCount from (iItem -1) to iSize
+            Move (asQuatedArray[iCount].sOverwrite = sOverwrite) to bFound
+            If (bFound = True) Break
+        Loop
+        If (bFound = True) Begin
+            Move asQuatedArray[iCount].sContent to sValue
+        End
+        Function_Return sValue
+    End_Function
+    
+    Function _OverWriteStringAdd String sContent String sOverwrite Integer iStart Integer iArrayItem tTokenizer ByRef TokenizerData Returns Integer
+        Integer iLength iEnd               
+        String sChar
+        
+        Move (Left(sOverwrite, 1)) to sChar
+        If (Right(sOverwrite, 1) <> sChar) Begin
+            Append sOverwrite sChar
+        End
+        Move (Trim(sOverwrite)) to sOverwrite
+        Move (Trim(sContent))   to sContent
+        Move (Length(sContent)) to iLength
+        Move sContent           to TokenizerData.asStringConstant[iArrayItem].sContent
+        Move sOverwrite         to TokenizerData.asStringConstant[iArrayItem].sOverwrite
+        Move iStart             to TokenizerData.asStringConstant[iArrayItem].iStartPos
+        Move (iStart + iLength) to TokenizerData.asStringConstant[iArrayItem].iEndPos
+        Move iLength            to TokenizerData.asStringConstant[iArrayItem].iLength
+        Function_Return (iArrayItem + 1) // Increase array item for next call.
     End_Function
 
     // This will replace the string literals in a line with overstrike characters
@@ -2851,10 +3043,10 @@ Class cBaseFuncLib is a cObject
     //       should be possible to simplify, but how?
     Function _OverstrikeStrings tTokenizer ByRef TokenizerData Returns String
         Boolean bDoubleQuote bSingleQuote bChanged bHasEndSemiColon bIsInDF23MultiLineString  bIsInSemiColonMultiLineString
-        Boolean bIsOpenString bIsInSingleQuote
-        Integer iChar iLength iPos iDoubleQuotes iSingleQuotes
-        String  sChar sText sTrippelDoubleQuote sContent
-       
+        Boolean bIsOpenString bIsInSingleQuote bOK
+        Integer iChar iLength iPos iDoubleQuotes iSingleQuotes iString iStart
+        String  sChar sText sTrippelDoubleQuote sContent sOverwrite
+        
         // If we already have applied this function to a source line, do nothing.
         If (TokenizerData.bHasOverstrikeChars = True) Begin
             Function_Return TokenizerData.sOverstrikeLine
@@ -2897,31 +3089,45 @@ Class cBaseFuncLib is a cObject
                 End
             End
         End
-
+        
+        Move (SizeOfArray(TokenizerData.asStringConstant)) to iString
         Move False to bDoubleQuote
         Move False to bSingleQuote
         Get _NumberOfStringQuotes sText CI_SingleQuotes to iSingleQuotes
         Get _NumberOfStringQuotes sText CI_DoubleQuotes to iDoubleQuotes
+        
         // This property is set when a multi-line string is started, to indicate
         // if the beginning of the string was a single- or double-quote character.
         Get pbIsInSingleQuote to bIsInSingleQuote
         If (bIsInDF23MultiLineString = True or bIsInSemiColonMultiLineString = True) Begin
             If (bIsInSingleQuote = False) Begin
-                If (iDoubleQuotes = 0 and iSingleQuotes < 2) Begin
+                If (iDoubleQuotes = 0 and iSingleQuotes < 2) Begin 
+                    Move sText to sContent
                     Move (Length(sText)) to iLength
                     Move (Repeat("_", iLength)) to sText
                     If (bHasEndSemiColon = True) Begin
                         Move (Left(sText, (Length(sText) -1))) to sText
                         Append sText ";"
-                    End
+                    End           
+                    Move sContent to TokenizerData.asStringConstant[iString].sContent
+                    Move sText    to TokenizerData.asStringConstant[iString].sOverwrite
+                    Move 1        to TokenizerData.asStringConstant[iString].iStartPos
+                    Move iLength  to TokenizerData.asStringConstant[iString].iEndPos
+                    Move iLength  to TokenizerData.asStringConstant[iString].iLength
                     Move sText to TokenizerData.sOverstrikeLine
                     Function_Return TokenizerData.sOverstrikeLine
                 End
             End
             Else Begin
                 If (iSingleQuotes = 0) Begin
+                    Move sText to sContent
                     Move (Length(sText)) to iLength
                     Move (Repeat("+", iLength)) to sText
+                    Move sContent to TokenizerData.asStringConstant[iString].sContent
+                    Move sText    to TokenizerData.asStringConstant[iString].sOverwrite
+                    Move 1        to TokenizerData.asStringConstant[iString].iStartPos
+                    Move iLength  to TokenizerData.asStringConstant[iString].iEndPos
+                    Move iLength  to TokenizerData.asStringConstant[iString].iLength
                     Move sText to TokenizerData.sOverstrikeLine
                     Function_Return TokenizerData.sOverstrikeLine
                 End
@@ -2943,6 +3149,7 @@ Class cBaseFuncLib is a cObject
             Function_Return sText
         End
 
+        Move 0 to iStart
         For iChar from 1 to iLength
             Move (Mid(sText, 1, iChar)) to sChar
             If (sChar = Character(9)) Begin                  // tab characters should be treated as a single space char, this keeps the
@@ -2950,13 +3157,25 @@ Class cBaseFuncLib is a cObject
                 Move True to bChanged
                 Move " " to sChar
             End
+            // If closing double quote:
             If (bDoubleQuote and sChar= '"') Begin
                 Move True to bChanged
+                Append sContent sChar
+                Get _OverWriteStringAdd sContent ('"' + sOverwrite + '"') iStart iString (&TokenizerData) to iString
+                Move 0 to iStart
+                Move "" to sContent    
+                Move "" to sOverwrite
                 Move "" to sChar
                 Move False to bDoubleQuote
             End
+            // If closing single quote:
             If (bSingleQuote and sChar = "'") Begin
-                Move True to bChanged
+                Move True to bChanged  
+                Append sContent sChar
+                Get _OverWriteStringAdd sContent ("'" + sOverwrite + "'") iStart iString (&TokenizerData) to iString
+                Move 0 to iStart
+                Move "" to sContent
+                Move "" to sOverwrite
                 Move "" to sChar
                 Move False to bSingleQuote
             End
@@ -2980,9 +3199,7 @@ Class cBaseFuncLib is a cObject
                     Move "" to sChar
                 End
             End
-            If (bIsOpenString = True) Begin
 
-            End
             If (bSingleQuote = False and sChar ='"') Begin
                 Move (Mid(sText, 3, iChar)) to sTrippelDoubleQuote
                 If (sTrippelDoubleQuote = '"""') Begin
@@ -2993,18 +3210,28 @@ Class cBaseFuncLib is a cObject
                 End
             End
             If (bDoubleQuote = False and sChar = "'") Begin
-                Move True to bSingleQuote
+                Move True to bSingleQuote  
             End
             If bDoubleQuote Begin
-                If (sChar <> '"') Begin
+                If (sChar <> '"') Begin    
+                    Append sOverwrite "_"      
                     Move (Overstrike("_", sText, iChar)) to sText
+                    Append sContent sChar
+                End
+                If (iStart = 0) Begin
+                    Move iChar to iStart
                     Append sContent sChar
                 End
                 Move True to bChanged
             End
             Else If bSingleQuote Begin
                 If (sChar <> "'") Begin
+                    Append sOverwrite "+" 
                     Move (Overstrike("+", sText, iChar)) to sText
+                    Append sContent sChar 
+                End
+                If (iStart = 0) Begin
+                    Move iChar to iStart
                     Append sContent sChar
                 End
                 Move True to bChanged
@@ -3012,8 +3239,15 @@ Class cBaseFuncLib is a cObject
         Loop
 
         If (bChanged = True) Begin
-            Move True          to TokenizerData.bHasOverstrikeChars
-            Move (Trim(sText)) to sText
+            If (bIsOpenString = True) Begin
+                If (bDoubleQuote = True) Begin
+                    Get _OverWriteStringAdd sContent ('"' + sOverwrite + '"') iStart iString (&TokenizerData) to iString
+                End
+                Else If (bSingleQuote = True) Begin
+                    Get _OverWriteStringAdd sContent ("'" + sOverwrite + "'") iStart iString (&TokenizerData) to iString
+                End
+            End
+            Move True to TokenizerData.bHasOverstrikeChars 
             // Add back the end-of-line semi-colon:
             If (bHasEndSemiColon = True) Begin
                 Move (Left(sText, (Length(sText) -1))) to sText
@@ -3528,11 +3762,13 @@ Class cBaseFuncLib is a cObject
     // The line will be broken up by spaces " ", *except* for expressions. Each expression will exist as a
     // separate member/item.
     Function _SplitSourceLineToTokens tTokenizer ByRef TokenizerData Returns tTokenizer
-        String sOverstrikeLine
+        String sOverstrikeLine sItem sReplace sOrg sOverWrite sExpression sToken
         String[] asLineTokens
-        String sReplace sOrg
-        Integer iSize iCount iItem iPos
-        tExpression[] aExpressions aExpressionsEmpty
+        Integer iSize iCount iItem iPos iString iStringConstantSize
+        Boolean bFound
+        tExpression[] aExpressions aExpressionsEmpty   
+        tQuotedString[] asStringConstant 
+        tQuotedString QuotedString
 
         // We need to retrieve expressions from the sOverstrikeLine, as they else will
         // be splitted on several items (if expression contains spaces) in the array and
@@ -3541,7 +3777,7 @@ Class cBaseFuncLib is a cObject
         Move TokenizerData.sOverstrikeLine to sOrg
         
         // _ExtractExpression is called recursively. This is why we use a procedure as it simplifies the work for us.
-        Send _ExtractExpressions sOverstrikeLine sOrg (&aExpressions)
+        Send _ExtractExpressions sOverstrikeLine sOrg (&TokenizerData) (&aExpressions)
         Move (SizeOfArray(aExpressions)) to iSize
         Decrement iSize
 
@@ -3551,7 +3787,11 @@ Class cBaseFuncLib is a cObject
             Move aExpressions to TokenizerData.aExpressions
             For iCount from 0 to iSize
                 Move (FillString("|", aExpressions[iCount].iLength)) to sReplace
-                Move (Pos(aExpressions[iCount].sExpression, sOverstrikeLine)) to iPos
+                Move (Pos(aExpressions[iCount].sExpressionOS, sOverstrikeLine)) to iPos 
+                If (iPos = 0) Begin
+                    Get _ReplaceParanthesis aExpressions[iCount].sExpressionOS to sExpression
+                    Move (Pos(sExpression, sOverstrikeLine)) to iPos
+                End
                 If (iPos <> 0) Begin
                     Move (Overstrike(sReplace, sOverstrikeLine, aExpressions[iCount].iStartPos)) to sOverstrikeLine
                 End
@@ -3571,16 +3811,53 @@ Class cBaseFuncLib is a cObject
                 Decrement iSize
                 Decrement iCount
             End
-        Loop
-
-        // If there were any expressions, place them back into asLineTokens as items.
-        Move (SizeOfArray(aExpressions)) to iSize
+        Loop   
+        
+        // If there are any string constants, replace the overstriked value with the original text string:
+        Move (SizeOfArray(asLineTokens)) to iSize
         Decrement iSize
+        For iCount from 0 to iSize
+            Move asLineTokens[iCount] to sToken 
+            Get _IsOverwriteValue sToken to bFound
+            If (bFound = True) Begin 
+                Get _ReplaceParanthesis sToken to sToken
+                // We need to use a special search function for SearchArray as else it will give us false positives,
+                // e.g. a "+" in asStringConstant will be found in a asLineTokens "+++",
+                // and we need an exact match.   
+                Move sToken to QuotedString.sOverwrite
+                Move (SearchArray(QuotedString, TokenizerData.asStringConstant, Self, RefFunc(__FindStringArraContent))) to iItem
+                If (iItem <> -1) Begin
+                    Move TokenizerData.asStringConstant[iItem].sContent to sItem 
+                    Move sItem to asLineTokens[iCount]  
+                    If ((iItem +1) = SizeOfArray(TokenizerData.asStringConstant)) Begin
+                        Move iSize to iCount // We're out of here.     
+                    End
+                End
+            End
+        Loop
+        
+        Move TokenizerData.asStringConstant  to asStringConstant
+        Move (SizeOfArray(asStringConstant)) to iStringConstantSize
+        Decrement iStringConstantSize
+        // If there were any expressions, place them back in the asLineTokens array as items.
+        Move (SizeOfArray(aExpressions)) to iSize
+        Decrement iSize 
+        Move 0 to iString 
+        Move False to Err
         If (iSize <> -1) Begin
             For iCount from 0 to iSize
                 Move (FillString("|", aExpressions[iCount].iLength)) to sReplace
                 Move (SearchArray(sReplace, asLineTokens)) to iItem
-                If (iItem <> -1) Begin
+                If (iItem <> -1) Begin 
+                    If (iString <= iStringConstantSize) Begin
+                        Move asStringConstant[iString].sOverwrite to sOverWrite
+                        Move (Pos(sOverWrite, aExpressions[iCount].sExpression)) to iPos
+                        If (iPos <> 0) Begin
+                            Move (Replace(sOverwrite, aExpressions[iCount].sExpression, asStringConstant[iString].sContent)) ;
+                                to aExpressions[iCount].sExpression
+                            Increment iString
+                        End
+                    End
                     Move aExpressions[iCount].sExpression to asLineTokens[iItem]
                 End
             Loop
@@ -3636,22 +3913,74 @@ Class cBaseFuncLib is a cObject
 
     // Get the "to xxx" part, but without the "to" keyword.
     Function _ToStatement tTokenizer ByRef TokenizerData Returns tToken
-        String sOverstrikeLine sToStatement
-        Integer iPos
+        String sToStatement sOverWrite sLine
+        Integer iPos iSize iCount iStart iItem iEnd
         tToken Data
-
-        Move "" to sToStatement
-        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
-        Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sOverstrikeLine))) to iPos
-        If (iPos = 0) Begin
+        
+        If (TokenizerData.bLineIsReady = True) Begin
             Function_Return Data
         End
-        Move (iPos + 4) to Data.iStartPos
-        Move (Mid(sOverstrikeLine, (Length(sOverstrikeLine) -1), (iPos + Length(CS_To) + 1))) to sToStatement
+        Move (SearchArray(CS_To, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+        If (iItem = -1) Begin
+            Function_Return Data
+        End
+        
+        Move (iItem + 1) to iStart    
+        Move (SizeOfArray(TokenizerData.asLineTokens)) to iSize
+        Decrement iSize     
+        For iCount from iStart to iSize
+            Append sToStatement TokenizerData.asLineTokens[iCount] " "
+        Loop           
+
+        Move (Pos(Lowercase(CS_To * String(Data.sCode)), Trim(Lowercase(TokenizerData.sLine)))) to iStart
+        Move (iStart + 2)         to Data.iStartPos // "Of" = +2
         Move (Trim(sToStatement)) to Data.sCode
+
+//        Move "" to sToStatement
+//        Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+//        Move (Pos((" " + Lowercase(CS_To) + " "), Lowercase(sOverstrikeLine))) to iPos
+//        If (iPos = 0) Begin
+//            Function_Return Data
+//        End
+//        Move (iPos + 4) to Data.iStartPos
+//        Move (Mid(sOverstrikeLine, (Length(sOverstrikeLine) -1), (iPos + Length(CS_To) + 1))) to sToStatement
 
         Function_Return Data
     End_Function
+
+    Function OpenOutput String sFileName Returns Integer
+        Integer iCh
+
+        Get Seq_New_Channel to iCh
+        If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
+            Error DFERR_PROGRAM "DF_SEQ_CHANNEL_NOT_AVAILABLE"
+            Function_Return DF_SEQ_CHANNEL_NOT_AVAILABLE
+        End
+        Direct_Output channel iCh sFileName
+        Function_Return iCh
+    End_Function
+
+    Procedure CloseOutput Integer iCh
+        Close_Output channel iCh
+        Send Seq_Release_Channel iCh
+    End_Procedure
+
+    Function OpenInput String sFileName Returns Integer
+        Integer iCh
+
+        Get Seq_New_Channel to iCh
+        If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
+            Error DFERR_PROGRAM "DF_SEQ_CHANNEL_NOT_AVAILABLE"
+            Function_Return DF_SEQ_CHANNEL_NOT_AVAILABLE
+        End
+        Direct_Input channel iCh ("binary:" + sFileName)
+        Function_Return iCh
+    End_Function
+
+    Procedure CloseInput Integer iCh
+        Close_Input channel iCh
+        Send Seq_Release_Channel iCh
+    End_Procedure
 
     // * Dummy function for the Studio's Code Explorer *
     // *** MAIN PUBLIC MESSAGE for this system class is the Tokenizer ***
@@ -3732,7 +4061,7 @@ Class cBaseFuncLib is a cObject
             If (pbIsInDF23MultiLineComment(Self) = True) Begin
                 Get _IsDF23CommentEnd TokenizerData.sLine to bFound
                 If (bFound = True) Begin
-                    Send ResetRefactoringProperties
+                    Send _ResetRefactoringProperties
                 End
                 Move True to TokenizerData.bIsInDF23MultiLineComment
                 Get _DF23CommentOverwrite TokenizerData.sLine to TokenizerData.sOverstrikeLine
@@ -3747,7 +4076,7 @@ Class cBaseFuncLib is a cObject
                 Get _IsDF23CommentStart TokenizerData.sLine to TokenizerData.bIsInDF23MultiLineComment
                 If (TokenizerData.bIsInDF23MultiLineComment = True) Begin
                     Get _DF23CommentOverwrite TokenizerData.sLine to TokenizerData.sOverstrikeLine
-                    Send ResetRefactoringProperties
+                    Send _ResetRefactoringProperties
                     Set pbIsInDF23MultiLineComment      to True
                     Move True  to TokenizerData.bIsComment
                     Move True  to TokenizerData.bLineIsReady
@@ -3805,7 +4134,7 @@ Class cBaseFuncLib is a cObject
             End
         End
         Else Begin
-            Send ResetRefactoringProperties
+            Send _ResetRefactoringProperties
         End
 
         // DF 23 Multi-line strings are lines ending with a @, @SQL or """
@@ -3815,7 +4144,7 @@ Class cBaseFuncLib is a cObject
             Get _IsDF23String (&TokenizerData) to TokenizerData.bIsDF23String
             Get _IsMultiLineStringEnd TokenizerData.sOverstrikeLine to bFound
             If (bFound = True) Begin
-                Send ResetRefactoringProperties
+                Send _ResetRefactoringProperties
                 Move False to TokenizerData.bIsInDF23MultiLineString
                 Move False to TokenizerData.bIsOpenString
                 Move True  to TokenizerData.bLineIsReady
