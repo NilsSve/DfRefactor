@@ -17,8 +17,8 @@ Use cRDCDbSpinForm.pkg
 Use cRDCButton.pkg
 Use cRDCForm.pkg
  
-Use cFunctionsDataDictionary.dd
 Use cSysFileDataDictionary.dd
+Use cFunctionsDataDictionary.dd
 Use cFolderSelHeaDataDictionary.dd
 Use cFolderSelDtlDataDictionary.dd
 Use cdbCJGridColumn.pkg
@@ -40,6 +40,7 @@ Object oImageList is a cImageList32
 End_Object                                 
 
 Register_Procedure RefreshSelectionUpdate
+Register_Procedure ActivateProcess
 
 Activate_View Activate_oRefactorView for oRefactorView
 Object oRefactorView is a cRefactorDbView
@@ -67,7 +68,7 @@ Object oRefactorView is a cRefactorDbView
     Object oFunctions_DD is a cFunctionsDataDictionary  
         
         // In this view we are also interested in saving the system file,
-        // when the oSysFile_CountSourceLines_cb object is changed.
+        // when the oCountSourceLines_cb object is changed.
         // So relay save message here.
         Procedure Request_Save
             SaveRecord SysFile
@@ -126,8 +127,9 @@ Object oRefactorView is a cRefactorDbView
                     Set pbAllowDeleteRow to False
                     Set pbAllowInsertRow to False
                     Set pbAutoAppend to False
-                    Set pbDbShowInvertSelectionsMenuItem to True
-                    // Need this if we have lots of records to load all records in the grid.
+                    Set pbDbShowInvertSelectionsMenuItem to True 
+                    // Need this to load all records in the grid,
+                    // else the select buttons won't work.
                     Set pbStaticData to True
                         
                     Object oFunctions_ID is a cRDCDbCJGridColumn
@@ -143,12 +145,15 @@ Object oRefactorView is a cRefactorDbView
                         Set piWidth to 291
                         Set psCaption to "Function Name (Suggestion list)"    
                         Set psToolTip to "This is a full text suggestion list. You can start typing to search for any keyword and a suggestion list will appear for you to select from."
+                        // NOTE: The phoData_Col property must be set for the checkbox selections to work!
                         Set phoData_Col to Self   
                         Set pbFullText to True    
                         Set pbAllowRemove to False
+                        Set Status_Help to (psToolTip(Self))
                         
                         Function OnGetTooltip Integer iRow String sValue String sText Returns String
                             Get RowValue of oFunctions_Function_Help iRow to sText
+                            Set Status_Help to sText
                             Function_Return sText
                         End_Function
             
@@ -160,9 +165,11 @@ Object oRefactorView is a cRefactorDbView
                         Set psCaption to "Description"
                         Set pbEditable to False
                         Set psToolTip to "A short description of whate the refactoring function does. Hover the mouse over a function row to see more help on what it does."
+                        Set Status_Help to (psToolTip(Self))
             
                         Function OnGetTooltip Integer iRow String sValue String sText Returns String
                             Get RowValue of oFunctions_Function_Help iRow to sText
+                            Set Status_Help to sText
                             Function_Return sText
                         End_Function
             
@@ -177,21 +184,24 @@ Object oRefactorView is a cRefactorDbView
                         // pbEditable *must* be set after the pbComboButton setting.
                         Set pbEditable to False
                         Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
+                        Set Status_Help to (psToolTip(Self))
             
                         Function OnGetTooltip Integer iRow String sValue String sText Returns String
                             Move "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing." to sText
+                            Set Status_Help to sText
                             Function_Return sText
                         End_Function
             
                     End_Object                    
 
-                    Object oFunctions_Parameter is a cDbCJGridColumn
+                    Object oFunctions_Parameter is a cRDCDbCJGridColumn
                         Entry_Item Functions.Parameter
                         Set piWidth to 74
                         Set psCaption to "Parameter"
                         Set pbComboButton to True  
                         Set pbComboEntryState to False
                         Set psToolTip to "For some functions an extra parameter can be passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
+                        Set Status_Help to (psToolTip(Self))
             
                         Procedure OnEntry
                             Send ComboFillList
@@ -217,16 +227,18 @@ Object oRefactorView is a cRefactorDbView
                         Function OnGetTooltip Integer iRow String sValue String sText Returns String
                             Get RowValue of oFunctions_ParameterHelp iRow to sText
                             Move (Replaces("\n", sText, CS_CRLF)) to sText
+                            Set Status_Help to sText
                             Function_Return sText
                         End_Function
             
                     End_Object
 
-                    Object oFunctions_ParameterHelp is a cDbCJGridColumn
+                    Object oFunctions_ParameterHelp is a cRDCDbCJGridColumn
                         Entry_Item Functions.ParameterHelp
                         Set piWidth to 200
                         Set psCaption to "Parameter Help"
                         Set pbVisible to False
+                        Set Status_Help to (psToolTip(Self))
                     End_Object
 
                     Object oFunctions_Function_Help is a cRDCDbCJGridColumn
@@ -234,6 +246,7 @@ Object oRefactorView is a cRefactorDbView
                         Set piWidth to 221
                         Set psCaption to "Help"
                         Set pbVisible to False
+                        Set Status_Help to (psToolTip(Self))
                     End_Object
             
                     Object oFunctions_Selected is a cRDCDbCJGridColumn
@@ -241,12 +254,14 @@ Object oRefactorView is a cRefactorDbView
                         Set piWidth to 45
                         Set psCaption to "Select"
                         Set pbCheckbox to True
-                        Set peHeaderAlignment to xtpAlignmentCenter  
                         Set phoCheckbox_Col to Self
+                        Set peHeaderAlignment to xtpAlignmentCenter  
                         Set peFooterAlignment to  xtpAlignmentCenter
+                        Set Status_Help to (psToolTip(Self))
             
                         Function OnGetTooltip Integer iRow String sValue String sText Returns String
                             Get RowValue of oFunctions_Function_Help iRow to sText
+                            Set Status_Help to sText
                             Function_Return sText
                         End_Function
             
@@ -271,13 +286,15 @@ Object oRefactorView is a cRefactorDbView
                         Function_Return bSave
                     End_Procedure
                     
+                    On_Key Key_Ctrl+Key_F5 Send ActivateProcess
                 End_Object
 
                 Object oSelectAll_btn is a Button
                     Set Size to 14 62
                     Set Location to 10 255
                     Set Label to "Select All"
-                    Set psImage to "SelectAll.ico"
+                    Set psImage to "SelectAll.ico"   
+                    Set psToolTip to "(Ctrl+A)"
                     Set peAnchors to anTopRight
                     Procedure OnClick
                         Send SelectAll of oFunctionSelection_grd
@@ -289,6 +306,7 @@ Object oRefactorView is a cRefactorDbView
                     Set Location to 10 321
                     Set Label to "Select None"
                     Set psImage to "SelectNone.ico"
+                    Set psToolTip to "(Ctrl+N)"
                     Set peAnchors to anTopRight
                     Procedure OnClick
                         Send SelectNone of oFunctionSelection_grd
@@ -300,6 +318,7 @@ Object oRefactorView is a cRefactorDbView
                     Set Location to 10 387
                     Set Label to "Invert Selections"
                     Set psImage to "SelectInvert.ico"
+                    Set psToolTip to "(Ctrl+I)"
                     Set peAnchors to anTopRight
                     Procedure OnClick
                         Send SelectInvert of oFunctionSelection_grd
@@ -367,35 +386,6 @@ Object oRefactorView is a cRefactorDbView
                   
                 End_Object
     
-//                Object oDisabledInfo_txt is a TextBox
-//                    Set Auto_Size_State to False
-//                    Set Size to 7 485
-//                    Set Location to 0 104
-//                    Set Justification_Mode to JMode_Left
-//                    Set FontWeight to fw_Bold
-//                    Set peAnchors to anTopRight
-//                    
-//                    Object oDisabledInfo_Idle is an cIdleHandler
-//                        Set pbEnabled to True
-//                        Procedure OnIdle
-//                            String sText sSWSFile 
-//                            Boolean bSelected
-//                            
-//                            Get Field_Current_Value of oSysFile_DD Field SysFile.bCountSourceLines to bSelected
-//                            If (bSelected = True) Begin
-//                                Move 'Grid is disabled because the Checkbox: "Only count Source Lines" above the "Start Refactoring" button has been checked!' to sText
-//                            End                 
-//                            Else Begin
-//                                Move "" to sText
-//                            End
-//                            Set Value of oDisabledInfo_txt to sText  
-//                            Get psSWSFile of ghoApplication to sSWSFile
-//                            Set Enabled_State of oFunctionSelection_grd to (sSWSFile <> "" and bSelected = False)  
-//                        End_Procedure
-//                    End_Object
-//            
-//                End_Object
-                
                 Procedure OnFileDropped String sFilename Boolean bLast
                     Delegate Send OnFileDropped sFilename bLast
                 End_Procedure
@@ -435,16 +425,18 @@ Object oRefactorView is a cRefactorDbView
                     Set pbAllowAppendRow to False
                     Set pbAllowDeleteRow to True
                     Set pbAllowInsertRow to True
+                    Set pbAutoAppend to False
                     Set pbDbShowAddFolderMenuItem to True
+                    Set pbDbOpenContainingFolderMenuItem to True
                     Set pbDbShowRemoveItemMenuItem to True  
                     Set pbDbShowInvertSelectionsMenuItem to True
                     
                     Set Verify_Delete_msg to (RefFunc(No_Confirmation))
-                    // Need this if we have lots of records to load all records in the grid,
+                    // Need this to load all records in the grid,
                     // else the select buttons won't work.
                     Set pbStaticData to True
                     
-                    Object oFolderSelDtl_ID is a cDbCJGridColumn
+                    Object oFolderSelDtl_ID is a cRDCDbCJGridColumn
                         Entry_Item FolderSelDtl.ID
                         Set piWidth to 35
                         Set psCaption to "ID"
@@ -462,7 +454,7 @@ Object oRefactorView is a cRefactorDbView
                         Set psCaption to "Folder Name"
                         Set psToolTip to "The process will run on all files that match the 'File Extensions Filter' comboform for the selected folders and all subfolders"
                         Set psFooterText to "No of Folders Selected:"
-                        // NOTE: The phoData_Col property must be set for checkbox selections to work!
+                        // NOTE: The phoData_Col property must be set for the checkbox selections to work!
                         Set phoData_Col to Self
                         Set pbFullText to True    
                         Set pbAllowRemove to False
@@ -474,8 +466,8 @@ Object oRefactorView is a cRefactorDbView
                         Set piWidth to 45
                         Set psCaption to "Select"
                         Set pbCheckbox to True
-                        Set peHeaderAlignment to xtpAlignmentCenter  
                         Set phoCheckbox_Col to Self
+                        Set peHeaderAlignment to xtpAlignmentCenter  
                         Set peFooterAlignment to  xtpAlignmentCenter
                     End_Object
 
@@ -489,17 +481,17 @@ Object oRefactorView is a cRefactorDbView
                     
                     // Normally all columns in a cRDCCJSelectionGrid are disabled from editing.
                     // However, here we need it to be able to activate the suggestion list.
-                    Function CanEditColumn Integer iCol Returns Boolean
-                        Boolean bState
-                        Integer iFolderName_Col
-                        
-                        Move False to bState
-                        Get piColumnId of oDbFoldername_Col to iFolderName_Col
-                        If (iCol = iFolderName_Col) Begin
-                            Move True to bState
-                        End
-                        Function_Return bState
-                    End_Function  
+//                    Function CanEditColumn Integer iCol Returns Boolean
+//                        Boolean bState
+//                        Integer iFolderName_Col
+//                        
+//                        Move False to bState
+//                        Get piColumnId of oDbFoldername_Col to iFolderName_Col
+//                        If (iCol = iFolderName_Col) Begin
+//                            Move True to bState
+//                        End
+//                        Function_Return bState
+//                    End_Function  
                     
                     Procedure Refresh Integer eMode
                         String[] asFolders
@@ -533,6 +525,7 @@ Object oRefactorView is a cRefactorDbView
                     On_Key Key_Ctrl+Key_S   Send Request_Save
                     On_Key Key_Delete       Send Request_Delete
                     On_Key Key_Shift+Key_F2 Send Request_Delete 
+                    On_Key Key_Ctrl+Key_F5  Send ActivateProcess
                 End_Object
 
                 // Dummy object, not needed as we now have the buttons that can take focus.
@@ -550,6 +543,7 @@ Object oRefactorView is a cRefactorDbView
                     Set Location to 10 255
                     Set Label to "Select All"
                     Set psImage to "SelectAll.ico"
+                    Set psToolTip to "(Ctrl+A)"
                     Set peAnchors to anTopRight
                     Procedure OnClick
                         Send SelectAll of oDbFolders_grd
@@ -561,6 +555,7 @@ Object oRefactorView is a cRefactorDbView
                     Set Location to 10 321
                     Set Label to "Select None"
                     Set psImage to "SelectNone.ico"
+                    Set psToolTip to "(Ctrl+N)"
                     Set peAnchors to anTopRight
                     Procedure OnClick
                         Send SelectNone of oDbFolders_grd
@@ -572,6 +567,7 @@ Object oRefactorView is a cRefactorDbView
                     Set Location to 10 387
                     Set Label to "Invert Selections"
                     Set psImage to "SelectInvert.ico"
+                    Set psToolTip to "(Ctrl+I)"
                     Set peAnchors to anTopRight
                     Procedure OnClick
                         Send SelectInvert of oDbFolders_grd
@@ -801,7 +797,7 @@ Object oRefactorView is a cRefactorDbView
         Set Location to 246 270
         Set piMinSize to 48 367
         Set psLabel to "Refactor Code"
-        Set psNote to "Call functions for selected folders and filter" 
+        Set psNote to "Apply functions for selected folders and filter" 
         Set psToolTip to "Calls the selected functions for the matching selected folders and file extensions."
         Set psImage to "DFRefactor.ico"
         Set peAnchors to anBottomLeftRight
@@ -814,12 +810,12 @@ Object oRefactorView is a cRefactorDbView
             Set Label to "Selected Functions:"
             Set psToolTip to "Total number of functions selected."
             Set Label_FontWeight to fw_Bold
-            Set Label_Col_Offset to 0
             Set FontWeight to fw_Bold              
-            Set peAnchors to anBottomLeft    
+            Set Label_Col_Offset to 0
             Set Enabled_State to False
             Set Form_Justification_Mode to Form_DisplayRight
-
+            Set Form_Border to Border_None
+            Set peAnchors to anBottomLeft    
         End_Object
 
         Object oNoOfSelectedFolders_fm is a cRDCDbForm
@@ -834,6 +830,7 @@ Object oRefactorView is a cRefactorDbView
             Set FontWeight to fw_Bold  
             Set Enabled_State to False
             Set Form_Justification_Mode to Form_DisplayRight
+            Set Form_Border to Border_None
             Set peAnchors to anBottomLeft
 
             // This will show/hide the control:
@@ -849,56 +846,18 @@ Object oRefactorView is a cRefactorDbView
 
         End_Object
 
-        Object oSelectedIdleHandler is a cIdleHandler
-            Set pbEnabled to True
-            Procedure OnIdle
-                Integer iSelectedFuncs iTotalFuncs iSelectedFolders iTotalFolders
-                Handle hoDD
-                
-                Move SysFile.SelectedFunctionTotal to iSelectedFuncs
-                Get TotalNoOfFunctions of (Main_DD(Self)) to iTotalFuncs
-                Set Value of oNoOfSelectedFunctions_fm to (String(iSelectedFuncs) * "(" + String(iTotalFuncs) + ")")
-                
-                Move (oFolderSelHea_DD(Self)) to hoDD
-                Get TotalSelectedFolders of hoDD to iSelectedFolders
-                Get TotalFolders         of hoDD to iTotalFolders
-                Set Value of oNoOfSelectedFolders_fm to (String(iSelectedFolders) * "(" + String(iTotalFolders) + ")")
-            End_Procedure
-                
-        End_Object
-
-        Object oSysFile_CountSourceLines_cb is a dbCheckBox
+        Object oCountSourceLines_cb is a dbCheckBox
             Entry_Item SysFile.bCountSourceLines
             Set Server to oSysFile_DD
-            Set Location to 17 215
+            Set Location to 17 216
             Set Size to 8 109
             Set Label to "Count Source Lines (only)"   
 //            Set FontWeight to fw_Bold
             Set peAnchors to anBottomLeft 
             Set psToolTip to (String("This function will tell you how large your workspace is by counting the number of 'real' source lines for all selected folders and file extensions.") + String(CS_CR) + String("Note: It will skip blank or comments lines, and it will not count files generated by the Studio from COM components.") + String(CS_CR) + String(CS_CR) + String("This function needs be run in solitude, all other functions will be ignored."))
-            
-            Procedure OnChange
-                Boolean bChecked
-                Integer iSelectedFunctions iSelectedFolders
-                
-                Set Changed_State of oSysFile_DD to False
-                // If selected folders = 0, it is probably because the
-                // tab-page/folders grid hasn't been activated and thus
-                // it is empty. Activate it, and switch back to fill the folders grid.
-                // This is essential for the "Refactor" button routine to work.
-                If (iSelectedFolders = 0 and oDbFolders_tp(Self) <> 0) Begin
-                    Send Request_Next_Tab of (oMain_TabDialog(Self)) 3 
-                    Send Request_Next_Tab of (oMain_TabDialog(Self)) 3
-                End
 
-//                Get Checked_State to bChecked
-//                If (bChecked = True) Begin
-//                    Move 1 to iSelectedFunctions
-//                End                             
-//                Else Begin
-//                    Move SysFile.SelectedFunctionTotal to iSelectedFunctions
-//                End
-//                Set Value of oNoOfSelectedFunctions_fm to iSelectedFunctions
+            Procedure OnChange
+                Set Enabled_State of oReadOnly_cb to (Checked_State(Self) = False)
             End_Procedure
 
         End_Object
@@ -911,6 +870,30 @@ Object oRefactorView is a cRefactorDbView
             Set Label to "Read Only"
             Set peAnchors to anBottomLeft
             Set psToolTip to "If checked, no changes to the source code will be made - only shows statistics."
+
+            Procedure OnChange
+                Set Enabled_State of oCountSourceLines_cb to (Checked_State(Self) = False)
+            End_Procedure
+
+        End_Object
+
+        Object oSelectedIdleHandler is a cIdleHandler
+            Set pbEnabled to True
+            Procedure OnIdle
+                Integer iSelectedFuncs iTotalFuncs iSelectedFolders iTotalFolders
+                Handle hoDD
+                
+                Send Request_Save of oSysFile_DD
+                Move SysFile.SelectedFunctionTotal to iSelectedFuncs
+                Get TotalNoOfFunctions of (Main_DD(Self)) to iTotalFuncs
+                Set Value of oNoOfSelectedFunctions_fm to (String(iSelectedFuncs) * "(" + String(iTotalFuncs) + ")")
+                
+                Move (oFolderSelHea_DD(Self)) to hoDD
+                Get TotalSelectedFolders of hoDD to iSelectedFolders
+                Get TotalFolders         of hoDD to iTotalFolders
+                Set Value of oNoOfSelectedFolders_fm to (String(iSelectedFolders) * "(" + String(iTotalFolders) + ")")
+            End_Procedure
+                
         End_Object
 
         Object oExecute_btn is a cRDCButton
@@ -991,7 +974,7 @@ Object oRefactorView is a cRefactorDbView
         Move False to Err
         Send Request_Save_No_Clear of oSysFile_DD
         // Start by making the two string arrays and editors the same:
-        Get CollectFileData of ghoApplication to RefactorFiles
+        Get CollectFileData of ghoApplication (oFolderSelDtl_DD(Self)) to RefactorFiles
         Get phoEditor of ghoApplication to hoEditor
         If (Err = True) Begin
             Procedure_Return
@@ -1040,8 +1023,8 @@ Object oRefactorView is a cRefactorDbView
         Send Request_Assign of hoFolderSelHeaDD 
         Move FolderSelHea.ID to FolderSelDtl.FolderSelHeaID
         Move FolderSelHea.WorkspaceHomeFolder to FolderSelDtl.FolderName
-        Send Find of oFolderSelDtl_DD EQ Index.1
-        Send OnChange of oSysFile_CountSourceLines_cb
+        Send Find of oFolderSelDtl_DD GE Index.1
+        Send OnChange of oCountSourceLines_cb
         
         // Weird voodoo.
         // After a workspace has been opened, the enabled_state should also
@@ -1082,8 +1065,6 @@ Object oRefactorView is a cRefactorDbView
                 Set pbWorkspaceMode of ghoApplication to False
             End
             If (bSWSFile = True) Begin
-//                Send UpdateWorkspaceSelectorDisplay of ghoApplication sFileFolderName
-//                Set pbWorkspaceMode of ghoApplication to True
                 Send AddWorkSpaceFileToRegistry of ghoApplication sFileFolderName
                 Send UpdateWorkspaceSelectorDisplay of ghoApplication sFileFolderName
                 Send DisplayWorkspaceItem of (oWorkspaceSelector_Menuitem(ghoCommandBars)) sFileFolderName
