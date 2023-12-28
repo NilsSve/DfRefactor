@@ -1,0 +1,1 @@
+DECLARE @DatabaseName AS SYSNAME SET @DatabaseName = 'DATABASE_NAME_XXX' SELECT DB_NAME(DB_ID(@DatabaseName)) AS DatabaseName ,DATABASEPROPERTYEX(@DatabaseName, 'Collation') AS CollationUsedBySQLServerDatabase

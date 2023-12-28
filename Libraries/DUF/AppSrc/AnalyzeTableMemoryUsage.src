@@ -1,0 +1,519 @@
+// The AnalyzeTableMemoryUsage project can be added to any workspace
+// Simply copy it into the workspace AppSrc folder, add the project in the Studio and compile and run
+// It is used in combination with information contained in the "Memory Use in DataFlex Web Applications" Blog
+
+Use Windows.pkg
+Use cApplication.pkg
+Use cConnection.pkg
+
+Use seq_chnl.pkg
+Use gFormatNumbers.pkg
+Use db2_drv.pkg
+Use MSSqldrv.pkg
+Use odbc_drv.pkg
+
+Use Dfcursor.pkg
+Use cProcessStatusPanel.pkg
+Use cProgressBar.pkg
+
+
+Global_Variable Handle ghoAnalysisStatusPanel
+
+Struct tSqlVarTypes
+    Integer iType
+    String sTypeName
+    String sTypeReplaceName
+End_Struct
+
+Struct tTableMemoryUseData
+    String sTableName
+    Integer iExpectedMemUse
+End_Struct
+    
+
+// Object to show progress while process runs
+Object oAnalysisStatusPanel is a cProcessStatusPanel
+    Set Size to 93 326
+    Set Locate_Mode to Center_On_Panel
+
+    Move Self to ghoAnalysisStatusPanel 
+
+    Object oTitleTxt is a TextBox
+        Set location to 10 11
+        Set size to 17 304
+        Set Justification_Mode to JMode_Left
+    End_Object
+
+    Object oMessageTxt is a TextBox
+        Set location to 29 11
+        Set size to 17 304
+    End_Object
+
+    Object oActionTxt is a TextBox
+        Set Size to 7 30
+        Set location to 45 10
+    End_Object
+
+    Object oProgressBar is a cProgressBar
+        Set Size to 14 222
+        Set Location to 59 52
+        Set Skip_State to True
+    End_Object
+
+    Object oStopButton is a Button
+        Set Location to 76 138
+        Set Label to C_$Cancel
+        
+        Procedure OnClick
+            Send Close_panel
+        End_Procedure
+    
+    End_Object
+
+    // These messages bind the standard cProcessStatusPanel interface to the actual
+    // objects defined within this instance of the status panel.
+    
+    // note: all of the messages that change text should be forwarded
+    // as the forwarded messages allows the panel to paint when in a tight loop
+
+    Procedure Set Message_Text String sText
+        Set Label of oMessageTxt to sText
+        Forward Set Message_Text to sText
+    End_Procedure
+    
+    Function Message_Text Returns String
+        Function_Return (Label(oMessageTxt))
+    End_Function
+    
+    Procedure Set Action_Text String sText
+        Set Label of oActionTxt to sText
+        Forward Set Action_Text to sText
+    End_Procedure
+    
+    Function Action_Text Returns String
+        Function_Return (Label(oActionTxt))
+    End_Function
+    
+    Procedure Set Button_Text String sText
+        Set Label of oStopButton to sText
+        Forward Set Button_Text to sText
+    End_Procedure
+    
+    Function Button_Text Returns String
+        Function_Return (Label(oStopButton))
+    End_Function
+    
+    Procedure Set Title_Text String sText
+        Set Label of oTitleTxt to sText
+        Forward Set Title_Text to sText
+    End_Procedure
+    
+    Function Title_Text Returns String
+        Function_Return (Label(oTitleTxt))
+    End_Function
+
+    // gets called when status panel is activated passing whether a button should appear
+    Procedure EnableCancelButton Boolean bEnable
+        Set Enabled_State of oStopButton to bEnable
+    End_Procedure
+   
+    //
+    // Messages used in the Analysis status panel
+    //
+    
+    // Procedure DisplayAnalysisTask
+    // Updates the text in the status panel
+    // -------------------------------------------------------------    
+    Procedure DisplayAnalysisTask String sText 
+        Set Title_Text to sText
+    End_Procedure    
+    
+    
+    // Procedure AdvanceProgress
+    // Advance the progress bar
+    // -------------------------------------------------------------    
+    Procedure AdvanceProgress
+        Integer iCurPosition iMax iMin
+        Integer iPace
+        
+        Send Update_StatusPanel ""
+    
+        Get piMaximum of oProgressBar to iMax
+        Get piPosition of oProgressBar to iCurPosition    
+        Get piAdvanceBy of oProgressBar to iPace
+        If ((iCurPosition + iPace) > iMax) Begin
+            Get piMinimum of oProgressBar to iMin
+            Set piPosition of oProgressBar to iMin
+        End
+        
+        Send DoAdvance of oProgressBar
+    End_Procedure    
+    
+    
+    // Procedure StartProgressBar
+    // Displays the progress bar on the panel
+    // -------------------------------------------------------------    
+    Procedure StartProgressBar
+        Set piPosition of oProgressBar to 0
+        Set Visible_State of oProgressBar to True
+    End_Procedure   
+    
+    
+    // Procedure StopProgressBar
+    // Hides the progress bar on the panel
+    // -------------------------------------------------------------    
+    Procedure StopProgressBar
+        Set Visible_State of oProgressBar to False
+    End_Procedure   
+    
+        
+    // Procedure StartAnalysisPanel
+    // Initialize status panel for analysis
+    // -------------------------------------------------------------    
+    Procedure StartAnalysisPanel
+        // set cursor to hourglass
+        Send Cursor_Wait of Cursor_Control
+        
+        // disable cancel button
+        Set Allow_Cancel_State to False
+                    
+        // display status panel
+        Send Initialize_StatusPanel "Analyzing Table Memory Usage - Progress" "Initializing analysis..." ""
+        Send Start_StatusPanel 
+    End_Procedure
+    
+    
+    // Procedure StopAnalysisPanel
+    // Initialize status panel for analysis
+    // -------------------------------------------------------------    
+    Procedure StopAnalysisPanel
+        // remove status panel
+        Send Stop_StatusPanel 
+        
+        // enable cancel button (default)
+        Set Allow_Cancel_State to True
+        
+        // set cursor back to normal
+        Send Cursor_Ready of Cursor_Control
+    End_Procedure   
+      
+End_Object
+
+
+
+// Analysis process
+Object oAnalysisApplication is a cApplication
+    
+    Object oConnection is a cConnection
+        Use LoginEncryption.pkg
+        Use DatabaseLoginDialog.dg
+    End_Object
+
+
+    Property tSqlVarTypes[] ptMsSqlVarTypes
+    Property tSqlVarTypes[] ptDB2VarTypes
+    Property tSqlVarTypes[] ptODBCVarTypes
+
+    Property tTableMemoryUseData[] paTableMemoryUseData
+    Property Number pnBufSizeTotalWS
+    Property Number pnBufSizeSaveWS
+
+
+    Procedure DoInit
+        Integer iType
+        tSqlVarTypes[] msSQLVarTypes db2SQLVarTypes mysqlVarTypes
+        
+        // initialize MSSQL types
+        Move SQL_VARCHARMAX to msSQLVarTypes[iType].iType
+        Move "VarChar(max)" to msSQLVarTypes[iType].sTypeName
+        Move "VarChar" to msSQLVarTypes[iType].sTypeReplaceName
+        Increment iType
+        
+        Move SQL_WVARCHARMAX to msSQLVarTypes[iType].iType
+        Move "nVarChar(max)" to msSQLVarTypes[iType].sTypeName
+        Move "nVarChar" to msSQLVarTypes[iType].sTypeReplaceName
+        Increment iType
+        
+        Move SQL_VARBINARYMAX to msSQLVarTypes[iType].iType
+        Move "nVarBinary(max)" to msSQLVarTypes[iType].sTypeName
+        Move "nVarBinary" to msSQLVarTypes[iType].sTypeReplaceName
+        
+        Set ptMsSqlVarTypes to msSQLVarTypes
+
+        // initialize DB2 types
+        Move 0 to iType
+        
+        Move SQL_LONGVARCHAR to db2SQLVarTypes[iType].iType
+        Move "LongVarChar" to db2SQLVarTypes[iType].sTypeName
+        Move "VarChar" to db2SQLVarTypes[iType].sTypeReplaceName
+        Increment iType
+        
+        Move SQL_LONGVARBINARY to db2SQLVarTypes[iType].iType
+        Move "LongVarBinary" to db2SQLVarTypes[iType].sTypeName
+        Move "VarBinary" to db2SQLVarTypes[iType].sTypeReplaceName
+        Increment iType
+        
+        Move SQL_LONGVARGRAPHIC to db2SQLVarTypes[iType].iType
+        Move "LongVarGraphic" to db2SQLVarTypes[iType].sTypeName
+        Move "VarGraphic" to db2SQLVarTypes[iType].sTypeReplaceName
+        Increment iType
+
+        Set ptDB2VarTypes to db2SQLVarTypes
+        
+         // initialize MySQL types
+        Move 0 to iType
+        
+        Move SQL_LONGVARCHAR to mysqlVarTypes[iType].iType
+        Move "LongVarChar" to mysqlVarTypes[iType].sTypeName
+        Move "VarChar" to mysqlVarTypes[iType].sTypeReplaceName
+        Increment iType
+        
+        Move SQL_LONGVARBINARY to mysqlVarTypes[iType].iType
+        Move "LongVarBinary" to mysqlVarTypes[iType].sTypeName
+        Move "VarBinary" to mysqlVarTypes[iType].sTypeReplaceName
+        Increment iType
+        
+        Set ptODBCVarTypes to mysqlVarTypes
+    End_Procedure
+    
+    
+    Object oLogFile is a cObject
+        Property String psLogFile "TableStructLog.txt"
+        Property String psLogFileWithPath ""
+        Property Integer piChOut
+
+        // initialize output
+        Procedure InitializeOutput
+            String sDataPath sLogFile sWorkspaceDescription
+            Integer iChOut
+            Date dToday
+            
+            Move (Seq_New_Channel()) to iChOut
+            
+            Get psDataPath of (oWorkspace(oAnalysisApplication)) to sDataPath
+            Get PathAtIndex of (oWorkspace(oAnalysisApplication)) sDataPath 1 to sDataPath
+            Get psLogFile to sLogFile
+
+            Move (If(Right(sDataPath,1) <> "\", sDataPath - "\", sDataPath)) to sDataPath            
+            Set psLogFileWithPath to (sDataPath + sLogFile)
+            Set piChOut to iChOut
+            
+            Direct_Output channel iChOut sLogFile
+            Get psDescription of (oWorkspace(oAnalysisApplication)) to sWorkspaceDescription
+            Writeln channel iChOut "Workspace: " sWorkspaceDescription
+            Writeln channel iChOut "Data Path: " sDataPath
+            Move (CurrentDateTime()) to dToday
+            Writeln channel iChOut "Date Analyzed: " (String(dToday))
+            Writeln channel iChOut ""  // insert spacer line
+        End_Procedure
+        
+        // close output and display log file
+        Procedure ShowLog
+            String sLogFile
+            Integer iChOut
+            
+            Get psLogFileWithPath to sLogFile
+            Get piChOut to iChOut
+            
+            Close_Output channel iChOut
+            Send Seq_Release_Channel iChOut 
+            
+            Runprogram Background "notepad.exe" sLogFile
+        End_Procedure
+    
+    End_Object
+    
+    // Check if filelist entry is for an alias table:
+    // Master Table (alias) means that logical table name <> root name
+    // At the moment, the ".int" suffix is not supported
+    Function IsAliasTable String sTableName String sLogicalName String ByRef sDriver Returns String
+        Boolean bIsAlias
+        
+        Move (trim(sTableName)) to sTableName
+        Move (trim(sLogicalName)) to sLogicalName
+        
+        // root name could contain "MSSQLDRV:"
+        If (Lowercase(sTableName) contains "mssqldrv:") Begin
+            Move "mssqldrv" to sDriver
+            Move (Right(sTableName, Length(sTableName)-9)) to sTableName
+        End
+        // root name could contain "DB2_DRV:"
+        Else If (Lowercase(sTableName) contains "db2_drv:") Begin
+            Move "db2_drv" to sDriver
+            Move (Right(sTableName, Length(sTableName)-8)) to sTableName
+        End
+        // root name could contain "ODBC_DRV:"
+        Else If (Lowercase(sTableName) contains "odbc_drv:") Begin
+            Move "odbc_drv" to sDriver
+            Move (Right(sTableName, Length(sTableName)-9)) to sTableName
+        End
+        Else Begin
+            Move "dataflex" to sDriver
+        End
+        
+        Move (trim(Lowercase(sTableName)) <> Trim(Lowercase(sLogicalName))) to bIsAlias
+        
+        Function_Return bIsAlias
+    End_Function
+    
+    Procedure AnalyzeTable Handle hTable
+        Integer iChOut i iColumns iBlockSize iType iColLen iColNativeLen iCount
+        Number nBufSizeSave nBufSizeTotal nBufSizeSaveWS nBufSizeTotalWS
+        Integer iIndex iTypeCount
+        Boolean bIsAlias bErrorOpenFile
+        String sTableName sLogicalName sColName sLine sType sTypeChange sDriver sCurrentType
+        tTableMemoryUseData[] TableMemoryUseData
+        tSqlVarTypes[] varTypes
+        
+        // trap open table error so it's not fatal
+        Move False to Err
+        Send Ignore_All to Error_Object_Id        
+        Open hTable
+        Move Err to bErrorOpenFile
+        Send Trap_All of Error_Object_Id
+        
+        Get_Attribute DF_FILE_ROOT_NAME of hTable to sTableName
+        Get_Attribute DF_FILE_LOGICAL_NAME of hTable to sLogicalName
+        
+        If (bErrorOpenFile = False) Begin
+        Send DisplayAnalysisTask of ghoAnalysisStatusPanel ("Table - " + sTableName)
+
+        // only analyze master tables
+        Get IsAliasTable sTableName sLogicalName (&sDriver) to bIsAlias
+        If (not (bIsAlias)) Begin
+            Get piChOut of oLogFile to iChOut
+            
+            If (sDriver <> "dataflex") Begin
+                Get_Attribute DF_FILE_BLOCK_SIZE of hTable to iBlockSize
+            End
+            Else Begin
+                Move 0 to iBlockSize
+            End
+            
+            Writeln channel iChOut "Table: " sTableName
+            
+            // get array of types to check, based on driver
+            If (sDriver = "mssqldrv") Begin
+                Get ptMsSqlVarTypes to varTypes
+            End
+            Else If (sDriver = "db2_drv") Begin
+                Get ptDB2VarTypes to varTypes
+            End
+            Else If (sDriver = "odbc_drv") Begin
+                Get ptODBCVarTypes to varTypes
+            End
+            Move (SizeOfArray(varTypes)) to iTypeCount
+        
+            // identify problem columns
+            Get_Attribute DF_FILE_NUMBER_FIELDS of hTable to iColumns
+            Writeln channel iChOut "Columns: " (String(iColumns))
+            For i from 1 to iColumns
+                If (sDriver <> "dataflex") Begin
+                    Get_Attribute DF_FIELD_NATIVE_TYPE of hTable i to iType
+                    Get_Attribute DF_FIELD_NATIVE_TYPE_NAME of hTable i to sCurrentType
+                End
+                Get_Attribute DF_FIELD_LENGTH of hTable i to iColLen
+                Get_Attribute DF_FIELD_NATIVE_LENGTH of hTable i to iColNativeLen
+                Move (nBufSizeTotal + iColNativeLen) to nBufSizeTotal
+
+                // check for types that could have high memory use
+                For iIndex from 0 to (iTypeCount-1)
+                    If (iType = varTypes[iIndex].iType) Begin
+                        If (iColLen <= 8000) Begin
+                            Get_Attribute DF_FIELD_NAME of hTable i to sColName
+                            Move (nBufSizeSave + iColNativeLen - iColLen) to nBufSizeSave
+                            
+                            Move ("    Column '" + sColName + "' " + varTypes[iIndex].sTypeName + ", length used = " + ;
+                                (String(iColLen)) + ", recommend change to " + varTypes[iIndex].sTypeReplaceName) to sLine
+                            Writeln channel iChOut sLine
+                        End
+                        Else If (iColLen > 8000 and iColLen < 16000) Begin
+                            Move ("    Column '" + sColName + "' " + varTypes[iIndex].sTypeName + ", length used = " + ;
+                                (String(iColLen)) + ", column will use significant memory") to sLine
+                            Writeln channel iChOut sLine
+                        End
+                    End
+                Loop
+            Loop
+            
+            Writeln channel iChOut "Block Size: " (String(iBlockSize))
+            Writeln channel iChOut "Total Buffer Size: " (FormatNumber(nBufSizeTotal, 0))
+            Writeln channel iChOut "Expected Memory Use: " (FormatNumber(nBufSizeTotal * (iBlockSize+1), 0))
+            If (nBufSizeSave > 0) Begin
+                Writeln channel iChOut "Potential Memory Reduction: " (FormatNumber(nBufSizeSave * (iBlockSize+1), 0))
+            End
+            Writeln channel iChOut ""  // insert spacer line
+            
+            // save workspace totals
+            Get pnBufSizeTotalWS to nBufSizeTotalWS
+            Set pnBufSizeTotalWS to (nBufSizeTotalWS + (nBufSizeTotal * (iBlockSize+1)))
+            If (nBufSizeSave > 0) Begin
+                Get pnBufSizeSaveWS to nBufSizeSaveWS
+                Set pnBufSizeSaveWS to (nBufSizeSaveWS + (nBufSizeSave * (iBlockSize+1.00)))
+            End
+            
+            // store table if expected memory use > 5 MB
+            Get paTableMemoryUseData to TableMemoryUseData
+            Move (SizeOfArray(TableMemoryUseData)) to iCount
+            If ((nBufSizeTotal * (iBlockSize+1)) > 5000000) Begin
+                Move sTableName to TableMemoryUseData[iCount].sTableName
+                Move (nBufSizeTotal * (iBlockSize+1)) to TableMemoryUseData[iCount].iExpectedMemUse
+            End
+            Set paTableMemoryUseData to TableMemoryUseData
+            End
+        End
+    End_Procedure
+    
+    Procedure Go
+        Handle hTable
+        Integer iChOut i iCount
+        Number nBufSizeSaveWS nBufSizeTotalWS
+        tTableMemoryUseData[] TableMemoryUseData 
+        
+        Send AdvanceProgress of ghoAnalysisStatusPanel
+        
+        Send DoInit
+        Send InitializeOutput of oLogFile
+        
+        Send AdvanceProgress of ghoAnalysisStatusPanel
+        
+        Repeat
+            Get_Attribute DF_FILE_NEXT_USED of hTable to hTable
+            If (hTable > 0 and (hTable <> 50)) Begin
+                Send AnalyzeTable hTable
+            End
+            Send AdvanceProgress of ghoAnalysisStatusPanel
+        Until (hTable = 0)
+        
+        // write out analysis summary
+        Get piChOut of oLogFile to iChOut
+        Get pnBufSizeTotalWS to nBufSizeTotalWS
+        Get pnBufSizeSaveWS to nBufSizeSaveWS
+        Writeln channel iChOut "Total Expected Memory Use: " (FormatNumber(nBufSizeTotalWS, 0))
+        Writeln channel iChOut "Potential Memory Reduction: " (FormatNumber(nBufSizeSaveWS, 0))
+        
+        Get paTableMemoryUseData to TableMemoryUseData
+        Move (SizeOfArray(TableMemoryUseData)) to iCount
+        If (iCount > 0) Begin
+            Writeln channel iChOut ""  // insert spacer line
+            Writeln channel iChOut "Tables to Examine for Further Optimization:"
+            Writeln channel iChOut ""  // insert spacer line
+            For i from 0 to (iCount-1)
+                Writeln channel iChOut TableMemoryUseData[i].sTableName " / " (FormatNumber(TableMemoryUseData[i].iExpectedMemUse, 0))
+            Loop
+        End
+        
+        Send ShowLog of oLogFile
+    End_Procedure
+
+End_Object
+
+
+Send Info_Box "Press OK to start analysis..." "Analyze Table Memory Usage"
+Send StartAnalysisPanel of ghoAnalysisStatusPanel
+Send StartProgressBar of ghoAnalysisStatusPanel
+
+Send Go of oAnalysisApplication
+
+Send StopProgressBar of ghoAnalysisStatusPanel
+Send StopAnalysisPanel of ghoAnalysisStatusPanel

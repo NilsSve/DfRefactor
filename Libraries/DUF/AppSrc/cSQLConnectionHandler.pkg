@@ -1,0 +1,1176 @@
+//****************************************************************************
+// $Module type: Class
+// $Module name: cSQLConnectionHandler.pkg
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2015-08-11 @ 16:02 (Military date format: YY-MM-DD)
+//
+// Description : A handler class for using CLI connection ID's to login to a database server.
+//
+// $Rev History:
+//    2015-08-11  Module header created
+//    2016-09-26  Changed name of the objecthandle from ghoCreateConnectionID to ghoSQLConnectionHandler.
+//                Added a new structure for passing connection data back & forth.
+//                Added better error handling.
+//                Added a decompose message for the connection string.
+//    2017-01-09  Added support for Mertech drivers
+//                Big overhaul to comply better with "Managed Connections" (DF 19)
+//                These changes make the class compatible with DFConnId.ini (can read/write DAW connection ini-files)
+//    2017-02-12  Reworked the whole connection property interface.
+//                Now there is one struct property that is the at cencter of a connection.
+//    2023-11-06 *** REMOVED ALL SUPPORT FOR MERTECH DRIVERS ***
+//****************************************************************************
+Use cli.pkg
+Use MSSqldrv.pkg
+Use db2_drv.pkg
+Use odbc_drv.pkg
+Use cSQLConnectionIniFile.pkg
+Use cDbUpdateDatabaseDriver.pkg
+Use vWin32fh.pkg
+
+// The cConnection class is the new SQL connections class for DF 19.
+// If an object of the cConnection class hasn't been instantiated we use a "dummy" class in its place.
+#IFNDEF get_ComparetConnectionById
+    Use cConnectionDUF.pkg
+#ENDIF
+
+// We're making references to this object handle so we need it defined
+// here as well as for the cDbUpdateHandler class
+#IFNDEF ghoDbUpdateHandler
+    Global_Variable Handle ghoDbUpdateHandler
+    Move 0 to ghoDbUpdateHandler
+#ENDIF
+
+#IFNDEF ghoSQLConnectionHandler
+    Global_Variable Handle ghoSQLConnectionHandler
+    Move 0 to ghoSQLConnectionHandler
+#ENDIF
+
+Class cSQLConnectionHandler is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Move Self to ghoSQLConnectionHandler
+
+        Property Handle phoSQLConnectionIniFile (Create(Self,RefClass(cSQLConnectionIniFile)))
+
+        // These properties are used by the cDbUpdateVersion and cDbUpdateFunctionLibrary classes,
+        // but put here so they can be set/get in both class objects. Those classes has "relay"
+        // methods to this class.
+        Property Boolean pbUseConnectionID True
+        Property Boolean pbToANSI          True
+        Property Boolean pbRecnum          True
+        Property Boolean pbCopyData        True
+        Property Boolean pbApiTableUpdateAuto    False
+        Property Boolean pbCompareDate_DateTime  False
+        Property Boolean pbCompareIndexAscending False
+        Property Boolean pbCompareIndexUppercase False
+
+        // Driver default value settings:
+        // Note: When the object is created the corresponding values
+        // from the driver .int files are read.
+        // Sample: Get_Attribute DF_DRIVER_DEFAULT_DEFAULT_NUMERIC of {driverNumber} to {StringVariable}
+        Property String psDriverDefaultValueASCII    ""
+        Property String psDriverDefaultValueBinary   ""
+        Property String psDriverDefaultValueDate     ""
+        Property String psDriverDefaultValueDateTime ""
+        Property String psDriverDefaultValueNumeric  ""
+        Property String psDriverDefaultValueText     ""
+
+        // Driver "nullability" settings:
+        // Note: When the object is created the corresponding values
+        // from the driver .int files are read.
+        // Get_Attribute DF_DRIVER_DEFAULT_NULLABLE_ASCII of {driverNumber} to {BooleanVariable}
+        Property Boolean pbDriverDefaultNullableASCII    False
+        Property Boolean pbDriverDefaultNullableBinary   False
+        Property Boolean pbDriverDefaultNullableDate     False
+        Property Boolean pbDriverDefaultNullableDateTime False
+        Property Boolean pbDriverDefaultNullableNumeric  False
+        Property Boolean pbDriverDefaultNullableText     False
+
+        // *** This is the central point of connection data for the Database Update Framework ***
+        //     It is private because the get/set version also updates the DAW
+        //     driver interfaces.
+        //     There are also procedure/function pairs to set/get individual data members
+        //     of the struct they are all routed throu this struct property.
+        { Visibility=Private }
+        Property tSQLConnection Private.pSQLConnection
+
+    End_Procedure
+
+    Procedure End_Construct_Object
+        tSQLConnection SQLConnection
+
+        Forward Send End_Construct_Object
+
+        // Now is the time to read and apply SQL connection settings.
+        Get SetupSQLConnection True True to SQLConnection
+        Set Private.pSQLConnection to SQLConnection
+    End_Procedure
+
+    // *** Properties ***
+    // All connection related "properties" (get/set pairs) are really done by changing the
+    // private.pSQLConnection struct connection property. These "properties" are
+    // merely here for conveniance.
+    //
+    // The pSQLConnection get/set are here so we have a "central hub"
+    // where we update data to/from the DAW driver interfaces and this framework.
+    // This struct property contains all the connection data.
+    //
+    { MethodType=Property }
+    Procedure Set pSQLConnection tSQLConnection SQLConnection
+        Boolean bOK
+
+        Set Private.pSQLConnection to SQLConnection
+
+        // When starting a program we might not have a connection id yet:
+        If (SQLConnection.sDriverID = DATAFLEX_ID) Begin
+//        If (SQLConnection.sConnectionID = "" or SQLConnection.sDriverID = DATAFLEX_ID) Begin
+            Procedure_Return
+        End
+
+        // If a DAW DFConnId.ini file was read instead of the DUF SQLConnections.ini file we should by now
+        // be logged in already and don't want to do it again.
+        If (SQLConnection.bDAWConnection = False) Begin
+            // After we have set the class property we need to tell the DAW
+            // driver interfaces about the change & make a new login.
+            Get SQLLogin SQLConnection to bOK
+            If (bOK = False) Begin
+                Error DFERR_PROGRAM "Login error."
+            End
+        End
+
+        // Now is the time to setup our driver default values by reading the driver .int file:
+        Send SetupDriverDefaults SQLConnection.sDriverID
+
+    End_Procedure
+
+    // Similar to _SqlCheckCurrentDriver but generates no error and it doesn't
+    // attempt to load the driver.
+    // Returns true if the passed driver is SQL based.
+    Function IsSQLDriver String sDriverID Returns Boolean
+        Boolean bOK
+        Get IsDAWSQLDriver sDriverID to bOK
+        Function_Return bOK
+    End_Function
+
+    // Reads the driver .int file and sets class properties of the cDbUpdateFunctionLibrary accordingly.
+    Procedure SetupDriverDefaults String sDriverID
+        String sAttributeValue
+        Integer iDriverID
+        Boolean bNULL bSQLDriver
+
+        Get IsSQLDriver sDriverID to bSQLDriver
+        If (bSQLDriver = False) Begin
+            Procedure_Return
+        End                                      
+        
+        Get DriverIndex sDriverID to iDriverID
+
+        // Driver default values for various data types:
+        Get_Attribute DF_DRIVER_DEFAULT_DEFAULT_ASCII of iDriverID      to sAttributeValue
+        Set psDriverDefaultValueASCII                                   to sAttributeValue
+
+        Get_Attribute DF_DRIVER_DEFAULT_DEFAULT_BINARY of iDriverID     to sAttributeValue
+        Set psDriverDefaultValueBinary                                  to sAttributeValue
+
+        Get_Attribute DF_DRIVER_DEFAULT_DEFAULT_DATE of iDriverID       to sAttributeValue
+        Set psDriverDefaultValueDate                                    to sAttributeValue
+
+        Get_Attribute DF_DRIVER_DEFAULT_DEFAULT_DATETIME of iDriverID   to sAttributeValue
+        Set psDriverDefaultValueDateTime                                to sAttributeValue
+
+        Get_Attribute DF_DRIVER_DEFAULT_DEFAULT_NUMERIC of iDriverID    to sAttributeValue
+        Set psDriverDefaultValueNumeric                                 to sAttributeValue
+
+        Get_Attribute DF_DRIVER_DEFAULT_DEFAULT_TEXT of iDriverID       to sAttributeValue
+        Set psDriverDefaultValueText                                    to sAttributeValue
+
+        // The default setting for the "nullability" of newly created ASCII columns.
+        Get_Attribute DF_DRIVER_DEFAULT_NULLABLE_ASCII      of iDriverID to bNULL
+        Set pbDriverDefaultNullableASCII to bNULL
+
+        Get_Attribute DF_DRIVER_DEFAULT_NULLABLE_BINARY     of iDriverID to bNULL
+        Set pbDriverDefaultNullableBinary to bNULL
+
+        Get_Attribute DF_DRIVER_DEFAULT_NULLABLE_DATE       of iDriverID to bNULL
+        Set pbDriverDefaultNullableDate to bNULL
+
+        Get_Attribute DF_DRIVER_DEFAULT_NULLABLE_DATETIME   of iDriverID to bNULL
+        Set pbDriverDefaultNullableDateTime to bNULL
+
+        Get_Attribute DF_DRIVER_DEFAULT_NULLABLE_NUMERIC    of iDriverID to bNULL
+        Set pbDriverDefaultNullableNumeric to bNULL
+
+        Get_Attribute DF_DRIVER_DEFAULT_NULLABLE_TEXT       of iDriverID to bNULL
+        Set pbDriverDefaultNullableText to bNULL
+
+    End_Procedure
+
+    Function SQLLogin tSQLConnection SQLConnection Returns Boolean
+        Boolean bOK bIsDaw
+        String sConnectionString
+        Handle hoErrorObj hoDriver hoIniFile
+        Integer iDriverID
+
+        Move False to bOK
+        Get IsDAWSQLDriver SQLConnection.sDriverID to bIsDaw
+
+        Get phoSQLConnectionIniFile to hoIniFile
+        Get ConstructConnectionString SQLConnection.sDriverID SQLConnection.sServer SQLConnection.sDatabase SQLConnection.bTrusted SQLConnection.sUserID SQLConnection.sPassword to sConnectionString
+        Get DriverIndex SQLConnection.sDriverID to iDriverID
+        If (iDriverID = 0) Begin
+            Move hoErrorObj to Error_Object_Id
+            Function_Return False
+        End
+
+        Set_Attribute DF_DRIVER_SILENT_LOGIN of iDriverID to SQLConnection.bSilentLogin
+        Get Create (RefClass(cDbUpdateDatabaseDriver)) to hoDriver
+        Set psDriverID of hoDriver to SQLConnection.sDriverID
+        Get DbLogin    of hoDriver sConnectionString SQLConnection.sServer SQLConnection.sDatabase SQLConnection.bTrusted SQLConnection.sUserID SQLConnection.sPassword to bOK
+        Send Destroy   of hoDriver
+
+        Function_Return bOK
+    End_Function
+
+    Function pSQLConnection Returns tSQLConnection
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection
+    End_Function
+
+    { MethodType=Property }
+    Procedure Set psConnectionID String sValue
+        tSQLConnection SQLConnection
+
+        Get Private.pSQLConnection to SQLConnection
+        If (SQLConnection.sConnectionID = "") Begin
+            Move sValue to SQLConnection.sConnectionID
+        End
+
+        // Else we might want to change the current connection ID
+        Else If (SQLConnection.sConnectionID <> "" and SQLConnection.sConnectionID <> sValue) Begin
+            Move False to Err
+            Logout SQLConnection.sDriverID
+            // This will also make a login to the new server.
+            Get SQLIniFileConnectionID of (phoSQLConnectionIniFile(Self)) sValue to SQLConnection
+        End
+        Set pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function psConnectionID Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.sConnectionID
+    End_Function
+
+    // Note: If the psDriverID + other connection properties are to be changed,
+    //       the psDriverID *must* be the first property that is changed!
+    //       Otherwise errors might be raised by the driver when e.g. the format
+    //       for a connection string has the wrong format for that driver.
+    { MethodType=Property Category="Database" InitialValue="Default" }
+    { EnumList="DATAFLEX, MSSQLDRV, DB2_DRV, ODBC_DRV, SQL_DRV, MDSPGSQL, MDSMYSQL, ORA_DRV" }
+    Procedure Set psDriverID String sValue
+        tSQLConnection SQLConnection
+        Get pSQLConnection to SQLConnection
+        Move sValue        to SQLConnection.sDriverID
+        Set pSQLConnection to SQLConnection
+        If (sValue <> DATAFLEX_ID) Begin
+            Get ConstructConnectionString SQLConnection.sDriverID SQLConnection.sServer SQLConnection.sDatabase SQLConnection.bTrusted SQLConnection.sUserID SQLConnection.sPassword to SQLConnection.sConnectionString
+        End
+    End_Procedure
+
+    Function psDriverID Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        If (SQLConnection.sDriverID = "") Begin
+            Move DATAFLEX_ID to SQLConnection.sDriverID // Default is the DataFlex driver.
+        End
+        Function_Return SQLConnection.sDriverID
+    End_Function
+
+    { MethodType=Property }
+    Procedure Set psConnectionString String sValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move sValue        to SQLConnection.sConnectionString
+        Set pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function psConnectionString Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.sConnectionString
+    End_Function
+
+    Procedure Set psServer String sValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move sValue        to SQLConnection.sServer
+        Get ConstructConnectionString SQLConnection.sDriverID SQLConnection.sServer SQLConnection.sDatabase SQLConnection.bTrusted SQLConnection.sUserID SQLConnection.sPassword to SQLConnection.sConnectionString
+        Set pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function psServer Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.sServer
+    End_Function
+
+    Procedure Set psDatabase String sValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move sValue        to SQLConnection.sDatabase
+        Get ConstructConnectionString SQLConnection.sDriverID SQLConnection.sServer SQLConnection.sDatabase SQLConnection.bTrusted SQLConnection.sUserID SQLConnection.sPassword to SQLConnection.sConnectionString
+        Set pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function psDatabase Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.sDatabase
+    End_Function
+
+    Procedure Set psUserID String sValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move sValue        to SQLConnection.sUserID
+        Get ConstructConnectionString SQLConnection.sDriverID SQLConnection.sServer SQLConnection.sDatabase SQLConnection.bTrusted SQLConnection.sUserID SQLConnection.sPassword to SQLConnection.sConnectionString
+        Set pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function psUserID Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.sUserID
+    End_Function
+
+    // This is the uncrypted password
+    Procedure Set psPassword String sValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move sValue        to SQLConnection.sPassword
+        Get ConstructConnectionString SQLConnection.sDriverID SQLConnection.sServer SQLConnection.sDatabase SQLConnection.bTrusted SQLConnection.sUserID SQLConnection.sPassword to SQLConnection.sConnectionString
+        Set pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function psPassword Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.sPassword
+    End_Function
+
+    Procedure Set pbTrusted Boolean bValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move bValue        to SQLConnection.bTrusted
+        Get ConstructConnectionString SQLConnection.sDriverID SQLConnection.sServer SQLConnection.sDatabase SQLConnection.bTrusted SQLConnection.sUserID SQLConnection.sPassword to SQLConnection.sConnectionString
+        Set pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function pbTrusted Returns Boolean
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.bTrusted
+    End_Function
+
+    // *** All of these properties are special to the Database Update Framework ***
+    //     Thus they are not propagated to the DAW classes and that is why
+    //     the Private.pSQLConnection property is set instead of the going throu
+    //     the central pSQLConnection "hub".
+    Procedure Set pbSilentLogin Boolean bValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move bValue to SQLConnection.bTrusted
+        Set Private.pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function pbSilentLogin Returns Boolean
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.bSilentLogin
+    End_Function
+
+    { MethodType=Property Category="Database" InitialValue=Default }
+    { EnumList="EN_DbTypeMSSQL, EN_DbTypeMySQL, EN_DbTypeOracle, EN_DbTypeDB2, EN_DbTypePostgre, EN_DbTypeDataFlex" }
+    Procedure Set piDbType Integer iValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move iValue to SQLConnection.iDbType
+        Set Private.pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function piDbType Returns Integer
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.iDbType
+    End_Function
+
+    {MethodType=Property Category="Convert to SQL" InitialValue="Default" }
+    Procedure Set psBaseTableSpace String sValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move sValue to SQLConnection.sBaseTableSpace
+        Set Private.pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function psBaseTableSpace Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.sBaseTableSpace
+    End_Function
+
+    {MethodType=Property Category="Convert to SQL" InitialValue="Default" }
+    Procedure Set psIndexTableSpace String sValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move sValue to SQLConnection.sIndexTableSpace
+        Set Private.pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function psIndexTableSpace Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.sIndexTableSpace
+    End_Function
+
+    {MethodType=Property Category="Convert to SQL" InitialValue="Default" }
+    Procedure Set psLongTableSpace String sValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move sValue to SQLConnection.sLongTableSpace
+        Set Private.pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function psLongTableSpace Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.sLongTableSpace
+    End_Function
+
+    {MethodType=Property Category="Convert to SQL" InitialValue="Default" }
+    Procedure Set psSchema String sValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move sValue to SQLConnection.sSchema
+        Set Private.pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function psSchema Returns String
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.sSchema
+    End_Function
+
+    Procedure Set pbEnabled Boolean bValue
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Move bValue to SQLConnection.bEnabled
+        Set Private.pSQLConnection to SQLConnection
+    End_Procedure
+
+    Function pbEnabled Returns Boolean
+        tSQLConnection SQLConnection
+        Get Private.pSQLConnection to SQLConnection
+        Function_Return SQLConnection.bEnabled
+    End_Function
+
+
+    // ************************************
+    Function SetupSQLConnection Boolean bReadDFConnSettings Boolean bReadSQLConnections Returns tSQLConnection
+        tSQLConnection SQLConnection
+
+        // If this object was created by the cDbUpdateHandler class we will
+        // deferr reading SQL connection values until later.
+        If (bReadDFConnSettings = True) Begin
+            // This is the new SQL login logic for DF 19 and up; "Managed Connections"
+            If (ghoConnection > 0) Begin
+                Get ReadcConnections to SQLConnection
+            End
+
+            // In addition to the above; there might be other values set even if a cConnection
+            // object is used.
+            If (bReadSQLConnections = True) Begin
+                Get ReadSQLConnectionsIniSettings to SQLConnection
+            End
+        End
+
+        Function_Return SQLConnection
+    End_Function
+
+    // This is for the new cConnection class used by DF 19 and up (only).
+    Function ReadcConnections Returns tSQLConnection
+        tConnection Connection
+        tSQLConnection SQLConnection SQLConnectionEmpty
+        Integer iRetval iDbType
+        Boolean bOK bConnected
+        String sConnectionID
+
+        #IFDEF get_ComparetConnectionById
+            tConnection[] Connections
+            // - If the DF 19 cConnection class has been used in the cApplication object
+            // - and there are multiple connection id's defined for the same driver. This is
+            //   because otherwise we can't possibly know which connection id to use... So
+            //   we then generate an error and abort the program...
+            Get IsSinglecConnection (&sConnectionID) to bOK
+            If (bOK = False) Begin
+                Error DFERR_PROGRAM ("Programming error. The psConnectionID must be set in the cDbUpdateVersion object when a cConnect object is used in the cApplication object, and there are multiple connections defined. Program will now exit!")
+                Abort
+            End
+            If (sConnectionID = "") Begin
+                Get ConnectionIDs of ghoConnection to Connections
+                If (SizeOfArray(Connections) > 0) Begin
+                    Move Connections[0].sId to sConnectionID
+                End
+            End
+
+            Move 0 to iRetval
+            // DAW DF19 connection info:
+            // We first check that the connection is OK:
+            Get ConnectionIdIndex of ghoConnection sConnectionID to iRetval
+            // It might happen that no connection has been setup although the object exists, in case we do nothing.
+            If (iRetval = -1) Begin
+                Function_Return SQLConnectionEmpty
+            End
+
+            If (sConnectionID <> "") Begin
+                Get ConnectionIdInfo of ghoConnection sConnectionID to Connection
+            End
+            If (Connection.sId = "") Begin
+                Move True to SQLConnectionEmpty.bError
+                Function_Return SQLConnectionEmpty
+            End
+
+            // DUF connection info struct property:
+            Get Private.pSQLConnection                       to SQLConnection
+
+            Move Connection.sId to sConnectionID
+            Get IsConnectionIdLoggedIn of ghoConnection sConnectionID to bConnected
+
+            If (bConnected = False) Begin
+                Get LoginConnectionId of ghoConnection sConnectionID to iRetval
+                If (iRetval <> 0) Begin
+                    Send UserError CS_DUF_CannotLoginToServer
+                    Send Exit_Application
+                End
+                Move True                                   to SQLConnection.bDAWConnection
+                // We need to get the DAW connection info again as it might have
+                // been changed in the DAW db login dialog.
+                Get ConnectionIdInfo of ghoConnection sConnectionID to Connection
+            End
+
+            Move True                                        to SQLConnection.bEnabled
+            Move Connection.bTrustedConnection               to SQLConnection.bTrusted
+
+            // Not used in DUF:
+            // Move Connection.iDriverIndex                    to SQLConnection.iDriverIndex
+
+            Move (If(Connection.iOptions = 0, False, True))  to SQLConnection.bSilentLogin
+            Move Connection.sConnectionString                to SQLConnection.sConnectionString
+            Move Connection.sDriver                          to SQLConnection.sDriverID
+            Move Connection.sId                              to SQLConnection.sConnectionID
+            Move Connection.sUID                             to SQLConnection.sUserID
+            Move Connection.sPWD                             to SQLConnection.sPassword
+
+            // Not used in DUF:
+            // Move Connection.sSection to SQLConnection.xxx
+
+            // The rest of the properties of the SQLConnection struct should have been
+            // setup in the cDbUpdateHandler object, and we should be able to reach them through delegation:
+            If (Connection.sDriver <> ODBC_DRV_ID) Begin
+                Get ParseKeyWord Connection.sString (CS_SQLIniServerKeyword + "=")       to SQLConnection.sServer
+            End
+            If (Connection.sDriver = ODBC_DRV_ID) Begin
+                Get ParseKeyWord Connection.sString (CS_SQLIniDSNKeyword + "=")          to SQLConnection.sServer
+                If (SQLConnection.sServer = "") Begin
+                    Get ParseKeyWord Connection.sString (CS_SQLIniFileDSNKeyword  + "=") to SQLConnection.sServer
+                End
+            End
+
+            Get ParseKeyWord Connection.sString (CS_SQLIniDatabaseKeyword  + "=")        to SQLConnection.sDatabase
+
+            // The DbType is a bit special. If the piDbType has _not_ been setup in object code we try to derave
+            // the value from the driver id:
+            Get SqlUtilDbTypeFromDriver of (phoSQLConnectionIniFile(Self)) Connection.sDriver to SQLConnection.iDbType
+            // ...but in case it has been explicitly set in the object we use that value.
+            Get piDbType                                     to iDbType
+            If (iDbType <> SQLConnection.iDbType) Begin
+                Move iDbType to SQLConnection.iDbType
+            End
+            Get psBaseTableSpace                             to SQLConnection.sBaseTableSpace
+            Get psLongTableSpace                             to SQLConnection.sLongTableSpace
+            Get psIndexTableSpace                            to SQLConnection.sIndexTableSpace
+            Get psSchema                                     to SQLConnection.sSchema
+
+            // We finally set the struct property to the newly fetched values.
+            Set pSQLConnection to SQLConnection
+        #ENDIF
+
+        Function_Return SQLConnection
+    End_Function
+
+    // Returns True if the psConnectionID has been set in the cDbUpateHandler object,
+    // or the DAW cConnect array of registered connection only contains one active/enabled
+    // connection id for a particular driver.
+    // So either the psConnectionID or the psDriverID can have been set in the cDbUpdateHandler
+    // object. We can then match a connection id from the DAW cConnect class array.
+    // Returns False if there are multiple connections that are enabled or the psConnectionID has
+    // been set in the cDbUpdateHandler object but it cannot be found amongst the registered
+    // connections of the DAW cConnect class.
+    Function IsSinglecConnection String ByRef sConnectionID Returns Boolean
+        tConnection[] ConnIdArray
+        Integer iCount iSize iConnectionIDCounter
+        Boolean bEnabled bFound
+        String sConnectionID2 sDriverID sDriverConn
+
+        Move False to bFound
+        If (ghoConnection > 0) Begin
+
+            // The property of the cDbUpdateHandler container object
+            Get psDriverID to sDriverID
+
+            Move 0 to iConnectionIDCounter
+            // This is the the DAW cConnect array with all registered connection id's.
+            #IFDEF get_ComparetConnectionById
+                Get ConnectionIDs of ghoConnection to ConnIdArray
+            #ENDIF
+            Move (SizeOfArray(ConnIdArray)) to iSize
+            Decrement iSize
+            For iCount from 0 to iSize
+                Move ConnIdArray[iCount].sDriver to sDriverConn
+                Move ConnIdArray[iCount].sId to sConnectionID2
+                Move (ConnIdArray[iCount].bDisabled = False) to bEnabled
+                // If no psConnectionID specified in the cDbUpdateHandler, we check if there is a driver
+                // connection in the DAW cConnect object _and_ that there is only one!
+                If (sConnectionID = "") Begin
+                    Move (sDriverID = sDriverConn and bEnabled = True) to bFound
+                End
+                Else Begin
+                    If (Uppercase(sConnectionID) = Uppercase(sConnectionID2)) Begin
+                        Move iSize to iCount // Then we've found what we were looking for and we're out of here...
+                    End
+                End
+
+                If (bFound = True) Begin
+                    Increment iConnectionIDCounter
+                End
+            Loop
+            Move (iConnectionIDCounter <= 1 and sDriverConn <> "" and sConnectionID2 <> "") to bFound
+            If (bFound = True) Begin
+                Move sConnectionID2 to sConnectionID
+            End
+        End
+
+        // Special case; a cConnection object has been setup in the cApplication,
+        // but no DFConn.ini record has been created.
+        If (iSize = -1) Begin
+            Move True to bFound
+        End
+
+        Function_Return bFound
+    End_Function
+
+    // Send on object creation to read the default connection string settings, and
+    // create a connection to the server.
+    Function ReadSQLConnectionsIniSettings Returns tSQLConnection
+        String sPath sFileName
+        Boolean bExists bActive
+        tSQLConnection[] SQLConnectionArray
+        tSQLConnection SQLConnection SQLConnectionEmpty
+        Handle hoIniFile
+        Integer iSize iCount iRetval
+
+        Get psIniFilePath to sPath
+        Get phoSQLConnectionIniFile to hoIniFile
+        If (sPath = "") Begin
+            Get ApplicationPath of hoIniFile to sPath
+            Set psIniFilePath   of hoIniFile to sPath
+        End
+        Get vFolderFormat sPath to sPath
+        Get psIniFileName to sFileName
+        Get vFilePathExists (sPath + sFileName) to bExists
+
+        Get SQLIniFileReadConnections of hoIniFile to SQLConnectionArray
+        Move (SizeOfArray(SQLConnectionArray)) to iSize
+        If (iSize = 0) Begin
+            // This may have been set by the "ReadcConnections" function,
+            // if a cConnection object has been setup for DataFlex 19 or later
+            // in the cApplication object.
+            Get pSQLConnection to SQLConnection
+            If (SQLConnection.sConnectionID = "") Begin
+                Function_Return SQLConnectionEmpty
+            End
+            Move SQLConnection to SQLConnectionArray[0] 
+            Move 1 to iSize
+        End
+
+        Move False to bActive
+        // The first connection should be the one that is active, but all connections might have been disabled.
+        Decrement iSize
+        For iCount from 0 to iSize
+            Move SQLConnectionArray[iCount] to SQLConnection
+            If (SQLConnection.bEnabled = True) Begin
+                Move True to bActive
+                Move iSize to iCount // We've found the enabled item, so we're out of here.
+            End
+        Loop
+
+        // In case all connections have been disabled, we're out of here.
+        If (bActive = False) Begin
+            Function_Return SQLConnectionEmpty
+        End
+
+        Send CreateSQLConnection SQLConnection.sDriverID SQLConnection.sConnectionID ;
+             SQLConnection.sServer SQLConnection.sDatabase SQLConnection.bTrusted ;
+             SQLConnection.sUserID SQLConnection.sPassword SQLConnection.bSilentLogin False
+
+        Set pSQLConnection to SQLConnection
+        Get AutoSetConnectionID to iRetval
+
+        Function_Return SQLConnection
+    End_Function
+
+    Procedure Set psIniFilePath String sPath
+        Set psIniFilePath of (phoSQLConnectionIniFile(Self)) to sPath
+    End_Procedure
+
+    Function psIniFilePath Returns String
+        String sRetval
+        Get psIniFilePath of (phoSQLConnectionIniFile(Self)) to sRetval
+        Function_Return sRetval
+    End_Function
+
+    { MethodType=Property Category="Behavior" InitialValue="SQL Connections"}
+    Procedure Set psIniFileName String sFileName
+        Set psIniFileName of (phoSQLConnectionIniFile(Self)) to sFileName
+    End_Procedure
+
+    Function psIniFileName Returns String
+        String sRetval
+        Get psIniFileName of (phoSQLConnectionIniFile(Self)) to sRetval
+        Function_Return sRetval
+    End_Function
+
+    { MethodType=Property Category="Behavior" InitialValue="SQL Connections"}
+    Procedure Set psIniSectionName String sSection
+        Set psIniSectionName of (phoSQLConnectionIniFile(Self)) to sSection
+    End_Procedure
+
+    { MethodType=Property Category="Behavior"}
+    Function psIniSectionName Returns String
+        String sRetval
+        Get psIniSectionName of (phoSQLConnectionIniFile(Self)) to sRetval
+        Function_Return sRetval
+    End_Function
+
+    Procedure Set IniFileValue String sSection String sValueName String sValue
+        Handle ho
+        Get phoSQLConnectionIniFile to ho
+        Set IniFileValue of ho to sSection sValueName sValue
+    End_Procedure
+
+    Function IniFileValue String sSection String sValueName String sDefaultValue Returns String
+        Handle ho
+        String sRetval
+        Get phoSQLConnectionIniFile to ho
+        Get IniFileValue of ho sSection sValueName sDefaultValue to sRetval
+        Function_Return sRetval
+    End_Function
+
+    Function SectionExists String sSection Returns Boolean
+        Handle ho
+        Boolean bRetval
+        Get phoSQLConnectionIniFile to ho
+        Get SectionExists of ho sSection to bRetval
+        Function_Return bRetval
+    End_Function
+
+    Function KeyExists String sSection String sKey Returns Boolean
+        Handle ho
+        Boolean bRetval
+        Get phoSQLConnectionIniFile to ho
+        Get KeyExists of ho sSection sKey to bRetval
+        Function_Return bRetval
+    End_Function
+
+    Function EncryptPassword String sPassword Returns String
+        Handle ho
+        String sRetval
+        Get phoSQLConnectionIniFile to ho
+        Get EncryptPassword of ho sPassword to sRetval
+        Function_Return sRetval
+    End_Function
+
+    Function DecryptPassword String sPassword Returns String
+        Handle ho
+        String sRetval
+        Get phoSQLConnectionIniFile to ho
+        Get DecryptPassword of ho sPassword to sRetval
+        Function_Return sRetval
+    End_Function
+
+    // *** Main Connection Message ***
+    Procedure CreateSQLConnection String sDriverID String sConnectionID String sServer String sDatabase Boolean bTrusted String sUserID String sPassword Boolean bSilent Boolean bExitProgram
+        Handle hoDriver
+        String sConnectionString sError
+        Boolean bLoginSuccessful
+
+        Get ConstructConnectionString sDriverID sServer sDatabase bTrusted sUserID sPassword to sConnectionString
+        Get Create (RefClass(cDbUpdateDatabaseDriver)) to hoDriver
+        Set psDriverID of hoDriver to sDriverID
+        Get DbLogin of hoDriver sConnectionString sServer sDatabase bTrusted sUserID sPassword to bLoginSuccessful
+        If (bLoginSuccessful = False) Begin
+            Error DFERR_PROGRAM (CS_DUF_CannotLoginToServer * CS_DUF_ErrorText * String(sError) + "\nConnectionID = " * sConnectionID + "\nConnection String = " * sConnectionString)   
+            If (bExitProgram = True) Begin
+                Send Exit_Application
+            End
+        End
+        Send Destroy of hoDriver
+    End_Procedure
+
+    Function RedirectConnection String sOldConnection String sNewConnection Returns Integer
+        Integer iRetval
+        Handle hoCLI
+        String sDriverID
+
+        Get psDriverID to sDriverID
+        Get Create (Refclass(cCLIHandler)) to hoCLI
+        If (hoCLI <> 0) Begin
+            Set psDriverID of hoCLI to sDriverID
+            Get RedirectConnection of hoCLI sOldConnection sNewConnection to iRetval
+            Send Destroy of hoCLI
+        End
+
+        Function_Return iRetval
+    End_Function
+
+    Procedure CreateConnParamsFromConnectionString String sDriverID String sConnectionString
+        tSQLConnection SQLConnection
+
+        Set psDriverID to sDriverID
+        Get DeComposeConnectionString sDriverID sConnectionString to SQLConnection
+        Send CreateSQLConnection SQLConnection.sDriverID SQLConnection.sConnectionID SQLConnection.sServer;
+                                 SQLConnection.sDatabase SQLConnection.bTrusted SQLConnection.sUserID SQLConnection.sPassword SQLConnection.bTrusted False
+    End_Procedure
+
+    // This is needed when e.g. the connection id we have specified in the program code
+    // also exists in e.g. the MSSQLDRV.ini file (can either be local in the Data folder
+    // or the one in the DataFlex Bin folder.)
+    // We then need to delete the current one before creating a new one.
+    // This is because the parameters may differ between the program code and the
+    // MSSQLDRV.ini file in a deployed environment. Also DataFlex will generate an error
+    // when one tries to create a Connection ID that already exists.
+    Procedure RemoveExistingConnectionID String sDriverID String sConnectionID
+        Integer iResult iDriver iNumConn iConn
+        Handle hoCLI
+        String sID
+
+        If (sDriverID = "" or sConnectionID = "") Begin
+            Procedure_Return
+        End
+
+        Move 0 to iResult
+        Get Create (RefClass(cCLIHandler)) to hoCLI
+        If (hoCLI <> 0) Begin
+            Set psDriverID of hoCLI to sDriverID
+            Get DriverIndex sDriverID to iDriver
+            Get_Attribute DF_DRIVER_NUMBER_CONNECTION_IDS of iDriver to iNumConn
+            Decrement iNumConn
+            For iConn from 0 to iNumConn
+                Get_Attribute DF_DRIVER_CONNECTION_ID of iDriver iConn to sID
+                If (Uppercase(sID) = Uppercase(sConnectionID)) Begin
+                    Get DeleteConnectionID of hoCLI sConnectionID -1 to iResult
+                End
+            Loop
+            Send Destroy of hoCLI
+        End
+
+    End_Procedure
+
+    Function ExistingConnectionSettings String sDriverID String sConnectionID Returns tSQLConnection
+        Integer iResult iDriver iNumConn iConn
+        Handle hoCLI
+        String sID sConnectionString sVal sDatabase
+        tSQLConnection SQLConnection
+        Boolean bTrusted
+
+        Move 0 to iResult
+        Get Create (RefClass(cCLIHandler)) to hoCLI
+        If (hoCLI <> 0) Begin
+            Set psDriverID of hoCLI to sDriverID
+            Get DriverIndex sDriverID to iDriver
+            Get_Attribute DF_DRIVER_NUMBER_CONNECTION_IDS of iDriver to iNumConn
+            Decrement iNumConn
+            For iConn from 0 to iNumConn
+                Get_Attribute DF_DRIVER_CONNECTION_ID of iDriver iConn to sID
+                If (Uppercase(sID) = Uppercase(sConnectionID)) Begin
+                    Move sDriverID                                                      to SQLConnection.sDriverID      // For completeness only...
+                    Get_Attribute DF_DRIVER_CONNECTION_ID of iDriver iConn              to SQLConnection.sConnectionID  // For completeness only...
+                    Get_Attribute DF_DRIVER_CONNECTION_ID_STRING of iDriver iConn       to sConnectionString
+                    Move sConnectionString                                              to SQLConnection.sConnectionString
+                    Get_Attribute DF_DRIVER_CONNECTION_ID_OPTIONS of iDriver iConn      to SQLConnection.bSilentLogin
+                    Get ParseKeyWord sConnectionString (CS_SQLIniServerKeyword + "=")   to SQLConnection.sServer
+                    Get ParseKeyWord sConnectionString (CS_SQLIniDatabaseKeyword + "=") to SQLConnection.sDatabase
+                    Get ParseKeyWord sConnectionString (CS_SQLIniUIDKeyword + "=")      to SQLConnection.sUserID
+                    Get ParseKeyWord sConnectionString (CS_SQLIniPWDKeyword + "=")      to SQLConnection.sPassword
+
+                    Case Begin
+                        Case (sDriverID = MSSQLDRV_ID)
+                            Get ParseKeyWord sConnectionString (CS_SQLIniTrustedKeyword + "=") to sVal
+                            Move (If(Uppercase(sVal) = Uppercase(CS_SQLIniConnectionYes), True, False)) to bTrusted
+                            Move bTrusted                                               to SQLConnection.bTrusted
+                            Case Break
+                        Case (sDriverID = DB2_DRV_ID)
+                            Get ParseKeyWord sConnectionString (CS_SQLIniDSNKeyword + "=") to SQLConnection.sServer
+                            Case Break
+                        Case (sDriverID = ODBC_DRV_ID)
+                            Get ParseKeyWord sConnectionString (CS_SQLIniDSNKeyword + "=") to SQLConnection.sServer
+                            If (SQLConnection.sServer = "") Begin
+                                Get ParseKeyWord sConnectionString (CS_SQLIniFileDSNKeyword  + "=") to SQLConnection.sServer
+                            End
+                            Case Break
+                        Case Else
+                            Error ("Wrong driver ID passed:" * sDriverID)
+                            Case Break
+                    Case End
+                End
+            Loop
+            Send Destroy of hoCLI
+        End
+
+        Function_Return SQLConnection
+    End_Function
+
+    Function DriverIndex String sDriverID Returns Integer
+        String  sCurrentDriver
+        Integer iNumberOfDrivers iDriver iCount
+
+        Move 0 to iDriver
+        Move 0 to iCount
+        Get_Attribute DF_NUMBER_DRIVERS to iNumberOfDrivers
+        For iCount from 1 to iNumberOfDrivers
+            Get_Attribute DF_DRIVER_NAME of iCount to sCurrentDriver
+            If ( Uppercase(sCurrentDriver) = Uppercase(sDriverID) ) Begin
+                Function_Return iCount
+            End
+        Loop
+
+        // If driver not previously loaded; attempt to do so now.
+        If (iDriver = 0) Begin
+            Move 0 to LastErr
+            Load_Driver sDriverID
+            // If driver could not be loaded.
+            If (LastErr = DFERR_CANT_LOAD_DLL) Begin
+                Move -1 to iCount
+            End
+        End
+        Function_Return iCount
+    End_Function
+
+    // This will update connection settings of the cCLIHandler object with that passed struct values.
+    Procedure UpdateConnectionString tSQLConnection SQLConnection
+        String sDriverID sConnectionID sServer sDatabase sUserID sPassword
+        Boolean bTrusted bSilent
+        Integer iRetval
+
+        Move SQLConnection.sDriverID     to sDriverID
+        Move SQLConnection.sConnectionID to sConnectionID
+        Move SQLConnection.sServer       to sServer
+        Move SQLConnection.sDatabase     to sDatabase
+        Move SQLConnection.bTrusted      to bTrusted
+        Move SQLConnection.sUserID       to sUserID
+        Move SQLConnection.sPassword     to sPassword
+        Move SQLConnection.bSilentLogin  to bSilent
+
+        Send CreateSQLConnection sDriverID sConnectionID sServer sDatabase bTrusted sUserID sPassword bSilent False
+        // Note that this message will first delete the current ConnectionID if it exists; which is needed by the cCLIHandler logic.
+        Get AutoSetConnectionID to iRetval
+    End_Procedure
+
+    // Called when the object is constructed.
+    // It will check the psDriverID for a ConnectionID and save it
+    // as psConnectionID property. It is later used whenever a login to
+    // the database is needed.
+    Function AutoSetConnectionID Returns Boolean
+        String sConnectionID sDriverID sConnectionString
+        Integer iDriver iRetval
+        Handle hoCLI
+        Boolean bOK bSilent
+
+        Get pbSilentLogin      to bSilent
+        Get psConnectionID     to sConnectionID
+        Get psConnectionString to sConnectionString
+        // Get the driver Connection ID string & set the psConnectionString property.
+        Get psDriverID to sDriverID
+        Get _SqlCheckCurrentDriver sDriverID to bOK
+        If (bOK = False) Begin
+            Function_Return False
+        End
+
+        Get DriverIndex sDriverID          to iDriver
+        // If driver not loaded; load it.
+        If (iDriver = 0) Begin
+            Load_Driver sDriverID
+            Get DriverIndex sDriverID      to iDriver
+        End
+        // This shouldn't be possible; unless the driver.dll file is missing or something...
+        If (iDriver = 0) Begin
+            Error DFERR_PROGRAM ("The database driver could not be loaded! Connection to database failed." * sDriverID)
+            Function_Return False
+        End           
+        Set_Attribute DF_DRIVER_LOGIN_ON_OPEN of iDriver to True
+        
+        Get Create (RefClass(cCLIHandler)) to hoCLI
+        Set psDriverID of hoCLI            to sDriverID
+        // Delete the connection first; in case it exists
+        Get DeleteConnectionID of hoCLI sConnectionID -1 to iRetval
+        Get CreateConnectionID of hoCLI sConnectionID sConnectionString bSilent to iRetval 
+        Send Destroy of hoCLI
+
+        Function_Return (iRetval = 0)
+    End_Function
+
+    Function _SqlCheckCurrentDriver String sDriverID Returns Boolean
+        Boolean bOK
+
+        Get IsDAWSQLDriver sDriverID to bOK
+
+        If (bOK = False) Begin
+            Error DFERR_PROGRAM "Driver needs to be one of MSSQLDRV_ID, DB2_DRV_ID or ODBC_DRV_ID"
+            Function_Return False
+        End
+
+        Function_Return True
+    End_Function
+
+    Function IsDAWSQLDriver String sDriverID Returns Boolean
+        Boolean bOK
+        Move (sDriverID = MSSQLDRV_ID or sDriverID = DB2_DRV_ID or sDriverID = ODBC_DRV_ID) to bOK
+        Function_Return bOK
+    End_Function
+
+    Function ConstructConnectionString String sDriverID String sServer String sDatabase Boolean bTrusted String sUserID String sPassword Returns String
+        Handle hoIniFile
+        String sConnect
+
+        Get phoSQLConnectionIniFile to hoIniFile
+        Get ConstructConnectionString of hoIniFile sDriverID sServer sDatabase bTrusted sUserID sPassword to sConnect
+
+        Function_Return sConnect
+    End_Function
+
+    // Sample sConnString: "SERVER=(local)\SQLEXPRESS;UID=dbuser;PWD=secret;DATABASE=OrderEntry;, 0"
+    // Pass a complete driver connection string
+    // Returns the following as a struct:
+    //   sServer, sDatabase, sUser, sPassword & True if Trusted_Connection is used.
+    // Finally also returns a boolean TRUE if trusted_connection=yes, else false is returned.
+    //
+    Function DeComposeConnectionString String sDriverID String sConnectionString Returns tSQLConnection
+        tSQLConnection SQLConnection
+        String sValue sConnectionID sServer sDatabase sUserID sPassword
+        Boolean bTrusted bSilent bOK
+        Integer iPos
+
+        Get _SqlCheckCurrentDriver sDriverID to bOK
+        If (bOK = False) Begin
+            Function_Return SQLConnection
+        End
+
+        Move False to bTrusted
+        Move False to bSilent
+
+        Case Begin
+            Case (sDriverID = MSSQLDRV_ID)
+                Get ParseKeyWord sConnectionString (CS_SQLIniServerKeyword + "=")   to sServer
+                Get ParseKeyWord sConnectionString (CS_SQLIniDatabaseKeyword + "=") to sDatabase
+                Get ParseKeyWord sConnectionString (CS_SQLIniTrustedKeyword + "=")  to sValue
+                Move (If(Uppercase(sValue) = "YES", True, False))                   to bTrusted
+                If (bTrusted = False) Begin
+                    Get ParseKeyWord sConnectionString (CS_SQLIniUIDKeyword + "=")  to sUserID
+                    Get ParseKeyWord sConnectionString (CS_SQLIniPWDKeyword + "=")  to sPassword
+                End
+                Case Break
+
+            Case (sDriverID = ODBC_DRV_ID)
+                If (uppercase(sConnectionString) contains ("." + CS_SQLIniDSNKeyword)) Begin
+                    Get ParseKeyWord sConnectionString (CS_SQLIniFileDSNKeyword + "=")  to sServer
+                End
+                Else Begin
+                    Get ParseKeyWord sConnectionString (CS_SQLIniDSNKeyword + "=")      to sServer
+                End
+
+                Get ParseKeyWord sConnectionString (CS_SQLIniTrustedKeyword + "=")  to sValue
+                Move (If(Uppercase(sValue) = "YES", True, False))                   to bTrusted
+                If (bTrusted = False) Begin
+                    Get ParseKeyWord sConnectionString (CS_SQLIniUIDKeyword + "=")  to sUserID
+                    Get ParseKeyWord sConnectionString (CS_SQLIniPWDKeyword + "=")  to sPassword
+                End
+                Case Break
+
+            Case (sDriverID = DB2_DRV_ID)
+                Get ParseKeyWord sConnectionString (CS_SQLIniDSNKeyword + "=")      to sServer
+                Get ParseKeyWord sConnectionString (CS_SQLIniUIDKeyword + "=")      to sUserID
+                Get ParseKeyWord sConnectionString (CS_SQLIniPWDKeyword + "=")      to sPassword
+                Case Break
+
+            Case (sDriverID = DATAFLEX_ID)    // Dummy stub.
+                Break
+        Case End
+
+        Get ParseKeyWord sConnectionString (Uppercase(CS_SQLConnectionIDText))  to sConnectionID
+
+        // bSilent?
+        Move (Pos(",0", sConnectionString))                                     to iPos
+        If (iPos = 0) Begin
+            Move (Pos(",1", sConnectionString))                                 to iPos
+        End
+        If (iPos = 0) Begin
+            Move "0"                                                            to sValue
+        End
+        Else Begin
+            Move (Mid(sConnectionString, 1, (iPos +1)))                         to sValue
+        End
+        Move (If(sValue = 1, True, False))                                      to bSilent
+
+        Move (Trim(sDriverID))                                                  to SQLConnection.sDriverID
+        Move (Trim(sConnectionID))                                              to SQLConnection.sConnectionID
+        Move (Trim(sConnectionString))                                          to SQLConnection.sConnectionString
+        Move (Trim(sServer))                                                    to SQLConnection.sServer
+        Move (Trim(sDatabase))                                                  to SQLConnection.sDatabase
+        Move bTrusted                                                           to SQLConnection.bTrusted
+        Move (Trim(sUserID))                                                    to SQLConnection.sUserID
+        Move (Trim(sPassword))                                                  to SQLConnection.sPassword
+        Move bSilent                                                            to SQLConnection.bSilentLogin
+
+        Function_Return SQLConnection
+    End_Function
+
+    #Include ParseKeyWord.pkg
+
+    // To update the SQLSettings.ini file with updated connection data (SQLConnection struct data).
+    Function SQLIniFileSetDefaultConnection String sConnectionID Returns Boolean
+        Handle ho
+        Integer iIndex
+        Boolean bRetval bOK
+        tSQLConnection SQLConnection
+
+        Get pSQLConnection to SQLConnection
+        Get phoSQLConnectionIniFile to ho
+        Get SQLIniFileConnectionIDIndex of ho sConnectionID to iIndex
+        If (iIndex = -1) Begin
+            Function_Return False
+        End
+
+        Get SQLIniFileUpdateConnection of ho SQLConnection to bRetval
+        Send UpdateConnectionString SQLConnection
+        If (ghoConnection > 0) Begin
+            Get ConnectionIdIndex of ghoConnection SQLConnection.sConnectionID to iIndex
+            If (iIndex <> -1) Begin
+                Get RedirectConnectionId of ghoConnection SQLConnection.sConnectionID (SQLConnection.sServer + ";" + CS_SQLIniDatabaseKeyword + "=" + SQLConnection.sDatabase) SQLConnection.sUserID SQLConnection.sPassword SQLConnection.bTrusted True to bOK
+            End
+        End
+
+        Function_Return bRetval
+    End_Function
+
+End_Class
