@@ -15,6 +15,8 @@ Use vwin32fh.pkg
 Use cSysFileDataDictionary.dd
 Use cFunctionsDataDictionary.dd  
 Use cFunctionsADataDictionary.dd
+Use cFolderSelHeaDataDictionary.dd
+Use cFolderSelDtlDataDictionary.dd
 Use cRefactorEngine.pkg
 
 Activate_View Activate_oRefactorTestBench for oRefactorTestBench
@@ -37,6 +39,15 @@ Object oRefactorTestBench is a cRefactorDbView
             Function_Return 0
         End_Function
 
+    End_Object
+
+    Object oFolderSelHea_DD is a cFolderSelHeaDataDictionary
+        Set phoFolderSelHeaDD of ghoApplication to Self  
+    End_Object
+
+    Object oFolderSelDtl_DD is a cFolderSelDtlDataDictionary
+        Set DDO_Server to oFolderSelHea_DD
+        Set Constrain_File to FolderSelHea.File_Number
     End_Object
 
     Object oFunctions_DD is a cFunctionsADataDictionary
@@ -62,26 +73,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     Object oSplitterContainer is a cDbSplitterContainer
         Set piSplitterLocation to 498
         
-        // ToDo: This messes up the dynamic sizing of objects at startup.
-        // So this is probably to early to make this kind of manipulation.
-        // Research is needed where & when it should be made.
-//        Procedure Page_Delete 
-//            Integer iLocation
-//            Get piGuiSplitterLocation to iLocation
-//            Send WriteDword of ghoApplication CS_Splitters CS_TestingViewSplitterPos iLocation
-//            Forward Send Page_Delete
-//        End_Procedure 
-//        
-//        Procedure Page Integer iPageObject
-//            Integer iLocation
-//            
-//            Get ReadDword of ghoApplication CS_Splitters CS_TestingViewSplitterPos 0 to iLocation
-//            If (iLocation <> 0) Begin
-//                Set piGuiSplitterLocation to iLocation
-//            End
-//            Forward Send Page iPageObject
-//        End_Procedure
-
         Object oSplitterContainerChild1 is a cDbSplitterContainerChild
 
             Object oOpenDialog is a OpenDialog
@@ -106,9 +97,10 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             Object oLegacyCode_edt is a cRefactorScintillaEditor
                 Set Size to 176 484
                 Set Location to 17 6
+                Set phoEditorEditView to Self
                 Set phoEditorLegacy of ghoApplication to (Self)
                 Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
-
+                
                 Property Boolean pbIsFileDropped False
                 
                 Procedure OnFileDropped String sFileName Boolean bLast
@@ -159,6 +151,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Label_FontWeight to fw_Bold
                 Set Label_Row_Offset to 1
                 Set FontWeight to fw_Bold
+                Set Form_Border to Border_None
                 Set peAnchors to anBottomRight
                 
                 Procedure Set Value Integer iItem String sValue
@@ -188,6 +181,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set Label_Justification_Mode to JMode_Right
                     Set peAnchors to anBottomLeftRight 
                     Set Label_FontWeight to fw_Bold
+                    Set Form_Border to Border_None
                 End_Object
 
                 Object oRefactoredCodeFilename_fm is a cFileNameForm
@@ -198,6 +192,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set Label_Justification_Mode to JMode_Right
                     Set peAnchors to anBottomLeftRight
                     Set Label_FontWeight to fw_Bold
+                    Set Form_Border to Border_None
                 End_Object
 
             End_Object
@@ -220,7 +215,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set phoEditorRefactored of ghoApplication to (Self)
                 Set phoEditor of ghoApplication to (Self)
                 Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_RefactoredCode)
-                Set phoCodeMaxEditor to Self
         
                 Procedure OnModified
                     Integer iLines
@@ -239,6 +233,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Form_Datatype to 0 
                 Set FontWeight to fw_Bold
                 Set Label_Row_Offset to 1
+                Set Form_Border to Border_None
                 Set peAnchors to anBottomLeft
                 
                 Procedure Set Value Integer iItem String sValue
@@ -263,22 +258,23 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Set Label_FontWeight to fw_Bold
                 Set FontWeight to fw_Bold
                 Set Label_Row_Offset to 1
+                Set Form_Border to Border_None
                 Set peAnchors to anBottomLeft
             End_Object
 
             Object oAction_grp is a cRDCDbHeaderGroup
-                Set Size to 66 418
+                Set Size to 66 416
                 Set Location to 210 6
                 Set Label to "Refactor Code"
                 Set psImage to "DFRefactor.ico"
-                Set psNote to "Call selected functions"
+                Set psNote to "Apply selected functions"
                 Set psToolTip to "Click the 'Start Refactoring!' button to execute selected refactoring functions."
                 Set pbUseLargeFontHeight to True
                 Set peAnchors to anBottomLeftRight
 
                 Object oNoOfSelectedFunctions_fm is a cRDCDbForm
                     Set Size to 13 30
-                    Set Location to 36 170
+                    Set Location to 39 111
                     Set Label_Justification_Mode to JMode_Right
                     Set Label to "Selected Functions:"
                     Set psToolTip to "Total number of functions selected."
@@ -287,24 +283,32 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set FontWeight to fw_Bold 
                     Set Form_Justification_Mode to Form_DisplayRight
                     Set Enabled_State to False
+                    Set Form_Border to Border_None
                     Set peAnchors to anBottomLeft
 
                     Object oSelectedFunctionsIdleHandler is a cIdleHandler
                         Set pbEnabled to True
                         Procedure OnIdle
                             Integer iSelectedFuncs iTotalFuncs
+                            Send Request_Save of oSysFile_DD
                             Move SysFile.SelectedFunctionTotal to iSelectedFuncs
                             Get TotalNoOfFunctions of (Main_DD(Self)) to iTotalFuncs
                             Set Value of oNoOfSelectedFunctions_fm to (String(iSelectedFuncs) * "(" + String(iTotalFuncs) + ")")
-                        End_Procedure
+                        End_Procedure 
+                        
                     End_Object
 
+                    Procedure Mouse_Click Integer iWindowNumber Integer iPosition
+                        Forward Send Mouse_Click iWindowNumber iPosition 
+                        Send Activate_oSelectFunctions_vw
+                    End_Procedure
+                        
                 End_Object
 
                 Object oSysFile_CountSourceLines_cb is a dbCheckBox
                     Entry_Item SysFile.bCountSourceLines
                     Set Server to oSysFile_DD
-                    Set Location to 13 203
+                    Set Location to 16 144
                     Set Size to 8 109
                     Set Label to "Count Source Lines (only)"   
 //                    Set FontWeight to fw_Bold
@@ -345,7 +349,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 Object oReadOnly_cb is a dbCheckbox
                     Entry_Item SysFile.bReadOnly
                     Set Server to oSysFile_DD
-                    Set Location to 13 303
+                    Set Location to 16 244
                     Set Size to 8 109
                     Set Label to "Read Only"
                     Set peAnchors to anBottomLeft
@@ -354,7 +358,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     
                 Object oRefactor_btn is a cRDCButton
                     Set Size to 30 98
-                    Set Location to 27 203
+                    Set Location to 30 144
                     Set Label to "Start &Refactoring!"
                     Set Default_State to True
                     Set psToolTip to "Refactors the legacy code from the left editor, then saves it to disk. (Ctrl+F5)"
@@ -383,11 +387,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 End_Object
 
                 Object oCompileRefactoredCode_btn is a cRDCButton
-                    Set Size to 14 53
-                    Set Location to 29 303
+                    Set Size to 30 53
+                    Set Location to 30 244
                     Set Label to "Compile"
                     Set peAnchors to anBottomLeft
-                    Set psImage to "CompileProject.ico"
+                    Set psImage to "CompileProject.ico"  
+                    Set piImageSize to 24
                     Set psToolTip to "Compiles a test program (CompiledRefactoredCode.src) where the refactored code file is Use'd. (F5)"
                 
                     Procedure OnClick
@@ -402,47 +407,49 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             
                 End_Object
 
-                Object oShowCompileErrors_btn is a cRDCButton
-                    Set Size to 14 53
-                    Set Location to 43 303
-                    Set Label to "&Errors"
-                    Set peAnchors to anBottomLeft
-                    Set psImage to "CompileErrors.ico"
-                    Set psToolTip to "Show compilation errors (Ctrl+E)"
-                    Set MultiLineState to True
-                
-                    Procedure OnClick
-                        String sAppSrcPath
-                        Boolean bExists
-    
-                        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrcPath
-                        Get vFolderFormat sAppSrcPath to sAppSrcPath
-                        Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
-                        If (bExists = True) Begin
-                            Send ActivateErrorDialog of (Client_Id(phoMainPanel(ghoApplication))) (sAppSrcPath + CS_TestErrFile)
-                        End
-                    End_Procedure  
-                    
-                    Function IsEnabled Returns Boolean
-                        Boolean bExists
-                        String sAppSrcPath
-                        Integer iLines
-    
-                        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrcPath
-                        Get vFolderFormat sAppSrcPath to sAppSrcPath
-                        Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
-                        Get SC_LineCount of (phoEditorRefactored(ghoApplication)) to iLines
-                        Function_Return (bExists = True and iLines > 1)
-                    End_Function
-            
-                End_Object
+//                Object oShowCompileErrors_btn is a cRDCButton
+//                    Set Size to 30 53
+//                    Set Location to 30 299
+//                    Set Label to "View &Errors"
+//                    Set peAnchors to anBottomLeft
+//                    Set psImage to "CompileErrors.ico"
+//                    Set psToolTip to "Show compilation errors (Ctrl+E)"
+//                    Set MultiLineState to True
+//                
+//                    Procedure OnClick
+//                        String sAppSrcPath
+//                        Boolean bExists
+//    
+//                        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrcPath
+//                        Get vFolderFormat sAppSrcPath to sAppSrcPath
+//                        Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
+//                        If (bExists = True) Begin
+//                            Send ActivateCompileErrorDialog of (Client_Id(phoMainPanel(ghoApplication))) (sAppSrcPath + CS_TestErrFile)
+//                        End
+//                    End_Procedure  
+//                    
+//                    Function IsEnabled Returns Boolean
+//                        Boolean bExists
+//                        String sAppSrcPath
+//                        Integer iLines
+//    
+//                        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrcPath
+//                        Get vFolderFormat sAppSrcPath to sAppSrcPath
+//                        Get vFilePathExists (sAppSrcPath + CS_TestErrFile) to bExists
+//                        Get SC_LineCount of (phoEditorRefactored(ghoApplication)) to iLines
+//                        Function_Return (bExists = True and iLines > 1)
+//                    End_Function
+//            
+//                End_Object
         
                 Object oStartCompareProgram_btn is a cRDCButton
-                    Set Size to 23 53
-                    Set Location to 32 363
+                    Set Size to 30 53
+                    Set Location to 30 299
+//                    Set Location to 30 354
                     Set Label to "Co&mpare Code"
                     Set peAnchors to anBottomLeft
                     Set psImage to "Compare.ico"
+                    Set piImageSize to 24
                     Set psToolTip to "Starts the selected compare program and passes the two source files (Ctrl+M). It automatically saves the source files first."
                     Set MultiLineState to True
                 
@@ -502,7 +509,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Get vCopyFile sLegacyFileName sRefactoredFileName to bOK
         Set psCurrentSourceFileName of ghoApplication to sRefactoredFileName
         
-        Get CollectFileData of ghoApplication to RefactorFiles
+        Get CollectFileData of ghoApplication (oFolderSelDtl_DD(Self)) to RefactorFiles
         If (Err = True) Begin
             Procedure_Return
         End
@@ -532,6 +539,27 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Function_Return iRetval
     End_Function
         
+    // These two messages writes & reads where the splitter should appear.
+    Procedure Page_Delete 
+        Integer iLocation
+        Get piGuiSplitterLocation of oSplitterContainer to iLocation
+        Send WriteInteger of ghoApplication CS_Splitters CS_TestingViewSplitterPos iLocation
+        Forward Send Page_Delete
+    End_Procedure 
+    
+    Procedure Add_Focus Handle hoParent Returns Integer
+        Integer iErr iLocation
+        
+        Forward Get msg_Add_Focus hoParent to iErr
+        If (iErr <> 0) Begin
+            Procedure_Return    
+        End
+        Get ReadInteger of ghoApplication CS_Splitters CS_TestingViewSplitterPos 498 to iLocation
+        If (iLocation <> 0) Begin
+            Set piGuiSplitterLocation of oSplitterContainer to iLocation
+        End
+    End_Procedure
+
     Procedure Activating
         Send Request_Assign of oSysFile_DD
         Send Refind_Records of oSysFile_DD
