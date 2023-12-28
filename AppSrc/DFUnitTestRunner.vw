@@ -86,8 +86,28 @@ Object DFUnitTestRunner_vw is a View
         Set Location to 46 13
         Set peAnchors to anAll
         Set Border_Style to Border_Thick
-
-        Delegate Set phoOutputBox to Self
+        Delegate Set phoOutputBox to Self 
+        
+        Procedure Copy
+            String sLine
+            Integer iLine iPos iChar
+            Get LineFromChar -1 to iLine
+            Get Line iLine to sLine
+            Move (Pos("on line:", sLine)) to iPos
+            If (iPos <> 0) Begin
+                Move (Trim(Mid(sLine, Length(sLine), (iPos + Length("on line:"))))) to sLine
+                Move sLine to iLine 
+                Direct_Output channel 9 "clipboard:"
+                Writeln channel 9 iLine
+                Close_Output channel 9
+                Set StatusText of (StatusBar_Id(Self)) to ("Line:" * String(iLine) * "has been copied. Press Ctrl+G in the studio, then Ctrl+V to jump to the source line.")
+            End 
+            Else Begin
+                Forward Send Copy
+            End
+        End_Procedure
+        
+        On_Key Key_Ctrl+Key_C Send Copy
     End_Object
 
     Object oEditor_tb is a TextBox
