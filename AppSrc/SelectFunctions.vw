@@ -13,8 +13,8 @@ Use cFunctionsDataDictionary.dd
 
 Register_Function MyDelete_Confirmation Returns Integer
 
-ACTIVATE_VIEW Activate_oMaintainFunctions FOR oMaintainFunctions
-Object oMaintainFunctions is a cRefactorDbView
+Activate_View Activate_oSelectFunctions_vw for oSelectFunctions_vw
+Object oSelectFunctions_vw is a cRefactorDbView
     Set Location to 2 4
     Set Size to 110 635
     Set Label to "Select Functions"
@@ -359,4 +359,4 @@ Object oMaintainFunctions is a cRefactorDbView
     On_Key Key_Ctrl+Key_S  Send Request_Save
     On_Key Key_F2          Send Request_Save
     On_Key Key_Ctrl+Key_F4 Send None
-End_Object 
+End_Object
