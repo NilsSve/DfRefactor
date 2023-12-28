@@ -160,6 +160,8 @@ Struct tRefactorSettings
     Boolean bCountSourceLines           // If we should only count source lines (all other functions will be ignored).
     Boolean bReadOnly                   // Run through the selected refactor functions but *do not* make changes to any source file.
     Boolean bWorkspaceMode              // If true all files that matches the selected file filter and selected folders will be affected by refactoring functions.
+    Boolean bShowStartQuestion          // Should the engine show a question before starting the refactoring process
+    Boolean bShowSummary                // Should the log/summary dialog be dispalyed automatically after the engine is finished.
     //
     String  sFileFilter                 // File selection filter.
     tRefactorFiles FileData             // Contains three arrays; Paths, FileNames & Path+FileNames
@@ -213,6 +215,7 @@ Struct tExpression
     Integer iStartPos 
     Integer iLength 
     String sExpression
+    String sExpressionOS // Overstrike expression variant
 End_Struct   
 
 Struct tQuotedString
@@ -336,6 +339,13 @@ Define CS_WorkspaceRecentKey        for "Recent"
 Define CS_PropertiesKeyWord         for "Properties"
 Define CS_ThemeKeyWord              for "Theme"
 Define CS_VersionKeyWord            for "Version"
+Define CS_Projects                  for "Projects"
+Define CS_Project                   for "Project"
+Define CS_Application               for "Application" 
+Define CS_Icon                      for "Icon"
+Define CS_AppSrcPath                for "AppSrcPath"
+Define CS_BitmapPath                for "BitmapPath" 
+Define CS_Workspace                 for "Workspace"
 Define CS_OpenWorkspace             for "Select &Workspace"
 //Define CS_OpenWorkspace             for "Open &Workspace"
 Define CS_CurrentWorkspace          for "Current &Workspace:"
@@ -437,6 +447,8 @@ Define CS_RefactoredCode for "RefactoredCode.pkg"
 Define CS_ImpExpFileJson for "DFRefactorImportExportFile.json" 
 Define CS_ExportJsonFile for "ExportJsonFile"
 Define CS_ImportJsonFile for "ImportJsonFile"
+Define CS_ShowQuestion   for "StartQuestion"
+Define CS_ShowSummary    for "ShowSummary"
 
 // Refactor Testing program:
 Define CS_Trim           for "Trim"    
