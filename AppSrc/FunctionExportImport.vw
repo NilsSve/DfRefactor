@@ -2,7 +2,8 @@
 // Functions Export/Import
 //
 
-Use DFClient.pkg
+Use DFClient.pkg                                  
+Use cRefactorDbView.pkg
 Use DFEntry.pkg
 Use File_dlg.pkg
 Use cDbTextEdit.pkg
@@ -15,7 +16,7 @@ Use oExportImportFunctions.pkg
 Use cFunctionsDataDictionary.dd
 
 ACTIVATE_VIEW Activate_oFunctionsExportImport FOR oFunctionsExportImport
-Object oFunctionsExportImport is a dbView
+Object oFunctionsExportImport is a cRefactorDbView
     Set Location to 5 5
     Set Size to 372 650
     Set Label to "Export/Import"
@@ -114,6 +115,24 @@ Object oFunctionsExportImport is a dbView
             Set Label_Row_Offset to 0
             Set Read_Only_State to True
             Set Border_Style to Border_WindowEdge
+
+            // The cDbTextEdit contains a peculiarity in the sense that it 
+            // doesn't right trim the buffer value. This results in a really
+            // annyoing runtime error when you try to add text to an existing
+            // record. The error is triggered becvause the maximal length then
+            // gets exceeded. This "ccures" it.
+            Procedure Refresh Integer iNotifyMode
+                Handle hoServer
+                String sVal
+                Get Server to hoServer
+                Forward Send Refresh iNotifyMode
+                If (iNotifyMode = Mode_Find_or_Clear_Set or iNotifyMode = Mode_Save) Begin
+                    Get Field_Current_Value of hoServer Field Functions.Function_Help to sVal
+                    Move (Rtrim(sVal)) to sVal
+                    Set Value to sVal
+                End
+            End_Procedure
+            
         End_Object 
 
         Object oCopyToRight_btn is a cRDCButton
@@ -294,7 +313,7 @@ Object oFunctionsExportImport is a dbView
             Set Label to "Export Data to Json"
             Set psToolTip to "Export selected function ID's data records *and* the corresponding function text(s) from the cRefactorFuncLib repository class."
             Set peAnchors to anNone 
-            Set psImage to "Json.ico"
+            Set psImage to "JsonFile.ico"
             Set piImageSize to 32
             Set MultiLineState to True
         
@@ -348,7 +367,7 @@ Object oFunctionsExportImport is a dbView
             Set Location to 58 564
             Set Label to "View Json File"
             Set psToolTip to "View the Json file with the associated program."
-            Set psImage to "View.ico"
+            Set psImage to "ViewJson.ico"
             Set piImageSize to 32
             Set MultiLineState to True
         
@@ -588,7 +607,7 @@ Object oFunctionsExportImport is a dbView
             Set Location to 32 564
             Set Label to "Import Json Data"
             Set psToolTip to "Imports data from the selected DFRefactor Json import-file."
-            Set psImage to "Json.ico"
+            Set psImage to "JsonFile.ico"
             Set piImageSize to 32
             Set MultiLineState to True
         
@@ -635,7 +654,7 @@ Object oFunctionsExportImport is a dbView
             Set Location to 32 493
             Set Label to "View Json File"
             Set psToolTip to "View the Json file with the associated program."
-            Set psImage to "View.ico"
+            Set psImage to "ViewJson.ico"
             Set piImageSize to 32
             Set MultiLineState to True
         
