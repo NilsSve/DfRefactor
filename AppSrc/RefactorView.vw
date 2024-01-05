@@ -292,7 +292,7 @@ Object oRefactorView is a cRefactorDbView
 
                 Object oSelectAll_btn is a Button
                     Set Size to 14 62
-                    Set Location to 10 255
+                    Set Location to 9 261
                     Set Label to "Select All"
                     Set psImage to "SelectAll.ico"   
                     Set psToolTip to "(Ctrl+A)"
@@ -304,7 +304,7 @@ Object oRefactorView is a cRefactorDbView
 
                 Object oSelectNone_btn is a Button
                     Set Size to 14 62
-                    Set Location to 10 321
+                    Set Location to 9 327
                     Set Label to "Select None"
                     Set psImage to "SelectNone.ico"
                     Set psToolTip to "(Ctrl+N)"
@@ -316,7 +316,7 @@ Object oRefactorView is a cRefactorDbView
 
                 Object oSelectInvert_btn is a Button
                     Set Size to 14 74
-                    Set Location to 10 387
+                    Set Location to 9 393
                     Set Label to "Invert Selections"
                     Set psImage to "SelectInvert.ico"
                     Set psToolTip to "(Ctrl+I)"
@@ -328,7 +328,7 @@ Object oRefactorView is a cRefactorDbView
 
                 Object oConstrainByType_cf is a ComboForm
                     Set Size to 14 99
-                    Set Location to 10 546
+                    Set Location to 9 546
                     Set peAnchors to anTopRight
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
@@ -541,7 +541,7 @@ Object oRefactorView is a cRefactorDbView
 
                 Object oSelectAll_btn is a Button
                     Set Size to 14 62
-                    Set Location to 10 255
+                    Set Location to 9 255
                     Set Label to "Select All"
                     Set psImage to "SelectAll.ico"
                     Set psToolTip to "(Ctrl+A)"
@@ -553,7 +553,7 @@ Object oRefactorView is a cRefactorDbView
                 
                 Object oSelectNone_btn is a Button
                     Set Size to 14 62
-                    Set Location to 10 321
+                    Set Location to 9 321
                     Set Label to "Select None"
                     Set psImage to "SelectNone.ico"
                     Set psToolTip to "(Ctrl+N)"
@@ -565,7 +565,7 @@ Object oRefactorView is a cRefactorDbView
 
                 Object oSelectInvert_btn is a Button
                     Set Size to 14 74
-                    Set Location to 10 387
+                    Set Location to 9 387
                     Set Label to "Invert Selections"
                     Set psImage to "SelectInvert.ico"
                     Set psToolTip to "(Ctrl+I)"
@@ -805,8 +805,8 @@ Object oRefactorView is a cRefactorDbView
         Set pbUseLargeFontHeight to True
 
         Object oNoOfSelectedFunctions_fm is a cRDCDbForm
-            Set Size to 13 40
-            Set Location to 32 171
+            Set Size to 13 32
+            Set Location to 32 179
             Set Label_Justification_Mode to JMode_Right
             Set Label to "Selected Functions:"
             Set psToolTip to "Total number of functions selected."
@@ -820,8 +820,8 @@ Object oRefactorView is a cRefactorDbView
         End_Object
 
         Object oNoOfSelectedFolders_fm is a cRDCDbForm
-            Set Size to 13 40
-            Set Location to 45 171
+            Set Size to 13 32
+            Set Location to 45 179
             Set Label_Justification_Mode to JMode_Right
             Set Label to "Selected Folders:"
             Set psToolTip to "Total number of folders selected."
@@ -866,7 +866,7 @@ Object oRefactorView is a cRefactorDbView
         Object oReadOnly_cb is a dbCheckbox
             Entry_Item SysFile.bReadOnly
             Set Server to oSysFile_DD
-            Set Location to 17 315
+            Set Location to 17 318
             Set Size to 8 109
             Set Label to "Read Only"
             Set peAnchors to anBottomLeft
@@ -964,7 +964,7 @@ Object oRefactorView is a cRefactorDbView
 
         Object oStartCompareProgram_btn is a cRDCButton
             Set Size to 30 54
-            Set Location to 30 317
+            Set Location to 29 317
             Set Label to "Co&mpare Code"
             Set peAnchors to anBottomLeft
             Set psImage to "Compare.ico"
@@ -974,18 +974,42 @@ Object oRefactorView is a cRefactorDbView
         
             Procedure OnClick
                 String sCompareApp
-                Send Execute of (oSave_ToolItem(ghoCommandBars))
+                Boolean bWorkspaceMode
                 Get psFileCompareApp of ghoApplication to sCompareApp
-                Send CompareFiles of ghoApplication sCompareApp
+                Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
+                If (bWorkspaceMode = True) Begin
+                    Send ComparePaths of ghoApplication sCompareApp
+                End
+                Else Begin
+                    Send CompareFiles of ghoApplication sCompareApp
+                End
             End_Procedure
     
             Function IsEnabled Returns Boolean
-                Integer iLines  
-                // ToDo: What should we check for?
-//                Get SC_LineCount of (phoEditor(Self)) to iLines
-                Function_Return (iLines > 1)
+                String sSourcePath sBackupPath
+                String sBackupName sSourceFilename sCompareApp
+                Boolean bWorkspaceMode bOK
+
+                Move False to bOK
+                Get psFileCompareApp of ghoApplication to sCompareApp
+                If (sCompareApp <> "") Begin
+                    Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
+                    Get psCurrentSourceFileName of ghoApplication to sSourceFilename
+                    Get IsBackupFile of ghoApplication sSourceFilename to sBackupName
+                    If (bWorkspaceMode = True) Begin
+                        Get SourceFilePath of ghoApplication to sSourcePath
+                        Get HomeBackupFilePath of ghoApplication to sBackupPath
+                        Move (sSourcePath <> "" and sBackupPath <> "") to bOK
+                    End
+                    Else Begin
+                        Move (sSourceFilename <> "" and sBackupName <> "") to bOK
+                    End
+                End
+
+                Function_Return bOK
             End_Function
-    
+
+
         End_Object
 
     End_Object
