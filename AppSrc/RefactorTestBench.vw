@@ -74,6 +74,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Set piSplitterLocation to 498
         
         Object oSplitterContainerChild1 is a cDbSplitterContainerChild
+            Set peNeighborhood to nhPublic
 
             Object oOpenDialog is a OpenDialog
                 Set Dialog_Caption to "Select your file compare application of choice"
@@ -200,6 +201,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         End_Object
 
         Object oSplitterContainerChild2 is a cDbSplitterContainerChild
+            Set peNeighborhood to nhPublic
 
             Object oLegacyEditor_tb is a TextBox
                 Set Size to 10 84
@@ -341,7 +343,9 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                     Set peAnchors to anBottomLeft
                     
                     Procedure OnClick   
+                        Set Value of oRefactoredCode_Time_fm to ""
                         Delegate Send RefactoreCode
+                        Set Value of oRefactoredCode_Time_fm to (psTotalTime(ghoRefactorEngine))
                     End_Procedure 
                     
                     Function IsEnabled Returns Boolean   
@@ -350,30 +354,9 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
                 
                 End_Object
 
-                Object oCompileRefactoredCode_btn is a cRDCButton
-                    Set Size to 30 53
-                    Set Location to 30 244
-                    Set Label to "Compile"
-                    Set peAnchors to anBottomLeft
-                    Set psImage to "CompileProject.ico"  
-                    Set piImageSize to 24
-                    Set psToolTip to "Compiles a test program (CompiledRefactoredCode.src) where the refactored code file is Use'd. (F5)"
-                
-                    Procedure OnClick
-                        Send CompileRefactoredCode of ghoApplication
-                    End_Procedure  
-                    
-                    Function IsEnabled Returns Boolean
-                        Integer iLines
-                        Get SC_LineCount of (phoEditor(Self)) to iLines
-                        Function_Return (iLines > 1)
-                    End_Function
-            
-                End_Object
-
                 Object oStartCompareProgram_btn is a cRDCButton
                     Set Size to 30 53
-                    Set Location to 30 299
+                    Set Location to 30 246
                     Set Label to "Co&mpare Code"
                     Set peAnchors to anBottomLeft
                     Set psImage to "Compare.ico"
@@ -396,6 +379,28 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             
                 End_Object
 
+                Object oCompileRefactoredCode_btn is a cRDCButton
+                    Set Size to 30 53
+                    Set Location to 30 303
+                    Set Label to "Test Compile"
+                    Set peAnchors to anBottomLeft
+                    Set psImage to "CompileProject.ico"  
+                    Set piImageSize to 24
+                    Set psToolTip to "Compiles a test program (CompiledRefactoredCode.src) where the refactored code file is Use'd. (F5)"
+                    Set MultiLineState to True
+                
+                    Procedure OnClick
+                        Send CompileRefactoredCode of ghoApplication
+                    End_Procedure  
+                    
+                    Function IsEnabled Returns Boolean
+                        Integer iLines
+                        Get SC_LineCount of (phoEditor(Self)) to iLines
+                        Function_Return (iLines > 1)
+                    End_Function
+            
+                End_Object
+
             End_Object
             
         End_Object
@@ -403,8 +408,12 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     End_Object
 
     Procedure OnSetFocus
-        Set Value of (oLegacyCodeFilename_fm(Self))     to (psCodeFile(phoEditorLegacy(ghoApplication)))
-        Set Value of (oRefactoredCodeFilename_fm(Self)) to (psCodeFile(phoEditorRefactored(ghoApplication))) 
+        If (oLegacyCodeFilename_fm(Self) <> 0) Begin
+            Set Value of (oLegacyCodeFilename_fm(Self))     to (psCodeFile(phoEditorLegacy(ghoApplication)))
+        End
+        If (oRefactoredCodeFilename_fm(Self) <> 0) Begin
+            Set Value of (oRefactoredCodeFilename_fm(Self)) to (psCodeFile(phoEditorRefactored(ghoApplication))) 
+        End
     End_Procedure
     
     //
@@ -426,7 +435,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
             End
         End 
         
-        Set Value of oRefactoredCode_Time_fm to ""
         Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
         Get psCodeFile          of hoLegacyEditor     to sLegacyFileName
         Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor        
@@ -446,7 +454,6 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         Send StartRefactoringEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor
         // Save the result
         Send SaveFile of hoRefactoredEditor
-        Set Value of oRefactoredCode_Time_fm to (psTotalTime(ghoRefactorEngine))
     End_Procedure
 
     // Delete the .err file if exists.
