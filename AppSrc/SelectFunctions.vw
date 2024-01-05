@@ -29,13 +29,10 @@ Object oSelectFunctions_vw is a cRefactorDbView
 
     Object oFunctions_DD is a cFunctionsDataDictionary  
         
-        // In this view we are also interested in saving the system file,
-        // when the oSysFile_CountSourceLines_cb object is changed.
-        // So relay save message here.
-        Procedure Request_Save
-            Send Request_Save of oSysFile_DD
-            Forward Send Request_Save
-        End_Procedure
+//        Procedure Request_Save
+//            Send Request_Save of oSysFile_DD
+//            Forward Send Request_Save
+//        End_Procedure
         
         Procedure OnConstrain
             If (piFunctionType(Self) <> eAll_Functions) Begin
@@ -63,8 +60,9 @@ Object oSelectFunctions_vw is a cRefactorDbView
             Set Size to 76 620
             Set Location to 27 10
             Set Ordering to 5
-            Set pbStaticData to True
             Set pbDbShowInvertSelectionsMenuItem to True
+            Set pbDbShowEditMenuItem to True
+            Set pbStaticData to True
                 
             Object oFunctions_ID is a cRDCDbCJGridColumn
                 Entry_Item Functions.ID
@@ -78,9 +76,10 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 Entry_Item Functions.Function_Name
                 Set piWidth to 285
                 Set psCaption to "Function Name (Suggestion list)"    
-                Set phoData_Col to Self   
                 Set pbFullText to True    
                 Set psToolTip to "This is a full text suggestion list. You can start typing to search for any keyword and a suggestion list will appear for you to select from."
+                Set Status_Help to (psToolTip(Self))
+                Set phoData_Col to Self   
                 Set pbAllowRemove to False
                 
                 Function OnGetTooltip Integer iRow String sValue String sText Returns String
@@ -214,18 +213,17 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 Function_Return bSave
             End_Procedure
             
-            Procedure OnComRowDblClick Variant llRow Variant llItem
+            Procedure Request_Edit
                 Integer iFunctionID iSelectedCol iParameterCol
                 Get piColumnId of oFunctions_Parameter to iParameterCol
                 Get SelectedColumn to iSelectedCol
                 If (iSelectedCol = iParameterCol) Begin
                     Procedure_Return
                 End
-                Forward Send OnComRowDblClick llRow llItem   
                 Get Field_Current_Value of oFunctions_DD Field Functions.ID to iFunctionID
                 Delegate Send ActivateFunctionsView iFunctionID
             End_Procedure
-
+                    
         End_Object
 
         Object oSelectAll_btn is a Button
