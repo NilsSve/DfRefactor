@@ -211,11 +211,12 @@ End_Enum_List
 
 Struct tExpression
     { EnumList="{CI_LeftExpression1, CI_LeftExpression2, CI_OfExpression, CI_ToTexpression}" }
+    String sExpression
+    String sExpressionOS // Overstrike expression variant
+    String sExpressionNP // No added Paranthesis
     Integer eExpressionMode
     Integer iStartPos 
     Integer iLength 
-    String sExpression
-    String sExpressionOS // Overstrike expression variant
 End_Struct   
 
 Struct tQuotedString
@@ -307,8 +308,12 @@ End_Struct
 #IFNDEF clGreenGrey
     Define clGreenGrey              for (RGB(64, 84, 93))
     Define clGreenGreyLight         for (RGB(7, 117, 104))
+    Define clDarkGreen                  for (RGB(49, 60, 83))
 #ENDIF
-Define clDarkGreen                  for (RGB(49, 60, 83))
+#IFNDEF CI_DarkTheme
+    Define clDarkTheme for (RGB(36,36,36)) 
+    Define clDarkThemeText for clWhite
+#ENDIF
 
 Define CS_StudioTools               for "\Studio\Tools"
 Define CS_RegWorkspace              for "<workspace>"
