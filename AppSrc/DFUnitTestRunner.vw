@@ -97,10 +97,10 @@ Object DFUnitTestRunner_vw is a View
             If (iPos <> 0) Begin
                 Move (Trim(Mid(sLine, Length(sLine), (iPos + Length("on line:"))))) to sLine
                 Move sLine to iLine 
-                Direct_Output channel 9 "clipboard:"
-                Writeln channel 9 iLine
+                Direct_Output channel 9 "Clipboard:"
+                Write channel 9 iLine
                 Close_Output channel 9
-                Set StatusText of (StatusBar_Id(Self)) to ("Line:" * String(iLine) * "has been copied. Press Ctrl+G in the studio, then Ctrl+V to jump to the source line.")
+                Set StatusText of (StatusBar_Id(ghoCommandBars)) to ("The number:" * String(iLine) * "was copied to Windows Clipboard. Press Ctrl+G in the studio, to jump to that source line.")
             End 
             Else Begin
                 Forward Send Copy
