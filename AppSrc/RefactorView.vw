@@ -45,7 +45,7 @@ Register_Procedure ActivateProcess
 Activate_View Activate_oRefactorView for oRefactorView
 Object oRefactorView is a cRefactorDbView
     Set Location to 1 0
-    Set Size to 315 642
+    Set Size to 315 654
     Set Label to "Selections"
     Set Icon to "DFRefactor.ico"
     Set pbAcceptDropFiles to True
@@ -91,7 +91,7 @@ Object oRefactorView is a cRefactorDbView
     Set Server to oFunctions_DD
                                     
     Object oMain_TabDialog is a dbTabDialog
-        Set Size to 241 642
+        Set Size to 241 653
         Set piMinSize to 140 510
         Set Location to 0 -2
         Set Rotate_Mode to RM_Rotate
@@ -105,7 +105,7 @@ Object oRefactorView is a cRefactorDbView
             Set Label to "Select Functions"
 
             Object oSelectFunctions_grp is a cRDCDbHeaderGroup
-                Set Size to 219 634
+                Set Size to 219 655
                 Set piMinSize to 126 490
                 Set Location to 4 0
                 Set Label to "Function List"             
@@ -117,7 +117,7 @@ Object oRefactorView is a cRefactorDbView
                 Set piImageIndex to Ico_Functions
 
                 Object oFunctionSelection_grd is a cRDCDbCJGrid
-                    Set Size to 204 621
+                    Set Size to 204 636
                     Set Location to 27 9
                     Set Ordering to 5
                     Set piLayoutBuild to 4
@@ -127,7 +127,7 @@ Object oRefactorView is a cRefactorDbView
                     Set pbAllowDeleteRow to False
                     Set pbAllowInsertRow to False
                     Set pbAutoAppend to False
-                    Set pbDbShowInvertSelectionsMenuItem to True 
+                    Set pbDbShowInvertSelectionsMenuItem to True     
                     // Need this to load all records in the grid,
                     // else the select buttons won't work.
                     Set pbStaticData to True
@@ -144,12 +144,13 @@ Object oRefactorView is a cRefactorDbView
                         Entry_Item Functions.Function_Name
                         Set piWidth to 291
                         Set psCaption to "Function Name (Suggestion list)"    
+                        Set pbFullText to True    
                         Set psToolTip to "This is a full text suggestion list. You can start typing to search for any keyword and a suggestion list will appear for you to select from."
+                        Set Status_Help to (psToolTip(Self))
                         // NOTE: The phoData_Col property must be set for the checkbox selections to work!
                         Set phoData_Col to Self   
-                        Set pbFullText to True    
                         Set pbAllowRemove to False
-                        Set Status_Help to (psToolTip(Self))
+//                        Set Prompt_Button_Mode to PB_PromptOff
                         
                         Function OnGetTooltip Integer iRow String sValue String sText Returns String
                             Get RowValue of oFunctions_Function_Help iRow to sText
@@ -327,7 +328,7 @@ Object oRefactorView is a cRefactorDbView
 
                 Object oConstrainByType_cf is a ComboForm
                     Set Size to 14 99
-                    Set Location to 10 531
+                    Set Location to 10 546
                     Set peAnchors to anTopRight
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
@@ -793,7 +794,7 @@ Object oRefactorView is a cRefactorDbView
     End_Object
 
     Object oRunNow_grp is a cRDCDbHeaderGroup
-        Set Size to 66 367 //48 367
+        Set Size to 66 377
         Set Location to 246 270
         Set piMinSize to 48 367
         Set psLabel to "Refactor Code"
@@ -960,6 +961,32 @@ Object oRefactorView is a cRefactorDbView
             Get psSWSFile of ghoApplication to sSWSFile
             Set Enabled_State to (sSWSFile <> "")
         End_Procedure
+
+        Object oStartCompareProgram_btn is a cRDCButton
+            Set Size to 30 54
+            Set Location to 30 317
+            Set Label to "Co&mpare Code"
+            Set peAnchors to anBottomLeft
+            Set psImage to "Compare.ico"
+            Set piImageSize to 24
+            Set psToolTip to "Starts the selected compare program and passes the two source files (Ctrl+M). It automatically saves the source files first."
+            Set MultiLineState to True
+        
+            Procedure OnClick
+                String sCompareApp
+                Send Execute of (oSave_ToolItem(ghoCommandBars))
+                Get psFileCompareApp of ghoApplication to sCompareApp
+                Send CompareFiles of ghoApplication sCompareApp
+            End_Procedure
+    
+            Function IsEnabled Returns Boolean
+                Integer iLines  
+                // ToDo: What should we check for?
+//                Get SC_LineCount of (phoEditor(Self)) to iLines
+                Function_Return (iLines > 1)
+            End_Function
+    
+        End_Object
 
     End_Object
 
