@@ -109,7 +109,7 @@ Object oRefactorView is a cRefactorDbView
                 Set piMinSize to 126 490
                 Set Location to 4 0
                 Set Label to "Function List"             
-                Set psImage to "FunctionLibrary.ico"
+                Set psImage to "FunctionLookup.ico"
                 Set psNote to "Select functions. Right click grid for options."
                 Set psToolTip to "Standard refactoring functions are functions that are called once for each source line."
                 Set Border_Style to Border_None
