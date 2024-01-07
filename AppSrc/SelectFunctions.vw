@@ -29,11 +29,6 @@ Object oSelectFunctions_vw is a cRefactorDbView
 
     Object oFunctions_DD is a cFunctionsDataDictionary  
         
-//        Procedure Request_Save
-//            Send Request_Save of oSysFile_DD
-//            Forward Send Request_Save
-//        End_Procedure
-        
         Procedure OnConstrain
             If (piFunctionType(Self) <> eAll_Functions) Begin
                 Constrain Functions.Type eq (piFunctionType(Self))
@@ -114,7 +109,6 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
     
                 Function OnGetTooltip Integer iRow String sValue String sText Returns String
-//                            Get RowValue of oFunctions_Function_Help iRow to sText
                     Move "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing." to sText
                     Function_Return sText
                 End_Function
