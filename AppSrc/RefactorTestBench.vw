@@ -67,9 +67,6 @@ Object oRefactorTestBench is a cRefactorDbView
     Set Main_DD to oFunctions_DD
     Set Server to oFunctions_DD
 
-Define CS_Splitters              for "Splitters"
-Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
-
     Object oSplitterContainer is a cDbSplitterContainer
         Set piSplitterLocation to 498
         
@@ -479,7 +476,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
     Procedure Page_Delete 
         Integer iLocation
         Get piGuiSplitterLocation of oSplitterContainer to iLocation
-        Send WriteInteger of ghoApplication CS_Splitters CS_TestingViewSplitterPos iLocation
+        Send WriteInteger of ghoApplication CS_Splitters CS_TestBenchViewSplitterPos iLocation
         Forward Send Page_Delete
     End_Procedure 
     
@@ -490,7 +487,7 @@ Define CS_TestingViewSplitterPos for "TestingViewSplitterPos"
         If (iErr <> 0) Begin
             Procedure_Return    
         End
-        Get ReadInteger of ghoApplication CS_Splitters CS_TestingViewSplitterPos 498 to iLocation
+        Get ReadInteger of ghoApplication CS_Splitters CS_TestBenchViewSplitterPos 498 to iLocation
         If (iLocation <> 0) Begin
             Set piGuiSplitterLocation of oSplitterContainer to iLocation
         End
