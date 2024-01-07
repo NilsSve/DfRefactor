@@ -432,11 +432,15 @@ Define CS_RemoveProjectObjectStructure  for "RemoveProjectObjectStructure"
 //Define CS_RemoveBlankLines              for "RemoveBlankLines"
 Define CS_UnusedSourceFiles             for "ReportUnusedSourceFiles"
 
-// Refactor Testing program:
-Define CS_Compiler       for "DFComp.exe"
-Define CS_CompOptions    for "-e0fv2i0"     
+// Refactor Testing program:             
 Define CS_TestProgram    for "CompiledRefactoredCode.src"
 Define CS_TestErrFile    for "CompiledRefactoredCode.err"
+Define CS_Compiler       for "DFComp.exe"
+Define CS_DFCompiler     for "DFCompiler"
+Define CS_Build_Options  for "Build_Options"
+Define CS_CompOptions    for "-e0fv2i0"     
+Define CS_Splitters      for "Splitters"
+Define CS_TestBenchViewSplitterPos for "TestBenchViewSplitterPos"
 
 #IF (!@ = 230)
     Define CS_SWSFile        for "DFRefactor23.0.sws"
@@ -452,7 +456,7 @@ Define CS_RefactoredCode for "RefactoredCode.pkg"
 Define CS_ImpExpFileJson for "DFRefactorImportExportFile.json" 
 Define CS_ExportJsonFile for "ExportJsonFile"
 Define CS_ImportJsonFile for "ImportJsonFile"
-Define CS_ShowQuestion   for "StartQuestion"
+Define CS_ShowQuestion   for "ShowQuestion"
 Define CS_ShowSummary    for "ShowSummary"
 
 // Refactor Testing program:
