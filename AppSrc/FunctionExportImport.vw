@@ -310,7 +310,7 @@ Object oFunctionsExportImport is a cRefactorDbView
         Object oExport_btn is a cRDCButton
             Set Size to 24 66
             Set Location to 33 564
-            Set Label to "Export Data to Json"
+            Set Label to "Export Data"
             Set psToolTip to "Export selected function ID's data records *and* the corresponding function text(s) from the cRefactorFuncLib repository class."
             Set peAnchors to anNone 
             Set psImage to "JsonFile.ico"
@@ -605,7 +605,7 @@ Object oFunctionsExportImport is a cRefactorDbView
         Object oImport_btn is a cRDCButton
             Set Size to 24 66
             Set Location to 32 564
-            Set Label to "Import Json Data"
+            Set Label to "Import Data"
             Set psToolTip to "Imports data from the selected DFRefactor Json import-file."
             Set psImage to "JsonFile.ico"
             Set piImageSize to 32
