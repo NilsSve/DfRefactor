@@ -58,6 +58,7 @@ Object oSelectFunctions_vw is a cRefactorDbView
             Set pbDbShowInvertSelectionsMenuItem to True
             Set pbDbShowEditMenuItem to True
             Set pbStaticData to True
+            Set pbHeaderPrompts to False
                 
             Object oFunctions_ID is a cRDCDbCJGridColumn
                 Entry_Item Functions.ID
