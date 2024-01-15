@@ -416,7 +416,7 @@ Object oRefactorTestBench is a cRefactorDbView
     //
     // ToDo: *** MAIN FUNCTION CALL ***
     //
-    Procedure RefactoreCode //Boolean bUseConstraints
+    Procedure RefactoreCode
         String sLegacyFileName sRefactoredFileName
         Handle hoLegacyEditor hoRefactoredEditor
         Integer iRetval
