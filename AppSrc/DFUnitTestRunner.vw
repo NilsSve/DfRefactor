@@ -7,13 +7,11 @@ Use cRefactorScintillaEditor.pkg
 
 Activate_View Activate_DFUnitTestRunner_vw for DFUnitTestRunner_vw
 Object DFUnitTestRunner_vw is a View
-    Set Size to 323 253
-    Set Location to 0 -1
+    Set Size to 370 253
+    Set Location to 10 10
     Set Maximize_Icon to True
-    Set Minimize_Icon to False
-    Set Sysmenu_Icon to False
-    Set Border_Style to Border_None
-    Set piMinSize to 250 235 
+    Set Border_Style to Border_Thick 
+    Set View_Mode to Viewmode_Normal 
     Set pbAutoActivate to True
     Set phoRefactorView of ghoApplication to Self   
 
@@ -23,7 +21,7 @@ Object DFUnitTestRunner_vw is a View
 
     Object oTestCode_edt is a cRefactorScintillaEditor
         Set Size to 30 227
-        Set Location to 290 12
+        Set Location to 337 12
         Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
         Set peAnchors to anBottomLeftRight     
         Set pbExternalModifyCheck to False
@@ -91,7 +89,7 @@ Object DFUnitTestRunner_vw is a View
     End_Object
 
     Object oOutputBox is a cDFUnitUIListReporter
-        Set Size to 229 236
+        Set Size to 276 236
         Set Location to 46 13
         Set peAnchors to anAll
         Set Border_Style to Border_Thick
@@ -121,7 +119,7 @@ Object DFUnitTestRunner_vw is a View
 
     Object oEditor_tb is a TextBox
         Set Size to 10 34
-        Set Location to 278 13
+        Set Location to 325 13
         Set Label to "Scintilla Test Editor:"
         Set peAnchors to anBottomLeft
     End_Object
@@ -129,7 +127,7 @@ Object DFUnitTestRunner_vw is a View
     Procedure ScaleFont Integer iDirection 
     End_Procedure 
 
-    Procedure End_Construct_Object   
+    Procedure End_Construct_Object
         Forward Send End_Construct_Object
     End_Procedure
 

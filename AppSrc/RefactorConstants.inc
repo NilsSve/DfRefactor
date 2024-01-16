@@ -308,7 +308,7 @@ End_Struct
 #IFNDEF clGreenGrey
     Define clGreenGrey              for (RGB(64, 84, 93))
     Define clGreenGreyLight         for (RGB(7, 117, 104))
-    Define clDarkGreen                  for (RGB(49, 60, 83))
+    Define clDarkGreen              for (RGB(49, 60, 83))
 #ENDIF
 #IFNDEF CI_DarkTheme
     Define clDarkTheme for (RGB(36,36,36)) 
