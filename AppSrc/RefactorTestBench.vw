@@ -193,6 +193,12 @@ Object oRefactorTestBench is a cRefactorDbView
                     Set Form_Border to Border_None
                 End_Object
 
+                Procedure Add_Focus Handle hoParent Returns Integer
+                    Forward Send Add_Focus hoParent
+                    Set Value of oLegacyCodeFilename_fm     to (psCodeFile(phoEditorLegacy(ghoApplication)))
+                    Set Value of oRefactoredCodeFilename_fm to (psCodeFile(phoEditorRefactored(ghoApplication))) 
+                End_Procedure                                  
+            
             End_Object
 
         End_Object
@@ -404,15 +410,6 @@ Object oRefactorTestBench is a cRefactorDbView
 
     End_Object
 
-    Procedure OnSetFocus
-        If (oLegacyCodeFilename_fm(Self) <> 0) Begin
-            Set Value of (oLegacyCodeFilename_fm(Self))     to (psCodeFile(phoEditorLegacy(ghoApplication)))
-        End
-        If (oRefactoredCodeFilename_fm(Self) <> 0) Begin
-            Set Value of (oRefactoredCodeFilename_fm(Self)) to (psCodeFile(phoEditorRefactored(ghoApplication))) 
-        End
-    End_Procedure
-    
     //
     // ToDo: *** MAIN FUNCTION CALL ***
     //
