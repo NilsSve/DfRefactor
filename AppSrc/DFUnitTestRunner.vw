@@ -4,7 +4,6 @@ Use DFUnit\Reporting\ReporterManager.pkg
 Use DFUnit\Reporting\Reporters\UIListReporter.pkg
 Use cRDCButtonDPI.pkg
 Use cRefactorScintillaEditor.pkg
-Use cRefactorFuncLib.pkg
 
 Activate_View Activate_DFUnitTestRunner_vw for DFUnitTestRunner_vw
 Object DFUnitTestRunner_vw is a View
@@ -18,7 +17,17 @@ Object DFUnitTestRunner_vw is a View
     Set pbAutoActivate to True
     Set phoRefactorView of ghoApplication to Self   
 
-    Object oRefactorFunctionLibrary is a cRefactorFuncLib
+//    Automatically instantiated by the ghoApplication object (cRefactorAppliation)
+//    Object oRefactorFunctionLibrary is a cRefactorFuncLib
+//    End_Object
+
+    Object oTestCode_edt is a cRefactorScintillaEditor
+        Set Size to 30 227
+        Set Location to 290 12
+        Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
+        Set peAnchors to anBottomLeftRight     
+        Set pbExternalModifyCheck to False
+        Set phoEditor of ghoRefactorFuncLib to Self
     End_Object
 
     Object oRunTestsButton is a cRDCButtonDPI
@@ -115,14 +124,6 @@ Object DFUnitTestRunner_vw is a View
         Set Location to 278 13
         Set Label to "Scintilla Test Editor:"
         Set peAnchors to anBottomLeft
-    End_Object
-
-    Object oTestCode_edt is a cRefactorScintillaEditor
-        Set Size to 30 227
-        Set Location to 290 12
-        Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
-        Set peAnchors to anBottomLeftRight
-        Set phoEditor of ghoRefactorFuncLib to Self
     End_Object
 
     Procedure ScaleFont Integer iDirection 
