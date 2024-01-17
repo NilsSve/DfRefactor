@@ -307,7 +307,7 @@ End_Struct
 
 #IFNDEF clGreenGrey
     Define clGreenGrey              for (RGB(64, 84, 93))
-    Define clGreenGreyLight         for (RGB(45, 130, 149)) //(RGB(7, 117, 104))
+    Define clGreenGreyLight         for (RGB(7, 117, 104))
     Define clDarkGreen              for (RGB(49, 60, 83)) 
     Define clAlternateRowBgColor    for (RGB(216, 217, 227))    // HTML #D8D9E3
     Define clStatusBarColor         for (RGB(45, 130, 149))     // HTML #2D8295
