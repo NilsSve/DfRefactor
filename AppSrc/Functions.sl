@@ -1,11 +1,11 @@
 // Functions.sl
 // Functions Lookup List
 
+Use Windows.pkg
 Use DFClient.pkg
 Use cDbCJGridPromptList.pkg
 Use cDbCJGridColumn.pkg
-Use Windows.pkg
-
+Use RefactorConstants.inc
 Use cFunctionsDataDictionary.dd
 
 CD_Popup_Object oFunctions_sl is a dbModalPanel
@@ -28,6 +28,7 @@ CD_Popup_Object oFunctions_sl is a dbModalPanel
         Set pbAllowColumnRemove to False
         Set psLayoutSection to "oFunctions_sl_oSelList"
         Set pbUseAlternateRowBackgroundColor to True
+        Set piAlternateRowBackgroundColor to clAlternateRowBgColor   
         Set pbShowRowFocus to True
         Set pbUseFocusCellRectangle to True
         Set pbShadeSortColumn to False
