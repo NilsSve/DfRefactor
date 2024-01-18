@@ -220,7 +220,8 @@ Object oRefactorTestBench is a cRefactorDbView
                 Set phoEditorRefactored of ghoApplication to (Self)
                 Set phoEditor of ghoApplication to (Self)
                 Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_RefactoredCode)
-        
+                Set pbExternalModifyCheck to False
+                 
                 Procedure OnModified
                     Integer iLines
                     Get Line_Count to iLines
@@ -428,11 +429,12 @@ Object oRefactorTestBench is a cRefactorDbView
                 Procedure_Return
             End
         End 
-        
         Send CloseCompileErrorDialog
+        Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor
+        Send Request_Clear of hoRefactoredEditor
+        
         Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
         Get psCodeFile          of hoLegacyEditor     to sLegacyFileName
-        Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor        
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
         // We need to copy the legacy file to the refactor file before we start our work,
         // because else the ghoRefactorEngine would overwrite the sLegacyFileName with
