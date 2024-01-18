@@ -429,6 +429,7 @@ Object oRefactorTestBench is a cRefactorDbView
             End
         End 
         
+        Send CloseCompileErrorDialog
         Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
         Get psCodeFile          of hoLegacyEditor     to sLegacyFileName
         Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor        
