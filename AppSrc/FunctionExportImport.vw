@@ -11,7 +11,7 @@ Use cCJGridColumn.pkg
 Use cRDCCJSelectionGrid.pkg
 Use cRDCDbHeaderGroup.pkg
 Use cRDCButton.pkg                             
-Use oExportImportFunctions.pkg
+Use cExportImportFunctions.pkg
 
 Use cFunctionsDataDictionary.dd
 
@@ -26,6 +26,10 @@ Object oFunctionsExportImport is a cRefactorDbView
     
     Property Handle phoSelection_lst
     Property Handle phoSelection_grd
+
+    Object oImportExportFunctions is a cImportExportFunctions
+        Move Self to ghoImportExportFunctions 
+    End_Object
 
     Object oFunctions_DD is a cFunctionsDataDictionary
     End_Object 
