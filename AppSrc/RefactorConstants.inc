@@ -312,6 +312,7 @@ End_Struct
     Define clAlternateRowBgColor    for (RGB(216, 217, 227))    // HTML #D8D9E3
     Define clStatusBarColor         for (RGB(45, 130, 149))     // HTML #2D8295
     Define clEditorBackGround       for (RGB(25, 110, 130))     // HTML #196E82
+    Define clBaseColor              for (RGB(239, 239, 239))    // HTML #EFEFEF
 #ENDIF
 #IFNDEF CI_DarkTheme
     Define clDarkTheme for (RGB(36,36,36)) 
