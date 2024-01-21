@@ -1,8 +1,9 @@
-Use Dfclient.pkg
+﻿Use Dfclient.pkg
 Use cCJGridColumnRowIndicator.pkg
 Use cDbCJGridColumnSuggestion.pkg
 
 Use cRefactorDbView.pkg
+Use cRDCDbHeaderGroup.pkg
 Use cRDCDbCJGrid.pkg
 Use cRDCDbCJGridColumn.pkg
 Use cRDCDbForm.pkg
