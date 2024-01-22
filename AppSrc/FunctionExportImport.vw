@@ -1,4 +1,4 @@
-// C:\Projects\DF18\DfRefactor\AppSrc\FunctionExportImport.vw
+﻿// C:\Projects\DF18\DfRefactor\AppSrc\FunctionExportImport.vw
 // Functions Export/Import
 //
 
@@ -45,13 +45,16 @@ Object oFunctionsExportImport is a cRefactorDbView
         Set psNote to "Info about Export/Import"
         Set psToolTip to "How to Export/Import function data to/from Json file."
         Set peAnchors to anNone
+        Set Color to clEditorBackGround  
+        Set piLabelColor to clWhite
 
         Object oInfo_tb is a TextBox
             Set Auto_Size_State to False
             Set Size to 67 419
-            Set Location to 29 59
+            Set Location to 29 45
             Set Justification_Mode to JMode_Left
             Set Label to "Info text"
+            Set TextColor to clWhite
             
             Procedure Page Integer iPageObject  
                 String sVal
