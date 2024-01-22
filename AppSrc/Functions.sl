@@ -33,8 +33,8 @@ CD_Popup_Object oFunctions_sl is a dbModalPanel
         Set pbUseFocusCellRectangle to True
         Set pbShadeSortColumn to False
         Set pbAutoServer to False
-        Set piSelectedRowBackColor to clStatusBarColor
-        Set piHighlightBackColor   to clStatusBarColor
+        Set piSelectedRowBackColor to clActiveRow
+        Set piHighlightBackColor   to clActiveRow
 
         Object oFunctions_ID is a cDbCJGridColumn
             Entry_Item Functions.ID
