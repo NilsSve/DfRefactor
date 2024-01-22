@@ -1,4 +1,4 @@
-Use Cursor.pkg
+﻿Use Cursor.pkg
 Use dfLine.pkg
 Use cCJCommandBarSystem.pkg
 Use cDbCJGridColumnSuggestion.pkg
@@ -150,7 +150,6 @@ Object oRefactorView is a cRefactorDbView
                         // NOTE: The phoData_Col property must be set for the checkbox selections to work!
                         Set phoData_Col to Self   
                         Set pbAllowRemove to False
-//                        Set Prompt_Button_Mode to PB_PromptOff
                         
                         Function OnGetTooltip Integer iRow String sValue String sText Returns String
                             Get RowValue of oFunctions_Function_Help iRow to sText
@@ -445,10 +444,6 @@ Object oRefactorView is a cRefactorDbView
                         Set peTextAlignment to xtpAlignmentCenter
                     End_Object
 
-//                    Object oCJGridColumnRowIndicator is a cCJGridColumnRowIndicator
-//                        Set piWidth to 30
-//                    End_Object   
-
                     Object oDbFoldername_Col is a cDbCJGridColumnSuggestion
                         Entry_Item FolderSelDtl.FolderName
                         Set piWidth to 797
@@ -479,20 +474,6 @@ Object oRefactorView is a cRefactorDbView
                         Move (SearchArray(FolderDataName, asSavedFolders)) to iRow
                         Function_Return (iRow <> -1)
                     End_Function 
-                    
-                    // Normally all columns in a cRDCCJSelectionGrid are disabled from editing.
-                    // However, here we need it to be able to activate the suggestion list.
-//                    Function CanEditColumn Integer iCol Returns Boolean
-//                        Boolean bState
-//                        Integer iFolderName_Col
-//                        
-//                        Move False to bState
-//                        Get piColumnId of oDbFoldername_Col to iFolderName_Col
-//                        If (iCol = iFolderName_Col) Begin
-//                            Move True to bState
-//                        End
-//                        Function_Return bState
-//                    End_Function  
                     
                     Procedure Refresh Integer eMode
                         String[] asFolders
@@ -528,16 +509,6 @@ Object oRefactorView is a cRefactorDbView
                     On_Key Key_Shift+Key_F2 Send Request_Delete 
                     On_Key Key_Ctrl+Key_F5  Send ActivateProcess
                 End_Object
-
-                // Dummy object, not needed as we now have the buttons that can take focus.
-//                Object oDbFolderSelHea_HomeFolder is a dbForm
-//                    Entry_Item FolderSelHea.WorkspaceHomeFolder   
-//                    Set Server to oFolderSelHea_DD
-//                    Set Size to 12 200 
-//                    Set Location to 0 300                      
-//                    Set Enabled_State to False
-////                    Set Visible_State to False
-//                End_Object
 
                 Object oSelectAll_btn is a Button
                     Set Size to 14 62
@@ -1024,7 +995,6 @@ Object oRefactorView is a cRefactorDbView
         
         Move False to Err
         Send Request_Save_No_Clear of oSysFile_DD
-        // Start by making the two string arrays and editors the same:
         Get CollectFileData of ghoApplication (oFolderSelDtl_DD(Self)) to RefactorFiles
         Get phoEditor of ghoApplication to hoEditor
         If (Err = True) Begin
@@ -1032,7 +1002,7 @@ Object oRefactorView is a cRefactorDbView
         End
 
         // Start the Engine!
-        Send StartRefactoringEngine of ghoRefactorEngine RefactorFiles hoEditor
+        Send StartEngine of ghoRefactorEngine RefactorFiles hoEditor
     End_Procedure
 
     Function pbShouldSave Returns Boolean

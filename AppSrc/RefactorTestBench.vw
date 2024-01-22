@@ -161,6 +161,7 @@ Object oRefactorTestBench is a cRefactorDbView
                     Move (FormatValue(iValue, sFormatString)) to sValue
                     Forward Set Value to sValue
                 End_Procedure
+
             End_Object
         
             Object oSaveFiles_grp is a cRDCDbHeaderGroup
@@ -449,7 +450,7 @@ Object oRefactorTestBench is a cRefactorDbView
         End
 
         // Start the Engine!
-        Send StartRefactoringEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor
+        Send StartEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor
         // Save the result
         Send SaveFile of hoRefactoredEditor
     End_Procedure
@@ -506,4 +507,3 @@ Procedure JumpToSourceLine Integer iLine
     Send Activate_oRefactorTestBench
     Send JumpToSourceLine of hoEdit iLine    
 End_Procedure
-            
