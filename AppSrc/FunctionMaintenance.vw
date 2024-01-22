@@ -1,4 +1,4 @@
-// C:\Projects\DF18\DfRefactor\AppSrc\FunctionMaintenance.vw
+﻿// C:\Projects\DF18\DfRefactor\AppSrc\FunctionMaintenance.vw
 // Functions Maintenance
 //
 Use cRefactorDbView.pkg
@@ -141,14 +141,6 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
             Set Label to "Private Function"
         End_Object
 
-//                Object oFunctions_bWriteProtected is a cRDCDbCheckBox
-//                    Entry_Item Functions.bWriteProtected
-//                    Set Location to 157 79
-//                    Set Size to 10 60
-//                    Set Label to "Write Protected (This is a system type function and cannot be changed)"
-//                    Set Enabled_State to False
-//                End_Object
-
         Object oFunctions_bHasParameter is a cRDCDbCheckBox
             Entry_Item Functions.bHasParameter
             Set Location to 177 112
@@ -259,10 +251,10 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
                         If (FunctionsA.Type = eAll_Functions or FunctionsA.Type = eStandard_Function or FunctionsA.Type = eRemove_Function) Begin
                             Get iFunctionID of ghoRefactorFuncLib (&sLine) sParameter to bChanged
                         End
-                        // ToDo: We need a visible pho<Editor object (scintilla) for this to work:
-//                                If (FunctionsA.Type = eEditor_Function or FunctionsA.Type = eReport_Function or FunctionsA.Type = eOther_Function) Begin                                    
-//                                    Get iFunctionID of ghoRefactorFuncLib (&asSource) sParameter to bChanged
-//                                End
+                        // ToDo: We need a visible pho<Editor object (scintilla) for this to work, so skip for now:
+//                        If (FunctionsA.Type = eEditor_Function or FunctionsA.Type = eReport_Function or FunctionsA.Type = eOther_Function) Begin
+//                            Get iFunctionID of ghoRefactorFuncLib (&asSource) sParameter to bChanged
+//                        End
                         If (FunctionsA.Type = eOther_FunctionAll or FunctionsA.Type = eReport_FunctionAll) Begin                                    
                             Get iFunctionID of ghoRefactorFuncLib (&asSourceFiles) sParameter to bChanged
                         End

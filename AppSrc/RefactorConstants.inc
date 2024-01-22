@@ -1,4 +1,4 @@
-// Copyright (c) 2018 Nils Svedmyr, RDC Tools International
+﻿// Copyright (c) 2018 Nils Svedmyr, RDC Tools International
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -30,8 +30,7 @@ Use cFilesystem.pkg
 !A [] $157 !1 !2
 #ENDCOMMAND
 
-// change the terminal fonts.
-
+// Change the terminal fonts.
 CONSOLE_TYPEFACE "Times New Roman"
 CONSOLE_FONTSIZE 12 8
 
@@ -523,5 +522,46 @@ Define CS_EndObject      for "End_Object"
 Define CS_EndFunction    for "End_Function"
 Define CS_EndProcedure   for "End_Procedure"
 
-// cRegex Expression Constants:
-//
+// Struct that mimics the Functions data table:
+Struct tFunctionData
+    String ID   
+    String Function_Name
+    String Function_Description
+    String Function_Help
+    String SummaryText 
+    Boolean Selected
+    Integer Type
+    Boolean bHasParameter
+    String Parameter
+    String ParameterValidation
+    String ParameterHelp
+    Boolean bPrivate  
+    Number Counter
+End_Struct
+
+Struct tFunctionCode  
+    String  sFunctionName
+    Integer iSourceLines
+    String[] CodeArray
+End_Struct
+
+Struct tUnitTestCode
+    String  sFunctionName
+    Integer iSourceLines
+    String[] UnitArray
+End_Struct
+
+Struct tExportImport
+    Integer iNoOfFunctions
+    tFunctionData[] Data
+    tFunctionCode[] Code
+    tUnitTestCode[] Unit
+End_Struct
+
+Define CS_FunctionLibraryFile       for "cRefactorFuncLib.pkg"
+Define CS_UnitTestsFile             for "oUnit_Tests.pkg"
+Define CS_UnitTestsTokenizerFunc    for "Tokenizer"
+Define CS_ImportBackupFolder        for "ImportBackup"
+Define CS_FunctionLibraryClassStart for "Class cRefactorFuncLib is a cBaseFuncLib"
+Define CS_Comment1                  for '// NOTE: Do *not* add any code after this "End_Class"!'
+Define CS_Comment2                  for '//       It will be removed by the Export/Import logic.'

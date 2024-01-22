@@ -316,34 +316,6 @@ Object oSelectFunctions_vw is a cRefactorDbView
           
         End_Object
 
-//        Object oDisabledInfo_txt is a TextBox
-//            Set Auto_Size_State to False
-//            Set Size to 7 375
-//            Set Location to 0 153
-//            Set Justification_Mode to JMode_Left
-//            Set FontWeight to fw_Bold
-//            Set peAnchors to anTopRight
-//            
-//            Object oDisabledInfo_Idle is an cIdleHandler
-//                Set pbEnabled to True
-//                Procedure OnIdle
-//                    String sText sSWSFile 
-//                    Boolean bSelected
-//                    
-//                    Get Field_Current_Value of oSysFile_DD Field SysFile.bCountSourceLines to bSelected
-//                    If (bSelected = True) Begin
-//                        Move 'Grid is disabled because the Checkbox: "Only count Source Lines" above the "Start Refactoring" button has been checked!' to sText
-//                    End                 
-//                    Else Begin
-//                        Move "" to sText
-//                    End
-//                    Set Value of oDisabledInfo_txt to sText  
-//                    Set Enabled_State of oFunctionSelection_grd to (bSelected = False)  
-//                End_Procedure
-//            End_Object
-//    
-//        End_Object
-        
     End_Object
                     
     Set Verify_Delete_msg to (RefFunc(MyDelete_Confirmation))

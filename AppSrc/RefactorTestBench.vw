@@ -413,9 +413,9 @@ Object oRefactorTestBench is a cRefactorDbView
 
     End_Object
 
-    //
-    // ToDo: *** MAIN FUNCTION CALL ***
-    //
+    Procedure MAIN_FUNCTION_CALL
+    End_Procedure
+    
     Procedure RefactoreCode
         String sLegacyFileName sRefactoredFileName
         Handle hoLegacyEditor hoRefactoredEditor
