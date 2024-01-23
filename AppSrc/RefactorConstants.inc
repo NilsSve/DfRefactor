@@ -331,6 +331,8 @@ Define CS_Separator                 for "Separator"
 
 Define CPC_OpenFile                 for 1 // perfcounter on open file
 Define CS_Settings                  for "Settings"
+Define CS_GridTheme                 for "GridTheme"
+Define CS_GridCaptionColor          for "GridCaptionColor"
 Define CS_GridFontSize              for "GridFontSize"
 Define CS_TabPosition               for "TabPosition"
 Define CS_StarZenSourceExplorer     for "StarZenSourceExplorer"
