@@ -274,6 +274,7 @@ Struct tTokenizer
     Boolean bIsInProcedure              // Are we in a procedure declaration
     Boolean bIsInClass                  // Are we in a command declaration
     Boolean bIsInCommand                // Are we in a command declaration e.g. #Commmand Move...
+    Boolean bIsInStruct                 // Are we in a struct
     Boolean bIsVariableDeclaration      // Is the line a variable declaration
     Boolean bHasIfCommand               // True if at least one "if" on the line.
     
