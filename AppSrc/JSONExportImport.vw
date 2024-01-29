@@ -14,11 +14,11 @@ Use cExportImportFunctions.pkg
 
 Use cFunctionsDataDictionary.dd
 
-ACTIVATE_VIEW Activate_oFunctionsExportImport FOR oFunctionsExportImport
-Object oFunctionsExportImport is a cRefactorDbView
+Activate_View Activate_oJSONExportImport for oJSONExportImport
+Object oJSONExportImport is a cRefactorDbView
     Set Location to 5 5
     Set Size to 372 650
-    Set Label to "Export/Import"
+    Set Label to "JSON Export/Import"
     Set Border_Style to Border_Thick
     Set Icon to "Export.ico"
     Set pbAutoActivate to True   
@@ -685,5 +685,4 @@ Object oFunctionsExportImport is a cRefactorDbView
         
     End_Object
 
-End_Object 
-
+End_Object
