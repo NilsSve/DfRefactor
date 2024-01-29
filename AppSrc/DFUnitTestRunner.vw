@@ -1,4 +1,5 @@
-Use DFClient.pkg
+﻿Use DFClient.pkg
+Use oGridCopyMenu.pkg
 Use cUnitCommandBar.pkg
 Use DFUnit\Reporting\ReporterManager.pkg
 Use DFUnit\Reporting\Reporters\UIListReporter.pkg
@@ -7,7 +8,7 @@ Use cRefactorScintillaEditor.pkg
 
 Activate_View Activate_DFUnitTestRunner_vw for DFUnitTestRunner_vw
 Object DFUnitTestRunner_vw is a View
-    Set Size to 370 253
+    Set Size to 381 253
     Set Location to 10 10
     Set Maximize_Icon to True
     Set Border_Style to Border_Thick 
@@ -15,13 +16,13 @@ Object DFUnitTestRunner_vw is a View
     Set pbAutoActivate to True
     Set phoRefactorView of ghoApplication to Self   
 
-//    Automatically instantiated by the ghoApplication object (cRefactorAppliation)
+//    Automatically instantiated in cRefactorApplication's End_Construct_Object.
 //    Object oRefactorFunctionLibrary is a cRefactorFuncLib
 //    End_Object
 
     Object oTestCode_edt is a cRefactorScintillaEditor
-        Set Size to 30 227
-        Set Location to 337 12
+        Set Size to 45 227
+        Set Location to 333 12
         Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
         Set peAnchors to anBottomLeftRight     
         Set pbExternalModifyCheck to False
@@ -89,13 +90,15 @@ Object DFUnitTestRunner_vw is a View
     End_Object
 
     Object oOutputBox is a cDFUnitUIListReporter
-        Set Size to 276 236
+        Set Size to 272 236
         Set Location to 46 13
         Set peAnchors to anAll
         Set Border_Style to Border_Thick
         Delegate Set phoOutputBox to Self 
         
-        Procedure Copy
+        Set Floating_Menu_Object to  (oGridCopyMenu(Self))  
+
+        Procedure CopyErrorLineNo
             String sLine
             Integer iLine iPos iChar
             Get LineFromChar -1 to iLine
@@ -110,16 +113,21 @@ Object DFUnitTestRunner_vw is a View
                 Set StatusText of (StatusBar_Id(ghoCommandBars)) to ("The number:" * String(iLine) * "was copied to Windows Clipboard. Press Ctrl+G in the studio, to jump to that source line.")
             End 
             Else Begin
-                Forward Send Copy
+                Send Copy of (Focus(Self))
             End
         End_Procedure
         
+        Procedure Add_Focus Handle hoParent Returns Integer
+            Forward Send Add_Focus hoParent
+            Set phInvokingObject of (oGridCopyMenu(Self)) to Self
+        End_Procedure
+
         On_Key Key_Ctrl+Key_C Send Copy
     End_Object
 
     Object oEditor_tb is a TextBox
         Set Size to 10 34
-        Set Location to 325 13
+        Set Location to 323 13
         Set Label to "Scintilla Test Editor:"
         Set peAnchors to anBottomLeft
     End_Object
