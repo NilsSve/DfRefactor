@@ -35,7 +35,7 @@ CD_Popup_Object oFunctions_sl is a dbModalPanel
         Set pbAutoServer to False
         Set piSelectedRowBackColor to clActiveRow
         Set piHighlightBackColor   to clActiveRow
-        Set piCaptionBackColor     to clEditorBackGround
+        Set piCaptionBackColor     to clProgramIconBg
         Set piCaptionForeColor     to clWhite   
         Set peVisualTheme to xtpGridThemeVisualStudio2017
 
