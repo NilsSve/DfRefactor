@@ -967,7 +967,8 @@ Object oRefactorView is a cRefactorDbView
     End_Object
 
     //
-    // ToDo: *** MAIN FUNCTION CALL ***
+    Procedure MAIN_FUNCTION_CALL // ***
+    End_Procedure
     //
     Procedure RefactoreCode
         Handle hoEditor 
