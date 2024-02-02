@@ -957,29 +957,10 @@ Object oRefactorView is a cRefactorDbView
             End_Procedure
     
             Function IsEnabled Returns Boolean
-                String sSourcePath sBackupPath
-                String sBackupName sSourceFilename sCompareApp
-                Boolean bWorkspaceMode bOK
-
-                Move False to bOK
-                Get psFileCompareApp of ghoApplication to sCompareApp
-                If (sCompareApp <> "") Begin
-                    Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
-                    Get psCurrentSourceFileName of ghoApplication to sSourceFilename
-                    Get IsBackupFile of ghoApplication sSourceFilename to sBackupName
-                    If (bWorkspaceMode = True) Begin
-                        Get SourceFilePath of ghoApplication to sSourcePath
-                        Get HomeBackupFilePath of ghoApplication to sBackupPath
-                        Move (sSourcePath <> "" and sBackupPath <> "") to bOK
-                    End
-                    Else Begin
-                        Move (sSourceFilename <> "" and sBackupName <> "") to bOK
-                    End
-                End
-
-                Function_Return bOK
+                Boolean bIsEnabled
+                Get IsEnabled of (oCompare_MenuItem(ghoCommandBars)) to bIsEnabled
+                Function_Return bIsEnabled
             End_Function
-
 
         End_Object
 
