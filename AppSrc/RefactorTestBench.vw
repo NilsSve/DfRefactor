@@ -228,7 +228,10 @@ Object oRefactorTestBench is a cRefactorDbView
                     Integer iLines
                     Get Line_Count to iLines
                     Set Value of oRefactoredCode_NoOfLines_fm to iLines                    
-                End_Procedure          
+                End_Procedure
+                
+                Procedure OnFileDropped String sFilename Boolean bLast
+                End_Procedure
                 
                 On_Key Key_Ctrl+Key_E Send Execute of (oErrorLog_ToolItem(ghoCommandBars))
             End_Object
