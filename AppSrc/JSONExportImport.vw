@@ -247,6 +247,11 @@ Object oJSONExportImport is a cRefactorDbView
             Set pbShowInvertSelectionsMenuItem to False
             Set psNoItemsText to "No data yet..."
             Delegate Set phoSelection_grd to Self  
+            
+            Procedure End_Construct_Object
+                Forward Send End_Construct_Object
+                Set phoContextMenu to 0
+            End_Procedure
 
             Object oCJGridColumnRowIndicator is a cCJGridColumnRowIndicator
                 Set piWidth to 25
