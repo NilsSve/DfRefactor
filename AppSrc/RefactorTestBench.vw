@@ -330,7 +330,7 @@ Object oRefactorTestBench is a cRefactorDbView
                 Object oReadOnly_cb is a dbCheckbox
                     Entry_Item SysFile.bReadOnly
                     Set Server to oSysFile_DD
-                    Set Location to 16 244
+                    Set Location to 16 246
                     Set Size to 8 109
                     Set Label to "Read Only"
                     Set peAnchors to anBottomLeft

@@ -915,7 +915,7 @@ Object oRefactorView is a cRefactorDbView
                 End
 
                 If (bEnabled = True) Begin
-                    Get TotalFolders of (phoFolderSelHeaDD(ghoApplication)) to iFolders
+                    Get TotalSelectedFolders of (phoFolderSelHeaDD(ghoApplication)) to iFolders
                     Move (iFolders <> 0) to bEnabled
                 End          
                 If (bEnabled = False) Begin
