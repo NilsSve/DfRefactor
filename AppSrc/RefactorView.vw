@@ -600,19 +600,24 @@ Object oRefactorView is a cRefactorDbView
             Set Enabled_State to (sSWSFile <> "")
         End_Procedure
 
-        Object oFileNameFilters_cf is a cRDCDbComboForm 
-            Entry_Item SysFile.FileExtensionFilter
-            Set Server to oSysFile_DD
+        // Note: We can't set the entry to "SysFile.FileExtensionFilter", because
+        // DataFlex does not handle datadictonary system file fields well.
+        // In fact what happens is that is not possible to edit the comboform, other
+        // than selecting an existing value from the list.
+        // We therefore handle the saving/editing of the comboform manually.
+        Object oFileNameFilters_cf is a cRDCDbComboForm
+//            Entry_Item SysFile.FileExtensionFilter
+//            Set Server to oSysFile_DD
             Set Size to 12 250
             Set Location to 30 4
             Set psToolTip to "Select file extensions filter. Each extension must start with a wildcard character and a dot (*.) and file extensions must be separated with a semicolon (;)"
             Set Status_Help to (psToolTip(Self))
             Set Combo_Sort_State to False
             Set pbAutoEnable to True
-            Set Label_Row_Offset to 1
+            Set peAnchors to anTopLeftRight
+            Set Form_Border to 0
             Set Label_Justification_Mode to JMode_Top
             Set Label_Col_Offset to 0
-            Set peAnchors to anTopLeftRight
 
             Property Integer piMaxUserFilters 8
 
@@ -643,7 +648,7 @@ Object oRefactorView is a cRefactorDbView
                     Send Combo_Add_Item (Trim(asUserExtensions[iCount]))
                 Loop
 
-                Set Value to CS_StdExtensions
+                Set Value to (Trim(SysFile.FileExtensionFilter))
             End_Procedure
 
             Function UserSavedExtensions Returns String[]
@@ -662,9 +667,31 @@ Object oRefactorView is a cRefactorDbView
                 Function_Return asUserExtensions
             End_Function
 
+            Procedure OnChange
+                String sVal
+                Boolean bChanged
+                
+                Get Value to sVal
+                Move (sVal <> Trim(SysFile.FileExtensionFilter)) to bChanged 
+                If (bChanged = True) Begin
+                    Set Field_Changed_Value of (oSysfile_DD(phoRefactorView(ghoApplication))) Field SysFile.FileExtensionFilter to sVal
+                    Set Field_Changed_State of (oSysfile_DD(phoRefactorView(ghoApplication))) Field SysFile.FileExtensionFilter to True
+                    Set Changed_State of (oSysfile_DD(phoRefactorView(ghoApplication)))  to True
+                End
+            End_Procedure  
+
+            Function DEOInformation Handle ByRef hoServer Boolean ByRef bHasRecord Boolean ByRef bChanged Boolean ByRef bHasIndex Returns Boolean
+                Get Changed_State to bChanged
+                Function_Return True
+            End_Function
+            
             // Note: Can't save new extensions entered by user with the
-            // OnChange event, as it would save character per character.
+            // OnChange event, as it would save character by character.
             Procedure OnExitObject
+                Send Request_Save
+            End_Procedure
+
+            Procedure Request_Save
                 String sDFExtensions sDFVersion sNewExt
                 Integer iMajorVersion iMinorVersion iCount iSize iMaxUserFilters iItem
                 String[] asUserExtensions
@@ -677,6 +704,12 @@ Object oRefactorView is a cRefactorDbView
 
                 Get piMaxUserFilters to iSize
                 Get Value to sNewExt
+                
+                Reread SysFile
+                    Move sNewExt to SysFile.FileExtensionFilter
+                    SaveRecord SysFile
+                Unlock
+                
                 If (sNewExt <> CS_StdExtensions and ;
                     sNewExt <> CS_DFAndTemplExt and ;
                     sNewExt <> CS_PkgIncExt and ;
@@ -702,7 +735,6 @@ Object oRefactorView is a cRefactorDbView
                         Move iSize to iCount // Get out of loop
                     End
                 End
-
             End_Procedure
 
             Function IsExtensionInRegistry String sExt Returns Boolean
@@ -759,7 +791,10 @@ Object oRefactorView is a cRefactorDbView
 
                 Function_Return bEnabled
             End_Function
-
+            
+            
+            On_Key Key_Ctrl+Key_S Send OnExitObject
+            On_Key Key_F2         Send OnExitObject
         End_Object
 
     End_Object
@@ -966,7 +1001,6 @@ Object oRefactorView is a cRefactorDbView
 
     End_Object
 
-    //
     Procedure MAIN_FUNCTION_CALL // ***
     End_Procedure
     //
@@ -1006,7 +1040,6 @@ Object oRefactorView is a cRefactorDbView
 
     Procedure OnSetFocus
         Set piActiveView of ghoApplication to CI_CleanupSource Self
-        Set Changed_State of oSysFile_DD to False
     End_Procedure
 
     Procedure OnWorkspaceLoaded
