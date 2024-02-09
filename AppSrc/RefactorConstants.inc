@@ -298,9 +298,6 @@ Struct tTokenizer
     tExpression[] aExpressions          // Struct array with all expressions within "()" and their position on the source line.
     tQuotedString[] asStringConstant    // Struct string array with original text string constants for the sLine content.
     String[] asLineTokens               // The sOverstrikeLine is broken up by spaces to a string array, but expressions are kept together on one array line even if it contains spaces.
-    // The lowercase string array was removed as it was not needed. Instead the build in
-    // case insensitive help search function DFSTRICMP is used whenever needed.
-    // String[] asLineTokensLC             // The same content as array above *but* in LowerCase.
     tBooleanIndicator BooleanIndicator  // [*Select*] Move iA to iB or "*Indicate* x as y" See: Function _ExtractLegacyBooleanContent.
     tOperatorsInfo OperatorsInfo        // Operator info e.g. "eq", "=", "lt", "<" etc.
 End_Struct        
