@@ -213,6 +213,7 @@ Struct tExpression
     String sExpression
     String sExpressionOS // Overstrike expression variant
     String sExpressionNP // No added Paranthesis
+    String sExpressionWS // With Spaces (including multiple consequitive spaces, if any)
     Integer eExpressionMode
     Integer iStartPos 
     Integer iLength 
