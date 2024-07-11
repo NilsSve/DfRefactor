@@ -468,6 +468,8 @@ Define CS_ShowSummary    for "ShowSummary"
 // Refactor Testing program:
 Define CS_Trim           for "Trim"    
 Define CS_Length         for "Length"  
+Define CS_Left           for "Left"
+Define CS_Right          for "Right"
 Define CS_Pos            for "Pos"   
 Define CS_Replace        for "Replace"
 Define CS_In             for "In" 
