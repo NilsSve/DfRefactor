@@ -128,7 +128,7 @@ Object DFUnitTestRunner_vw is a View
     Object oEditor_tb is a TextBox
         Set Size to 10 34
         Set Location to 323 13
-        Set Label to "Output Scintilla Editor Unit Tests:"
+        Set Label to "Unit Test Output Scintilla Editor:"
         Set peAnchors to anBottomLeft
     End_Object
 
