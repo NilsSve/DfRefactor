@@ -949,7 +949,7 @@ Object oRefactorView is a cRefactorDbView
                     Move (SysFile.SelectedFunctionTotal > 0) to bEnabled
                 End
 
-                If (bEnabled = True) Begin
+                If (bEnabled = True and bWorkspaceMode = True) Begin
                     Get TotalSelectedFolders of (phoFolderSelHeaDD(ghoApplication)) to iFolders
                     Move (iFolders <> 0) to bEnabled
                 End          
