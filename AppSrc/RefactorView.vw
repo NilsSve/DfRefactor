@@ -2,7 +2,7 @@
 Use dfLine.pkg
 Use cCJCommandBarSystem.pkg
 Use cDbCJGridColumnSuggestion.pkg
-Use cRDCCJGridColumnSuggestion.pkg
+//Use cRDCCJGridColumnSuggestion.pkg
 Use DFEnChk.pkg
 Use dfTabDlg.pkg
 
