@@ -220,6 +220,14 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 Delegate Send ActivateFunctionsView iFunctionID
             End_Procedure
                     
+            // Augment to also show # of functions in the "ID" footer
+            Procedure DoSetCheckboxFooterText
+                Integer iItems
+                Forward Send DoSetCheckboxFooterText
+                Get ItemCount to iItems
+                Set psFooterText of oFunctions_ID  to ("#" * String(iItems))
+            End_Procedure
+                    
         End_Object
 
         Object oSelectAll_btn is a Button
