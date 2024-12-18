@@ -11,6 +11,7 @@ Use cRDCDbCJGrid.pkg
 Use cRDCDbCJGridColumn.pkg
 Use cRDCCJSelectionGrid.pkg
 Use cRDCDbComboForm.pkg
+Use RefactorConstants.inc
 Use cRDCDbHeaderGroup.pkg
 Use cRDCDbForm.pkg
 Use cRDCDbSpinForm.pkg
