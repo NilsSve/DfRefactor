@@ -2,7 +2,7 @@
 Use dfLine.pkg
 Use cCJCommandBarSystem.pkg
 Use cDbCJGridColumnSuggestion.pkg
-Use cRDCCJGridColumnSuggestion.pkg
+//Use cRDCCJGridColumnSuggestion.pkg
 Use DFEnChk.pkg
 Use dfTabDlg.pkg
 
@@ -11,6 +11,7 @@ Use cRDCDbCJGrid.pkg
 Use cRDCDbCJGridColumn.pkg
 Use cRDCCJSelectionGrid.pkg
 Use cRDCDbComboForm.pkg
+Use RefactorConstants.inc
 Use cRDCDbHeaderGroup.pkg
 Use cRDCDbForm.pkg
 Use cRDCDbSpinForm.pkg
@@ -66,7 +67,6 @@ Object oRefactorView is a cRefactorDbView
     End_Object
 
     Object oFunctions_DD is a cFunctionsDataDictionary  
-        
         // In this view we are also interested in saving the system file,
         // when the oCountSourceLines_cb object is changed.
         // So relay save message here.
@@ -113,25 +113,20 @@ Object oRefactorView is a cRefactorDbView
                 Set psNote to "Select functions. Right click grid for options."
                 Set psToolTip to "Standard refactoring functions are functions that are called once for each source line."
                 Set Border_Style to Border_None
-                Set peAnchors to anAll
                 Set piImageIndex to Ico_Functions
+                Set peAnchors to anAll
 
                 Object oFunctionSelection_grd is a cRDCDbCJGrid
                     Set Size to 204 636
                     Set Location to 27 9
                     Set Ordering to 5
-                    Set piLayoutBuild to 4
-                    Set pbHeaderReorders to True
-                    Set pbHeaderTogglesDirection to True
-                    Set pbAllowAppendRow to False
-                    Set pbAllowDeleteRow to False
-                    Set pbAllowInsertRow to False
-                    Set pbAutoAppend to False
+                    Set piLayoutBuild to 5
                     Set pbDbShowInvertSelectionsMenuItem to True     
+                    Set pbHeaderPrompts to False
                     // Need this to load all records in the grid,
                     // else the select buttons won't work.
-                    Set pbStaticData to True
-                        
+                    Set pbStaticData to False   
+
                     Object oFunctions_ID is a cRDCDbCJGridColumn
                         Entry_Item Functions.ID
                         Set piWidth to 35
@@ -286,6 +281,23 @@ Object oRefactorView is a cRefactorDbView
                         Function_Return bSave
                     End_Procedure
                     
+                    // Augment to also show # of functions in the "ID" footer
+                    Procedure DoSetCheckboxFooterText
+                        Integer iItems
+                        Forward Send DoSetCheckboxFooterText
+                        Get ItemCount to iItems
+                        Set psFooterText of oFunctions_ID  to ("#" * String(iItems))
+                    End_Procedure
+                    
+//                    Procedure DataLoadAdjustOnAddFocus
+//                        Forward Send DataLoadAdjustOnAddFocus
+//                        Send MovetoFirstRow
+//                    End_Procedure    
+        Procedure Activating
+            Forward Send Activating
+            
+            Send MoveToFirstRow //of oDbCJGrid1
+        End_Procedure
                     On_Key Key_Ctrl+Key_F5 Send ActivateProcess
                 End_Object
 

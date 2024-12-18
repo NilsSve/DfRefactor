@@ -117,7 +117,7 @@ Object oSelectFunctions_vw is a cRefactorDbView
     
             End_Object                    
 
-            Object oFunctions_Parameter is a cDbCJGridColumn
+            Object oFunctions_Parameter is a cRDCDbCJGridColumn //cDbCJGridColumn
                 Entry_Item Functions.Parameter
                 Set piWidth to 100
                 Set psCaption to "Parameter" "Option"
@@ -160,7 +160,7 @@ Object oSelectFunctions_vw is a cRefactorDbView
     
             End_Object
 
-            Object oFunctions_ParameterHelp is a cDbCJGridColumn
+            Object oFunctions_ParameterHelp is a cRDCDbCJGridColumn //cDbCJGridColumn
                 Entry_Item Functions.ParameterHelp
                 Set piWidth to 200
                 Set psCaption to "Parameter Help"
@@ -218,6 +218,14 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 End
                 Get Field_Current_Value of oFunctions_DD Field Functions.ID to iFunctionID
                 Delegate Send ActivateFunctionsView iFunctionID
+            End_Procedure
+                    
+            // Augment to also show # of functions in the "ID" footer
+            Procedure DoSetCheckboxFooterText
+                Integer iItems
+                Forward Send DoSetCheckboxFooterText
+                Get ItemCount to iItems
+                Set psFooterText of oFunctions_ID  to ("#" * String(iItems))
             End_Procedure
                     
         End_Object
