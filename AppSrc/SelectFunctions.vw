@@ -117,7 +117,7 @@ Object oSelectFunctions_vw is a cRefactorDbView
     
             End_Object                    
 
-            Object oFunctions_Parameter is a cDbCJGridColumn
+            Object oFunctions_Parameter is a cRDCDbCJGridColumn //cDbCJGridColumn
                 Entry_Item Functions.Parameter
                 Set piWidth to 100
                 Set psCaption to "Parameter" "Option"
@@ -160,7 +160,7 @@ Object oSelectFunctions_vw is a cRefactorDbView
     
             End_Object
 
-            Object oFunctions_ParameterHelp is a cDbCJGridColumn
+            Object oFunctions_ParameterHelp is a cRDCDbCJGridColumn //cDbCJGridColumn
                 Entry_Item Functions.ParameterHelp
                 Set piWidth to 200
                 Set psCaption to "Parameter Help"
