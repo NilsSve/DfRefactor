@@ -24,7 +24,6 @@ CD_Popup_Object oFunctions_sl is a dbModalPanel
     Object oSelList is a cDbCJGridPromptList
         Set Size to 105 259
         Set Location to 5 5
-        Set peAnchors to anAll
         Set pbAllowColumnRemove to False
         Set psLayoutSection to "oFunctions_sl_oSelList"
         Set pbUseAlternateRowBackgroundColor to True
@@ -37,7 +36,8 @@ CD_Popup_Object oFunctions_sl is a dbModalPanel
         Set piHighlightBackColor   to clActiveRow
         Set piCaptionBackColor     to clProgramIconBg
         Set piCaptionForeColor     to clWhite   
-        Set peVisualTheme to xtpGridThemeVisualStudio2017
+        Set peVisualTheme to xtpGridThemeVisualStudio2012Light //xtpGridThemeVisualStudio2017
+        Set peAnchors to anAll
 
         Object oFunctions_ID is a cDbCJGridColumn
             Entry_Item Functions.ID

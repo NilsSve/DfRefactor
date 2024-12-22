@@ -9,7 +9,6 @@ Use dfTabDlg.pkg
 Use cRefactorDbView.pkg
 Use cRDCDbCJGrid.pkg  
 Use cRDCDbCJGridColumn.pkg
-Use cRDCCJSelectionGrid.pkg
 Use cRDCDbComboForm.pkg
 Use RefactorConstants.inc
 Use cRDCDbHeaderGroup.pkg
