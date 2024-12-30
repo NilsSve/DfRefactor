@@ -449,11 +449,15 @@ Define CS_Splitters      for "Splitters"
 Define CS_TestBenchViewSplitterPos for "TestBenchViewSplitterPos"
 
 #IF (!@ = 230)
-    Define CS_SWSFile        for "DFRefactor23.0.sws"
+    Define CS_SWSFile    for "DFRefactor23.0.sws"
 #ENDIF
 #IF (!@ = 240)
-    Define CS_SWSFile        for "DFRefactor24.0.sws"
+    Define CS_SWSFile    for "DFRefactor24.0.sws"
 #ENDIF
+#IF (!@ = 250)
+    Define CS_SWSFile    for "DFRefactor25.0.sws"
+#ENDIF
+    
     
 Define CS_DFUnitTest     for "DFUnit_TestRunner"
 Define CS_DFRefactor     for "DFRefactor"
