@@ -1,3 +1,3 @@
-TYPE
-DESCRIPTION
-COMMENT
+Type
+Description
+Comment

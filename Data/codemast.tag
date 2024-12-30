@@ -1,3 +1,3 @@
-TYPE
-CODE
-DESCRIPTION
+Type
+Code
+Description
