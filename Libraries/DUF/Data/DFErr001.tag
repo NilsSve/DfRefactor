@@ -1,2 +1,0 @@
-Error_Descr
-Note
