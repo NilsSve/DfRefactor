@@ -123,11 +123,13 @@ Struct tWorkspace
     String sWorkspaceFull    
 End_Struct
 
+#IFNDEF cx_DbSelect_All    
 Enum_List
     Define cx_DbSelect_All
     Define cx_DbSelect_None
     Define cx_DbSelect_Invert
 End_Enum_List
+#ENDIF
 
 Struct tRefactorCheckbox
     Handle hObject
