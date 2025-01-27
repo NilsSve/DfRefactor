@@ -45,7 +45,29 @@ Define CS_SplitBySpaceSemiColumn    for "Split line space and semicolon"
 Define CS_SplitBySemiColumn         for "Split line with semicolon"
 Define CS_SplitByBeginEnd           for "Add a Begin/End block"
 
-// ToDo: These doesn't feel right! Ask Wil about them
+Struct tFuncEnumList
+    String[] asEnumList         // String array with enumerations values
+    String sInitialValue        // Default value for the enumeration list
+    String sParamHelp           // Help text that is displayed when user sets param values.
+End_Struct
+
+Struct tFuncParam
+    String sByRef               // If parameter is called with a "ByRef"
+    String sType                // Variable type.
+    String sVarName             // Variable name.
+End_Struct
+
+Struct tFuncLib
+    String sName                // Function Name
+    tFuncParam[] FuncParamArray // Function parameter types and variable names.
+    String sReturnType          // Function return type.
+    Integer eFunctionType       // The type of function.
+    String sHelp                // Function help text
+    Boolean bFuncEnumList       // True if the FuncEnumList struct contains data.
+    tFuncEnumList FuncEnumList
+End_Struct
+
+// ToDo: Is this correct?
 // Aren't modern DD classes named o<tablename>_DataDictionary ?
 Enum_List
     Define eDDUnknown       for 0 // style unknown or not yet classified
@@ -78,7 +100,7 @@ Enum_List
 End_Enum_List
 
 Enum_List
-    Define eAll_Functions         for 0 
+    Define eAll_Functions         for 0   // Only used for selecting certain groups of functions in the program.
     Define eStandard_Function     for 1   // One source line at a time will be passed for these functions.
     Define eRemove_Function       for 2   // One source line at a time will be passed for these functions.
     Define eEditor_Function       for 3   // A source file as a string array will be passed
@@ -483,7 +505,7 @@ Define CS_If             for "If"
 Define CS_Else           for "Else"
 Define CS_Begin          for "Begin"
 Define CS_With           for "With" 
-Define CS_At             for "At"   
+Define CS_At               for "At"   
 Define CS_As             for "As"  
 Define CS_To             for "to"
 Define CS_Of             for "of"
@@ -569,10 +591,11 @@ Struct tExportImport
     tUnitTestCode[] Unit
 End_Struct
 
-Define CS_FunctionLibraryFile       for "cRefactorFuncLib.pkg"
+Define CS_FunctionLibraryFile       for "oRefactorFuncLib.pkg"
 Define CS_UnitTestsFile             for "oUnit_Tests.pkg"
 Define CS_UnitTestsTokenizerFunc    for "Tokenizer"
 Define CS_ImportBackupFolder        for "ImportBackup"
-Define CS_FunctionLibraryClassStart for "Class cRefactorFuncLib is a cBaseFuncLib"
+Define CS_FunctionLibraryStart      for " Function "
+//Define CS_FunctionLibraryClassStart for "Class cRefactorFuncLib is a cBaseFuncLib"
 Define CS_Comment1                  for '// NOTE: Do *not* add any code after this "End_Class"!'
 Define CS_Comment2                  for '//       It will be removed by the Export/Import logic.'
