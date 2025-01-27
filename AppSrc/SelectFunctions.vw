@@ -86,19 +86,27 @@ Object oSelectFunctions_vw is a cRefactorDbView
     
             End_Object
 
-            Object oFunctions_Function_Description is a cRDCDbCJGridColumn
-                Entry_Item Functions.Function_Description
-                Set piWidth to 340
-                Set psCaption to "Description"
-                Set pbEditable to False
-                Set psToolTip to "A short description of whate the refactoring function does. Hover the mouse over a function row to see more help on what it does."
-    
-                Function OnGetTooltip Integer iRow String sValue String sText Returns String
-                    Get RowValue of oFunctions_Function_Help iRow to sText
-                    Function_Return sText
-                End_Function
-    
+            Object oFunctions_Function_Help is a cRDCDbCJGridColumn
+                Entry_Item Functions.Function_Help
+                Set piWidth to 221
+                Set psCaption to "Help"
+//                Set pbVisible to False
+                Set pbMultiLine to True
             End_Object
+    
+//            Object oFunctions_Function_Description is a cRDCDbCJGridColumn
+//                Entry_Item Functions.Function_Description
+//                Set piWidth to 340
+//                Set psCaption to "Description"
+//                Set pbEditable to False
+//                Set psToolTip to "A short description of whate the refactoring function does. Hover the mouse over a function row to see more help on what it does."
+//    
+//                Function OnGetTooltip Integer iRow String sValue String sText Returns String
+//                    Get RowValue of oFunctions_Function_Help iRow to sText
+//                    Function_Return sText
+//                End_Function
+//    
+//            End_Object
 
             Object oFunctions_Type is a cRDCDbCJGridColumn
                 Entry_Item Functions.Type
@@ -160,20 +168,13 @@ Object oSelectFunctions_vw is a cRefactorDbView
     
             End_Object
 
-            Object oFunctions_ParameterHelp is a cRDCDbCJGridColumn //cDbCJGridColumn
+            Object oFunctions_ParameterHelp is a cRDCDbCJGridColumn
                 Entry_Item Functions.ParameterHelp
                 Set piWidth to 200
                 Set psCaption to "Parameter Help"
                 Set pbVisible to False
             End_Object
 
-            Object oFunctions_Function_Help is a cRDCDbCJGridColumn
-                Entry_Item Functions.Function_Help
-                Set piWidth to 221
-                Set psCaption to "Help"
-                Set pbVisible to False
-            End_Object
-    
             Object oFunctions_Selected is a cRDCDbCJGridColumn
                 Entry_Item Functions.Selected
                 Set piWidth to 39
