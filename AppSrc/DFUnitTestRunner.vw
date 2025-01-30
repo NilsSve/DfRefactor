@@ -5,6 +5,7 @@ Use DFUnit\Reporting\ReporterManager.pkg
 Use DFUnit\Reporting\Reporters\UIListReporter.pkg
 Use cRDCButtonDPI.pkg
 Use cRefactorScintillaEditor.pkg
+Use cRefactorFuncLib.pkg
 
 Activate_View Activate_DFUnitTestRunner_vw for DFUnitTestRunner_vw
 Object DFUnitTestRunner_vw is a View
@@ -15,10 +16,6 @@ Object DFUnitTestRunner_vw is a View
     Set View_Mode to Viewmode_Normal 
     Set pbAutoActivate to True
     Set phoRefactorView of ghoApplication to Self   
-
-//    Automatically instantiated in cRefactorApplication's End_Construct_Object.
-//    Object oRefactorFunctionLibrary is a cRefactorFuncLib
-//    End_Object
 
     Object oTestCode_edt is a cRefactorScintillaEditor
         Set Size to 45 227
