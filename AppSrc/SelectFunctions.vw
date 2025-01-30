@@ -17,7 +17,7 @@ Register_Function MyDelete_Confirmation Returns Integer
 Activate_View Activate_oSelectFunctions_vw for oSelectFunctions_vw
 Object oSelectFunctions_vw is a cRefactorDbView
     Set Location to 2 4
-    Set Size to 110 635
+    Set Size to 193 635
     Set Label to "Select Functions"
     Set Border_Style to Border_Thick
     Set pbAutoActivate to True   
@@ -42,25 +42,32 @@ Object oSelectFunctions_vw is a cRefactorDbView
     Set Server  To oFunctions_DD
 
     Object oSelectFunctions_grp is a cRDCDbHeaderGroup
-        Set Size to 107 637
+        Set Size to 190 637
         Set piMinSize to 107 490
         Set Location to 4 0
         Set Label to "Function List"             
         Set psImage to "FunctionLookup.ico"
-        Set psNote to "Space to select. Double-Click to Edit, right-click for grid options."
+        Set psNote to "Space to select. Click to Edit, right-click for grid options."
         Set psToolTip to "Standard refactoring functions are functions that are called once for each source line."
         Set Border_Style to Border_None
-        Set peAnchors to anTopBottom
+        Set peAnchors to anAll
 
         Object oFunctionSelection_grd is a cRDCDbCJGrid
-            Set Size to 76 620
-            Set Location to 27 10
-            Set Ordering to 5
+            Set Size to 159 620
+            Set Location to 27 10  
+            Set Ordering to 2
             Set pbDbShowInvertSelectionsMenuItem to True
-            Set pbDbShowEditMenuItem to True
-            Set pbStaticData to True
+            Set pbDbShowEditMenuItem to False 
             Set pbHeaderPrompts to False
-                
+            Set piHScrollStep to 1
+            // Need this to load all records in the grid,
+            // else the select buttons won't work properly.
+            Set pbStaticData to True  
+            Set pbEditOnClick to True
+            Set piLayoutBuild to 6 
+            Set pbEditOnKeyNavigation to False
+            Set pbShowNonActiveInPlaceButton to False
+
             Object oFunctions_ID is a cRDCDbCJGridColumn
                 Entry_Item Functions.ID
                 Set piWidth to 30
@@ -71,80 +78,59 @@ Object oSelectFunctions_vw is a cRefactorDbView
 
             Object oFunctions_Function_Name is a cDbCJGridColumnSuggestion
                 Entry_Item Functions.Function_Name
-                Set piWidth to 285
+                Set piWidth to 185
                 Set psCaption to "Function Name (Suggestion list)"    
-                Set pbFullText to True    
                 Set psToolTip to "This is a full text suggestion list. You can start typing to search for any keyword and a suggestion list will appear for you to select from."
                 Set Status_Help to (psToolTip(Self))
-                Set phoData_Col to Self   
+                Set pbFullText to True    
                 Set pbAllowRemove to False
-                
-                Function OnGetTooltip Integer iRow String sValue String sText Returns String
-                    Get RowValue of oFunctions_Function_Help iRow to sText
-                    Function_Return sText
-                End_Function
-    
+                Set phoData_Col to Self   
             End_Object
 
             Object oFunctions_Function_Help is a cRDCDbCJGridColumn
                 Entry_Item Functions.Function_Help
-                Set piWidth to 221
-                Set psCaption to "Help"
-//                Set pbVisible to False
+                Set piWidth to 320
+                Set peHeaderAlignment to xtpAlignmentCenter
+                Set psCaption to "Help Text"
+                Set pbEditable to False
                 Set pbMultiLine to True
             End_Object
     
-//            Object oFunctions_Function_Description is a cRDCDbCJGridColumn
-//                Entry_Item Functions.Function_Description
-//                Set piWidth to 340
-//                Set psCaption to "Description"
-//                Set pbEditable to False
-//                Set psToolTip to "A short description of whate the refactoring function does. Hover the mouse over a function row to see more help on what it does."
-//    
-//                Function OnGetTooltip Integer iRow String sValue String sText Returns String
-//                    Get RowValue of oFunctions_Function_Help iRow to sText
-//                    Function_Return sText
-//                End_Function
-//    
-//            End_Object
-
             Object oFunctions_Type is a cRDCDbCJGridColumn
                 Entry_Item Functions.Type
-                Set piWidth to 170
+                Set piWidth to 130
                 Set psCaption to "Type"
+                Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
                 Set peHeaderAlignment to xtpAlignmentCenter  
+                Set peTextAlignment to xtpAlignmentCenter
                 Set pbComboButton to True
                 // pbEditable *must* be set after the pbComboButton setting.
                 Set pbEditable to False
-                Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
-    
-                Function OnGetTooltip Integer iRow String sValue String sText Returns String
-                    Move "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing." to sText
-                    Function_Return sText
-                End_Function
-    
+                Set pbComboEntryState to False
+                Set Status_Help to (psToolTip(Self))
             End_Object                    
 
-            Object oFunctions_Parameter is a cRDCDbCJGridColumn //cDbCJGridColumn
+            Object oFunctions_Parameter is a cRDCDbCJGridColumn
                 Entry_Item Functions.Parameter
                 Set piWidth to 100
-                Set psCaption to "Parameter" "Option"
-                Set pbComboButton to True  
-                Set pbComboEntryState to False
-                Set psToolTip to "Double-click for dropdown choices when there is a value. For some functions an extra parameter is passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
+                Set psCaption to "Parameter"
+                Set peHeaderAlignment to xtpAlignmentCenter  
+                Set pbComboButton to True 
+                // pbEditable *must* be set after the pbComboButton setting.
+                Set pbEditable to True
+                Set pbComboEntryState to False 
+                Set psToolTip to "Click for dropdown choices when there is a value. For some functions an extra parameter is passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
+                Set Status_Help to (psToolTip(Self))
     
-                Procedure OnEntry
-                    Send ComboFillList
-                End_Procedure
-                
                 Procedure ComboFillList
                     String sParameterList
                     String[] asParameters
                     Integer iSize iCount
                     
-                    Send ComboDeleteData
-                    Get Field_Current_Value of (Server(Self)) Field Functions.ParameterValidation to sParameterList
+                    Get Field_Current_Value of (Main_DD(Self)) Field Functions.ParameterValidation to sParameterList
                     If (sParameterList <> "") Begin
+                        Set pbComboButton to True
+                        Send ComboDeleteData
                         Get StrSplitToArray  sParameterList "," to asParameters
                         Move (SizeOfArray(asParameters)) to iSize
                         Decrement iSize
@@ -152,43 +138,56 @@ Object oSelectFunctions_vw is a cRefactorDbView
                             Send ComboAddItem asParameters[iCount] iCount
                         Loop
                     End
+                    Else Begin
+                        Set pbComboButton to False
+                    End
                 End_Procedure
-    
+
+                Procedure OnEntry
+                    Send ComboFillList
+                End_Procedure 
+                
                 Function OnGetTooltip Integer iRow String sValue String sText Returns String
                     Get RowValue of oFunctions_ParameterHelp iRow to sText
                     If (sText <> "") Begin
+                        Move (Replaces("\r\n", sText, CS_CRLF)) to sText
                         Move (Replaces("\n", sText, CS_CRLF)) to sText
-                        Move ("Double-click for dropdown choises." * String(sText)) to sText
                     End 
                     Else Begin
-                        Move "Double-click for dropdown choises on rows that has a value. For some functions an extra parameter is used. You can only select from existing values. Hover the mouse over a value to see valid values to be selected from." to sText
+                        Move "Dropdown with choises on rows that has a value. For some functions an extra parameter is used. You can only select from existing values. Hover the mouse over an item to see all valid values to select from." to sText
                     End
                     Function_Return sText
                 End_Function
     
             End_Object
 
-            Object oFunctions_ParameterHelp is a cRDCDbCJGridColumn
-                Entry_Item Functions.ParameterHelp
-                Set piWidth to 200
-                Set psCaption to "Parameter Help"
-                Set pbVisible to False
-            End_Object
-
             Object oFunctions_Selected is a cRDCDbCJGridColumn
                 Entry_Item Functions.Selected
                 Set piWidth to 39
                 Set psCaption to "Select"
+                Set pbAllowRemove to False
                 Set pbCheckbox to True
                 Set peHeaderAlignment to xtpAlignmentCenter  
+                Set peFooterAlignment to xtpAlignmentCenter
+                Set Status_Help to (psToolTip(Self))
                 Set phoCheckbox_Col to Self
-                Set peFooterAlignment to  xtpAlignmentCenter
-    
-                Function OnGetTooltip Integer iRow String sValue String sText Returns String
-                    Get RowValue of oFunctions_Function_Help iRow to sText
-                    Function_Return sText
-                End_Function
-    
+            End_Object
+
+            Object oFunctions_SummaryText is a cRDCDbCJGridColumn
+                Entry_Item Functions.SummaryText
+                Set piWidth to 200
+                Set psCaption to "Summary Text"
+                Set pbEditable to False
+                Set pbMultiLine to True
+                Set pbVisible to False
+            End_Object
+
+            Object oFunctions_ParameterHelp is a cRDCDbCJGridColumn
+                Entry_Item Functions.ParameterHelp
+                Set piWidth to 150
+                Set psCaption to "Parameter Help"
+                Set pbVisible to False
+                Set pbShowInFieldChooser to False
             End_Object
 
             // The Functions.Function_Name column is a cDbCJGridColumnSuggestion
@@ -210,15 +209,8 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 Function_Return bSave
             End_Procedure
             
+            // The function edit view has been removed.
             Procedure Request_Edit
-                Integer iFunctionID iSelectedCol iParameterCol
-                Get piColumnId of oFunctions_Parameter to iParameterCol
-                Get SelectedColumn to iSelectedCol
-                If (iSelectedCol = iParameterCol) Begin
-                    Procedure_Return
-                End
-                Get Field_Current_Value of oFunctions_DD Field Functions.ID to iFunctionID
-                Delegate Send ActivateFunctionsView iFunctionID
             End_Procedure
                     
             // Augment to also show # of functions in the "ID" footer
@@ -228,7 +220,34 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 Get ItemCount to iItems
                 Set psFooterText of oFunctions_ID  to ("#" * String(iItems))
             End_Procedure
-                    
+
+//            Procedure LoadData 
+//                Handle hoDataSource hoServer
+//                Integer iRows iFile
+//                tDataSourceRow[] TheData 
+//                Boolean bFound
+//                
+//                Get Server to hoServer
+//                Get Main_File of hoServer to iFile
+//                Send Request_Read of hoServer FIRST_RECORD 2
+//                Move (Found) to bFound
+//                Get phoDataSource to hoDataSource
+//                While (bFound)
+//                    Get CreateDataSourceRow of hoDataSource to TheData[iRows]
+//                    Increment iRows
+//                    Send Request_Read of hoServer GT iFile 2
+//                    Move (Found) to bFound
+//                Loop
+//                Send InitializeData TheData 
+//                Send Reset of hoDataSource
+//                Send MoveToFirstRow
+//            End_Procedure
+//
+//            Procedure Activating
+//                Forward Send Activating
+//                Send LoadData 
+//            End_Procedure 
+            
         End_Object
 
         Object oSelectAll_btn is a Button
@@ -326,7 +345,7 @@ Object oSelectFunctions_vw is a cRefactorDbView
         End_Object
 
     End_Object
-                    
+
     Set Verify_Delete_msg to (RefFunc(MyDelete_Confirmation))
     Set Verify_Save_msg to (RefFunc(No_Confirmation))
 
