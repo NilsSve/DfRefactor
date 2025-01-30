@@ -63,20 +63,10 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
             Set Label_Row_Offset to 0
         End_Object 
     
-        Object oFunctionsFunction_Description is a cRDCDbForm
-            Entry_Item Functions.Function_Description
-            Set Size to 12 321
-            Set Location to 71 112
-            Set Label to "Function Description"
-            Set Label_Justification_mode to jMode_right
-            Set Label_Col_Offset to 2
-            Set Label_Row_Offset to 0
-        End_Object 
-    
         Object oFunctionsFunction_Help is a cDbTextEdit
             Entry_Item Functions.Function_Help
-            Set Size to 35 321
-            Set Location to 85 112
+            Set Size to 47 321
+            Set Location to 73 112
             Set Label to "Function Help"
             Set Label_Justification_mode to jMode_right
             Set Label_Col_Offset to 2
