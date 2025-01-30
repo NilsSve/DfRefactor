@@ -1,5 +1,3 @@
-Next_Functions_ID
-Next_FolderSel_ID
 SelectedFunctionTotal
 SelectedStandardFunctions
 SelectedEditorFunctions
