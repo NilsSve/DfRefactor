@@ -119,14 +119,16 @@ Object oRefactorView is a cRefactorDbView
                     Set Size to 204 636
                     Set Location to 27 9
                     Set Ordering to 2
-                    Set piHScrollStep to 1
                     Set pbDbShowInvertSelectionsMenuItem to True     
                     Set pbHeaderPrompts to False
                     Set pbDbShowEditMenuItem to False
+                    Set piHScrollStep to 1
                     // Need this to load all records in the grid,
                     // else the select buttons won't work.
                     Set pbStaticData to True   
                     Set pbEditOnClick to True
+                    Set pbEditOnKeyNavigation to False
+                    Set pbShowNonActiveInPlaceButton to False
                     Set piLayoutBuild to 7
 
                     Object oFunctions_ID is a cRDCDbCJGridColumn
@@ -141,9 +143,9 @@ Object oRefactorView is a cRefactorDbView
                         Entry_Item Functions.Function_Name
                         Set piWidth to 180
                         Set psCaption to "Function Name (Suggestion list)"    
-                        Set pbFullText to True    
                         Set psToolTip to "This is a full text suggestion list. You can start typing to search for any keyword and a suggestion list will appear for you to select from."
                         Set Status_Help to (psToolTip(Self))
+                        Set pbFullText to True    
                         Set pbAllowRemove to False
                         Set phoData_Col to Self   
                     End_Object
@@ -162,43 +164,45 @@ Object oRefactorView is a cRefactorDbView
                         Set piWidth to 130
                         Set psCaption to "Type"
                         Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
+                        Set Status_Help to (psToolTip(Self))
                         Set peHeaderAlignment to xtpAlignmentCenter  
                         Set peTextAlignment to xtpAlignmentCenter
                         Set pbComboButton to True
                         // pbEditable *must* be set after the pbComboButton setting.
                         Set pbEditable to False
                         Set pbComboEntryState to False
-                        Set Status_Help to (psToolTip(Self))
                     End_Object                    
 
                     Object oFunctions_Parameter is a cRDCDbCJGridColumn
                         Entry_Item Functions.Parameter
                         Set piWidth to 100
                         Set psCaption to "Parameter"
+                        Set psToolTip to "For some functions an extra parameter can be passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
+                        Set Status_Help to (psToolTip(Self))
                         Set peHeaderAlignment to xtpAlignmentCenter  
-//                        Set peTextAlignment to xtpAlignmentCenter
                         Set pbComboButton to True 
                         // pbEditable *must* be set after the pbComboButton setting.
                         Set pbEditable to True
                         Set pbComboEntryState to False 
-                        Set psToolTip to "For some functions an extra parameter can be passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
-                        Set Status_Help to (psToolTip(Self))
             
                         Procedure ComboFillList
                             String sParameterList
                             String[] asParameters
                             Integer iSize iCount
                             
-                            Move "" to sParameterList
-                            Send ComboDeleteData
                             Get Field_Current_Value of (Main_DD(Self)) Field Functions.ParameterValidation to sParameterList
                             If (sParameterList <> "") Begin
+                                Set pbComboButton to True
+                                Send ComboDeleteData
                                 Get StrSplitToArray  sParameterList "," to asParameters
                                 Move (SizeOfArray(asParameters)) to iSize
                                 Decrement iSize
                                 For iCount from 0 to iSize
                                     Send ComboAddItem asParameters[iCount] iCount
                                 Loop
+                            End
+                            Else Begin
+                                Set pbComboButton to False
                             End
                         End_Procedure
             
@@ -215,7 +219,6 @@ Object oRefactorView is a cRefactorDbView
                             Else Begin
                                 Move "Dropdown with choises on rows that has a value. For some functions an extra parameter is used. You can only select from existing values. Hover the mouse over an item to see all valid values to select from." to sText
                             End
-                            Set Status_Help to sText
                             Function_Return sText
                         End_Function
             
@@ -256,14 +259,12 @@ Object oRefactorView is a cRefactorDbView
                     // current cell (edit object) and that data will be changed(!)
                     // The logic below guards against the data value gets changed.
                     Function CanSaveRow Returns Boolean
-                        Handle hoDataSource
                         Boolean bSave bChange
                         
                         Move True to bSave
-                        Get phoDataSource to hoDataSource
                         Get Field_Changed_State of (Main_DD(Self)) Field Functions.Function_Name to bChange
                         If (bChange = True) Begin
-                            Send ResetSelectedRow of hoDataSource
+                            Send ResetSelectedRow of (phoDataSource(Self))
                             Move False to bSave
                         End
                         Function_Return bSave
@@ -277,11 +278,6 @@ Object oRefactorView is a cRefactorDbView
                         Set psFooterText of oFunctions_ID  to ("#" * String(iItems))
                     End_Procedure
                     
-                    Procedure Page Integer iPageObject
-                        Forward Send Page iPageObject
-                        Send MoveToFirstRow 
-                    End_Procedure
-
                     On_Key Key_Ctrl+Key_F5 Send ActivateProcess
                 End_Object
 

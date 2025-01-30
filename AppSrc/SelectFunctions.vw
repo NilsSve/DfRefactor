@@ -64,9 +64,9 @@ Object oSelectFunctions_vw is a cRefactorDbView
             // else the select buttons won't work properly.
             Set pbStaticData to True  
             Set pbEditOnClick to True
-            Set piLayoutBuild to 6 
             Set pbEditOnKeyNavigation to False
             Set pbShowNonActiveInPlaceButton to False
+            Set piLayoutBuild to 6 
 
             Object oFunctions_ID is a cRDCDbCJGridColumn
                 Entry_Item Functions.ID
@@ -101,26 +101,26 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 Set piWidth to 130
                 Set psCaption to "Type"
                 Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
+                Set Status_Help to (psToolTip(Self))
                 Set peHeaderAlignment to xtpAlignmentCenter  
                 Set peTextAlignment to xtpAlignmentCenter
                 Set pbComboButton to True
                 // pbEditable *must* be set after the pbComboButton setting.
                 Set pbEditable to False
                 Set pbComboEntryState to False
-                Set Status_Help to (psToolTip(Self))
             End_Object                    
 
             Object oFunctions_Parameter is a cRDCDbCJGridColumn
                 Entry_Item Functions.Parameter
                 Set piWidth to 100
                 Set psCaption to "Parameter"
+                Set psToolTip to "Click for dropdown choices when there is a value. For some functions an extra parameter is passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
+                Set Status_Help to (psToolTip(Self))
                 Set peHeaderAlignment to xtpAlignmentCenter  
                 Set pbComboButton to True 
                 // pbEditable *must* be set after the pbComboButton setting.
                 Set pbEditable to True
                 Set pbComboEntryState to False 
-                Set psToolTip to "Click for dropdown choices when there is a value. For some functions an extra parameter is passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
-                Set Status_Help to (psToolTip(Self))
     
                 Procedure ComboFillList
                     String sParameterList
@@ -196,14 +196,12 @@ Object oSelectFunctions_vw is a cRefactorDbView
             // current cell (edit object) and that data will be changed(!)
             // The logic below guards against the data value gets changed.
             Function CanSaveRow Returns Boolean
-                Handle hoDataSource
                 Boolean bSave bChange
                 
                 Move True to bSave
-                Get phoDataSource to hoDataSource
                 Get Field_Changed_State of (Main_DD(Self)) Field Functions.Function_Name to bChange
                 If (bChange = True) Begin
-                    Send ResetSelectedRow of hoDataSource
+                    Send ResetSelectedRow of (phoDataSource(Self))
                     Move False to bSave
                 End
                 Function_Return bSave
