@@ -52,7 +52,7 @@ Struct tFuncEnumList
 End_Struct
 
 Struct tFuncParam
-    String sByRef               // If parameter is called with a "ByRef"
+    Boolean bByRef              // If parameter is called with a "ByRef"
     String sType                // Variable type.
     String sVarName             // Variable name.
 End_Struct
@@ -62,6 +62,7 @@ Struct tFuncLib
     tFuncParam[] FuncParamArray // Function parameter types and variable names.
     String sReturnType          // Function return type.
     Integer eFunctionType       // The type of function.
+    String sSummary             // Summary text. 
     String sHelp                // Function help text
     Boolean bFuncEnumList       // True if the FuncEnumList struct contains data.
     tFuncEnumList FuncEnumList
@@ -128,16 +129,16 @@ Enum_List
 End_Enum_List
 
 Enum_List
-    Define CI_SplitBySpaceAndSemicolon for 1
-    Define CI_SplitBySemicolon         for 2
-    Define CI_SplitToBeginEndBlock     for 3
+    Define eSplitBySpaceAndSemicolon for 1
+    Define eSplitBySemicolon         for 2
+    Define eSplitToBeginEndBlock     for 3
 End_Enum_List  
 
-{ EnumList="CI_FirstCommand, CI_SecondCommand, CI_ThirdCommand"}
+{ EnumList = "eFirstCommand, eSecondCommand, eThirdCommand" }
 Enum_List
-    Define CI_FirstCommand
-    Define CI_SecondCommand
-    Define CI_ThirdCommand
+    Define eFirstCommand
+    Define eSecondCommand
+    Define eThirdCommand
 End_Enum_List
 
 Struct tWorkspace
@@ -200,9 +201,6 @@ End_Struct
 Struct tCJComboBoxContent
     String sText
     Integer eTheme
-#IFDEF IS$WIN64
-    Integer iMissingAlignment1
-#ENDIF
 End_Struct
 
 Struct tBackupFiles
@@ -211,29 +209,29 @@ Struct tBackupFiles
     DateTime dtFileDate
 End_Struct    
 
-{ EnumList="{CI_SingleQuotes, CI_DoubleQuotes}" }
+{ EnumList = "eSingleQuotes, eDoubleQuotes" }
 Enum_List
-    Define CI_SingleQuotes
-    Define CI_DoubleQuotes
+    Define eSingleQuotes
+    Define eDoubleQuotes
 End_Enum_List 
 
-{ EnumList="{CI_LeftExpression1, CI_LeftExpression2, CI_OfExpression, CI_ToTexpression}" }
+{ EnumList = "eLeftExpression1, eLeftExpression2, eOfExpression, eToTexpression" }
 Enum_List
-    Define CI_LeftExpression1
-    Define CI_LeftExpression2
-    Define CI_OfExpression
-    Define CI_ToTexpression
+    Define eLeftExpression1
+    Define eLeftExpression2
+    Define eOfExpression
+    Define eToTexpression
 End_Enum_List 
 
-{ EnumList="{CI_LeftPart, CI_OfPart, CI_ToPart}" }
-Enum_List
-    Define CI_LeftPart
-    Define CI_OfPart
-    Define CI_ToPart
-End_Enum_List 
+//{ EnumList = "eLeftPart, eOfPart, eToPart" }
+//Enum_List
+//    Define eLeftPart
+//    Define eOfPart
+//    Define eToPart
+//End_Enum_List 
 
 Struct tExpression
-    { EnumList="{CI_LeftExpression1, CI_LeftExpression2, CI_OfExpression, CI_ToTexpression}" }
+    { EnumList = "eLeftExpression1, eLeftExpression2, eOfExpression, eToTexpression" }
     String sExpression
     String sExpressionOS // Overstrike expression variant
     String sExpressionNP // No added Paranthesis
@@ -270,7 +268,7 @@ Struct tBooleanToken              // Note: sOverStrikeLine should be used when u
     Boolean bDoubleBoolean        // [Found ~Found], ie two boolean indicators within the square brackets.
 End_Struct
 
-{ EnumList="{CI_FirstBoolean, CI_SecondBoolean, CI_ToBoolean}" }
+{ EnumList = "CI_FirstBoolean, CI_SecondBoolean, CI_ToBoolean" }
 Enum_List
     Define CI_FirstBoolean
     Define CI_SecondBoolean
@@ -331,13 +329,17 @@ End_Struct
     Define clGreenGrey              for (RGB(64, 84, 93))
     Define clGreenGreyLight         for (RGB(7, 117, 104))
     Define clDarkGreen              for (RGB(49, 60, 83)) 
+#ENDIF
+
+#IFNDEF clAlternateRowBgColor
+    Define clAlternateRowBgColor    for (RGB(216, 217, 227))    // HTML #D8D9E3
     Define clStatusBarColor         for (RGB(45, 130, 149))     // HTML #2D8295
     Define clEditorBackGround       for (RGB(36, 49, 68))       // HTML 243144
     Define clBaseColor              for (RGB(239, 239, 239))    // HTML #EFEFEF  
-    Define clAlternateRowBgColor    for (RGB(216, 217, 227))    // HTML #D8D9E3
     Define clActiveRow              for (RGB(1, 82, 119))       // HTML #015277 
     Define clProgramIconBg          for (RGB(43, 59, 83))       // HTML #2B3B53
 #ENDIF
+
 #IFNDEF CI_DarkTheme
     Define clDarkTheme for (RGB(36,36,36)) 
     Define clDarkThemeText for clWhite
@@ -482,7 +484,6 @@ Define CS_TestBenchViewSplitterPos for "TestBenchViewSplitterPos"
     Define CS_SWSFile    for "DFRefactor25.0.sws"
 #ENDIF
     
-    
 Define CS_DFUnitTest     for "DFUnit_TestRunner"
 Define CS_DFRefactor     for "DFRefactor"
 Define CS_LegacyCode     for "LegacyCode.pkg"
@@ -595,7 +596,6 @@ Define CS_FunctionLibraryFile       for "oRefactorFuncLib.pkg"
 Define CS_UnitTestsFile             for "oUnit_Tests.pkg"
 Define CS_UnitTestsTokenizerFunc    for "Tokenizer"
 Define CS_ImportBackupFolder        for "ImportBackup"
-Define CS_FunctionLibraryStart      for " Function "
-//Define CS_FunctionLibraryClassStart for "Class cRefactorFuncLib is a cBaseFuncLib"
-Define CS_Comment1                  for '// NOTE: Do *not* add any code after this "End_Class"!'
+Define CS_FunctionLibraryStart      for "Object oRefactorFuncLib is a cRefactorFuncLib"
+Define CS_Comment1                  for '// NOTE: Do *not* add any code after this "End_Object"!'
 Define CS_Comment2                  for '//       It will be removed by the Export/Import logic.'
