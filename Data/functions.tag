@@ -1,6 +1,5 @@
 ID
 Function_Name
-Function_Description
 Function_Help
 SummaryText
 Selected
@@ -11,3 +10,4 @@ ParameterValidation
 ParameterHelp
 bPrivate
 Counter
+bPublished
