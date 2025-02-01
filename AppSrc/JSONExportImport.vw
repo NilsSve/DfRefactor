@@ -2,7 +2,8 @@
 // Functions Export/Import
 //
 Use DFClient.pkg                                  
-Use cRefactorDbView.pkg
+//Use cRefactorDbView.pkg
+Use cRDCDbView.pkg
 Use DFEntry.pkg
 Use File_dlg.pkg
 Use cDbTextEdit.pkg
@@ -15,7 +16,7 @@ Use cExportImportFunctions.pkg
 Use cFunctionsDataDictionary.dd
 
 Activate_View Activate_oJSONExportImport for oJSONExportImport
-Object oJSONExportImport is a cRefactorDbView
+Object oJSONExportImport is a cRDCDbView
     Set Location to 5 5
     Set Size to 372 650
     Set Label to "JSON Export/Import"
@@ -100,11 +101,11 @@ Object oJSONExportImport is a cRefactorDbView
             Set Label_row_Offset to 0  
         End_Object 
      
-        Object oFunctionsFunction_Description is a dbForm
-            Entry_Item Functions.Function_Description
+        Object oFunctionsFunction_SummaryText is a dbForm
+            Entry_Item Functions.SummaryText
             Set Size to 12 250
             Set Location to 61 59
-            Set Label to "Description"
+            Set Label to "Summary Text"
             Set Label_Justification_mode to jMode_right
             Set Label_Col_Offset to 2
             Set Label_row_Offset to 0

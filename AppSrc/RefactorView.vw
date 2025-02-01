@@ -1,12 +1,13 @@
 ﻿Use Cursor.pkg
 Use dfLine.pkg
 Use cCJCommandBarSystem.pkg
-Use cDbCJGridColumnSuggestion.pkg
-//Use cRDCCJGridColumnSuggestion.pkg
+//Use cDbCJGridColumnSuggestion.pkg
+Use cRDCSuggestionsBaseClasses.pkg
 Use DFEnChk.pkg
 Use dfTabDlg.pkg
 
-Use cRefactorDbView.pkg
+//Use cRefactorDbView.pkg
+Use cRDCDbView.pkg
 Use cRDCDbCJGrid.pkg  
 Use cRDCDbCJGridColumn.pkg
 Use cRDCDbComboForm.pkg
@@ -43,7 +44,7 @@ Register_Procedure RefreshSelectionUpdate
 Register_Procedure ActivateProcess
 
 Activate_View Activate_oRefactorView for oRefactorView
-Object oRefactorView is a cRefactorDbView
+Object oRefactorView is a cRDCDbView
     Set Location to 1 0
     Set Size to 315 654
     Set Label to "Selections"
@@ -78,6 +79,7 @@ Object oRefactorView is a cRefactorDbView
             If (piFunctionType(Self) <> eAll_Functions) Begin
                 Constrain Functions.Type eq (piFunctionType(Self))
             End
+            Constrain Functions.bPublished eq (True)
         End_Procedure
 
     End_Object
@@ -139,7 +141,7 @@ Object oRefactorView is a cRefactorDbView
                         Set peTextAlignment to xtpAlignmentCenter
                     End_Object
 
-                    Object oFunctions_Function_Name is a cDbCJGridColumnSuggestion
+                    Object oFunctions_Function_Name is a cDbCJGridColumnSuggestionNew //cDbCJGridColumnSuggestion
                         Entry_Item Functions.Function_Name
                         Set piWidth to 180
                         Set psCaption to "Function Name (Suggestion list)"    
@@ -594,8 +596,8 @@ Object oRefactorView is a cRefactorDbView
         // than selecting an existing value from the list.
         // We therefore handle the saving/editing of the comboform manually.
         Object oFileNameFilters_cf is a cRDCDbComboForm
-//            Entry_Item SysFile.FileExtensionFilter
-//            Set Server to oSysFile_DD
+            // Entry_Item SysFile.FileExtensionFilter
+            // Set Server to oSysFile_DD
             Set Size to 12 250
             Set Location to 30 4
             Set psToolTip to "Select file extensions filter. Each extension must start with a wildcard character and a dot (*.) and file extensions must be separated with a semicolon (;)"

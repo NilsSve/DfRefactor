@@ -1,8 +1,8 @@
 ﻿Use Dfclient.pkg
 Use cCJGridColumnRowIndicator.pkg
-Use cDbCJGridColumnSuggestion.pkg
-
-Use cRefactorDbView.pkg
+Use cRDCSuggestionsBaseClasses.pkg
+//Use cRefactorDbView.pkg
+Use cRDCDbView.pkg
 Use cRDCDbHeaderGroup.pkg
 Use cRDCDbCJGrid.pkg
 Use cRDCDbCJGridColumn.pkg
@@ -15,7 +15,7 @@ Use cFunctionsDataDictionary.dd
 Register_Function MyDelete_Confirmation Returns Integer
 
 Activate_View Activate_oSelectFunctions_vw for oSelectFunctions_vw
-Object oSelectFunctions_vw is a cRefactorDbView
+Object oSelectFunctions_vw is a cRDCDbView
     Set Location to 2 4
     Set Size to 193 635
     Set Label to "Select Functions"
@@ -34,6 +34,7 @@ Object oSelectFunctions_vw is a cRefactorDbView
             If (piFunctionType(Self) <> eAll_Functions) Begin
                 Constrain Functions.Type eq (piFunctionType(Self))
             End
+            Constrain Functions.bPublished eq (True)
         End_Procedure
 
     End_Object
@@ -76,7 +77,7 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 Set peTextAlignment to xtpAlignmentCenter
             End_Object
 
-            Object oFunctions_Function_Name is a cDbCJGridColumnSuggestion
+            Object oFunctions_Function_Name is a cDbCJGridColumnSuggestionNew //cDbCJGridColumnSuggestion
                 Entry_Item Functions.Function_Name
                 Set piWidth to 185
                 Set psCaption to "Function Name (Suggestion list)"    
@@ -84,7 +85,7 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 Set Status_Help to (psToolTip(Self))
                 Set pbFullText to True    
                 Set pbAllowRemove to False
-                Set phoData_Col to Self   
+                Set phoData_Col to Self 
             End_Object
 
             Object oFunctions_Function_Help is a cRDCDbCJGridColumn
@@ -219,32 +220,34 @@ Object oSelectFunctions_vw is a cRefactorDbView
                 Set psFooterText of oFunctions_ID  to ("#" * String(iItems))
             End_Procedure
 
-//            Procedure LoadData 
-//                Handle hoDataSource hoServer
-//                Integer iRows iFile
-//                tDataSourceRow[] TheData 
-//                Boolean bFound
-//                
-//                Get Server to hoServer
-//                Get Main_File of hoServer to iFile
-//                Send Request_Read of hoServer FIRST_RECORD 2
-//                Move (Found) to bFound
-//                Get phoDataSource to hoDataSource
-//                While (bFound)
-//                    Get CreateDataSourceRow of hoDataSource to TheData[iRows]
-//                    Increment iRows
-//                    Send Request_Read of hoServer GT iFile 2
-//                    Move (Found) to bFound
-//                Loop
-//                Send InitializeData TheData 
-//                Send Reset of hoDataSource
-//                Send MoveToFirstRow
-//            End_Procedure
-//
-//            Procedure Activating
-//                Forward Send Activating
-//                Send LoadData 
-//            End_Procedure 
+            Procedure LoadData 
+                Handle hoDataSource hoServer
+                Integer iRows iFile
+                tDataSourceRow[] TheData 
+                Boolean bFound
+                
+                Get Server to hoServer
+                Get Main_File of hoServer to iFile
+                Send Request_Read of hoServer FIRST_RECORD 2
+                Move (Found) to bFound
+                Get phoDataSource to hoDataSource
+                While (bFound)
+                    Get CreateDataSourceRow of hoDataSource to TheData[iRows]
+                    Increment iRows
+                    Send Request_Read of hoServer GT iFile 2
+                    Move (Found) to bFound
+                Loop
+                Send InitializeData TheData 
+                Send Reset of hoDataSource
+                Send MoveToFirstRow
+            End_Procedure
+
+            // For unknown reason the first row in the list is *not* highlighted
+            // when the grid is filled. This fixes it.
+            Procedure Activating
+                Forward Send Activating
+                Send LoadData 
+            End_Procedure 
             
         End_Object
 
