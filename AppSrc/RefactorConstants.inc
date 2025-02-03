@@ -81,7 +81,7 @@ Define CS_DDOldStyle      for "<tablename>_DD"
 Define CS_DDLegacyStyle   for "o<tablename>_DD"
 Define CS_DDNewStyle      for "o<tablename>_dd"
 
-Struct tFunctionTypes
+/*Struct tFunctionTypes
     Integer iAll_Functions
     Integer iStandard_Function
     Integer iRemove_Function
@@ -90,7 +90,7 @@ Struct tFunctionTypes
     Integer iReport_FunctionAll
     Integer iOther_Function
     Integer iOther_FunctionAll
-End_Struct   
+End_Struct*/   
 
 Enum_List 
    Define eEngineOK         for 0
@@ -101,24 +101,24 @@ Enum_List
 End_Enum_List
 
 Enum_List
-    Define eAll_Functions         for 0   // Only used for selecting certain groups of functions in the program.
-    Define eStandard_Function     for 1   // One source line at a time will be passed for these functions.
-    Define eRemove_Function       for 2   // One source line at a time will be passed for these functions.
-    Define eEditor_Function       for 3   // A source file as a string array will be passed
-    Define eReport_Function       for 4   // A source file as a string array. Makes no source changes.
-    Define eReport_FunctionAll    for 5   // Makes no source changes.
-    Define eOther_Function        for 6   // A source file as a string array will be passed.
-    Define eOther_FunctionAll     for 7   // All selected files as a string array will be passed. 
+    Define eAllFunctions         for 0   // Only used for selecting certain groups of functions in the program.
+    Define eStandardFunction     for 1   // One source line at a time will be passed for these functions.
+    Define eRemoveFunction       for 2   // One source line at a time will be passed for these functions.
+    Define eEditorFunction       for 3   // A source file as a string array will be passed
+    Define eReportFunction       for 4   // A source file as a string array. Makes no source changes.
+    Define eReportFunctionAll    for 5   // Makes no source changes.
+    Define eOtherFunction        for 6   // A source file as a string array will be passed.
+    Define eOtherFunctionAll     for 7   // All selected files as a string array will be passed. 
 End_Enum_List
 
-Define CS_All_Functions             for "No Constrains - Show All"
-Define CS_Standard_Function         for "Standard - Line-by-line"
-Define CS_Remove_Function           for "Remove - Line-by-line"
-Define CS_Editor_Function           for "Editor - One File"
-Define CS_Report_Function           for "Report - One File"   // Makes no source changes.
-Define CS_Report_FunctionAll        for "Report - All Files"  // Makes no source changes.
-Define CS_Other_Function            for "Other - One File"
-Define CS_Other_FunctionAll         for "Other - All Files"
+Define CS_AllFunctions           for "No Constrains - Show All"
+Define CS_StandardFunction       for "eStandardFunction - Line-by-line"
+Define CS_RemoveFunction         for "eRemoveFunction - Line-by-line"
+Define CS_EditorFunction         for "eEditorFunction - One File"
+Define CS_ReportFunction         for "eReportFunction - One File"   // Makes no source changes.
+Define CS_ReportFunctionAll      for "eReportFunctionAll - All Files"  // Makes no source changes.
+Define CS_OtherFunction          for "eOtherFunction - One File"
+Define CS_OtherFunctionAll       for "eOtherFunctionAll - All Files"
 
 Enum_List
     Define cx_RegKeyAlreadyExist

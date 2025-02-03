@@ -31,7 +31,7 @@ Object oSelectFunctions_vw is a cRDCDbView
     Object oFunctions_DD is a cFunctionsDataDictionary  
         
         Procedure OnConstrain
-            If (piFunctionType(Self) <> eAll_Functions) Begin
+            If (piFunctionType(Self) <> eAllFunctions) Begin
                 Constrain Functions.Type eq (piFunctionType(Self))
             End
             Constrain Functions.bPublished eq (True)
@@ -253,7 +253,7 @@ Object oSelectFunctions_vw is a cRDCDbView
 
         Object oSelectAll_btn is a Button
             Set Size to 14 62
-            Set Location to 10 255
+            Set Location to 10 238
             Set Label to "Select All"
             Set psImage to "SelectAll.ico"
             Set peAnchors to anTopRight
@@ -264,7 +264,7 @@ Object oSelectFunctions_vw is a cRDCDbView
 
         Object oSelectNone_btn is a Button
             Set Size to 14 62
-            Set Location to 10 321
+            Set Location to 10 304
             Set Label to "Select None"
             Set psImage to "SelectNone.ico"
             Set peAnchors to anTopRight
@@ -275,7 +275,7 @@ Object oSelectFunctions_vw is a cRDCDbView
 
         Object oSelectInvert_btn is a Button
             Set Size to 14 74
-            Set Location to 10 387
+            Set Location to 10 370
             Set Label to "Invert Selections"
             Set psImage to "SelectInvert.ico"
             Set peAnchors to anTopRight
@@ -285,8 +285,8 @@ Object oSelectFunctions_vw is a cRDCDbView
         End_Object
 
         Object oConstrainByType_cf is a ComboForm
-            Set Size to 14 99
-            Set Location to 10 531
+            Set Size to 14 116
+            Set Location to 10 514
             Set peAnchors to anTopRight
             Set Label_Col_Offset to 2
             Set Label_Justification_Mode to JMode_Right
@@ -295,14 +295,14 @@ Object oSelectFunctions_vw is a cRDCDbView
             Set Combo_Sort_State to False
           
             Procedure Combo_Fill_List
-                Send Combo_Add_Item CS_All_Functions
-                Send Combo_Add_Item CS_Standard_Function
-                Send Combo_Add_Item CS_Remove_Function
-                Send Combo_Add_Item CS_Editor_Function
-                Send Combo_Add_Item CS_Report_Function   
-                Send Combo_Add_Item CS_Report_FunctionAll
-                Send Combo_Add_Item CS_Other_Function   
-                Send Combo_Add_Item CS_Other_FunctionAll
+                Send Combo_Add_Item CS_AllFunctions
+                Send Combo_Add_Item CS_StandardFunction
+                Send Combo_Add_Item CS_RemoveFunction
+                Send Combo_Add_Item CS_EditorFunction
+                Send Combo_Add_Item CS_ReportFunction   
+                Send Combo_Add_Item CS_ReportFunctionAll
+                Send Combo_Add_Item CS_OtherFunction   
+                Send Combo_Add_Item CS_OtherFunctionAll
             End_Procedure
           
             Procedure OnChange
@@ -311,29 +311,29 @@ Object oSelectFunctions_vw is a cRDCDbView
                 
                 Get Value to sValue
                 Case Begin
-                    Case (sValue = CS_All_Functions)
-                        Move eAll_Functions to iType
+                    Case (sValue = CS_AllFunctions)
+                        Move eAllFunctions to iType
                         Case Break
-                    Case (sValue = CS_Standard_Function)
-                        Move eStandard_Function to iType
+                    Case (sValue = CS_StandardFunction)
+                        Move eStandardFunction to iType
                         Case Break
-                    Case (sValue = CS_Remove_Function)
-                        Move eRemove_Function to iType
+                    Case (sValue = CS_RemoveFunction)
+                        Move eRemoveFunction to iType
                         Case Break                            
-                    Case (sValue = CS_Editor_Function)
-                        Move eEditor_Function to iType
+                    Case (sValue = CS_EditorFunction)
+                        Move eEditorFunction to iType
                         Case Break
-                    Case (sValue = CS_Report_Function)
-                        Move eReport_Function to iType
+                    Case (sValue = CS_ReportFunction)
+                        Move eReportFunction to iType
                         Case Break
-                    Case (sValue = CS_Report_FunctionAll)
-                        Move eReport_FunctionAll to iType
+                    Case (sValue = CS_ReportFunctionAll)
+                        Move eReportFunctionAll to iType
                         Case Break
-                    Case (sValue = CS_Other_Function)
-                        Move eOther_Function to iType
+                    Case (sValue = CS_OtherFunction)
+                        Move eOtherFunction to iType
                         Case Break
-                    Case (sValue = CS_Other_FunctionAll)
-                        Move eOther_FunctionAll to iType
+                    Case (sValue = CS_OtherFunctionAll)
+                        Move eOtherFunctionAll to iType
                         Case Break
                     Case Else
                 Case End
