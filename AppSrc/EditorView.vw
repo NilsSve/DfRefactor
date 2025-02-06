@@ -3,7 +3,6 @@ Use cRefactorApplication.pkg
 Use cRefactorDbView.pkg
 Use cRefactorScintillaEditor.pkg
 Use oEditorProperties.pkg
-//Use mfiletime.pkg
 Use vWin32fh.pkg
 Use cFunctionsDataDictionary.dd
 Use dfClient.pkg
