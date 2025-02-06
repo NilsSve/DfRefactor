@@ -1,4 +1,4 @@
-Use Windows.pkg
+﻿Use Windows.pkg
 Use cRefactorApplication.pkg
 Use cRefactorDbView.pkg
 Use cRefactorScintillaEditor.pkg
@@ -17,7 +17,7 @@ Object oEditorView_vw is a cRefactorDbView
     Set pbAutoActivate to True
     Set pbAcceptDropFiles to True
     Set Icon to "Editor.ico"
-    Set Label to "Editor for 'Editor Functions'"
+    Set Label to "Editor (Editor Functions)"
 
     Set phoEditorView of ghoApplication to Self
 
