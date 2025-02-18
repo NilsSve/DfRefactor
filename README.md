@@ -1,21 +1,21 @@
 # DFRefactor - An Automated Refactoring Tool for DataFlex
 
-DFRefactor is a powerful tool written in DataFlex and is totally free of cost. The tool assists with refactoring legacy DataFlex code. It specifically targets code that uses syntax no longer supported or encouraged. If you’re unfamiliar with the concept, refactoring involves improving the structure and readability of existing code without altering its external behavior.
+DFRefactor is a powerful, free tool written in DataFlex that assists in refactoring legacy DataFlex code. It specifically targets code that uses syntax that is no longer supported or encouraged. Refactoring involves improving the structure and readability of existing code without altering its external behavior.
 
-- The only DataFlex Studio version supported are the latest two. At current that means DataFlex 2024 and 2025. That doesn't mean that the program can't be used for projects/workspaces on earlier DataFlex versions. All this means is that one of the last two DataFlex Studio's needs to be installed to compile and run these refactoring programs. An older version of the tool that can be used with earlier DataFlex versions than 2023 is available as a separate branch. However, this branch is not maintained so you would be on your own to use it.
+- The only supported versions of DataFlex Studio are the latest two: currently, DataFlex 2024 and 2025. While this means that you need one of these two versions installed to compile and run the refactoring programs, it doesn't prevent you from using the tool on projects or workspaces created with earlier DataFlex versions. An older version of the tool, compatible with versions prior to 2023, is available as a separate branch. However, please note that this branch is not maintained, so you would need to use it at your own risk.
 
-DFRefactor is a tool written in DataFlex and helps with refactoring of old DataFlex code. To refactor source code, just select the wanted/needed functions and press "Start Refactoring", for a selected workspace.
+To refactor source code with DFRefactor, simply select the desired functions and click "Start Refactoring" for the chosen workspace.
 
-Code for all refactoring functions must be added to the main function repository; the oRefactorFuncLib.pkg object. In addition functions must be registered by a meta-tag: { Published = True } above the function declaration. There are also other meta-tags that are needed. Just follow the instructions at the top of the function library object.
+All refactoring functions must be added to the main function repository, contained within the `oRefactorFuncLib.pkg` object. Additionally, functions must be registered using the meta-tag: `{ Published = True }` above the function declaration. Other meta-tags are also required—please follow the instructions at the top of the function library object.
 
-There are several types of refactoring functions, but in general, source is passed to functions in a line-by-line fashion. Every refactoring function must have an interface of a "String ByRef sLine" and a second optional "String sParameter." It must also return a Boolean True if the passed source line was changed.
+There are various types of refactoring functions; generally, the source code is processed line by line. Every refactoring function must have the interface of a "String ByRef sLine" and an additional optional parameter "String sParameter." It should also return a Boolean value of True if the supplied source line was changed.
 
-The workspace consists of three important programs;
-- TestBench.src - A test bench used when developing & testing your own refactoring functions.
-- DFUnit_Testrunner.src - A series of unit tests. You need to add several unit tests for every new refactoring function that is to be added to the function repository.
-- DFRefactor.src - The main refactoring program that can be used after all functions has been proven to work as intended.
+The workspace consists of three important programs:
+- **TestBench.src**: A test bench used for developing and testing your custom refactoring functions.
+- **DFUnit_Testrunner.src**: A series of unit tests. You will need to add several unit tests for each new refactoring function included in the function repository.
+- **DFRefactor.src**: The main refactoring program that can be utilized once all functions have been tested and confirmed to work as intended.
 
-You need a DataFlex Studio 24.0 or later.
+You will need DataFlex Studio version 24.0 or later to use DFRefactor effectively.
 
 ![This is a sample of the DFRefactor.src program:](Bitmaps/DFRefactor.png)
 
