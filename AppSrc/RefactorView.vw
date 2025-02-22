@@ -11,7 +11,7 @@ Use cRDCDbView.pkg
 Use cRDCDbCJGrid.pkg  
 Use cRDCDbCJGridColumn.pkg
 Use cRDCDbComboForm.pkg
-Use RefactorConstants.inc
+Use RefactorConstants.h.pkg
 Use cRDCDbHeaderGroup.pkg
 Use cRDCDbForm.pkg
 Use cRDCDbSpinForm.pkg
