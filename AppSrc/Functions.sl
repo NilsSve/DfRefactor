@@ -5,7 +5,7 @@ Use Windows.pkg
 Use DFClient.pkg
 Use cDbCJGridPromptList.pkg
 Use cDbCJGridColumn.pkg
-Use RefactorConstants.inc
+Use RefactorConstants.h.pkg
 Use cFunctionsDataDictionary.dd
 
 CD_Popup_Object oFunctions_sl is a dbModalPanel

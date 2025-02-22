@@ -53,15 +53,14 @@ Object oJSONExportImport is a cRDCDbView
             Set Size to 67 419
             Set Location to 29 45
             Set Justification_Mode to JMode_Left
-            Set Label to "Info text"
+            Set Label to "How it works"
             Set TextColor to clWhite
             
             Procedure Page Integer iPageObject  
                 String sVal
                 Append sVal "This view is designed to enable you to Export/Import refactoring data and source code from one machine to another."
                 Append sVal "\n\nSelect the functions to be exported. The data from the Functions table together with the corresponding function code text "
-                Append sVal "from the cRefactorFuncLib class and oUnit_Tests.pkg will be exported to a Json file that can be copied/sent to another machine for import, in alphabetical order by function name."
-                Append sVal "\n\nNote that each function that has code in the cRefactorFuncLib class *must* also have been registrered under the 'Function Maintenance' tab-page."
+                Append sVal "from the oRefactorFuncLib- and oUnit_Tests objects, will be exported to a Json file that can be copied/sent to another machine for import, in alphabetical order by function name."
                 Move (Replaces("\n", sVal, (CS_CR))) to sVal
                 Set Label to sVal
                 Forward Send Page iPageObject
@@ -323,7 +322,7 @@ Object oJSONExportImport is a cRDCDbView
             Set Size to 24 66
             Set Location to 33 564
             Set Label to "Export Data"
-            Set psToolTip to "Export selected function ID's data records *and* the corresponding function text(s) from the cRefactorFuncLib repository class."
+            Set psToolTip to "Export selected function ID's data records *and* the corresponding function text(s) from the oRefactorFuncLib repository class."
             Set peAnchors to anNone 
             Set psImage to "JsonFile.ico"
             Set piImageSize to 32
