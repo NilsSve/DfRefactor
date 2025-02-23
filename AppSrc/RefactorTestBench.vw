@@ -498,6 +498,8 @@ Object oRefactorTestBench is a cRefactorDbView
         End
     End_Procedure
 
+    // DataFlex doesn't "like" DDO's for system files (1-record) very much.
+    // This is a little trick to help DataFlex to make the DDO work correctly.
     Procedure Activating
         Send Request_Assign of oSysFile_DD
         Send Refind_Records of oSysFile_DD

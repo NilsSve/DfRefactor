@@ -60,7 +60,7 @@ Use UserDefinedUseStatement.pkg
             """ }
         Function ChangeLeftCommandToFunction String ByRef sLine String sParameter Returns Boolean
             Boolean bChanged
-            Get _SingleCommandSyntaxToFunction (&sLine) CS_Left to bChanged
+            Get SingleCommandSyntaxToFunction (&sLine) CS_Left to bChanged
             Function_Return bChanged
         End_Function   
 
