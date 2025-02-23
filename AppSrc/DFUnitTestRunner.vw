@@ -9,22 +9,12 @@ Use cRefactorFuncLib.pkg
 
 Activate_View Activate_DFUnitTestRunner_vw for DFUnitTestRunner_vw
 Object DFUnitTestRunner_vw is a View
-    Set Size to 381 253
+    Set Size to 381 332
     Set Location to 10 10
     Set Maximize_Icon to True
     Set Border_Style to Border_Thick 
     Set View_Mode to Viewmode_Normal 
     Set pbAutoActivate to True
-    Set phoRefactorView of ghoApplication to Self   
-
-    Object oTestCode_edt is a cRefactorScintillaEditor
-        Set Size to 45 227
-        Set Location to 333 12
-        Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
-        Set peAnchors to anBottomLeftRight     
-        Set pbExternalModifyCheck to False
-        Set phoEditor of ghoRefactorFuncLib to Self
-    End_Object
 
     Object oRunTestsButton is a cRDCButtonDPI
         Set Size to 30 87
@@ -71,9 +61,23 @@ Object DFUnitTestRunner_vw is a View
 
     End_Object
 
+    Object oNextError_btn is a cRDCButtonDPI
+        Set Size to 14 66
+        Set Location to 24 175
+        Set Label to "Next Error"
+        Set piImageSize to 16
+        Set psImage to "ActionFind.ico"
+        Set psToolTip to "Find next '[Failed!]' line"
+
+        Procedure OnClick
+            Send FindNextError of oOutputBox
+        End_Procedure
+
+    End_Object
+
     Object oClose_btn is a cRDCButtonDPI
         Set Size to 30 61
-        Set Location to 9 177
+        Set Location to 9 256
         Set Label to "Exit"
         Set psImage to "ActionExit.ico"
         Set piImageSize to 36
@@ -85,9 +89,10 @@ Object DFUnitTestRunner_vw is a View
         End_Procedure
     
     End_Object
+    Set phoRefactorView of ghoApplication to Self   
 
     Object oOutputBox is a cDFUnitUIListReporter
-        Set Size to 272 236
+        Set Size to 272 315
         Set Location to 46 13
         Set peAnchors to anAll
         Set Border_Style to Border_Thick
@@ -123,7 +128,7 @@ Object DFUnitTestRunner_vw is a View
             Integer iSelStart iSelEnd
             String sSearchText
             
-            Move "[Failed!]" to sSearchText
+            Move CS_FailedClause to sSearchText
             Get FindText sSearchText 0 to iSelStart
             If (iSelStart = -1) Begin
                 Send Beginning_of_Data
@@ -144,6 +149,19 @@ Object DFUnitTestRunner_vw is a View
         Set Location to 323 13
         Set Label to "Unit Test Output Scintilla Editor:"
         Set peAnchors to anBottomLeft
+    End_Object
+
+    Object oTestCode_edt is a cRefactorScintillaEditor
+        Set Size to 45 306
+        Set Location to 333 12
+        Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
+        Set peAnchors to anBottomLeftRight     
+        Set pbExternalModifyCheck to False
+        Set phoEditor of ghoRefactorFuncLib to Self 
+        Procedure FindNextError
+            Send FindNextError of oOutputBox
+        End_Procedure
+        On_Key Key_Ctrl+Key_N Send FindNextError
     End_Object
 
     Procedure ScaleFont Integer iDirection 
