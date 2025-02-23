@@ -118,8 +118,25 @@ Object DFUnitTestRunner_vw is a View
             Forward Send Add_Focus hoParent
             Set phInvokingObject of (oGridCopyMenu(Self)) to Self
         End_Procedure
+        
+        Procedure FindNextError
+            Integer iSelStart iSelEnd
+            String sSearchText
+            
+            Move "[Failed!]" to sSearchText
+            Get FindText sSearchText 0 to iSelStart
+            If (iSelStart = -1) Begin
+                Send Beginning_of_Data
+                Get FindText sSearchText 0 to iSelStart
+            End
+            If (iSelStart <> -1) Begin
+                Move (Length(sSearchText) + iSelStart) to iSelEnd
+                Send SetSel iSelStart iSelEnd
+            End
+        End_Procedure
 
         On_Key Key_Ctrl+Key_C Send Copy
+        On_Key Key_Ctrl+Key_N Send FindNextError
     End_Object
 
     Object oEditor_tb is a TextBox
