@@ -67,7 +67,7 @@ Object DFUnitTestRunner_vw is a View
         Set Label to "Next Error"
         Set piImageSize to 16
         Set psImage to "ActionFind.ico"
-        Set psToolTip to "Find next '[Failed!]' line"
+        Set psToolTip to "Find next '[Failed!]' line (Ctrl+N)"
 
         Procedure OnClick
             Send FindNextError of oOutputBox
