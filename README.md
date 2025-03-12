@@ -1,5 +1,9 @@
 # DFRefactor - An Automated Refactoring Tool for DataFlex
 
+It is highly recommended to download/install the GitHub Desktop app as it will make your work so much easier. It can be downloaed via this link: https://desktop.github.com/download/​
+Then click the "<> Code" button and select "Open with GitHub Desktop". It will install the full repository at your selected download location.
+**Note: Do not select the "Download ZIP"**, as GitHub will not include libraries that are used by the workspace and you need to manually download them, quirky!
+
 DFRefactor is a powerful, free tool written in DataFlex that assists in refactoring legacy DataFlex code. It specifically targets code that uses syntax that is no longer supported or encouraged. Refactoring involves improving the structure and readability of existing code without altering its external behavior.
 
 - The only supported versions of DataFlex Studio are the latest two: currently, DataFlex 2024 and 2025. While this means that you need one of these two versions installed to compile and run the refactoring programs, it doesn't prevent you from using the tool on projects or workspaces created with earlier DataFlex versions. An older version of the tool, compatible with versions prior to 2023, is available as a separate branch. However, please note that this branch is not maintained, so you would need to use it at your own risk.
