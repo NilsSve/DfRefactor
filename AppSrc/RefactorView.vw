@@ -1034,9 +1034,9 @@ Object oRefactorView is a cRDCDbView
 
     Procedure OnWorkspaceLoaded
         Integer iSelectedFolders  
-        Handle hoFolderSelHeaDD
+        Handle hoFolderSelHeaDD hoDD
         Boolean bExists bOK
-        String sHomePath sUserName sWorkspaceHome
+        String sHomePath sUserName sWorkspaceHome sValue
         tFolderData[] asSavedFolders
         
         Get psWorkspaceHomePath  of ghoApplication to sWorkspaceHome
@@ -1052,6 +1052,13 @@ Object oRefactorView is a cRDCDbView
         Send Find of oFolderSelDtl_DD GE Index.1
         Send OnChange of oCountSourceLines_cb
         
+        Get Value of oConstrainByType_cf to sValue
+        If (sValue <> "") Begin
+            Set Value of oConstrainByType_cf to CS_AllFunctions
+        End
+        Move (oFunctions_DD(Self)) to hoDD
+        Set piFunctionType of hoDD to eAllFunctions 
+        Send Find of hoDD GE Index.1
         // Weird voodoo.
         // After a workspace has been opened, the enabled_state should also
         // be set to true, but it isn't until the mouse is hovered(!) over the grid.
