@@ -302,7 +302,7 @@ Object oRefactorTestBench is a cRefactorDbView
                         Procedure OnIdle
                             Integer iSelectedFuncs iTotalFuncs
                             Send Request_Save of oSysFile_DD
-                            Move SysFile.SelectedFunctionTotal to iSelectedFuncs
+                            Get TotalNoSelected    of (Main_DD(Self)) to iSelectedFuncs
                             Get TotalNoOfFunctions of (Main_DD(Self)) to iTotalFuncs
                             Set Value of oNoOfSelectedFunctions_fm to (String(iSelectedFuncs) * "(" + String(iTotalFuncs) + ")")
                         End_Procedure 
