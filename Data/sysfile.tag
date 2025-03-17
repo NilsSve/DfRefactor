@@ -15,3 +15,5 @@ iCountNumberOfChangedFiles
 iCountNumberOfLines
 bReadOnly
 iBackupDaysOverwriteCycle
+bReadOnly
+iBackupDaysOverwriteCycle
