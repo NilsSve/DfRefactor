@@ -10,20 +10,18 @@ Use dfClient.pkg
 Activate_View Activate_oEditorView_vw For oEditorView_vw
 Object oEditorView_vw is a cRefactorDbView
     Set Size to 263 492
-    Set Border_Style to Border_Thick
     Set Maximize_Icon to True
     Set Label to "Refactoring Editor"
+    Set Icon to "Editor.ico"
     Set pbAutoActivate to True
     Set pbAcceptDropFiles to True
-    Set Icon to "Editor.ico"
-    Set Label to "Editor (Editor Functions)"
 
     Set phoEditorView of ghoApplication to Self
 
     Object oEditorInfo_tb is a TextBox
         Set Size to 10 351
         Set Location to 4 20
-        Set Label to "Editor for functions of type: 'Editor - One File'. Those functions must have an active editor object to work."
+        Set Label to "When Single File mode is used, and for functions of type: 'Editor - One File'. Those functions must have an active editor object to work."
         Set FontWeight to fw_Bold
     End_Object
 
