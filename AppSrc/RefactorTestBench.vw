@@ -22,7 +22,6 @@ Use cRefactorEngine.pkg
 
 Activate_View Activate_oRefactorTestBench for oRefactorTestBench
 Object oRefactorTestBench is a cRefactorDbView
-    Set Border_Style to Border_Thick
     Set Size to 282 929
     Set Location to 2 7
     Set Label to "Test Bench"
