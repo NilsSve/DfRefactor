@@ -49,7 +49,7 @@ Object oHtmlHelp is a cHtmlHelp
     Set pbAlwaysOnTop to False
 End_Object
 
-Use Dfabout.pkg
+Use Dfabout.pkg // Contains RunProgramWait procedure.
 Use cRefactorApplication.pkg
 Object oApplication is a cRefactorApplication
     Set psProduct to "Test Bench"
@@ -155,9 +155,87 @@ Object oApplication is a cRefactorApplication
         End
     End_Procedure
 
+    // Delete the .err file if exists.
+    Function DeleteCompileErrorsFile String sProgram Returns Boolean
+        String sPath sErrFile
+        Boolean bExists bOK
+        Integer iPos
+        
+        Move True to bOK
+        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
+        Get vFolderFormat sPath to sPath
+        If (Lowercase(sProgram) contains ".") Begin
+            Move (Pos(".", sProgram)) to iPos
+            Move (Left(sProgram, iPos -1)) to sProgram
+        End
+        Move (sProgram + ".err") to sErrFile
+        File_Exist (sPath + sErrFile) bExists
+        If (bExists = True) Begin
+            Get vDeleteFile (sPath + sErrFile) to bOK
+            Move (not(bOK)) to bOK // The logic for the vDeleteFile is backwards.
+        End            
+        Function_Return bOK
+    End_Function
+        
+    // The passed sProgram param should only be the name without any extension.
+    Function CompileProgram String sProgram String ByRef sErrorText Returns Boolean
+        String sBinPath sHome sAppSrc sCompPath sComOptions sErrFile sProgramPath sSourceFile
+        Boolean bExists bOK
+        Integer iPos
+        
+        Get psCompiler to sCompPath
+        If (sCompPath = "") Begin
+            Get DFBinPath to sBinPath
+            Get vFolderFormat sBinPath to sBinPath
+            Move (sBinPath + CS_Compiler) to sCompPath
+        End
+        Get vFilePathExists sCompPath to bExists
+        If (bExists = False) Begin
+            Move ("The compiler program and path, that is setup with the 'Program Properties' dialog, cannot be found:\n" + sCompPath) to sErrorText
+            Function_Return False
+        End
+        
+        Get psHome       of (phoWorkspace(Self)) to sHome
+        Get psAppSrcPath of (phoWorkspace(Self)) to sAppSrc
+        Get vFolderFormat sHome to sHome
+        Get vFolderFormat sAppSrc to sAppSrc 
+        
+        If (Lowercase(sProgram) contains ".") Begin 
+            Move (Pos(".", sProgram)) to iPos
+            Move (Left(sProgram, iPos -1)) to sProgram
+        End
+        // Remove any "Program.err" file from the AppSrc folder:
+        Move (sAppSrc + sProgram + ".err") to sErrFile
+        Get DeleteCompileErrorsFile sErrFile to bOK
+        If (bOK = False) Begin
+            Move ("The" * String(sProgram) + ".err file, could not be deleted! Cannot continue compiling.") to sErrorText
+            Function_Return False
+        End
+        
+        Get ReadString of ghoApplication CS_Settings CS_Build_Options CS_CompOptions to sComOptions
+        Move (Replace("-x-", Lowercase(sComOptions), "")) to sComOptions
+        Move (Replace("-x",  Lowercase(sComOptions), "")) to sComOptions
+        Move (sProgram + ".src") to sSourceFile
+        Get psProgramPath of (phoWorkspace(ghoApplication)) to sProgramPath
+        Get vFolderFormat sProgramPath  to sProgramPath
+        
+        Send Cursor_Wait of Cursor_Control
+        Send RunProgramWait sCompPath ("-x" + '"' + sHome + CS_SWSFile + '"' * sComOptions * sSourceFile)
+        Send Cursor_Ready of Cursor_Control
+
+        // Check if there is a new "Program.err" file in the AppSrc folder:
+        Get vFilePathExists sErrFile to bExists 
+        If (bExists = True) Begin
+            Move ("The compilation of the" * (sProgram + ".src program") * "failed and can't be started. Please try to compile it from the Studio instead.") to sErrorText
+            Function_Return False
+        End
+        
+        Function_Return True
+    End_Function
+
     Procedure CompileRefactoredCode
-        String sRefactoredFile sBinPath sHome sAppSrc sCompareApp sCompPath sCompOpt
-        Boolean bExists bIsRefactoring
+        String sRefactoredFile sBinPath sHome sAppSrc sCompPath sCompOpt sErrorText sErrFile
+        Boolean bExists bIsRefactoring bOK
         Integer iLines
         Handle ho
         
@@ -168,38 +246,58 @@ Object oApplication is a cRefactorApplication
         Get phoEditorRefactored to ho
         Get Line_Count of ho to iLines
         If (iLines <= 1) Begin
-            Send Info_Box "You need to press 'Refactor Legacy Code', or short-cut key (Ctrl+R)"
+            Send Info_Box "You need to press the button 'Refactor Legacy Code', or use the short-cut key (Ctrl+F5), first."
             Procedure_Return
         End
         
-        Get psCompiler to sCompPath
-        If (sCompPath = "") Begin
-            Get DFBinPath to sBinPath
-            Get vFolderFormat sBinPath to sBinPath
-            Move (sBinPath + CS_Compiler) to sCompPath
-        End
-        Get psCompOpt to sCompOpt
-        Move (Replace("r", sCompOpt, "")) to sCompOpt
-        Get psHome of (phoWorkspace(Self)) to sHome
-        Get vFolderFormat sHome to sHome
+        // Save any changes and collect info:
+        Send Execute of (oSave_ToolItem(ghoCommandBars))
         Get psAppSrcPath of (phoWorkspace(Self)) to sAppSrc
         Get vFolderFormat sAppSrc to sAppSrc
-        
-        Send Execute of (oSave_ToolItem(ghoCommandBars))
-        
         Get psCodeFile of (phoEditorRefactored(Self)) to sRefactoredFile
-        Send Cursor_Wait of Cursor_Control
-        Runprogram Wait ('"' + sCompPath + '"' * "-x" + '"' + sHome + CS_SWSFile + '"' * String(sCompOpt) * String(CS_TestProgram))
+        Get DeleteCompileErrorsFile CS_TestErrFile to bOK
+        If (bOK = False) Begin
+            Move ("The" * String(CS_TestErrFile) + ".err file, could not be deleted! Cannot continue compiling.") to sErrorText
+            Procedure_Return
+        End
+
+        // Compile program:
+        Get CompileProgram CS_TestProgram (&sErrorText) to bOK
         
-        Send Cursor_Ready of Cursor_Control
+        // Show result:
         Get FileSize of ghoFileSystem (sAppSrc + CS_TestErrFile) to iLines
-        If (iLines > 0) Begin
+        If (iLines > 0 and bOK = False) Begin
             Send ActivateCompileErrorDialog of (Client_Id(ghoCommandBars)) (sAppSrc + CS_TestErrFile)
         End
         Else Begin                   
             Send CloseCompileErrorDialog of (Client_Id(ghoCommandBars))
             Send Info_Box "The refactored code compiled successfully!"
         End
+    End_Procedure
+    
+    // The sProgram param should be the name of the DF program to be run with NO extenstion.
+    Procedure RunDFProgram String sProgram
+        String sProgramPath
+        Boolean bExists
+        Integer iPos
+         
+        Get psProgramPath of (phoWorkspace(ghoApplication)) to sProgramPath
+        Get vFolderFormat sProgramPath to sProgramPath
+        If (Lowercase(sProgram) contains ".") Begin 
+            Move (Pos(".", sProgram)) to iPos
+            Move (Left(sProgram, iPos -1)) to sProgram
+        End
+        #IFDEF Is$Win64
+            Append sProgram "64.exe"
+        #ELSE
+            Append sProgram ".exe"
+        #ENDIF
+        Get vFilePathExists (sProgramPath + sProgram) to bExists
+        If (bExists = False) Begin
+            Send Info_Box ("The program file was not found:\n" + ('"' + sProgramPath + sProgram + '"'))
+            Procedure_Return
+        End
+        Runprogram Background (sProgramPath + sProgram)
     End_Procedure
     
     Procedure OpenContainingContainer
@@ -1190,56 +1288,22 @@ Object oMain is a Panel
                 Send CompileRunProgram CS_DFRefactor
             End_Procedure
         
-        End_Object
-
+        End_Object 
+        
         // Common method for oExternalProgramsToolbar and oDFRefactor_MenuItem OnExectute.
         Procedure CompileRunProgram String sProgram
-            Boolean bExists bEnabled
-            String sCompiler sProgramPath sProgramFile sSourceFile sBinPath sHome sComOptions sAppSrc sErrFile
+            Boolean bOK
+            String sErrorText
             
-            Get ReadString of ghoApplication CS_Settings CS_DFCompiler "" to sCompiler
-            Get vFilePathExists sCompiler to bExists
-            If (bExists = False) Begin
-                Send Info_Box ("The compiler program and path, setup on the 'Program Properties' dialog, cannot be found:\n" + sCompiler)
+            // Compile program:
+            Get CompileProgram of ghoApplication sProgram (&sErrorText) to bOK
+            If (bOK = False) Begin
+                Send Info_Box sErrorText
                 Procedure_Return
             End
-            Get psHome of (phoWorkspace(ghoApplication)) to sHome
-            Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sAppSrc
-            // Remove any "Program.err" file from the AppSrc folder:
-            Move (sAppSrc + sProgram + ".err") to sErrFile
-            Get vFilePathExists sErrFile to bExists
-            If (bExists = True) Begin
-                Get vDeleteFile sErrFile to bExists
-            End
-            Get vFolderFormat sAppSrc to sAppSrc
-            Get vFolderFormat sHome to sHome
-            Get psProgramPath of (phoWorkspace(ghoApplication)) to sProgramPath
-            Get vFolderFormat sProgramPath to sProgramPath
-            Move (sProgram + ".src") to sSourceFile
-            Get ReadString of ghoApplication CS_Settings CS_Build_Options CS_CompOptions to sComOptions
-            Move (Replace("-x-", Lowercase(sComOptions), "")) to sComOptions
-            Move (Replace("-x",  Lowercase(sComOptions), "")) to sComOptions
-            Send Cursor_Wait of Cursor_Control
-            Send RunProgramWait sCompiler ("-x" + '"' + sHome + CS_SWSFile + '"' * sComOptions * sSourceFile)
-            Send Cursor_Ready of Cursor_Control
-            // Check if there is any "Program.err" file in the AppSrc folder:
-            Get vFilePathExists sErrFile to bExists 
-            If (bExists = True) Begin
-                Send Info_Box ("The compilation of the" * (sProgram + ".src program") * "failed and can't be started. Please try to compile it from the Studio.")
-            End
-            Else If (Lowercase(sCompiler) contains "console" or (not(sComOptions contains "r"))) Begin
-                #IFDEF Is$Win64
-                    Append sProgram "64.exe"
-                #ELSE
-                    Append sProgram ".exe"
-                #ENDIF
-                Get vFilePathExists (sProgramPath + sProgram) to bExists
-                If (bExists = False) Begin
-                    Send Info_Box ("The program file was not found:\n" + ('"' + sProgramPath + sProgram + '"'))
-                    Procedure_Return
-                End
-                Runprogram Background (sProgramPath + sProgram)
-            End
+            
+            // Run the program:
+            Send RunDFProgram of ghoApplication sProgram
         End_Procedure
         
         // ToDo: Not sure if this is useful for this program. It can be started

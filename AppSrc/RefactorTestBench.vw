@@ -426,8 +426,8 @@ Object oRefactorTestBench is a cRefactorDbView
         tRefactorFiles RefactorFiles
         
         Move False to Err
-        Get DeleteCompileErrorsFile to iRetval
-        If (iRetval <> 0) Begin
+        Get DeleteCompileErrorsFile of ghoApplication CS_TestProgram to bOK
+        If (bOK = False) Begin
             Get YesNo_Box "Could not delete the compiler's error file. Continue?" to iRetval
             If (iRetval <> MBR_Yes) Begin
                 Procedure_Return
@@ -451,30 +451,12 @@ Object oRefactorTestBench is a cRefactorDbView
             Procedure_Return
         End
 
-        // Start the Engine!
+        // Start the Engine!                                                    
         Send StartEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor
         // Save the result
         Send SaveFile of hoRefactoredEditor
     End_Procedure
 
-    // Delete the .err file if exists.
-    Function DeleteCompileErrorsFile Returns Integer
-        String sPath sErrFile
-        Integer iRetval  
-        Boolean bExists
-        
-        Move 0 to iRetval
-        Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
-        Get vFolderFormat sPath to sPath
-        Move CS_TestProgram to sErrFile
-        Move (Replace(".src", sErrFile, ".err")) to sErrFile
-        File_Exist  (sPath + sErrFile) bExists
-        If (bExists = True) Begin
-            Get vDeleteFile (sPath + sErrFile) to iRetval
-        End            
-        Function_Return iRetval
-    End_Function
-        
     // These two messages writes & reads where the splitter should appear,
     // when the program is started.
     Procedure Page_Delete 
