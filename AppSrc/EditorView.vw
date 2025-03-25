@@ -13,7 +13,7 @@ Object oEditorView_vw is a cRefactorDbView
     Set Maximize_Icon to True
     Set Label to "Refactoring Editor"
     Set Icon to "Editor.ico"
-    Set pbAutoActivate to True
+//    Set pbAutoActivate to True
     Set pbAcceptDropFiles to True
 
     Set phoEditorView of ghoApplication to Self

@@ -16,7 +16,7 @@ Register_Function MyDelete_Confirmation Returns Integer
 Activate_View Activate_oSelectFunctions_vw for oSelectFunctions_vw
 Object oSelectFunctions_vw is a cRDCDbView
     Set Location to 2 4
-    Set Size to 193 635
+    Set Size to 193 636
     Set Label to "Select Functions"
     Set Border_Style to Border_Thick
     Set pbAutoActivate to True   
@@ -42,7 +42,7 @@ Object oSelectFunctions_vw is a cRDCDbView
     Set Server  To oFunctions_DD
 
     Object oSelectFunctions_grp is a cRDCDbHeaderGroup
-        Set Size to 190 637
+        Set Size to 190 634
         Set piMinSize to 107 490
         Set Location to 4 0
         Set Label to "Function List"             

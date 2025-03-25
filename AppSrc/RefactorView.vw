@@ -46,7 +46,7 @@ Register_Procedure ActivateProcess
 Activate_View Activate_oRefactorView for oRefactorView
 Object oRefactorView is a cRDCDbView
     Set Location to 1 0
-    Set Size to 315 654
+    Set Size to 272 638
     Set Label to "Selections"
     Set Icon to "DFRefactor.ico"
     Set pbAcceptDropFiles to True
@@ -92,9 +92,8 @@ Object oRefactorView is a cRDCDbView
     Set Server to oFunctions_DD
                                     
     Object oMain_TabDialog is a dbTabDialog
-        Set Size to 241 653
+        Set Size to 203 653
         Set piMinSize to 140 510
-        Set Location to 0 -2
         Set Rotate_Mode to RM_Rotate
         Set peAnchors to anAll
         Set Auto_Clear_DEO_State to False  
@@ -106,7 +105,7 @@ Object oRefactorView is a cRDCDbView
             Set Label to "Select Functions"
 
             Object oSelectFunctions_grp is a cRDCDbHeaderGroup
-                Set Size to 219 655
+                Set Size to 185 634
                 Set piMinSize to 126 490
                 Set Location to 4 0
                 Set Label to "Function List"             
@@ -118,8 +117,8 @@ Object oRefactorView is a cRDCDbView
                 Set peAnchors to anAll
 
                 Object oFunctionSelection_grd is a cRDCDbCJGrid
-                    Set Size to 204 636
-                    Set Location to 27 9
+                    Set Size to 156 620
+                    Set Location to 27 10
                     Set Ordering to 2
                     Set pbDbShowInvertSelectionsMenuItem to True     
                     Set pbHeaderPrompts to False
@@ -135,7 +134,7 @@ Object oRefactorView is a cRDCDbView
 
                     Object oFunctions_ID is a cRDCDbCJGridColumn
                         Entry_Item Functions.ID
-                        Set piWidth to 30
+                        Set piWidth to 36
                         Set psCaption to "ID"
                         Set pbEditable to False
                         Set peTextAlignment to xtpAlignmentCenter
@@ -143,7 +142,7 @@ Object oRefactorView is a cRDCDbView
 
                     Object oFunctions_Function_Name is a cDbCJGridColumnSuggestionNew //cDbCJGridColumnSuggestion
                         Entry_Item Functions.Function_Name
-                        Set piWidth to 180
+                        Set piWidth to 219
                         Set psCaption to "Function Name (Suggestion list)"    
                         Set psToolTip to "This is a full text suggestion list. You can start typing to search for any keyword and a suggestion list will appear for you to select from."
                         Set Status_Help to (psToolTip(Self))
@@ -154,7 +153,7 @@ Object oRefactorView is a cRDCDbView
 
                     Object oFunctions_Function_Help is a cRDCDbCJGridColumn
                         Entry_Item Functions.Function_Help
-                        Set piWidth to 370
+                        Set piWidth to 451
                         Set peHeaderAlignment to xtpAlignmentCenter
                         Set psCaption to "Help Text"
                         Set pbEditable to False
@@ -163,7 +162,7 @@ Object oRefactorView is a cRDCDbView
             
                     Object oFunctions_Type is a cRDCDbCJGridColumn
                         Entry_Item Functions.Type
-                        Set piWidth to 130
+                        Set piWidth to 158
                         Set psCaption to "Type"
                         Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
                         Set Status_Help to (psToolTip(Self))
@@ -177,7 +176,7 @@ Object oRefactorView is a cRDCDbView
 
                     Object oFunctions_Parameter is a cRDCDbCJGridColumn
                         Entry_Item Functions.Parameter
-                        Set piWidth to 100
+                        Set piWidth to 122
                         Set psCaption to "Parameter"
                         Set psToolTip to "For some functions an extra parameter can be passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
                         Set Status_Help to (psToolTip(Self))
@@ -228,7 +227,7 @@ Object oRefactorView is a cRDCDbView
 
                     Object oFunctions_Selected is a cRDCDbCJGridColumn
                         Entry_Item Functions.Selected
-                        Set piWidth to 39
+                        Set piWidth to 48
                         Set psCaption to "Select"
                         Set pbAllowRemove to False
                         Set pbCheckbox to True
@@ -285,7 +284,7 @@ Object oRefactorView is a cRDCDbView
 
                 Object oSelectAll_btn is a Button
                     Set Size to 14 62
-                    Set Location to 9 247
+                    Set Location to 10 238
                     Set Label to "Select All"
                     Set psImage to "SelectAll.ico"   
                     Set psToolTip to "(Ctrl+A)"
@@ -297,7 +296,7 @@ Object oRefactorView is a cRDCDbView
 
                 Object oSelectNone_btn is a Button
                     Set Size to 14 62
-                    Set Location to 9 313
+                    Set Location to 10 304
                     Set Label to "Select None"
                     Set psImage to "SelectNone.ico"
                     Set psToolTip to "(Ctrl+N)"
@@ -309,7 +308,7 @@ Object oRefactorView is a cRDCDbView
 
                 Object oSelectInvert_btn is a Button
                     Set Size to 14 74
-                    Set Location to 9 379
+                    Set Location to 10 370
                     Set Label to "Invert Selections"
                     Set psImage to "SelectInvert.ico"
                     Set psToolTip to "(Ctrl+I)"
@@ -320,8 +319,8 @@ Object oRefactorView is a cRDCDbView
                 End_Object
 
                 Object oConstrainByType_cf is a ComboForm
-                    Set Size to 14 123
-                    Set Location to 10 521
+                    Set Size to 14 116
+                    Set Location to 10 514
                     Set peAnchors to anTopRight
                     Set Label_Col_Offset to 2
                     Set Label_Justification_Mode to JMode_Right
@@ -399,7 +398,7 @@ Object oRefactorView is a cRDCDbView
     
             Object oDbSourceFolders_grp is a cRDCDbHeaderGroup
                 Set Location to 4 0
-                Set Size to 233 634
+                Set Size to 185 634
                 Set Label to "Folders List"
                 Set psImage to "Folder.ico"
                 Set psNote to "Select Folders. Right click grid for options"
@@ -410,8 +409,8 @@ Object oRefactorView is a cRDCDbView
 
                 Object oDbFolders_grd is a cRDCDbCJGrid
                     Set Server to oFolderSelDtl_DD
-                    Set Size to 204 621
-                    Set Location to 27 9
+                    Set Size to 157 620
+                    Set Location to 27 10
                     Set Ordering to 2
                     Set piLayoutBuild to 5
                     Set pbAllowDeleteRow to True
@@ -502,7 +501,7 @@ Object oRefactorView is a cRDCDbView
 
                 Object oSelectAll_btn is a Button
                     Set Size to 14 62
-                    Set Location to 9 255
+                    Set Location to 10 238
                     Set Label to "Select All"
                     Set psImage to "SelectAll.ico"
                     Set psToolTip to "(Ctrl+A)"
@@ -514,7 +513,7 @@ Object oRefactorView is a cRDCDbView
                 
                 Object oSelectNone_btn is a Button
                     Set Size to 14 62
-                    Set Location to 9 321
+                    Set Location to 10 304
                     Set Label to "Select None"
                     Set psImage to "SelectNone.ico"
                     Set psToolTip to "(Ctrl+N)"
@@ -526,7 +525,7 @@ Object oRefactorView is a cRDCDbView
 
                 Object oSelectInvert_btn is a Button
                     Set Size to 14 74
-                    Set Location to 9 387
+                    Set Location to 10 370
                     Set Label to "Invert Selections"
                     Set psImage to "SelectInvert.ico"
                     Set psToolTip to "(Ctrl+I)"
@@ -577,7 +576,7 @@ Object oRefactorView is a cRDCDbView
 
     Object oFileFilters_grp is a cRDCDbHeaderGroup
         Set Size to 66 260
-        Set Location to 246 6
+        Set Location to 203 6
         Set psLabel to "File Filter"
         Set psNote to "File Extensions Filter"
         Set psToolTip to "Select file extensions filter. Each extension must start with a wildcard character and a dot (*.) and file extensions must be separated with a semicolon (;)"
@@ -790,9 +789,9 @@ Object oRefactorView is a cRDCDbView
     End_Object
 
     Object oRunNow_grp is a cRDCDbHeaderGroup
-        Set Size to 66 377
-        Set Location to 246 270
-        Set piMinSize to 48 367
+        Set Size to 66 362
+        Set Location to 203 270
+        Set piMinSize to 48 362
         Set psLabel to "Refactor Code"
         Set psNote to "Apply functions for selected folders and filter" 
         Set psToolTip to "Calls the selected functions for the matching selected folders and file extensions."
@@ -802,7 +801,7 @@ Object oRefactorView is a cRDCDbView
 
         Object oNoOfSelectedFunctions_fm is a cRDCDbForm
             Set Size to 13 32
-            Set Location to 32 179
+            Set Location to 32 164
             Set Label_Justification_Mode to JMode_Right
             Set Label to "Selected Functions:"
             Set psToolTip to "Total number of functions selected."
@@ -817,7 +816,7 @@ Object oRefactorView is a cRDCDbView
 
         Object oNoOfSelectedFolders_fm is a cRDCDbForm
             Set Size to 13 32
-            Set Location to 45 179
+            Set Location to 45 164
             Set Label_Justification_Mode to JMode_Right
             Set Label to "Selected Folders:"
             Set psToolTip to "Total number of folders selected."
@@ -846,7 +845,7 @@ Object oRefactorView is a cRDCDbView
         Object oCountSourceLines_cb is a dbCheckBox
             Entry_Item SysFile.bCountSourceLines
             Set Server to oSysFile_DD
-            Set Location to 17 216
+            Set Location to 17 201
             Set Size to 8 109
             Set Label to "Count Source Lines (only)"   
 //            Set FontWeight to fw_Bold
@@ -862,7 +861,7 @@ Object oRefactorView is a cRDCDbView
         Object oReadOnly_cb is a dbCheckbox
             Entry_Item SysFile.bReadOnly
             Set Server to oSysFile_DD
-            Set Location to 17 318
+            Set Location to 17 303
             Set Size to 8 109
             Set Label to "Read Only"
             Set peAnchors to anBottomLeft
@@ -895,7 +894,7 @@ Object oRefactorView is a cRDCDbView
 
         Object oExecute_btn is a cRDCButton
             Set Size to 30 98
-            Set Location to 29 215
+            Set Location to 29 200
             Set Label to "Start &Refactoring!" //"&Refactor Code Now!"
             Set psToolTip to "Start processing the selected refactoring functions. If 'Workspace' mode has been selected from the toolbar all source files that matches the 'File Extensions Filter' will be processed. Else the operations will take place on a single file only. (Alt+R or Ctrl+R)"
             Set pbAutoEnable to True
@@ -960,7 +959,7 @@ Object oRefactorView is a cRDCDbView
 
         Object oStartCompareProgram_btn is a cRDCButton
             Set Size to 30 54
-            Set Location to 29 317
+            Set Location to 29 302
             Set Label to "Co&mpare Code"
             Set peAnchors to anBottomLeft
             Set psImage to "Compare.ico"
