@@ -4,6 +4,12 @@ It is highly recommended to download and install the GitHub Desktop app, as it w
 
 Once installed use **the Edge browser**, click the "<> Code" button at this GitHub page and select "Open with GitHub Desktop." This will install the complete repository in your chosen download location. 
 
+**An alternate approach** is to copy the address from the browser for the DFRefactor GitHub page, aka;
+https://github.com/NilsSve/DfRefactor
+
+Then from GitHub Desktop, select "File - Clone a repostory", then select  the third tab-page "URL",
+and paste the path from above. Finally select your local path to install to, and click the "Clone" button.
+
 **Note:** Do not select "Download ZIP," as GitHub will not include the libraries used by the workspace, and you would need to download them manually, which can be cumbersome!
 
 DFRefactor is a powerful and free tool written in DataFlex that assists with refactoring legacy DataFlex code. It specifically targets code that uses syntax that is no longer supported or recommended. Refactoring is the process of improving the structure and readability of existing code without altering its external behavior.
