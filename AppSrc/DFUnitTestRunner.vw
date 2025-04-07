@@ -3,9 +3,35 @@ Use oGridCopyMenu.pkg
 Use cUnitCommandBar.pkg
 Use DFUnit\Reporting\ReporterManager.pkg
 Use DFUnit\Reporting\Reporters\UIListReporter.pkg
-Use cRDCButtonDPI.pkg
-Use cRefactorScintillaEditor.pkg
-Use cRefactorFuncLib.pkg
+
+// Comment out the next Define statement line to *not* use the
+// Scintilla Editor window.
+//Define CS_UseScintillaEditor for "cRefactorScintillaEditor"
+
+#IFDEF CS_UseScintillaEditor
+    Use cRefactorScintillaEditor.pkg
+#ELSE
+    Register_Procedure LoadFile String sFileName 
+    Register_Function IsFileTimeNewer String sFileName Returns Boolean 
+    Register_Function WriteDataToEditor String[] asCode Returns Boolean 
+    Register_Function EditorDataAsStringArray Returns String[]
+    Register_Function EditorFormatToUtf8 String sLine Returns String
+    Register_Function pbHasUtf8BOM Returns Boolean
+    Register_Function pbUtf8Mode Returns Boolean 
+    Register_Function Utf8ToEditorFormat String sLine Returns Boolean 
+    Register_Procedure Set pbHasUtf8BOM Boolean bState 
+    Register_Procedure Set pbUtf8Mode Boolean bState 
+    Register_Procedure Set pbOemMode Boolean bState 
+    Register_Procedure ShowTextEncoding Integer iEncoding
+    Register_Procedure ChangeTextEncoding 
+    Register_Procedure RefactorNormalizeCase 
+    Register_Procedure RefactorReIndent
+    Register_Procedure GotoLine Integer iLine
+    Register_Procedure RefactorReIndent
+    Register_Procedure SetAdjustments Boolean bState
+    Register_Procedure ApplyEditorOptions 
+    Register_Procedure OnPropsChange 
+#ENDIF
 
 Activate_View Activate_DFUnitTestRunner_vw for DFUnitTestRunner_vw
 Object DFUnitTestRunner_vw is a View
@@ -16,7 +42,7 @@ Object DFUnitTestRunner_vw is a View
     Set View_Mode to Viewmode_Normal 
     Set pbAutoActivate to True
 
-    Object oRunTestsButton is a cRDCButtonDPI
+    Object oRunTestsButton is a Button
         Set Size to 30 87
         Set Location to 9 12
         Set Label to "Run again"
@@ -35,7 +61,7 @@ Object DFUnitTestRunner_vw is a View
     
     End_Object
 
-    Object oFirstRow_btn is a cRDCButtonDPI
+    Object oFirstRow_btn is a Button
         Set Size to 14 66
         Set Location to 9 105
         Set Label to "View Top" 
@@ -48,7 +74,7 @@ Object DFUnitTestRunner_vw is a View
 
     End_Object
 
-    Object oLatestRow_btn is a cRDCButtonDPI
+    Object oLatestRow_btn is a Button
         Set Size to 14 66
         Set Location to 24 105
         Set Label to "View Bottom"
@@ -61,7 +87,7 @@ Object DFUnitTestRunner_vw is a View
 
     End_Object
 
-    Object oNextError_btn is a cRDCButtonDPI
+    Object oNextError_btn is a Button
         Set Size to 14 66
         Set Location to 24 175
         Set Label to "Next Error"
@@ -75,7 +101,7 @@ Object DFUnitTestRunner_vw is a View
 
     End_Object
 
-    Object oClose_btn is a cRDCButtonDPI
+    Object oClose_btn is a Button
         Set Size to 30 61
         Set Location to 9 256
         Set Label to "Exit"
@@ -151,6 +177,7 @@ Object DFUnitTestRunner_vw is a View
         Set peAnchors to anBottomLeft
     End_Object
 
+#IFDEF CS_UseScintillaEditor
     Object oTestCode_edt is a cRefactorScintillaEditor
         Set Size to 45 306
         Set Location to 333 12
@@ -163,6 +190,7 @@ Object DFUnitTestRunner_vw is a View
         End_Procedure
         On_Key Key_Ctrl+Key_N Send FindNextError
     End_Object
+#ENDIF
 
     Procedure ScaleFont Integer iDirection 
     End_Procedure 
