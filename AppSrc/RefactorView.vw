@@ -22,8 +22,6 @@ Use cSysFileDataDictionary.dd
 Use cFunctionsDataDictionary.dd
 Use cFolderSelHeaDataDictionary.dd
 Use cFolderSelDtlDataDictionary.dd
-Use cdbCJGridColumn.pkg
-Use Windows.pkg
 
 Enum_List
     Integer Ico_Folders
@@ -64,6 +62,23 @@ Object oRefactorView is a cRDCDbView
     Object oFolderSelDtl_DD is a cFolderSelDtlDataDictionary
         Set DDO_Server to oFolderSelHea_DD
         Set Constrain_File to FolderSelHea.File_Number
+
+        Procedure Relate_Main_File
+            String[] asFolders asEmpty
+            Integer iIDa iIDb
+            Get pasCmdLineSetSelectedFolders of ghoApplication to asFolders
+            If (SizeOfArray(asFolders) = 0) Begin
+                Procedure_Return
+            End
+            Forward Send Relate_Main_File
+            Get Field_Current_Value Field FolderSelDtl.FolderSelHeaID to iIDa
+            Get Field_Current_Value Field FolderSelDtl.ID             to iIDb
+            If (iIDa <> 0 and iIDb <> 0) Begin
+                Send CmdLineSetSelectedFolders asFolders 
+                // Reset ghoApplication property to only update database once on startup.
+                Set pasCmdLineSetSelectedFolders of ghoApplication to asEmpty
+            End
+        End_Procedure
     End_Object
 
     Object oFunctions_DD is a cFunctionsDataDictionary  
