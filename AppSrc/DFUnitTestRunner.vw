@@ -6,7 +6,7 @@ Use DFUnit\Reporting\Reporters\UIListReporter.pkg
 
 // Comment out the next Define statement line to *not* use the
 // Scintilla Editor window.
-//Define CS_UseScintillaEditor for "cRefactorScintillaEditor"
+Define CS_UseScintillaEditor for "cRefactorScintillaEditor"
 
 #IFDEF CS_UseScintillaEditor
     Use cRefactorScintillaEditor.pkg
