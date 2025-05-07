@@ -241,20 +241,6 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Send MoveToFirstRow
             End_Procedure
 
-//            Function ItemCount Returns Integer
-//                Integer iItems
-//                Forward Get ItemCount to iItems
-//                Set piItemCount of ghoApplication to iItems
-//                Function_Return iItems
-//            End_Function
-//
-//            Function CheckedItems Returns Integer
-//                Integer iSelected
-//                Forward Get CheckedItems to iSelected
-//                Set piCheckedItems of ghoApplication to iSelected
-//                Function_Return iSelected
-//            End_Function
-            
             // For unknown reason the first row in the list is *not* highlighted
             // when the grid is filled. This fixes it.
             Procedure Activating
