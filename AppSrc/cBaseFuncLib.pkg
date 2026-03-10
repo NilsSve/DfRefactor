@@ -439,7 +439,7 @@ Class cBaseFuncLib is a cObject
         If (Trim(sExpression) = "") Begin
             Get _FetchExpression TokenizerData.aExpressions eOfExpression to sExpression
             If (Trim(sExpression) = "") Begin
-                Get _FetchExpression TokenizerData.aExpressions eToTexpression to sExpression
+                Get _FetchExpression TokenizerData.aExpressions eToExpression to sExpression
             End
         End
         If (Trim(sExpression) = "") Begin
@@ -903,6 +903,9 @@ Class cBaseFuncLib is a cObject
         
         // If there's more line to process, recursively extract expressions
         If (sOverStrikeLine <> "") Begin
+            // Mask the already-extracted expression in sOrg so that recursive calls compute
+            // the correct absolute position when two expressions share the same overstrike form.
+            Move (Replace(sExpressionOS, sOrg, (FillString("|", iLength)))) to sOrg
             Send _ExtractExpressions sOverStrikeLine sOrg (&TokenizerData) (&aExpressions)
         End
     End_Procedure
@@ -1076,7 +1079,7 @@ Class cBaseFuncLib is a cObject
         
         Move (Pos(Lowercase(" " + CS_To + " "), Lowercase(sOrg))) to iPos
         If (iPos <> 0 and (Pos(Lowercase(Expression.sExpression), Lowercase(sOrg))) > iPos) Begin
-            Move eToTexpression to Expression.eExpressionMode
+            Move eToExpression to Expression.eExpressionMode
             Function_Return True
         End
         
@@ -1188,8 +1191,8 @@ Class cBaseFuncLib is a cObject
     // *Known limitation*:
     //   It can handle max two booleans within the same square bracket. E.g. "[Found Select]"
     Function _ExtractLegacyBooleanContent tTokenizer TokenizerData Returns tBooleanIndicator
-        Integer iItem iSize iCount
-        String sToken
+        Integer iItem iSize iCount iIdx
+        String sToken sCurrentGroup sFullExpression
         Boolean  bFound bIndicate bExpression bSystemBoolean bHasNot bTo bAs bIsListedWord bMove
         Boolean bHasLeftBracket bHasRightBracket
         tBooleanIndicator BooleanIndicator
@@ -1246,8 +1249,10 @@ Class cBaseFuncLib is a cObject
                     Get _HasTokenLeftBracket sToken to bHasLeftBracket
                 End
                 Get _HasTokenRighttBracket sToken to bHasRightBracket
-                Get ReplaceBrackets sToken to sToken
-                
+                If (bHasLeftBracket = True or bHasRightBracket = True) Begin
+                    Get ReplaceBrackets sToken to sToken
+                End
+
                 If (bTo = False and bAs = False) Begin
                     If (BooleanIndicator.FirstBoolean.sCode = "") Begin
                         Move bHasLeftBracket to BooleanIndicator.FirstBoolean.bHasBracket
@@ -1287,17 +1292,76 @@ Class cBaseFuncLib is a cObject
                         Move sToken      to BooleanIndicator.AsBoolean.sCode
                     End
                     // Do we have an expression after the "as"?
-                    Else Begin          
-                        Increment iItem
-                        For iCount from iItem to iSize
-                            Append sToken " " TokenizerData.asLineTokens[iCount]
-                        Loop
-                        Move (Trim(sToken)) to sToken
-                        Move (Pos("(", sToken) and Pos(")", sToken)) to bExpression
-                        If (bExpression = False) Begin
-                            Move ("(" + sToken + ")") to sToken
+                    Else Begin
+                        If (bHasNot = True) Begin
+                            // Handle multi-Not-bracket groups: e.g. [Not A Not B] and [Not C Not D]
+                            // sToken = first boolean name (already past the [Not prefix).
+                            // Build (Not(A) and Not(B) ...) groups, joined with outer parens.
+                            Move ("Not(" + sToken + ")") to sCurrentGroup
+                            Move "" to sFullExpression
+                            Move (iItem + 1) to iIdx
+                            While (iIdx <= iSize)
+                                Move TokenizerData.asLineTokens[iIdx] to sToken
+                                If (Right(sToken, 1) = "]") Begin
+                                    // End of current bracket group — strip ] and add last boolean
+                                    Move (Left(sToken, Length(sToken) - 1)) to sToken
+                                    If (sToken <> "") Begin
+                                        Append sCurrentGroup " and Not(" sToken ")"
+                                    End
+                                    // Close and accumulate this group
+                                    If (sFullExpression = "") Begin
+                                        Move ("(" + sCurrentGroup + ")") to sFullExpression
+                                    End
+                                    Else Begin
+                                        Move (sFullExpression + " and (" + sCurrentGroup + ")") to sFullExpression
+                                    End
+                                    Move "" to sCurrentGroup
+                                End
+                                Else If (Lowercase(sToken) = "not") Begin
+                                    // Within-group Not separator — skip; next token is the boolean name
+                                End
+                                Else If (Lowercase(sToken) = "and") Begin
+                                    // Between-group separator — skip
+                                End
+                                Else If (sToken = "[Not") Begin
+                                    // Start-of-new-bracket-group prefix — skip
+                                End
+                                Else Begin
+                                    // Boolean variable name — start new group or append to current
+                                    If (sCurrentGroup = "") Begin
+                                        Move ("Not(" + sToken + ")") to sCurrentGroup
+                                    End
+                                    Else Begin
+                                        Append sCurrentGroup " and Not(" sToken ")"
+                                    End
+                                End
+                                Increment iIdx
+                            Loop
+                            // Wrap in outer parens when result spans multiple groups
+                            If (sFullExpression contains " and ") Begin
+                                Move ("(" + sFullExpression + ")") to sToken
+                            End
+                            Else If (sFullExpression <> "") Begin
+                                Move sFullExpression to sToken
+                            End
+                            Else Begin
+                                Move ("(" + sCurrentGroup + ")") to sToken
+                            End
+                            // Not is already embedded per-item; clear flag so caller won't double-wrap
+                            Move False to BooleanIndicator.AsBoolean.bHasNot
                         End
-                        Move sToken to BooleanIndicator.AsBoolean.sCode 
+                        Else Begin
+                            Increment iItem
+                            For iCount from iItem to iSize
+                                Append sToken " " TokenizerData.asLineTokens[iCount]
+                            Loop
+                            Move (Trim(sToken)) to sToken
+                            Move (Pos("(", sToken) and Pos(")", sToken)) to bExpression
+                            If (bExpression = False) Begin
+                                Move ("(" + sToken + ")") to sToken
+                            End
+                        End
+                        Move sToken to BooleanIndicator.AsBoolean.sCode
                         Move iSize to iItem // Get out of loop.
                     End
                 End
@@ -2804,13 +2868,16 @@ Class cBaseFuncLib is a cObject
     
     Function _IsOverwriteValue String sOverwrite Returns Boolean
         Boolean bFound
-        Move (sOverwrite contains "'++" or sOverwrite contains "'+'" or sOverwrite contains "'__" or sOverwrite contains "'_'") to bFound
+        // Single-quoted strings: content is masked with CS_E (~)
+        // Single-quoted strings: content may also be masked with CS_U (^)
+        Move (sOverwrite contains ("'" + CS_E + CS_E) or sOverwrite contains ("'" + CS_E + "'") or ;
+             sOverwrite contains ("'" + CS_U + CS_U) or sOverwrite contains ("'" + CS_U + "'")) to bFound
         If (bFound = False) Begin
-            Move (sOverwrite contains '"++' or sOverwrite contains '"+"' or sOverwrite contains '"__' or sOverwrite contains '"_"') to bFound
+            // Double-quoted strings: content is masked with CS_U (^)
+            // Double-quoted strings: content may also be masked with CS_E (~)
+            Move (sOverwrite contains ('"' + CS_U + CS_U) or sOverwrite contains ('"' + CS_U + '"') or ;
+                 sOverwrite contains ('"' + CS_E + CS_E) or sOverwrite contains ('"' + CS_E + '"')) to bFound
         End
-//        If (bFound = False) Begin
-//            Move (sOverwrite contains '||' or sOverwrite contains '|') to bFound
-//        End
         Function_Return bFound
     End_Function
     
@@ -2937,7 +3004,7 @@ Class cBaseFuncLib is a cObject
                 If (iDoubleQuotes = 0 and iSingleQuotes < 2) Begin 
                     Move sText to sContent
                     Move (Length(sText)) to iLength
-                    Move (Repeat("_", iLength)) to sText
+                    Move (Repeat(CS_U, iLength)) to sText
                     If (bHasEndSemiColon = True) Begin
                         Move (Left(sText, (Length(sText) -1))) to sText
                         Append sText ";"
@@ -2955,7 +3022,7 @@ Class cBaseFuncLib is a cObject
                 If (iSingleQuotes = 0) Begin
                     Move sText to sContent
                     Move (Length(sText)) to iLength
-                    Move (Repeat("+", iLength)) to sText
+                    Move (Repeat(CS_E, iLength)) to sText
                     Move sContent to TokenizerData.asStringConstant[iString].sContent
                     Move sText    to TokenizerData.asStringConstant[iString].sOverwrite
                     Move 1        to TokenizerData.asStringConstant[iString].iStartPos
@@ -3046,9 +3113,9 @@ Class cBaseFuncLib is a cObject
                 Move True to bSingleQuote  
             End
             If bDoubleQuote Begin
-                If (sChar <> '"') Begin    
-                    Append sOverwrite "_"      
-                    Move (Overstrike("_", sText, iChar)) to sText
+                If (sChar <> '"') Begin
+                    Append sOverwrite CS_U
+                    Move (Overstrike(CS_U, sText, iChar)) to sText
                     Append sContent sChar
                 End
                 If (iStart = 0) Begin
@@ -3059,9 +3126,9 @@ Class cBaseFuncLib is a cObject
             End
             Else If bSingleQuote Begin
                 If (sChar <> "'") Begin
-                    Append sOverwrite "+" 
-                    Move (Overstrike("+", sText, iChar)) to sText
-                    Append sContent sChar 
+                    Append sOverwrite CS_E
+                    Move (Overstrike(CS_E, sText, iChar)) to sText
+                    Append sContent sChar
                 End
                 If (iStart = 0) Begin
                     Move iChar to iStart
@@ -3428,12 +3495,14 @@ Class cBaseFuncLib is a cObject
                     Move TokenizerData.BooleanIndicator.FirstBoolean.sCode to sToken
                 End
                 // If we have an expression and it contains an "IN" operator, we need to change it to "Contains",
-                // else there will be a compilation error.
+                // else there will be a compilation error. Also swap operands: "A IN B" => "B contains A".
                 If (Left(sToken, 1) = "(" and Right(sToken, 1) = ")" and Lowercase(sToken) contains Lowercase(CS_In)) Begin
                     If (Lowercase(sToken) contains (" " + Lowercase(CS_In) + " ")) Begin
                         Move (Pos((" " + Lowercase(CS_In) + " "), Lowercase(sToken))) to iPos
-                        Move (Overstrike("||", sToken, (iPos +1))) to sToken
-                        Move (Replace("||", sToken, CS_Contains)) to sToken
+                        // Extract left operand (before " IN ") and right operand (after " IN "), then swap
+                        Move (Mid(sToken, (iPos - 2), 2)) to sLine    // left operand (strip leading "(")
+                        Move (Mid(sToken, (Length(sToken) - iPos - Length(CS_In) - 2), (iPos + Length(CS_In) + 2))) to sToken // right operand (strip trailing ")")
+                        Move ("(" + Trim(sToken) + " " + CS_Contains + " " + Trim(sLine) + ")") to sToken
                     End
                 End
                 Append sOverStrikeLine " " sToken
@@ -3458,37 +3527,76 @@ Class cBaseFuncLib is a cObject
                             Move (Replace("(", sSecondBoolean, "")) to sSecondBoolean
                             Move (Replace(")", sSecondBoolean, "")) to sSecondBoolean
                         End
-                        
+
                         Move (SizeOfArray(TokenizerData.asLineTokens)) to iSize
                         Decrement iSize
                         Move (SearchArray(CS_If, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+                        Move "" to sLine       // accumulates non-expression tokens before the first expression
+                        Move False to bHasMove // tracks whether the (indicator and expression) wrapper has been emitted
                         For iCount from (iItem +1) to iSize
                             Move TokenizerData.asLineTokens[iCount] to sToken
                             If (Lowercase(sToken) = lowercase(CS_To) or Lowercase(sToken) = Lowercase(CS_As)) Begin
                                 Move iSize to iCount // We're out of here.
-                            End                                                     
+                            End
                             If (SizeOfArray(TokenizerData.aExpressions) <> 0) Begin
-                                Move sToken to Expression.sExpression
-                                Move (SearchArray(Expression, TokenizerData.aExpressions)) to iItem
-                                If (iItem <> -1) Begin  
+                                // Find expression by sExpression field only (SearchArray compares all struct fields):
+                                Move -1 to iItem
+                                Move (SizeOfArray(TokenizerData.aExpressions)) to iPos
+                                Decrement iPos
+                                For iLeftParanthesis from 0 to iPos
+                                    If (TokenizerData.aExpressions[iLeftParanthesis].sExpression = sToken) Begin
+                                        Move iLeftParanthesis to iItem
+                                        Move iPos to iLeftParanthesis  // break
+                                    End
+                                Loop
+                                If (iItem <> -1) Begin
                                     If (Lowercase(sToken) = Lowercase(CS_In)) Begin
                                         Move CS_Contains to sToken
                                     End
-                                    If (sSecondBoolean = "") Begin
-                                        Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " sToken ")"
+                                    If (sLine <> "") Begin
+                                        // Non-expression tokens precede the expression — wrap all together:
+                                        If (sSecondBoolean = "") Begin
+                                            Append sOverStrikeLine " (" (String(sFirstBoolean)) " and (" (Trim(sLine)) " " sToken "))"
+                                        End
+                                        Else Begin
+                                            Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " (String(sSecondBoolean)) " and (" (Trim(sLine)) " " sToken "))"
+                                        End
+                                        Move "" to sLine
                                     End
                                     Else Begin
-                                        Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " (String(sSecondBoolean)) " and " sToken ")"
+                                        If (sSecondBoolean = "") Begin
+                                            Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " sToken ")"
+                                        End
+                                        Else Begin
+                                            Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " (String(sSecondBoolean)) " and " sToken ")"
+                                        End
                                     End
+                                    Move True to bHasMove  // wrapper has been emitted
                                 End
                                 Else Begin
-                                    Append sOverStrikeLine " " sToken
+                                    If (bHasMove = False) Begin
+                                        // Before first expression — accumulate for possible prefix wrapping:
+                                        If (sLine = "") Begin
+                                            Move sToken to sLine
+                                        End
+                                        Else Begin
+                                            Append sLine " " sToken
+                                        End
+                                    End
+                                    Else Begin
+                                        // After expression wrapper — append remaining tokens directly:
+                                        Append sOverStrikeLine " " sToken
+                                    End
                                 End
                             End
                             Else Begin
                                 Append sOverStrikeLine " " sToken
                             End
                         Loop
+                        // If pre-expression tokens were collected but no expression was found, append them:
+                        If (sLine <> "") Begin
+                            Append sOverStrikeLine " " (Trim(sLine))
+                        End
                     End
                 End 
                 Case Break
@@ -3646,15 +3754,40 @@ Class cBaseFuncLib is a cObject
         
         For iCount from 0 to iSize
             Move TokenizerData.asLineTokens[iCount] to Expression1.sExpression
-            Move (SearchArray(Expression1, aExpressions)) to iItem1
+            // Find Expression1 in aExpressions by sExpression field only (SearchArray compares all struct fields):
+            Move -1 to iItem1
+            Move (SizeOfArray(aExpressions)) to iStart
+            Decrement iStart
+            For iPos from 0 to iStart
+                If (aExpressions[iPos].sExpression = Expression1.sExpression) Begin
+                    Move iPos to iItem1
+                    Move iStart to iPos  // break
+                End
+            Loop
             If (iItem1 <> -1) Begin
                 Move TokenizerData.asLineTokens[iCount +1] to sToken2
                 Move (Lowercase(sLegacyOperators) contains Lowercase(sToken2)) to bFound
                 If (bFound = True) Begin
                     Move TokenizerData.asLineTokens[iCount +2] to Expression2.sExpression
-                    Move (SearchArray(Expression2, aExpressions)) to iItem2
+                    // Find Expression2 in aExpressions by sExpression field only:
+                    Move -1 to iItem2
+                    Move (SizeOfArray(aExpressions)) to iStart
+                    Decrement iStart
+                    For iPos from 0 to iStart
+                        If (aExpressions[iPos].sExpression = Expression2.sExpression) Begin
+                            Move iPos to iItem2
+                            Move iStart to iPos  // break
+                        End
+                    Loop
                     If (iItem2 <> -1 and iItem1 < iItem2) Begin
-                        Move ("(" + Expression1.sExpression   * String(sToken2) * String(Expression2.sExpression)   + ")") to aExpressions[iItem1].sExpression
+                        // For numeric comparison operators (Gt/Ge/Lt/Le), strip outer parens from left expression:
+                        If (Lowercase(sToken2) = "gt" or Lowercase(sToken2) = "ge" or Lowercase(sToken2) = "lt" or Lowercase(sToken2) = "le") Begin
+                            Get ReplaceParanthesis Expression1.sExpression to sExpression
+                        End
+                        Else Begin
+                            Move Expression1.sExpression to sExpression
+                        End
+                        Move ("(" + sExpression * String(sToken2) * String(Expression2.sExpression) + ")") to aExpressions[iItem1].sExpression
                         Move ("(" + aExpressions[iItem1].sExpressionOS * String(sToken2) * aExpressions[iItem1 +1].sExpressionOS + ")") to aExpressions[iItem1].sExpressionOS
                         Move ("(" + aExpressions[iItem1].sExpressionWS * String(sToken2) * aExpressions[iItem1 +1].sExpressionWS + ")") to aExpressions[iItem1].sExpressionWS
                         // Note: This extra parenthesis is later removed by other Tokenizer function logic.
@@ -3700,6 +3833,22 @@ Class cBaseFuncLib is a cObject
         Move TokenizerData.sOverstrikeLine to sOverstrikeLine
         Move (SizeOfArray(aExpressions)) to iSize
         Decrement iSize
+
+        // Correct expression start positions: recursive calls in _ExtractExpressions compute
+        // positions relative to the remaining substring, not the full overstrike line.
+        // Re-scan the full overstrike sequentially, masking each found expression so that
+        // duplicate overstrike forms (e.g. two identical-looking expressions) resolve correctly.
+        If (iSize >= 0) Begin
+            Move sOverstrikeLine to sExpression   // working copy of the full overstrike
+            For iCount from 0 to iSize
+                Move (Pos(aExpressions[iCount].sExpressionOS, sExpression)) to iPos
+                If (iPos <> 0) Begin
+                    Move iPos to aExpressions[iCount].iStartPos
+                    Move (FillString("|", aExpressions[iCount].iLength)) to sReplace
+                    Move (Overstrike(sReplace, sExpression, iPos)) to sExpression
+                End
+            Loop
+        End
 
         // If expressions exists, temporarily replace them with the "|" symbol, before
         // splitting string to array.
@@ -3758,14 +3907,26 @@ Class cBaseFuncLib is a cObject
                 Move asLineTokens[iCount] to sToken 
                 Get _IsOverwriteValue sToken to bFound
                 // Also check that the asStringConstant content is not part of an expression.
-                If (bFound = True and iCountSC <= iSizeSC) Begin 
+                // Use position-based check: content-based check is unreliable here because Step 4
+                // hasn't run yet, so aExpressions[i].sExpression still contains overstrike chars.
+                If (bFound = True and iCountSC <= iSizeSC) Begin
                     Move TokenizerData.asStringConstant[iCountSC].sContent to sItem
-                    Move sItem to Expression.sExpression
-                    Move (SearchArray(Expression, aExpressions, Self, RefFunc(__FindExpressionArrayContains))) to iItem
-                    If (iItem <> -1 and iCountSC < iSizeSC) Begin
-                        Move TokenizerData.asStringConstant[iCountSC + 1].sContent to sItem       
+                    Move (SizeOfArray(aExpressions) - 1) to iPos
+                    Move -1 to iItem
+                    If (iPos >= 0) Begin
+                        For iString from 0 to iPos
+                            If (iItem = -1 and ;
+                                TokenizerData.asStringConstant[iCountSC].iStartPos >= aExpressions[iString].iStartPos and ;
+                                TokenizerData.asStringConstant[iCountSC].iStartPos < (aExpressions[iString].iStartPos + aExpressions[iString].iLength)) Begin
+                                Move iString to iItem
+                            End
+                        Loop
                     End
-                    Move sItem to asLineTokens[iCount]  
+                    If (iItem <> -1 and iCountSC < iSizeSC) Begin
+                        Increment iCountSC
+                        Move TokenizerData.asStringConstant[iCountSC].sContent to sItem
+                    End
+                    Move sItem to asLineTokens[iCount]
                     Increment iCountSC
                 End
             Loop
@@ -3788,7 +3949,14 @@ Class cBaseFuncLib is a cObject
                         Move TokenizerData.asStringConstant[iString].sOverwrite to sOverWrite
                         Move (Pos(sOverWrite, aExpressions[iCount].sExpressionOS)) to iPos
                         If (iPos <> 0) Begin
-                            Move (Replace(sOverwrite, aExpressions[iCount].sExpression, TokenizerData.asStringConstant[iString].sContent)) ;
+                            // Rebuild from sExpressionOS (always has masking chars intact, even if
+                            // _CreateExpressionVariants pre-substituted a wrong string into sExpression),
+                            // then apply the same normalization _CreateExpressionVariants would have:
+                            Get TrimInsideSpaces aExpressions[iCount].sExpressionOS to sExpression
+                            If (Left(sExpression, 1) <> "(") Begin
+                                Move ("(" + sExpression + ")") to sExpression
+                            End
+                            Move (Replace(sOverwrite, sExpression, TokenizerData.asStringConstant[iString].sContent)) ;
                                 to aExpressions[iCount].sExpression
                             Increment iString
                         End
@@ -4390,8 +4558,8 @@ Class cBaseFuncLib is a cObject
         Get _LeftCommand (&TokenizerData) eFirstCommand  to TokenizerData.FirstLeftCommand
         Get _LeftCommand (&TokenizerData) eSecondCommand to TokenizerData.SecondLeftCommand
 
-        Get _FetchExpression TokenizerData.aExpressions eOfExpression  to TokenizerData.sOfExpression
-        Get _FetchExpression TokenizerData.aExpressions eToTexpression to TokenizerData.sToExpression
+        Get _FetchExpression TokenizerData.aExpressions eOfExpression to TokenizerData.sOfExpression
+        Get _FetchExpression TokenizerData.aExpressions eToExpression to TokenizerData.sToExpression
         Get _LogicalOperators (&TokenizerData) to TokenizerData.OperatorsInfo
 
         // *** Note ***
