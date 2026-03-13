@@ -157,13 +157,41 @@ Object oRefactorView is a cRDCDbView
 
                     Object oFunctions_Function_Name is a cDbCJGridColumnSuggestionNew //cDbCJGridColumnSuggestion
                         Entry_Item Functions.Function_Name
-                        Set piWidth to 219
+                        Set piWidth to 180
                         Set psCaption to "Function Name (Suggestion list)"    
                         Set psToolTip to "This is a full text suggestion list. You can start typing to search for any keyword and a suggestion list will appear for you to select from."
                         Set Status_Help to (psToolTip(Self))
                         Set pbFullText to True    
                         Set pbAllowRemove to False
                         Set phoData_Col to Self   
+
+                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                            Get RowValue of oFunctions_Function_Help iRow to sText
+                            If (sText <> "") Begin
+                                Move (Replaces("\r\n", sText, CS_CRLF)) to sText
+                                Move (Replaces("\n", sText, CS_CRLF)) to sText
+                            End
+                            Function_Return sText
+                        End_Function
+            
+                    End_Object
+
+                    Object oFunctions_SummaryText is a cRDCDbCJGridColumn
+                        Entry_Item Functions.SummaryText
+                        Set piWidth to 200
+                        Set psCaption to "Summary Text"
+                        Set pbEditable to False
+                        Set pbMultiLine to True
+
+                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                            Get RowValue of oFunctions_Function_Help iRow to sText
+                            If (sText <> "") Begin
+                                Move (Replaces("\r\n", sText, CS_CRLF)) to sText
+                                Move (Replaces("\n", sText, CS_CRLF)) to sText
+                            End
+                            Function_Return sText
+                        End_Function
+            
                     End_Object
 
                     Object oFunctions_Function_Help is a cRDCDbCJGridColumn
@@ -173,6 +201,7 @@ Object oRefactorView is a cRDCDbView
                         Set psCaption to "Help Text"
                         Set pbEditable to False
                         Set pbMultiLine to True
+                        Set pbVisible to False
                     End_Object
             
                     Object oFunctions_Type is a cRDCDbCJGridColumn
@@ -187,6 +216,12 @@ Object oRefactorView is a cRDCDbView
                         // pbEditable *must* be set after the pbComboButton setting.
                         Set pbEditable to False
                         Set pbComboEntryState to False
+
+                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                            Get psToolTip to sText
+                            Function_Return sText
+                        End_Function
+            
                     End_Object                    
 
                     Object oFunctions_Parameter is a cRDCDbCJGridColumn
@@ -250,15 +285,6 @@ Object oRefactorView is a cRDCDbView
                         Set peFooterAlignment to xtpAlignmentCenter
                         Set Status_Help to (psToolTip(Self))
                         Set phoCheckbox_Col to Self
-                    End_Object
-
-                    Object oFunctions_SummaryText is a cRDCDbCJGridColumn
-                        Entry_Item Functions.SummaryText
-                        Set piWidth to 200
-                        Set psCaption to "Summary Text"
-                        Set pbEditable to False
-                        Set pbMultiLine to True
-                        Set pbVisible to False
                     End_Object
 
                     Object oFunctions_ParameterHelp is a cRDCDbCJGridColumn
