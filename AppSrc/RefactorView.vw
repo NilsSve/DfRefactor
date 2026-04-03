@@ -81,7 +81,9 @@ Object oRefactorView is a cRDCDbView
         End_Procedure
     End_Object
 
-    Object oFunctions_DD is a cFunctionsDataDictionary  
+    Object oFunctions_DD is a cFunctionsDataDictionary
+        Set Ordering to 2
+        
         // In this view we are also interested in saving the system file,
         // when the oCountSourceLines_cb object is changed.
         // So relay save message here.
@@ -134,7 +136,7 @@ Object oRefactorView is a cRDCDbView
                 Object oFunctionSelection_grd is a cRDCDbCJGrid
                     Set Size to 156 620
                     Set Location to 27 10
-                    Set Ordering to 2
+//                    Set Ordering to 2
                     Set pbDbShowInvertSelectionsMenuItem to True     
                     Set pbHeaderPrompts to False
                     Set pbDbShowEditMenuItem to False
@@ -145,7 +147,7 @@ Object oRefactorView is a cRDCDbView
                     Set pbEditOnClick to True
                     Set pbEditOnKeyNavigation to False
                     Set pbShowNonActiveInPlaceButton to False
-                    Set piLayoutBuild to 7
+                    Set piLayoutBuild to 8
 
                     Object oFunctions_ID is a cRDCDbCJGridColumn
                         Entry_Item Functions.ID
@@ -318,6 +320,14 @@ Object oRefactorView is a cRDCDbView
                         Forward Send DoSetCheckboxFooterText
                         Get ItemCount to iItems
                         Set psFooterText of oFunctions_ID  to ("#" * String(iItems))
+                    End_Procedure
+
+                    // Setting Ordering 2, doesn't help, the first ID number
+                    // in the grid gets the focus after it has been filled.
+                    // This makes sure the top record is shown.
+                    Procedure Add_Focus Handle hoParent Returns Integer
+                        Forward Send Add_Focus hoParent
+                        Send MoveToFirstRow    
                     End_Procedure
                     
                     On_Key Key_Ctrl+Key_F5 Send ActivateProcess
