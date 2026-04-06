@@ -710,8 +710,18 @@ Class cBaseFuncLib is a cObject
             If (iLength = 0) Begin
                 Get _IsOperator asArray[0] to bFound
                 If (bFound = True) Begin
-                    Move (String(asArray[0]) * String(asArray[1])) to sTail
-                    Function_Return sTail
+                    // Take the "operator + one-token" shortcut UNLESS asArray[1] is an INCOMPLETE
+                    // parenthesised sub-expression — i.e. it starts with '(' but does NOT end with ')'.
+                    // An incomplete token means the paren expression spans multiple space-separated tokens
+                    // (e.g. "Ne (sTo + sFileName) Begin" splits to asArray[1]="(sTo"), so the counting
+                    // loop below is needed to capture the full paren expression.
+                    // A complete token (starts AND ends with parens, e.g. "(_("_"))") should still use
+                    // the shortcut so that subsequent unrelated tokens ("DFWritePos ...") are excluded.
+                    If (Left(Trim(asArray[1]), 1) <> "(" or Right(Trim(asArray[1]), 1) = ")") Begin
+                        Move (String(asArray[0]) * String(asArray[1])) to sTail
+                        Function_Return sTail
+                    End
+                    // Fall through to the parenthesis-counting loop to capture the full tail.
                 End
             End
         End
@@ -1043,7 +1053,17 @@ Class cBaseFuncLib is a cObject
             Move sExpressionOS to sExpressionWS
         End
         Move sExpressionWS to sExpression
-        Get ReplaceParanthesis sExpression to sExpressionNP
+        // When the expression ends with a trailing semicolon (line continuation char), strip it
+        // before calling ReplaceParanthesis so that the resulting NP form still matches the original
+        // overstrike line (e.g. "((Length(sMin)) eq 1);" must yield "(Length(sMin)) eq 1;" not
+        // "(Length(sMin)) eq 1 ;").  The semicolon is then re-appended to the NP form.
+        If (Right(sExpression, 1) = ";") Begin
+            Get ReplaceParanthesis (Left(sExpression, Length(sExpression) - 1)) to sExpressionNP
+            Append sExpressionNP ";"
+        End
+        Else Begin
+            Get ReplaceParanthesis sExpression to sExpressionNP
+        End
         Get TrimInsideSpaces sExpression to sExpression
         Get _HasDoubleExpression sExpression to bFound
         Move (Left(sExpression, 1)) to sChar
@@ -3791,6 +3811,27 @@ Class cBaseFuncLib is a cObject
                         Move (RemoveFromArray(TokenizerData.asLineTokens, (iCount +1))) to TokenizerData.asLineTokens
                         Move (RemoveFromArray(TokenizerData.asLineTokens, (iCount +1))) to TokenizerData.asLineTokens
                     End
+                    // Right-hand side is a literal value (not an expression in aExpressions).
+                    // Still concatenate Expression1 + operator + literal and wrap in parentheses.
+                    // Example: (dag_arbtid+dag_restid) Ne 0 -> ((dag_arbtid+dag_restid) Ne 0)
+                    Else If (iItem2 = -1) Begin
+                        If (Lowercase(sToken2) = "gt" or Lowercase(sToken2) = "ge" or Lowercase(sToken2) = "lt" or Lowercase(sToken2) = "le") Begin
+                            Get ReplaceParanthesis Expression1.sExpression to sExpression
+                        End
+                        Else Begin
+                            Move Expression1.sExpression to sExpression
+                        End
+                        Move Expression2.sExpression to sToken3
+                        Move ("(" + sExpression * String(sToken2) * sToken3 + ")") to aExpressions[iItem1].sExpression
+                        Move ("(" + aExpressions[iItem1].sExpressionOS * String(sToken2) * sToken3 + ")") to aExpressions[iItem1].sExpressionOS
+                        Move ("(" + aExpressions[iItem1].sExpressionWS * String(sToken2) * sToken3 + ")") to aExpressions[iItem1].sExpressionWS
+                        Move ("(" + aExpressions[iItem1].sExpressionNP * String(sToken2) * sToken3 + ")") to aExpressions[iItem1].sExpressionNP
+                        Move aExpressions[iItem1].sExpression to sExpression
+                        Move (Length(sExpression)) to aExpressions[iItem1].iLength
+                        Move sExpression to TokenizerData.asLineTokens[iCount]
+                        Move (RemoveFromArray(TokenizerData.asLineTokens, (iCount +1))) to TokenizerData.asLineTokens
+                        Move (RemoveFromArray(TokenizerData.asLineTokens, (iCount +1))) to TokenizerData.asLineTokens
+                    End
                 End
                 Move (iCount + 2) to iCount 
                 Move (iSize - 2)  to iSize
@@ -3804,9 +3845,9 @@ Class cBaseFuncLib is a cObject
     // The line will be broken up by spaces " ", *except* for expressions. Each expression will exist as a
     // separate member/item.
     Function _SplitSourceLineToTokens tTokenizer ByRef TokenizerData Returns tTokenizer
-        String sOverstrikeLine sItem sReplace sOrg sOverWrite sExpression sToken
+        String sOverstrikeLine sItem sReplace sOrg sOverWrite sExpression sToken sSuffix
         String[] asLineTokens
-        Integer iSize iSizeSC iCount iCountSC iItem iPos iString iStringConstantSize
+        Integer iSize iSizeSC iCount iCountSC iItem iPos iString iStringConstantSize iToken iTokenSize
         Boolean bFound
         tExpression[] aExpressions aExpressionsEmpty 
         tExpression Expression  
@@ -3933,7 +3974,23 @@ Class cBaseFuncLib is a cObject
                 Move (FillString(CS_D, aExpressions[iCount].iLength)) to sReplace
                 Move (Pos(aExpressions[iCount].sExpressionOS, sOverstrikeLine)) to iPos 
                 Move (SearchArray(sReplace, asLineTokens)) to iItem
-                If (iItem <> -1) Begin 
+                // Fallback: if exact match failed, scan for a token that starts with the placeholder.
+                // This handles cases where trailing chars (e.g. ')' from an outer scope) got attached
+                // to the placeholder token after splitting by spaces.
+                If (iItem = -1) Begin
+                    Move (SizeOfArray(asLineTokens)) to iTokenSize
+                    Decrement iTokenSize
+                    For iToken from 0 to iTokenSize
+                        If (Left(asLineTokens[iToken], Length(sReplace)) = sReplace and ;
+                            Length(asLineTokens[iToken]) > Length(sReplace)) Begin
+                            Move iToken to iItem
+                            Break
+                        End
+                    Loop
+                End
+                If (iItem <> -1) Begin
+                    // Capture any trailing characters beyond the placeholder (e.g. trailing ')').
+                    Move (Replace(sReplace, asLineTokens[iItem], "")) to sSuffix
                     If (iString <= iStringConstantSize) Begin
                         Move TokenizerData.asStringConstant[iString].sOverwrite to sOverWrite
                         Move (Pos(sOverWrite, aExpressions[iCount].sExpressionOS)) to iPos
@@ -3951,12 +4008,26 @@ Class cBaseFuncLib is a cObject
                                     Move ("(" + sExpression + ")") to sExpression
                                 End
                             End
-                            Move (Replace(sOverwrite, sExpression, TokenizerData.asStringConstant[iString].sContent)) ;
-                                to aExpressions[iCount].sExpression
-                            Increment iString
+                            // Restore ALL string constants that belong to this expression.
+                            // An expression may contain multiple string literals (e.g. typ eq "3" or typ eq "4"),
+                            // each overstriked to the same placeholder pattern (e.g. "^").
+                            Move True to bFound
+                            While (iString <= iStringConstantSize and bFound = True)
+                                Move TokenizerData.asStringConstant[iString].sOverwrite to sOverWrite
+                                If (Pos(sOverWrite, sExpression) <> 0) Begin
+                                    Move (Replace(sOverwrite, sExpression, TokenizerData.asStringConstant[iString].sContent)) ;
+                                        to sExpression
+                                    Increment iString
+                                End
+                                Else Begin
+                                    Move False to bFound
+                                End
+                            Loop
+                            Move sExpression to aExpressions[iCount].sExpression
                         End
                     End
-                    Move aExpressions[iCount].sExpression to asLineTokens[iItem]
+                    // Restore expression text plus any trailing characters that were beyond the placeholder.
+                    Move (aExpressions[iCount].sExpression + sSuffix) to asLineTokens[iItem]
                 End
             Loop
         End
@@ -4230,10 +4301,16 @@ Class cBaseFuncLib is a cObject
             Move (SearchArray(sOperator, TokenizerData.asLineTokens, Desktop, (RefFunc(DFSTRICMP)))) to iItem
             If (iItem <> -1 and (SizeOfArray(TokenizerData.asLineTokens) > iItem +1)) Begin
                 Move TokenizerData.asLineTokens[iItem +1] to sToken
-                Move (Left(sOverStrikeLine, (iPosOperator + 1))) to sExpression    
+                Move (Left(sOverStrikeLine, (iPosOperator + 1))) to sExpression
                 Move (Mid(sExpression, Length(sOverStrikeLine), iPosFunction)) to sExpression
                 Append sExpression CS_S sToken
-                Move ("(" + Trim(sExpression) + ")") to sExpression
+                // Keep trailing semicolon (line continuation char) outside the parentheses.
+                If (Right(Trim(sExpression), 1) = ";") Begin
+                    Move ("(" + Left(Trim(sExpression), Length(Trim(sExpression)) - 1) + ");") to sExpression
+                End
+                Else Begin
+                    Move ("(" + Trim(sExpression) + ")") to sExpression
+                End
             End
         End
         Else If (bHasParenthesis = True) Begin
