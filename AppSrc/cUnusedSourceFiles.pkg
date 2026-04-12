@@ -5,16 +5,18 @@
 //
 //Use cRefactorApplication.pkg
 Use vWin32fh.pkg
+Use GlobalFunctionsProcedures.pkg
 Use RefactorConstants.h.pkg
 Use WsGlobalFunctions.pkg
 
+// Note: "Other" log files names (not CS_SummaryLogfileName) must end 
+//       with ".log.txt", to be shown in the "Other log files" dialog,
+//       that is available from the DfRefactor.src toolbar.
 Define CS_UnusedSourceLogFile for "UnusedSourceFiles.log.txt"
 
 Struct tUnusedSourceFiles
-    String sUsedPackageName
     String sFileName
     String sPath
-    Integer iRow
 End_Struct
 
 Class cUnusedSourceFiles is a cObject
@@ -81,9 +83,16 @@ Class cUnusedSourceFiles is a cObject
         Function_Return sLine
     End_Function
 
-    // Note: The function adds a ".pkg" to the package name if no extension has been specifieds in the source code.
-    Function ExtractPackageName String sLine Returns String
+    // Note: The function adds a ".pkg" to the package name if no extension has been specified in the source code.
+    //       It also resolves the path from the Use/Include statement to a full absolute path, so that files
+    //       with the same name in different folders can be correctly distinguished.
+    //       - If the Use statement contains a relative path (e.g. "Use AppSrc\Foo.pkg"), the path is resolved
+    //         by prepending the target workspace root (psHomePath of ghoApplication).
+    //       - If the Use statement is a bare filename (e.g. "Use Foo.pkg"), the bare lowercase filename is
+    //         returned as-is. UnusedPackages uses a bare-name fallback comparison for these entries.
+    Function ExtractUseFileName String sLine Returns String
         Integer iPos
+        String sHomePath
 
         Move (Trim(Lowercase(sLine))) to sLine
         Get StripComment sLine to sLine
@@ -97,13 +106,19 @@ Class cUnusedSourceFiles is a cObject
         End
         Move (Trim(sLine)) to sLine
         If (not(sLine contains ".")) Begin
-            Move (sLine + ".pkg") to sLine
+            Append sLine ".pkg"
         End
 
+        // Convert to full absolute path so same-named files in different folders are distinguished:
         Move (Pos(CS_DirSeparator, sLine)) to iPos
         If (iPos <> 0) Begin
-            Get ParseFileName sLine to sLine
+            // Relative path (e.g. "AppSrc\Foo.pkg") — resolve against target workspace root.
+            Get psHomePath of ghoApplication to sHomePath
+            Get vFolderFormat sHomePath to sHomePath
+            Move (Lowercase(sHomePath + sLine)) to sLine
         End
+        // Else: bare filename (e.g. "Foo.pkg") — return as-is (already lowercased).
+        // UnusedPackages handles these via a bare-name fallback comparison.
 
         Function_Return sLine
     End_Function
@@ -143,10 +158,11 @@ Class cUnusedSourceFiles is a cObject
         Function_Return asFile
     End_Function
 
-    Function SingleFileUsedPackages String sFullFilename Returns tUnusedSourceFiles[]
-        tUnusedSourceFiles[] asRetVal
-        String[] asFile
-        String sLine sPath sFilename sPackageName sSourceLine
+    // Reads a single source file and returns the full resolved paths of all
+    // Use(d) or #Include(d) files found within it.
+    Function SingleFileUsedPackages String sFullFilename Returns String[]
+        String[] asRetVal asFile
+        String sLine sPath sFilename sUsedFilename sSourceLine
         Integer iItem iCount iSize
         Boolean bOK
 
@@ -169,11 +185,8 @@ Class cUnusedSourceFiles is a cObject
             If (sSourceLine <> "") Begin
                 Get IsUseOrIncludeLine sLine to bOK
                 If (bOK = True) Begin
-                    Get ExtractPackageName sLine to sPackageName
-                    Move sPackageName to asRetVal[iItem].sUsedPackageName
-                    Move sPath        to asRetVal[iItem].sPath
-                    Move sFilename    to asRetVal[iItem].sFileName
-                    Move iCount       to asRetVal[iItem].iRow
+                    Get ExtractUseFileName sLine to sUsedFilename
+                    Move sUsedFilename to asRetVal[iItem]
                     Increment iItem
                 End
             End
@@ -205,72 +218,76 @@ Class cUnusedSourceFiles is a cObject
         Function_Return sLine
     End_Function
 
-    //    Function RemoveStructArrayDuplicates tUnusedSourceFiles[] asUsedSourceFiles Returns tUnusedSourceFiles[]
-    //        tUnusedSourceFiles[] asNoDuplicates
-    //        Integer iSize iCount iItem
-    //        String sUsedPackageName sUsedPackageNameCompare
-    //
-    //        Move 0 to iItem
-    //        Move (SortArray(asUsedSourceFiles))   to asUsedSourceFiles
-    //        Move (SizeOfArray(asUsedSourceFiles)) to iSize
-    //        Decrement iSize
-    //        For iCount from 0 to iSize
-    //            Move asUsedSourceFiles[iCount].sUsedPackageName to sUsedPackageName
-    //            Move asNoDuplicates[iItem].sUsedPackageName     to sUsedPackageNameCompare
-    //            If (Lowercase(sUsedPackageName) <> Lowercase(sUsedPackageNameCompare)) Begin
-    //                Move asUsedSourceFiles[iCount].iRow         to asNoDuplicates[iItem].iRow
-    //                Move asUsedSourceFiles[iCount].sFileName    to asNoDuplicates[iItem].sFileName
-    //                Move asUsedSourceFiles[iCount].sPath        to asNoDuplicates[iItem].sPath
-    //                Move sUsedPackageName                       to asNoDuplicates[iItem].sUsedPackageName
-    //                Increment iItem
-    //            End
-    //        Loop
-    //
-    //        Function_Return asNoDuplicates
-    //    End_Function
+    // Scans all source files and returns a sorted String[] of the full resolved paths
+    // of every file referenced by a Use or #Include statement across the entire workspace.
+    // Uses index-based accumulation to avoid the O(n²) cost of repeated AppendArray calls.
+    Function UsedPackageFiles tUnusedSourceFiles[] asSourceAllFiles Returns String[]
+        String[] asUsedFilenames asSingleFile
+        Integer iCount iSize iItem iSingleCount iSingleSize
 
-    // Note: Only uniqely identifed package files are returned in the struct array.
-    // All duplicates have been removed.
-    Function UsedPackageFiles tUnusedSourceFiles[] asSourceAllFiles Returns tUnusedSourceFiles[]
-        tUnusedSourceFiles[] asSingleFile asUsedSourceFiles
-        Integer iCount iSize
-
+        Move 0 to iItem
         Move (SizeOfArray(asSourceAllFiles)) to iSize
         Decrement iSize
         For iCount From 0 to iSize
             Get SingleFileUsedPackages (asSourceAllFiles[iCount].sPath + String(asSourceAllFiles[iCount].sFileName)) to asSingleFile
-            If (SizeOfArray(asSingleFile) <> 0) Begin
-                Move (AppendArray(asUsedSourceFiles, asSingleFile)) to asUsedSourceFiles
+            Move (SizeOfArray(asSingleFile)) to iSingleSize
+            If (iSingleSize > 0) Begin
+                Decrement iSingleSize
+                For iSingleCount from 0 to iSingleSize
+                    Move asSingleFile[iSingleCount] to asUsedFilenames[iItem]
+                    Increment iItem
+                Loop
             End
         Loop
 
-        // It doesn't make any time difference if duplicates are removed or not.
-        //        Get RemoveStructArrayDuplicates asUsedSourceFiles to asUsedSourceFiles
-
-        Function_Return asUsedSourceFiles
+        Function_Return asUsedFilenames
     End_Function
 
-    Function UnusedPackages tUnusedSourceFiles[] asUsedFiles tUnusedSourceFiles[] asAllFiles Returns tUnusedSourceFiles[]
-        Integer iCount iSize iIndex iItem
-        String sFilename sExt
+    Function UnusedPackages String[] asUsedFilenames tUnusedSourceFiles[] asAllFiles Returns tUnusedSourceFiles[]
+        Integer iCount iSize iIndex iItem iFullIdx iBareIdx
+        String sFullPath sExt sBareName
         tUnusedSourceFiles[] aUnusedSource
-        tUnusedSourceFiles UsedFile
+        String[] asUsedFullPaths asUsedBareNames
 
         Move 0 to iItem
-        Move (SortArray(asUsedFiles))  to asUsedFiles
         Move (SizeOfArray(asAllFiles)) to iSize
         Decrement iSize
-        
-        If (SizeOfArray(asUsedFiles) <> 0) Begin
+
+        If (SizeOfArray(asUsedFilenames) <> 0) Begin
+            // Split asUsedFilenames into two sorted String[] for efficient binary search:
+            //   asUsedFullPaths — entries resolved to a full absolute path (contain CS_DirSeparator)
+            //   asUsedBareNames — bare filenames (no path separator) from unqualified Use statements
+            Move 0 to iFullIdx
+            Move 0 to iBareIdx
+            Move (SizeOfArray(asUsedFilenames)) to iIndex
+            Decrement iIndex
+            For iCount from 0 to iIndex
+                Move (Lowercase(asUsedFilenames[iCount])) to asUsedFilenames[iCount]
+                If (Pos(CS_DirSeparator, asUsedFilenames[iCount]) <> 0) Begin
+                    Move asUsedFilenames[iCount] to asUsedFullPaths[iFullIdx]
+                    Increment iFullIdx
+                End
+                Else Begin
+                    Move asUsedFilenames[iCount] to asUsedBareNames[iBareIdx]
+                    Increment iBareIdx
+                End
+            Loop
+            Move (SortArray(asUsedFullPaths)) to asUsedFullPaths
+            Move (SortArray(asUsedBareNames)) to asUsedBareNames
+
             For iCount from 0 to iSize
-                Move asAllFiles[iCount].sFileName to sFilename
-                Move (Lowercase(sFilename))       to sFilename
-                Move sFilename                    to UsedFile.sUsedPackageName
-                Get ParseFileExtension sFilename  to sExt
-    
+                Move (Lowercase(asAllFiles[iCount].sPath + String(asAllFiles[iCount].sFileName))) to sFullPath
+                Get ParseFileExtension sFullPath to sExt
+
                 If (Lowercase(sExt) <> "src") Begin
-                    Move (SearchArray(UsedFile, asUsedFiles)) to iIndex
-                    If (iIndex = -1) Begin                                      
+                    // First try exact full-path match (path-qualified Use statements):
+                    Move (SearchArray(sFullPath, asUsedFullPaths)) to iIndex
+                    If (iIndex = -1) Begin
+                        // Fall back to bare-filename match (bare "Use Foo.pkg" statements):
+                        Get ParseFileName sFullPath to sBareName
+                        Move (SearchArray(sBareName, asUsedBareNames)) to iIndex
+                    End
+                    If (iIndex = -1) Begin
                         // Fix for Bug #182 "LoginEncryptionKey.inc" should never be listed as an unused source file.
                         If (Lowercase(asAllFiles[iCount].sFileName) <> "loginencryptionkey.inc") Begin
                             Move asAllFiles[iCount].sFileName to aUnusedSource[iItem].sFileName
@@ -301,16 +318,16 @@ Class cUnusedSourceFiles is a cObject
     End_Function
     
     Procedure RunUnusedSourceFiles
-        String[] asFiles  
+        String[] asFiles asUsedFilenames
         String sHomePath
-        tUnusedSourceFiles[] asAllSourceFiles asUsedFiles asUnusedSource
+        tUnusedSourceFiles[] asAllSourceFiles asUnusedSource
         Integer iCh iSize iCount
 
         Get psHomePath of ghoApplication to sHomePath
-        Get pasAllFiles                                 to asFiles 
-        Get FilesAsStructArray asFiles                  to asAllSourceFiles
-        Get UsedPackageFiles asAllSourceFiles           to asUsedFiles
-        Get UnusedPackages asUsedFiles asAllSourceFiles to asUnusedSource
+        Get pasAllFiles                                          to asFiles
+        Get FilesAsStructArray asFiles                           to asAllSourceFiles
+        Get UsedPackageFiles asAllSourceFiles                    to asUsedFilenames
+        Get UnusedPackages asUsedFilenames asAllSourceFiles      to asUnusedSource
         Set piNoOfUnusedSourceFiles to (SizeOfArray(asUnusedSource))
 
         Get OpenOutput  (psLogFile(Self)) to iCh
