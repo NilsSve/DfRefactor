@@ -87,8 +87,10 @@ Object oRefactorView is a cRDCDbView
         // In this view we are also interested in saving the system file,
         // when the oCountSourceLines_cb object is changed.
         // So relay save message here.
-        Procedure Request_Save
-            SaveRecord SysFile
+        Procedure Request_Save 
+            Lock
+                SaveRecord SysFile
+            Unlock
             Forward Send Request_Save
         End_Procedure
         
