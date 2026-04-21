@@ -1,4 +1,4 @@
-// cEncodingHelpers.pkg
+﻿// cEncodingHelpers.pkg
 //
 // Byte-safe UTF-8 <-> OEM conversion helpers.
 //
@@ -27,9 +27,9 @@ Use GlobalFunctionsProcedures.pkg   // MemCopy, ResizeArray, AddressOf, PointerT
 #IFNDEF ghoEncodingHelpersLoaded
 #IFDEF  ghoEncodingHelpersLoaded  // (force-definition pattern, no-op)
 #ENDIF
-Define ghoEncodingHelpersLoaded for 1
+    Define ghoEncodingHelpersLoaded for 1
+#ENDIF
 
-// ---------------------------------------------------------------------------
 // Utf8LineToOemBytes
 //
 // Converts a Unicode String to a UChar[] of CP850 (OEM) bytes.
@@ -37,7 +37,7 @@ Define ghoEncodingHelpersLoaded for 1
 //
 // Unlike DAC's Utf8ToOem, this function NEVER passes OEM bytes through
 // PointerToString, so characters at the tail of the line cannot be dropped.
-// ---------------------------------------------------------------------------
+//
 Function Utf8LineToOemBytes Global String sValue Returns UChar[]
     Pointer pWideBuf pOemBuf
     Integer iWideBufLen iOemBufLen iVoid
@@ -67,7 +67,6 @@ Function Utf8LineToOemBytes Global String sValue Returns UChar[]
     Function_Return ucaResult
 End_Function
 
-// ---------------------------------------------------------------------------
 // OemBytesToUtf8
 //
 // Converts a UChar[] of CP850 (OEM) bytes back to a Unicode String.
@@ -76,7 +75,7 @@ End_Function
 // The inbound direction IS safe to route through PointerToString at the end
 // -- the intermediate buffer holds UTF-8, which is exactly the encoding
 // PointerToString expects.
-// ---------------------------------------------------------------------------
+//
 Function OemBytesToUtf8 Global UChar[] ucaOemBytes Returns String
     Pointer pWideBuf pUtf8Buf
     Integer iOemLen iWideBufLen iUtf8BufLen iVoid
@@ -104,7 +103,6 @@ Function OemBytesToUtf8 Global UChar[] ucaOemBytes Returns String
     Function_Return sResult
 End_Function
 
-// ---------------------------------------------------------------------------
 // WriteOemFileFromStringArray
 //
 // Writes an array of Unicode source lines to disk as a CP850 (OEM) text
@@ -112,7 +110,7 @@ End_Function
 // is terminated with the supplied sLineBreak (typically CS_CRLF).
 //
 // Returns True on success, False on any I/O or allocation failure.
-// ---------------------------------------------------------------------------
+//
 Function WriteOemFileFromStringArray Global String[] asLines String sFilePath String sLineBreak Returns Boolean
     Integer iChannel iLineIdx iByteIdx iLineBytes iLineBreakBytes iDst iMax
     UChar[] ucaLine ucaLineBreak ucaFile
@@ -156,4 +154,87 @@ Function WriteOemFileFromStringArray Global String[] asLines String sFilePath St
     Function_Return (Err = False)
 End_Function
 
-#ENDIF  // ghoEncodingHelpersLoaded
+// ---------------------------------------------------------------------------
+// ReadOemFileAsStringArray
+//
+// Reads a legacy OEM (CP850) source file from disk as raw bytes and returns
+// a Unicode String[] of lines, one per source line.
+//
+// Why this exists
+// ---------------
+// The obvious way -- `OpenInput ("binary:" + sPath)` + `Readln` + OemToUtf8
+// -- is LOSSY under DataFlex 2025 Unicode mode. Diagnostics in
+// ReadFileToStringArray show that Readln on a "binary:" channel silently
+// decodes the incoming byte stream as UTF-8 while dropping bytes into the
+// String (Length(sLine) != SizeOfString(sLine) whenever multi-byte UTF-8
+// sequences are recognised). OEM bytes in the 0x80..0xFF range that are
+// invalid UTF-8 lead/continuation bytes get substituted with U+FFFD or
+// silently eaten -- producing the "two characters chopped off the tail"
+// symptom on lines containing Swedish 'Å'/'ä'.
+//
+// This function bypasses the lossy text-mode pipeline entirely:
+//   1. Read the whole file into a UChar[] with Read_Block on a binary channel.
+//   2. Walk the byte array, splitting on 0x0A (LF) and stripping trailing
+//      0x0D (CR) so both CRLF and LF line endings are handled.
+//   3. Convert each line's bytes to Unicode via OemBytesToUtf8, which does
+//      the full OEM -> UTF-16 -> UTF-8 -> PointerToString dance SAFELY
+//      (PointerToString only ever sees the UTF-8 intermediate, never OEM
+//      bytes).
+// ---------------------------------------------------------------------------
+Function ReadOemFileAsStringArray Global String sFilePath Returns String[]
+    Integer iChannel iFileSize iIdx iLineStart iLineLen iJ iLineCount
+    UChar[] ucaFile ucaLine
+    String[] asLines
+    String   sLine
+
+    Move (vWin32_APIFileSize(sFilePath)) to iFileSize
+    If (iFileSize <= 0) Function_Return asLines
+
+    // Read entire file as raw bytes.
+    Move (Seq_New_Channel()) to iChannel
+    If (iChannel < 0) Function_Return asLines
+    Direct_Input Channel iChannel ("binary:" + sFilePath)
+    If (Err) Begin
+        Send Seq_Release_Channel iChannel
+        Function_Return asLines
+    End
+    Read_Block Channel iChannel ucaFile iFileSize
+    Close_Input Channel iChannel
+    Send Seq_Release_Channel iChannel
+
+    // Split on LF, strip any trailing CR, decode each line via the safe helper.
+    Move 0 to iLineCount
+    Move 0 to iLineStart
+    For iIdx From 0 To (iFileSize - 1)
+        If (ucaFile[iIdx] = 10) Begin          // LF
+            Move (iIdx - iLineStart) to iLineLen
+            If (iLineLen > 0) Begin
+                If (ucaFile[iIdx - 1] = 13) Decrement iLineLen  // strip trailing CR
+            End
+            // Build a UChar[] for just this line's bytes.
+            Move (ResizeArray(ucaLine, 0)) to ucaLine
+            If (iLineLen > 0) Begin
+                Move (ResizeArray(ucaLine, iLineLen)) to ucaLine
+                For iJ From 0 To (iLineLen - 1)
+                    Move ucaFile[iLineStart + iJ] to ucaLine[iJ]
+                Loop
+            End
+            Move (OemBytesToUtf8(ucaLine)) to sLine
+            Move sLine to asLines[iLineCount]
+            Increment iLineCount
+            Move (iIdx + 1) to iLineStart
+        End
+    Loop
+    // Final line if file does not end with LF.
+    If (iLineStart < iFileSize) Begin
+        Move (iFileSize - iLineStart) to iLineLen
+        Move (ResizeArray(ucaLine, iLineLen)) to ucaLine
+        For iJ From 0 To (iLineLen - 1)
+            Move ucaFile[iLineStart + iJ] to ucaLine[iJ]
+        Loop
+        Move (OemBytesToUtf8(ucaLine)) to sLine
+        Move sLine to asLines[iLineCount]
+    End
+
+    Function_Return asLines
+End_Function
