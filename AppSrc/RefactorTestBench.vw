@@ -419,14 +419,15 @@ Object oRefactorTestBench is a cRefactorDbView
     End_Procedure
     
     Procedure RefactoreCode
-        String sLegacyFileName sRefactoredFileName
+        String sLegacyFileName sRefactoredFileName sErrFile
         Handle hoLegacyEditor hoRefactoredEditor
         Integer iRetval
         Boolean bOK
         tRefactorFiles RefactorFiles
         
-        Move False to Err
-        Get DeleteCompileErrorsFile of ghoApplication CS_TestProgram to bOK
+        Move False to Err                                  
+        Get TestErrorFile of ghoApplication to sErrFile
+        Get DeleteCompileErrorsFile of ghoApplication sErrFile to bOK
         If (bOK = False) Begin
             Get YesNo_Box "Could not delete the compiler's error file. Continue?" to iRetval
             If (iRetval <> MBR_Yes) Begin
