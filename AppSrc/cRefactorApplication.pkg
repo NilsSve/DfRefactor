@@ -780,28 +780,210 @@ Class cRefactorApplication is a cRDCApplication
         Function_Return (private.psSWSFile(Self))
     End_Function
 
-    // Updates DF_OPEN_PATH whenever a target workspace is opened or closed.
-    //
-    // When sSWSFile is non-empty the procedure reads the workspace's .sws file,
-    // resolves every AppSrc entry to a full absolute path, and prepends those
-    // paths to the original DF_OPEN_PATH that was captured at startup.  This
-    // means Get_File_Path finds packages from the target workspace first, then
-    // falls back to DFRefactor's own libraries and DataFlex system packages.
-    //
-    // When sSWSFile is empty (workspace closed) the original DF_OPEN_PATH is
-    // restored verbatim.
-    //
-    // All refactoring functions that call Get_File_Path can rely on this being
-    // correct for whatever workspace is currently being worked on — no per-
-    // function save/restore is required.
-    Procedure UpdateDFOpenPath String sSWSFile
-        String sOrgOpenPath sNewOpenPath sHomePath sAppSrc
-        tSwsFile SwsFile
+    // Resolves one raw workspace path entry to an absolute path.
+    // sHomePath must end with CS_DirSeparator (produced by vFolderFormat).
+    // Relative entries like "AppSrc" or ".\AppSrc" are resolved against
+    // sHomePath. Returns "" for empty input.
+    { Visibility=Private }
+    Function ResolveWorkspacePath String sRawPath String sHomePath Returns String
+        Move (Trim(sRawPath)) to sRawPath
+        If (sRawPath = "") Begin
+            Function_Return ""
+        End
+        If (not(sRawPath contains ":")) Begin
+            // Relative path: strip any leading ".\" then prepend workspace home.
+            If (Left(sRawPath, 2) = ".\") Begin
+                Move (Mid(sRawPath, CI_EOL, 3)) to sRawPath
+            End
+            Move (sHomePath + sRawPath) to sRawPath
+        End
+        // DF_OPEN_PATH entries must not have a trailing backslash.
+        If (Right(sRawPath, 1) = CS_DirSeparator) Begin
+            Move (Left(sRawPath, (Length(sRawPath) - 1))) to sRawPath
+        End
+        Function_Return sRawPath
+    End_Function
+
+    // Appends sPath to sPathList (semicolon-delimited) when not already present.
+    // Uses exact matching (avoids false positives such as "C:\A" in "C:\AB").
+    { Visibility=Private }
+    Function AppendToPathList String sPath String sPathList Returns String
+        If (sPath <> "") Begin
+            // Appending ";" ensures every entry ends with ";", enabling exact
+            // token matching regardless of position in the list.
+            If (not((Lowercase(sPathList) + ";") contains (Lowercase(sPath) + ";"))) Begin
+                If (sPathList = "") Begin
+                    Function_Return sPath
+                End
+                Function_Return (sPathList + ";" + sPath)
+            End
+        End
+        Function_Return sPathList
+    End_Function
+
+    // Merges each individual path from sSrcPaths (semicolon-delimited, already
+    // resolved) into sAccum, skipping duplicates. Returns the updated list.
+    { Visibility=Private }
+    Function MergeIntoPathList String sSrcPaths String sAccum Returns String
+        String sPath
+        Integer iIdx iCount
+
+        Get CountOfPaths of (phoWorkspace(Self)) sSrcPaths to iCount
+        For iIdx from 1 to iCount
+            Get PathAtIndex of (phoWorkspace(Self)) sSrcPaths iIdx to sPath
+            Get AppendToPathList sPath sAccum to sAccum
+        Loop
+        Function_Return sAccum
+    End_Function
+
+    // Collects AppSrc, DdSrc, and IdeSrc paths from a parsed tSwsFile struct,
+    // resolving each entry against sHomePath. Returns a semicolon-delimited
+    // list of absolute paths (no trailing backslashes).
+    { Visibility=Private }
+    Function CollectSwsSourcePaths tSwsFile SwsFile String sHomePath Returns String
+        String sResult sPath
         Integer iCount iSize
 
-        Get psOrgOpenPath to sOrgOpenPath
+        Move "" to sResult
 
-        // Nothing to do if the original path was never saved (very early call).
+        Move (SizeOfArray(SwsFile.Paths.asAppSrc)) to iSize
+        For iCount from 0 to (iSize - 1)
+            Get ResolveWorkspacePath SwsFile.Paths.asAppSrc[iCount] sHomePath to sPath
+            Get AppendToPathList sPath sResult to sResult
+        Loop
+
+        Move (SizeOfArray(SwsFile.Paths.asDdSrc)) to iSize
+        For iCount from 0 to (iSize - 1)
+            Get ResolveWorkspacePath SwsFile.Paths.asDdSrc[iCount] sHomePath to sPath
+            Get AppendToPathList sPath sResult to sResult
+        Loop
+
+        If (SwsFile.Paths.sIdeSrc <> "") Begin
+            Get ResolveWorkspacePath SwsFile.Paths.sIdeSrc sHomePath to sPath
+            Get AppendToPathList sPath sResult to sResult
+        End
+
+        Function_Return sResult
+    End_Function
+
+    // Collects all source folder paths for the target workspace indicated by
+    // sSWSFile, covering AppSrc, DdSrc, and IdeSrc, for both:
+    //
+    //   JSON format (DataFlex 26+):
+    //     Reads the parsed .sws struct.  Local library dependencies are
+    //     followed one level deep so that library source packages also resolve
+    //     via Get_File_Path.  Git/cloud references are skipped.
+    //
+    //   Old INI-format .ws workspace (DataFlex 25 and earlier):
+    //     AppSrcPath / DdSrcPath / IdeSrcPath are read from the .ws file.
+    //     Each field may be a semicolon-separated list that already includes
+    //     all library paths as configured in DataFlex Studio.
+    //
+    // Returns a semicolon-delimited list of absolute paths with no trailing
+    // backslashes, ready to be prepended to DF_OPEN_PATH.
+    Function GetTargetWorkspaceSourcePaths String sSWSFile Returns String
+        tSwsFile SwsFile SwsLibFile
+        String sResult sHomePath sDepPath sDepHome sWsFile sLibPaths sRaw sPath
+        String sAppSrcRaw sDdSrcRaw sIdeSrcRaw
+        Integer iCount iDepCount iPathCount iPathIdx
+        Handle hoIni
+        Boolean bExists
+
+        Get psHomePath to sHomePath
+        Get vFolderFormat sHomePath to sHomePath
+        Move "" to sResult
+
+        // ----------------------------------------------------------------
+        // JSON format (DataFlex 26+).
+        // ReadSwsJsonFile sets nDfVersion > 0 on successful JSON parse.
+        // ----------------------------------------------------------------
+        Get ReadSwsJsonFile sSWSFile to SwsFile
+        If (SwsFile.nDfVersion > 0) Begin
+            Get CollectSwsSourcePaths SwsFile sHomePath to sResult
+
+            // Follow simple (non-git/cloud) local dependencies one level deep.
+            Move (SizeOfArray(SwsFile.aDependencies)) to iDepCount
+            For iCount from 0 to (iDepCount - 1)
+                If (SwsFile.aDependencies[iCount].bIsObject = False) Begin
+                    Move (Trim(SwsFile.aDependencies[iCount].sPath)) to sDepPath
+                    // Skip cloud/git references (they contain "://").
+                    If (sDepPath <> "" and not(sDepPath contains "://")) Begin
+                        Get ResolveWorkspacePath sDepPath sHomePath to sDepPath
+                        // sDepPath is a directory; the library's .sws file is
+                        // expected at <dir>\<dirname>.sws.
+                        Get vFolderFormat sDepPath to sDepHome
+                        Get ParseFileName sDepPath to sPath
+                        Move (sDepHome + sPath + ".sws") to sWsFile
+                        Get vFilePathExists sWsFile to bExists
+                        If (bExists = False) Begin
+                            // Some references already point to the .sws file.
+                            Move (sDepPath + ".sws") to sWsFile
+                            Get vFilePathExists sWsFile to bExists
+                        End
+                        If (bExists) Begin
+                            Get ReadSwsJsonFile sWsFile to SwsLibFile
+                            Get CollectSwsSourcePaths SwsLibFile sDepHome to sLibPaths
+                            Get MergeIntoPathList sLibPaths sResult to sResult
+                        End
+                    End
+                End
+            Loop
+            Function_Return sResult
+        End
+
+        // ----------------------------------------------------------------
+        // Old INI-format .ws workspace (DataFlex 25 and earlier).
+        // AppSrcPath / DdSrcPath / IdeSrcPath are semicolon-separated lists
+        // that already include all configured library source paths.
+        // ----------------------------------------------------------------
+        Get WsFileNameFromSWSFileName sSWSFile to sWsFile
+        Get vFilePathExists sWsFile to bExists
+        If (bExists = False) Begin
+            Function_Return sResult
+        End
+
+        Get Create (RefClass(cIniFile)) to hoIni
+        Set psFilename of hoIni to sWsFile
+        Get ReadString of hoIni CS_Workspace CS_AppSrcPath "" to sAppSrcRaw
+        Get ReadString of hoIni CS_Workspace "DdSrcPath"    "" to sDdSrcRaw
+        Get ReadString of hoIni CS_Workspace "IdeSrcPath"   "" to sIdeSrcRaw
+        Send Destroy of hoIni
+
+        Get CountOfPaths of (phoWorkspace(Self)) sAppSrcRaw to iPathCount
+        For iPathIdx from 1 to iPathCount
+            Get PathAtIndex of (phoWorkspace(Self)) sAppSrcRaw iPathIdx to sRaw
+            Get ResolveWorkspacePath sRaw sHomePath to sPath
+            Get AppendToPathList sPath sResult to sResult
+        Loop
+
+        Get CountOfPaths of (phoWorkspace(Self)) sDdSrcRaw to iPathCount
+        For iPathIdx from 1 to iPathCount
+            Get PathAtIndex of (phoWorkspace(Self)) sDdSrcRaw iPathIdx to sRaw
+            Get ResolveWorkspacePath sRaw sHomePath to sPath
+            Get AppendToPathList sPath sResult to sResult
+        Loop
+
+        Get CountOfPaths of (phoWorkspace(Self)) sIdeSrcRaw to iPathCount
+        For iPathIdx from 1 to iPathCount
+            Get PathAtIndex of (phoWorkspace(Self)) sIdeSrcRaw iPathIdx to sRaw
+            Get ResolveWorkspacePath sRaw sHomePath to sPath
+            Get AppendToPathList sPath sResult to sResult
+        Loop
+
+        Function_Return sResult
+    End_Function
+
+    // Updates DF_OPEN_PATH whenever a target workspace is opened or closed.
+    // Called automatically from Set psSWSFile on every workspace change.
+    //
+    // Passing sSWSFile = "" restores DFRefactor's original DF_OPEN_PATH.
+    // All refactoring functions that use Get_File_Path benefit automatically
+    // without any per-function path management.
+    Procedure UpdateDFOpenPath String sSWSFile
+        String sOrgOpenPath sNewPaths
+
+        Get psOrgOpenPath to sOrgOpenPath
+        // Guard against a very early call before End_Construct_Object runs.
         If (sOrgOpenPath = "") Begin
             Procedure_Return
         End
@@ -812,53 +994,13 @@ Class cRefactorApplication is a cRDCApplication
             Procedure_Return
         End
 
-        Get psHomePath to sHomePath
-        Get vFolderFormat sHomePath to sHomePath
-
-        // Read AppSrc paths from a JSON-format .sws file (DataFlex 26+).
-        // For older workspaces ReadSwsJsonFile returns an empty struct, so
-        // asAppSrc will have zero elements and we fall through to the default.
-        Get ReadSwsJsonFile sSWSFile to SwsFile
-        Move "" to sNewOpenPath
-        Move (SizeOfArray(SwsFile.Paths.asAppSrc)) to iSize
-        If (iSize > 0) Begin
-            Decrement iSize
-            For iCount from 0 to iSize
-                Move (Trim(SwsFile.Paths.asAppSrc[iCount])) to sAppSrc
-                If (sAppSrc <> "") Begin
-                    // Resolve relative paths (e.g. "AppSrc" or ".\AppSrc")
-                    // against the workspace home folder.
-                    If (not(sAppSrc contains ":")) Begin
-                        If (Left(sAppSrc, 2) = ".\") Begin
-                            Move (Mid(sAppSrc, CI_EOL, 3)) to sAppSrc
-                        End
-                        Move (sHomePath + sAppSrc) to sAppSrc
-                    End
-                    // DF_OPEN_PATH entries must not have a trailing backslash.
-                    If (Right(sAppSrc, 1) = CS_DirSeparator) Begin
-                        Move (Left(sAppSrc, (Length(sAppSrc) - 1))) to sAppSrc
-                    End
-                    If (not(Lowercase(sNewOpenPath) contains Lowercase(sAppSrc))) Begin
-                        If (sNewOpenPath = "") Begin
-                            Move sAppSrc to sNewOpenPath
-                        End
-                        Else Begin
-                            Append sNewOpenPath (";" + sAppSrc)
-                        End
-                    End
-                End
-            Loop
+        Get GetTargetWorkspaceSourcePaths sSWSFile to sNewPaths
+        If (sNewPaths <> "") Begin
+            // Prepend target workspace paths; retain DFRefactor's own and
+            // DataFlex system paths as a fallback.
+            Set_Attribute DF_OPEN_PATH to (sNewPaths + ";" + sOrgOpenPath)
         End
-
-        // Fallback for older (non-JSON) workspaces: assume a standard AppSrc
-        // subfolder directly under the workspace home.
-        If (sNewOpenPath = "") Begin
-            Move (sHomePath + "AppSrc") to sNewOpenPath
-        End
-
-        // Prepend the target workspace's folders; retain DFRefactor's own paths
-        // as a fallback so library and system packages still resolve.
-        Set_Attribute DF_OPEN_PATH to (sNewOpenPath + ";" + sOrgOpenPath)
+        // If no paths were found, leave DF_OPEN_PATH unchanged.
     End_Procedure
 
     { MethodType=Property }
