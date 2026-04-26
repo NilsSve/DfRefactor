@@ -112,6 +112,11 @@ Class cRefactorApplication is a cRDCApplication
         Property String psStartupProgramPath ""
         Property String psStartupBitmapPath  ""
 
+        // Saved/restored around workspace scans that call Get_File_Path.
+        // Allows refactoring functions to temporarily redirect DF_OPEN_PATH
+        // to the target workspace's source folders.
+        Property String psOrgOpenPath ""
+
         Property Handle phoWorkspaceSelector_Menuitem
         Property Handle phoSwsOpenDialog
         Property Handle phoOpenSourceFileDialog
@@ -157,15 +162,22 @@ Class cRefactorApplication is a cRDCApplication
     End_Procedure         
                                   
     Procedure End_Construct_Object
+        String sOrgOpenPath
         Forward Send End_Construct_Object
-        
+
         Send InitUserName
-        Open SysFile  
+        Open SysFile
         Open Functions
         Open FunctionsA
-        Set private.psStarZenSourceExplorer to (Trim(SysFile.PathStarZen)) 
+        Set private.psStarZenSourceExplorer to (Trim(SysFile.PathStarZen))
         Set piBackupDaysOverwriteCycle      to SysFile.iBackupDaysOverwriteCycle
-    End_Procedure  
+
+        // Capture DF_OPEN_PATH at startup (DFRefactor's own workspace paths).
+        // UpdateDFOpenPath prepends the target workspace's source folders when
+        // a workspace is opened, and restores this value when it is closed.
+        Get_Attribute DF_OPEN_PATH to sOrgOpenPath
+        Set psOrgOpenPath to sOrgOpenPath
+    End_Procedure
     
     Function SourceFilePath Returns String
         String sFileName sPath
@@ -741,27 +753,113 @@ Class cRefactorApplication is a cRDCApplication
     { MethodType=Property }
     Procedure Set psSWSFile String sSWSFile
         String sPath sExt
-        
+
         Get ParseFoldername sSWSFile to sPath
         Get ParseFileExtension sSWSFile to sExt
-        // Has the user selected a ".ws" instead of a ".sws" file? 
+        // Has the user selected a ".ws" instead of a ".sws" file?
         // Then we need to adjust the path from "Programs" -> "Home"
         // aka one level up.
-        If (Lowercase(sExt) = "ws") Begin 
+        If (Lowercase(sExt) = "ws") Begin
             Move (Left(sPath, Length(sPath) -1)) to sPath
-            Get ParseFolderName sPath to sPath        
+            Get ParseFolderName sPath to sPath
         End
         If (sPath <> "") Begin
             Get vFolderFormat sPath to sPath
         End
         Set psHomePath to sPath
-        Set private.psSWSFile to sSWSFile 
+        Set private.psSWSFile to sSWSFile
+
+        // Redirect DF_OPEN_PATH to the target workspace's source folders so
+        // that Get_File_Path resolves packages there instead of in DFRefactor's
+        // own workspace.  Passing "" restores the original path.
+        Send UpdateDFOpenPath sSWSFile
     End_Procedure
 
     { MethodType=Property }
     Function psSWSFile Returns String
         Function_Return (private.psSWSFile(Self))
     End_Function
+
+    // Updates DF_OPEN_PATH whenever a target workspace is opened or closed.
+    //
+    // When sSWSFile is non-empty the procedure reads the workspace's .sws file,
+    // resolves every AppSrc entry to a full absolute path, and prepends those
+    // paths to the original DF_OPEN_PATH that was captured at startup.  This
+    // means Get_File_Path finds packages from the target workspace first, then
+    // falls back to DFRefactor's own libraries and DataFlex system packages.
+    //
+    // When sSWSFile is empty (workspace closed) the original DF_OPEN_PATH is
+    // restored verbatim.
+    //
+    // All refactoring functions that call Get_File_Path can rely on this being
+    // correct for whatever workspace is currently being worked on — no per-
+    // function save/restore is required.
+    Procedure UpdateDFOpenPath String sSWSFile
+        String sOrgOpenPath sNewOpenPath sHomePath sAppSrc
+        tSwsFile SwsFile
+        Integer iCount iSize
+
+        Get psOrgOpenPath to sOrgOpenPath
+
+        // Nothing to do if the original path was never saved (very early call).
+        If (sOrgOpenPath = "") Begin
+            Procedure_Return
+        End
+
+        If (sSWSFile = "") Begin
+            // Workspace closed — restore DFRefactor's own paths.
+            Set_Attribute DF_OPEN_PATH to sOrgOpenPath
+            Procedure_Return
+        End
+
+        Get psHomePath to sHomePath
+        Get vFolderFormat sHomePath to sHomePath
+
+        // Read AppSrc paths from a JSON-format .sws file (DataFlex 26+).
+        // For older workspaces ReadSwsJsonFile returns an empty struct, so
+        // asAppSrc will have zero elements and we fall through to the default.
+        Get ReadSwsJsonFile sSWSFile to SwsFile
+        Move "" to sNewOpenPath
+        Move (SizeOfArray(SwsFile.Paths.asAppSrc)) to iSize
+        If (iSize > 0) Begin
+            Decrement iSize
+            For iCount from 0 to iSize
+                Move (Trim(SwsFile.Paths.asAppSrc[iCount])) to sAppSrc
+                If (sAppSrc <> "") Begin
+                    // Resolve relative paths (e.g. "AppSrc" or ".\AppSrc")
+                    // against the workspace home folder.
+                    If (not(sAppSrc contains ":")) Begin
+                        If (Left(sAppSrc, 2) = ".\") Begin
+                            Move (Mid(sAppSrc, CI_EOL, 3)) to sAppSrc
+                        End
+                        Move (sHomePath + sAppSrc) to sAppSrc
+                    End
+                    // DF_OPEN_PATH entries must not have a trailing backslash.
+                    If (Right(sAppSrc, 1) = CS_DirSeparator) Begin
+                        Move (Left(sAppSrc, (Length(sAppSrc) - 1))) to sAppSrc
+                    End
+                    If (not(Lowercase(sNewOpenPath) contains Lowercase(sAppSrc))) Begin
+                        If (sNewOpenPath = "") Begin
+                            Move sAppSrc to sNewOpenPath
+                        End
+                        Else Begin
+                            Append sNewOpenPath (";" + sAppSrc)
+                        End
+                    End
+                End
+            Loop
+        End
+
+        // Fallback for older (non-JSON) workspaces: assume a standard AppSrc
+        // subfolder directly under the workspace home.
+        If (sNewOpenPath = "") Begin
+            Move (sHomePath + "AppSrc") to sNewOpenPath
+        End
+
+        // Prepend the target workspace's folders; retain DFRefactor's own paths
+        // as a fallback so library and system packages still resolve.
+        Set_Attribute DF_OPEN_PATH to (sNewOpenPath + ";" + sOrgOpenPath)
+    End_Procedure
 
     { MethodType=Property }
     Function psWorkspaceHomePath Returns String
