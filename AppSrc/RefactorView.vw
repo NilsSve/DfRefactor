@@ -1150,7 +1150,7 @@ Object oRefactorView is a cRDCDbView
                 Set pbWorkspaceMode of ghoApplication to False
             End
             If (bSWSFile = True) Begin
-                Send UppWorkSpaceFileToRegistry of ghoApplication sFileFolderName
+                Send UpdateWorkSpaceFileToRegistry  of ghoApplication sFileFolderName
                 Send UpdateWorkspaceSelectorDisplay of ghoApplication sFileFolderName
                 Send DisplayWorkspaceItem of (oWorkspaceSelector_Menuitem(ghoCommandBars)) sFileFolderName
             End
