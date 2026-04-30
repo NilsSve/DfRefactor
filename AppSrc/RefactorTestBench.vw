@@ -437,9 +437,14 @@ Object oRefactorTestBench is a cRefactorDbView
         Send CloseCompileErrorDialog
         Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor
         Send Request_Clear of hoRefactoredEditor
-        
+
         Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
-        Get psCodeFile          of hoLegacyEditor     to sLegacyFileName
+        Get psCodeFile          of hoLegacyEditor     to sLegacyFileName 
+
+// File format test:        
+//    Boolean bIsFileUTF8
+//    Get IsFileUTF8 of ghorefactorengine sLegacyFileName to bIsFileUTF8
+
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
         // We need to copy the legacy file to the refactor file before we start our work,
         // because else the ghoRefactorEngine would overwrite the sLegacyFileName with

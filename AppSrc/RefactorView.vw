@@ -138,7 +138,6 @@ Object oRefactorView is a cRDCDbView
                 Object oFunctionSelection_grd is a cRDCDbCJGrid
                     Set Size to 156 620
                     Set Location to 27 10
-//                    Set Ordering to 2
                     Set pbDbShowInvertSelectionsMenuItem to True     
                     Set pbHeaderPrompts to False
                     Set pbDbShowEditMenuItem to False
