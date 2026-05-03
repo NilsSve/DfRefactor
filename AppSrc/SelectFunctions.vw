@@ -126,12 +126,18 @@ Object oSelectFunctions_vw is a cRDCDbView
                     String sParameterList
                     String[] asParameters
                     Integer iSize iCount
-                    
+
                     Get Field_Current_Value of (Main_DD(Self)) Field Functions.ParameterValidation to sParameterList
-                    If (sParameterList <> "") Begin
-                        Set pbComboButton to True
+                    // "ANY" signals a free-text parameter: the user may type any value.
+                    If (Trim(Lowercase(sParameterList)) = "any") Begin
+                        Set pbComboButton     to False
+                        Set pbComboEntryState to True
+                    End
+                    Else If (sParameterList <> "") Begin
+                        Set pbComboButton     to True
+                        Set pbComboEntryState to False
                         Send ComboDeleteData
-                        Get StrSplitToArray  sParameterList "," to asParameters
+                        Get StrSplitToArray sParameterList "," to asParameters
                         Move (SizeOfArray(asParameters)) to iSize
                         Decrement iSize
                         For iCount from 0 to iSize
@@ -139,7 +145,8 @@ Object oSelectFunctions_vw is a cRDCDbView
                         Loop
                     End
                     Else Begin
-                        Set pbComboButton to False
+                        Set pbComboButton     to False
+                        Set pbComboEntryState to False
                     End
                 End_Procedure
 
@@ -154,7 +161,7 @@ Object oSelectFunctions_vw is a cRDCDbView
                         Move (Replaces("\n", sText, CS_CRLF)) to sText
                     End 
                     Else Begin
-                        Move "Dropdown with choises on rows that has a value. For some functions an extra parameter is used. You can only select from existing values. Hover the mouse over an item to see all valid values to select from." to sText
+                        Move "For some functions an extra parameter is used. You can only select from existing values, unless the the meta-data for the function has been set to { EnumList = 'ANY' }. Hover the mouse over an item to see all valid values to select from." to sText
                     End
                     Function_Return sText
                 End_Function
