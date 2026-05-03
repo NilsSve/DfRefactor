@@ -352,7 +352,7 @@ Object oRefactorTestBench is a cRefactorDbView
                     
                     Procedure OnClick   
                         Set Value of oRefactoredCode_Time_fm to ""
-                        Delegate Send RefactoreCode
+                        Delegate Send RefactorCode
                         Set Value of oRefactoredCode_Time_fm to (psTotalTime(ghoRefactorEngine))
                     End_Procedure 
                     
@@ -418,7 +418,7 @@ Object oRefactorTestBench is a cRefactorDbView
     Procedure MAIN_FUNCTION_CALL
     End_Procedure
     
-    Procedure RefactoreCode
+    Procedure RefactorCode
         String sLegacyFileName sRefactoredFileName sErrFile
         Handle hoLegacyEditor hoRefactoredEditor
         Integer iRetval
@@ -457,8 +457,13 @@ Object oRefactorTestBench is a cRefactorDbView
             Procedure_Return
         End
 
-        // Start the Engine!                                                    
+        // Start the Engine!
         Send StartEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor
+        // Reload the refactored file into the editor. This is necessary for
+        // eOtherFunctionAll functions (e.g. RefactorDbGridToCJGrid) which write
+        // their output directly to disk and bypass the in-memory editor content.
+        // For all other function types this is a harmless reload of the same content.
+        Send LoadFile of hoRefactoredEditor sRefactoredFileName
         // Save the result
         Send SaveFile of hoRefactoredEditor
     End_Procedure
