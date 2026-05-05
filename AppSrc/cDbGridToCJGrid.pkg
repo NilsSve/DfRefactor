@@ -7,10 +7,28 @@
 // Transformation rules applied to each DbGrid object found:
 //   - "Object X is a <OldGridClass>"    ->  "Object X is a <NewGridClass>"
 //   - Begin_Row / Entry_Item / End_Row  ->  removed; Entry_Items become column objects
-//   - "Set Form_Width   Item N to W"    ->  "Set piWidth to W"   on the column
-//   - "Set Header_Label Item N to "L""  ->  "Set psCaption to "L"" on the column
+//   - "Set Form_Width   [Item] N to W"   ->  "Set piWidth to W"     on column N
+//   - "Set Header_Label [Item] N to "L""->  "Set psCaption to "L"" on column N
+//   - "Set Column_Checkbox_State [Item] N to V"   ->  "Set pbCheckbox    to V"  on column N
+//   - "Set Column_Shadow_State   [Item] N to V"   ->  "Set pbEditable    to !V" on column N (inverted)
+//   - "Set Column_Combo_State    [Item] N to V"   ->  "Set pbComboButton to V"  on column N
+//   - "Set Combo_Sort_State      [Item] N to V"   ->  "Set pbComboSort   to V"  on column N
+//   - "Set Entry_State           [Item] N to V"   ->  "Set pbEditable    to V"  on column N
+//   - "Set Column_CapsLock_State [Item] N to V"   ->  "Set pbCapslock    to V"  on column N
+//   - "Set Form_Justification_Mode [Item] N to V" ->  "Set peTextAlignment to V" on column N
+//     (JMode_Left/0->xtpAlignLeft, JMode_Right/1->xtpAlignRight, JMode_Center/2->xtpAlignCenter)
+//   - The [Item] keyword is optional in all per-column Set statements above.
+//   - "Set Column_Prompt_Object  [Item] N to SL"  ->  "Set Prompt_Button_Mode to PB_PromptOn" +
+//                                                     "Set Prompt_Object to SL" on column N
+//   - "Set Form_Mask             [Item] N to V"   ->  "Set psMask to V"          on column N
+//   - "Set Numeric_Mask          [Item] N to V"   ->  "Set psMask to V"          on column N
+//   - "Set Form_DataType         [Item] N to V"   ->  "Set peDataType to V"      on column N
+//     (MASK_NUMERIC_WINDOW->typeNumeric, MASK_DATE_WINDOW->typeDate, MASK_DEFAULT_WINDOW->typeText)
+//   - "Set column_option [Item] N to NoEnter True/False" -> "Set pbEditable to False/True" on col N
+//     (only when NoEnter is present; other flags like NoTab are silently consumed)
 //   - Commented out: Set Main_File (hints which DDO to wire up in the new grid)
 //   - Removed: Set Wrap_State, Set psColumnsID
+//   - Removed: Define <constant> N (column index constants, no longer needed after conversion)
 //   - Commented out: Entry_Display procedure block (preserved for programmer review)
 //   - Translated: Set peResizeColumn        -> Set pbAllowColumnResize (rcNone only; others removed)
 //   - Translated: Set Prompt_Button_Mode    -> Set pbHeaderPrompts
@@ -30,7 +48,9 @@
 //   - Translated: Set CurrentRowTextColor   -> Set piHighlightForeColor
 //   - Translated: Set CurrentCellColor      -> Set piFocusCellBackColor
 //   - Translated: Set CurrentCellTextColor  -> Set piFocusCellForeColor
-//   - Removed:    Set Child_Table_State, Set Item_Limit, Set Base_Item, Set pbComboNavigation
+//   - Removed:    Set Child_Table_State, Set Item_Limit, Set Base_Item, Set pbComboNavigation,
+//               Set Move_Value_Out_State, Set Auto_Export_State,
+//               Set Auto_Index_State, Set Auto_Column_State
 //
 // Method override handling (Procedure/Function blocks inside the grid body):
 //   - Renamed:    Goto_Top_Row    -> MoveToFirstRow   (Forward Send/Get also renamed)
@@ -44,7 +64,9 @@
 //     Find_Record, Find_RowId, ReadByRowId, Read_By_Recnum, ServerOrderingOverride,
 //     Activate_Column, Activate_Item, DoAdjustGridWidths, Column_Combo_*, DoMakeColumnVisible,
 //     Request_Superfind, SuperFind, SuperFind_Next, SuperFind_Previous,
-//     Validate_Items, Exec_Entry, Exec_Exit, Exec_Validate
+//     Validate_Items, Exec_Entry, Exec_Exit, Exec_Validate,
+//     Change_Row_Color (-> consider OnSetRowColor),
+//     Mouse_Click (-> consider OnComRowDblClick)
 //   - All other procedure/function overrides are preserved unchanged.
 //
 // All other content (other Set properties, nested objects, etc.) is preserved unchanged.
@@ -228,6 +250,18 @@ Class cDbGridToCJGrid is a cObject
             Function_Return True
         End
         If (sTrimLower contains "pbcombonavigation") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "move_value_out_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "auto_export_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "auto_index_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "auto_column_state") Begin
             Function_Return True
         End
         Function_Return False
@@ -447,6 +481,12 @@ Class cDbGridToCJGrid is a cObject
         If (sMethodLower = "exec_validate") Begin
             Function_Return True
         End
+        If (sMethodLower = "change_row_color") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "mouse_click") Begin
+            Function_Return True
+        End
         Function_Return False
     End_Function
 
@@ -465,6 +505,12 @@ Class cDbGridToCJGrid is a cObject
         End
         If (sMethodLower = "move_to_column") Begin
             Function_Return "MoveToColumnObject (note: takes a column object handle, not a column number)"
+        End
+        If (sMethodLower = "change_row_color") Begin
+            Function_Return "OnSetRowColor on the grid object (note: per-row color logic moves into OnSetRowColor)"
+        End
+        If (sMethodLower = "mouse_click") Begin
+            Function_Return "OnComRowDblClick (note: receives Variant llRow, Variant llItem instead of window/position)"
         End
         Function_Return ""
     End_Function
@@ -775,6 +821,74 @@ Class cDbGridToCJGrid is a cObject
         Function_Return (Integer(Trim(sVal)))
     End_Function
 
+    // Parse the item index N from a per-column Set line, handling both:
+    //   "set <propname> item N to value"  (with  Item keyword)
+    //   "set <propname> N to value"       (without Item keyword)
+    // sPropName is the lowercase property name to locate in the line.
+    // Returns -1 when the index cannot be parsed.
+    Function ParseColumnItemIndex String sTrimLower String sPropName Returns Integer
+        Integer iProp iAfter iSpace
+        String  sRest
+
+        // Try the "item N" form first.
+        Move (Pos(" item ", sTrimLower)) to iProp
+        If (iProp <> 0) Begin
+            Move (Trim(Mid(sTrimLower, CI_EOL, (iProp + 6)))) to sRest
+            Move (Pos(CS_S, sRest)) to iSpace
+            If (iSpace > 0) Begin
+                Function_Return (Integer(Left(sRest, iSpace - 1)))
+            End
+            Function_Return (Integer(Trim(sRest)))
+        End
+
+        // No "item" keyword: N sits directly after the property name.
+        Move (Pos(sPropName, sTrimLower)) to iProp
+        If (iProp = 0) Begin
+            Function_Return -1
+        End
+        // Skip past the property name; iAfter is the position of the last char
+        // of sPropName, so iAfter+1 is the space, iAfter+2 onwards is "N to ...".
+        Move (iProp + Length(sPropName)) to iAfter
+        Move (Trim(Mid(sTrimLower, CI_EOL, (iAfter + 1)))) to sRest
+        // sRest = "N to value"
+        Move (Pos(CS_S, sRest)) to iSpace
+        If (iSpace > 0) Begin
+            Function_Return (Integer(Left(sRest, iSpace - 1)))
+        End
+        Function_Return (Integer(Trim(sRest)))
+    End_Function
+
+    // Translate a legacy Form_Justification_Mode value to a cDbCJGridColumn
+    // peTextAlignment constant.  Handles both symbolic and numeric forms.
+    // Returns the translated value, or the original value when unrecognised.
+    Function TranslateJustificationValue String sValLower Returns String
+        If (sValLower = "jmode_left"   or sValLower = "0") Begin
+            Function_Return "xtpAlignLeft"
+        End
+        If (sValLower = "jmode_right"  or sValLower = "1") Begin
+            Function_Return "xtpAlignRight"
+        End
+        If (sValLower = "jmode_center" or sValLower = "2") Begin
+            Function_Return "xtpAlignCenter"
+        End
+        Function_Return sValLower  // Unknown -- keep as-is for programmer to review.
+    End_Function
+
+    // Translate a legacy Form_DataType value to a cDbCJGridColumn peDataType constant.
+    // Returns the translated value, or the original value when unrecognised.
+    Function TranslateDataTypeValue String sValLower Returns String
+        If (sValLower = "mask_default_window") Begin
+            Function_Return "typeText"
+        End
+        If (sValLower = "mask_numeric_window") Begin
+            Function_Return "typeNumeric"
+        End
+        If (sValLower = "mask_date_window") Begin
+            Function_Return "typeDate"
+        End
+        Function_Return sValLower  // Unknown -- keep as-is for programmer to review.
+    End_Function
+
     // Derive a column object name from "Table.Field" -> "oTable_Field".
     Function DeriveColumnName String sFieldSpec Returns String
         Integer iDot iSpace
@@ -830,7 +944,20 @@ Class cDbGridToCJGrid is a cObject
     // sGridIndent is the leading whitespace of the parent grid Object line.
     // Column Object lines are indented one tab further; their properties
     // are indented two tabs further.
-    Procedure AppendColumnObjects String[] ByRef asOutput String sGridIndent String[] asEntryItems Integer[] aiFormWidths String[] asHeaderLabels
+    //
+    // Per-column optional arrays (all indexed by item number, "" = not set):
+    //   asCheckbox    -> Set pbCheckbox    to <value>  (Column_Checkbox_State)
+    //   asEditable    -> Set pbEditable    to <value>  (Entry_State same-sense;
+    //                                                   Column_Shadow_State inverted;
+    //                                                   column_option NoEnter inverted)
+    //   asComboButton -> Set pbComboButton to <value>  (Column_Combo_State)
+    //   asComboSort   -> Set pbComboSort   to <value>  (Combo_Sort_State)
+    //   asCapslock    -> Set pbCapslock    to <value>  (Column_CapsLock_State)
+    //   asTextAlign   -> Set peTextAlignment to <value>(Form_Justification_Mode translated)
+    //   asPromptObject-> Set Prompt_Button_Mode + Set Prompt_Object (Column_Prompt_Object)
+    //   asMask        -> Set psMask        to <value>  (Form_Mask / Numeric_Mask)
+    //   asDataType    -> Set peDataType    to <value>  (Form_DataType translated)
+    Procedure AppendColumnObjects String[] ByRef asOutput String sGridIndent String[] asEntryItems Integer[] aiFormWidths String[] asHeaderLabels String[] asCheckbox String[] asEditable String[] asComboButton String[] asComboSort String[] asCapslock String[] asTextAlign String[] asPromptObject String[] asMask String[] asDataType
         String  sSingle sColIndent sColProp sColName sFieldSpec sLabel sTargetCol
         Integer iCount iSize iWidth
 
@@ -872,7 +999,38 @@ Class cDbGridToCJGrid is a cObject
             Move (sColProp   + "Entry_Item " + sFieldSpec)                    to asOutput[SizeOfArray(asOutput)]
             Move (sColProp   + "Set piWidth to " + String(iWidth))            to asOutput[SizeOfArray(asOutput)]
             Move (sColProp   + "Set psCaption to " + '"' + sLabel + '"')      to asOutput[SizeOfArray(asOutput)]
-            Move (sColIndent + "End_Object")                                  to asOutput[SizeOfArray(asOutput)]
+
+            // Optional per-column translated properties.
+            If (iCount < SizeOfArray(asCheckbox) and asCheckbox[iCount] <> "") Begin
+                Move (sColProp + "Set pbCheckbox to " + asCheckbox[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+            If (iCount < SizeOfArray(asEditable) and asEditable[iCount] <> "") Begin
+                Move (sColProp + "Set pbEditable to " + asEditable[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+            If (iCount < SizeOfArray(asComboButton) and asComboButton[iCount] <> "") Begin
+                Move (sColProp + "Set pbComboButton to " + asComboButton[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+            If (iCount < SizeOfArray(asComboSort) and asComboSort[iCount] <> "") Begin
+                Move (sColProp + "Set pbComboSort to " + asComboSort[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+            If (iCount < SizeOfArray(asCapslock) and asCapslock[iCount] <> "") Begin
+                Move (sColProp + "Set pbCapslock to " + asCapslock[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+            If (iCount < SizeOfArray(asTextAlign) and asTextAlign[iCount] <> "") Begin
+                Move (sColProp + "Set peTextAlignment to " + asTextAlign[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+            If (iCount < SizeOfArray(asPromptObject) and asPromptObject[iCount] <> "") Begin
+                Move (sColProp + "Set Prompt_Button_Mode to PB_PromptOn")                          to asOutput[SizeOfArray(asOutput)]
+                Move (sColProp + "Set Prompt_Object to " + asPromptObject[iCount])                 to asOutput[SizeOfArray(asOutput)]
+            End
+            If (iCount < SizeOfArray(asMask) and asMask[iCount] <> "") Begin
+                Move (sColProp + "Set psMask to " + asMask[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+            If (iCount < SizeOfArray(asDataType) and asDataType[iCount] <> "") Begin
+                Move (sColProp + "Set peDataType to " + asDataType[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+
+            Move (sColIndent + "End_Object") to asOutput[SizeOfArray(asOutput)]
         Loop
     End_Procedure
 
@@ -883,8 +1041,10 @@ Class cDbGridToCJGrid is a cObject
     // the result back to pasSource. Returns the number of grids transformed.
     Function TransformSource Returns Integer
         String[] asSource asOutput asEntryItems asHeaderLabels asTranslated
+        String[] asCheckbox asEditable asComboButton asComboSort asCapslock asTextAlign
+        String[] asPromptObject asMask asDataType
         Integer[] aiFormWidths
-        String  sLine sTrimLine sLower sGridIndent sFieldSpec sLabel
+        String  sLine sTrimLine sLower sGridIndent sFieldSpec sLabel sValue sValLower
         String  sMethodName sOldMethodName sNewMethodName sHint sLineIndent
         Integer iCount iSize iGridsChanged iItemIdx iWidth iGridInnerNest iTr iTrSize
         Boolean bInBeginRow bInEntryDisplay bPendingColumns bSkip bFound bOK
@@ -920,6 +1080,15 @@ Class cDbGridToCJGrid is a cObject
                     Move (ResizeArray(asEntryItems,   0)) to asEntryItems
                     Move (ResizeArray(asHeaderLabels, 0)) to asHeaderLabels
                     Move (ResizeArray(aiFormWidths,   0)) to aiFormWidths
+                    Move (ResizeArray(asCheckbox,     0)) to asCheckbox
+                    Move (ResizeArray(asEditable,     0)) to asEditable
+                    Move (ResizeArray(asComboButton,  0)) to asComboButton
+                    Move (ResizeArray(asComboSort,    0)) to asComboSort
+                    Move (ResizeArray(asCapslock,     0)) to asCapslock
+                    Move (ResizeArray(asTextAlign,    0)) to asTextAlign
+                    Move (ResizeArray(asPromptObject, 0)) to asPromptObject
+                    Move (ResizeArray(asMask,         0)) to asMask
+                    Move (ResizeArray(asDataType,     0)) to asDataType
                     Move False to bInBeginRow
                     Move False to bInEntryDisplay
                     Move False to bPendingColumns
@@ -992,7 +1161,7 @@ Class cDbGridToCJGrid is a cObject
                     // This is the grid's own End_Object.
                     // Flush any pending columns (e.g. no Entry_Display after widths).
                     If (bPendingColumns = True) Begin
-                        Send AppendColumnObjects (&asOutput) sGridIndent asEntryItems aiFormWidths asHeaderLabels
+                        Send AppendColumnObjects (&asOutput) sGridIndent asEntryItems aiFormWidths asHeaderLabels asCheckbox asEditable asComboButton asComboSort asCapslock asTextAlign asPromptObject asMask asDataType
                         Move False to bPendingColumns
                     End
                 End
@@ -1012,37 +1181,160 @@ Class cDbGridToCJGrid is a cObject
                 Move True to bSkip
             End
 
-            // Inside a grid: collect Form_Width / Header_Label lines
+            // Inside a grid: collect per-column property lines (after End_Row).
+            // Both "Set Prop Item N to V" and "Set Prop N to V" are handled.
             If (bSkip = False and bPendingColumns = True) Begin
-                If (Pos("form_width", sLower) <> 0 and Pos(" item ", sLower) <> 0) Begin
-                    Get ParseItemIndex sLower to iItemIdx
+                If (Pos("form_width", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "form_width" to iItemIdx
                     Get ParseFormWidth sLower to iWidth
                     If (iItemIdx >= 0) Begin
                         Move iWidth to aiFormWidths[iItemIdx]
                     End
                     Move True to bSkip
                 End
-                Else If (Pos("header_label", sLower) <> 0 and Pos(" item ", sLower) <> 0) Begin
-                    Get ParseItemIndex sLower to iItemIdx
+                Else If (Pos("header_label", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "header_label" to iItemIdx
                     Get ParseHeaderLabel sLine to sLabel
                     If (iItemIdx >= 0) Begin
                         Move sLabel to asHeaderLabels[iItemIdx]
                     End
                     Move True to bSkip
                 End
+                Else If (Pos("column_checkbox_state", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "column_checkbox_state" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        Move sValue to asCheckbox[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("column_shadow_state", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "column_shadow_state" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        // Shadow=True means read-only, so invert to get pbEditable value.
+                        Move (Lowercase(Trim(sValue))) to sValLower
+                        Move (sValLower = "true" or sValLower = "1") to bOK
+                        Move (If(bOK, "False", "True")) to asEditable[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("column_combo_state", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "column_combo_state" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        Move sValue to asComboButton[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("combo_sort_state", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "combo_sort_state" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        Move sValue to asComboSort[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("entry_state", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "entry_state" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        Move sValue to asEditable[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("column_capslock_state", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "column_capslock_state" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        Move sValue to asCapslock[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("form_justification_mode", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "form_justification_mode" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        Get TranslateJustificationValue (Lowercase(Trim(sValue))) to sValue
+                        Move sValue to asTextAlign[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("column_prompt_object", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "column_prompt_object" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        Move sValue to asPromptObject[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("form_mask", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "form_mask" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        Move sValue to asMask[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("numeric_mask", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "numeric_mask" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        Move sValue to asMask[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("form_datatype", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "form_datatype" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        Get TranslateDataTypeValue (Lowercase(Trim(sValue))) to sValue
+                        Move sValue to asDataType[iItemIdx]
+                    End
+                    Move True to bSkip
+                End
+                Else If (Pos("column_option", sLower) <> 0) Begin
+                    Get ParseColumnItemIndex sLower "column_option" to iItemIdx
+                    Get ParseValueAfterTo sLine to sValue
+                    If (iItemIdx >= 0) Begin
+                        // Only process if NoEnter is mentioned; NoTab and other flags
+                        // have no CJGrid equivalent and are silently consumed.
+                        Move (Lowercase(Trim(sValue))) to sValLower
+                        If (sValLower contains "noenter") Begin
+                            If (sValLower contains "noenter true") Begin
+                                Move "False" to asEditable[iItemIdx]
+                            End
+                            Else Begin
+                                Move "True" to asEditable[iItemIdx]
+                            End
+                        End
+                    End
+                    Move True to bSkip
+                End
                 Else If (sTrimLine = "") Begin
-                    // Blank lines within the width/label block are swallowed.
+                    // Blank lines within the column-properties block are swallowed.
+                    Move True to bSkip
+                End
+                Else If (Left(sLower, 7) = "define ") Begin
+                    // Skip "Define COL_xxx for N" column index constants.
                     Move True to bSkip
                 End
                 Else Begin
-                    // First non-width/label, non-blank line: emit the column objects
+                    // First non-column-property, non-blank line: emit column objects
                     // now, then fall through to process this line as normal content.
-                    Send AppendColumnObjects (&asOutput) sGridIndent asEntryItems aiFormWidths asHeaderLabels
+                    Send AppendColumnObjects (&asOutput) sGridIndent asEntryItems aiFormWidths asHeaderLabels asCheckbox asEditable asComboButton asComboSort asCapslock asTextAlign asPromptObject asMask asDataType
                     Move False to bPendingColumns
                 End
             End
 
             // Inside a grid: direct grid content (iGridInnerNest = 1)
+            If (bSkip = False) Begin
+                // Skip "Define COL_xxx for N" column index constants — no longer needed.
+                If (Left(sLower, 7) = "define ") Begin
+                    Move True to bSkip
+                End
+            End
+
             If (bSkip = False) Begin
                 Move (Left(sLower, 9) = "begin_row") to bOK
                 If (bOK = True) Begin
@@ -1050,6 +1342,15 @@ Class cDbGridToCJGrid is a cObject
                     Move (ResizeArray(asEntryItems,   0)) to asEntryItems
                     Move (ResizeArray(asHeaderLabels, 0)) to asHeaderLabels
                     Move (ResizeArray(aiFormWidths,   0)) to aiFormWidths
+                    Move (ResizeArray(asCheckbox,     0)) to asCheckbox
+                    Move (ResizeArray(asEditable,     0)) to asEditable
+                    Move (ResizeArray(asComboButton,  0)) to asComboButton
+                    Move (ResizeArray(asComboSort,    0)) to asComboSort
+                    Move (ResizeArray(asCapslock,     0)) to asCapslock
+                    Move (ResizeArray(asTextAlign,    0)) to asTextAlign
+                    Move (ResizeArray(asPromptObject, 0)) to asPromptObject
+                    Move (ResizeArray(asMask,         0)) to asMask
+                    Move (ResizeArray(asDataType,     0)) to asDataType
                     Move True to bInBeginRow
                     Move True to bSkip
                 End
@@ -1058,7 +1359,7 @@ Class cDbGridToCJGrid is a cObject
                     If (bOK = True) Begin
                         // A nested Object is starting: flush pending columns first.
                         If (bPendingColumns = True) Begin
-                            Send AppendColumnObjects (&asOutput) sGridIndent asEntryItems aiFormWidths asHeaderLabels
+                            Send AppendColumnObjects (&asOutput) sGridIndent asEntryItems aiFormWidths asHeaderLabels asCheckbox asEditable asComboButton asComboSort asCapslock asTextAlign asPromptObject asMask asDataType
                             Move False to bPendingColumns
                         End
                         Move 2 to iGridInnerNest
