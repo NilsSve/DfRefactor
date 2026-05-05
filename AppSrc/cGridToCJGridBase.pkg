@@ -1,0 +1,996 @@
+/* cGridToCJGridBase.pkg
+
+ Abstract base class for CJ grid conversion worker classes.
+ Shared by:
+   cDbGridTocDbCJGrid  (data-aware:     DbGrid/cLangDbGrid -> cDbCJGrid)
+   cGridToCJGrid       (non-data-aware: Grid               -> cCJGrid)
+
+ This class provides all transformation logic that operates at the cCJGrid level —
+ property translation, legacy property removal, method renaming, Entry_Display
+ commenting, and legacy-only method commenting.  It does NOT know about column
+ sub-objects or Begin_Row / Entry_Item constructs; those are added by subclasses
+ through three override hooks:
+
+   OnGridStarted sGridIndent
+       Called once when a matching grid declaration is detected.
+       Subclasses reset their per-grid state here.
+
+   OnHandleGridLine sLine sTrimLine sLower asOutput ByRef sGridIndent bSkip ByRef
+       Called for every source line at nesting level 1 (direct grid content),
+       before the base class's own property/method dispatch.
+       Set bSkip True to consume the line; leave False to let base processing run.
+       The subclass may emit content into asOutput before returning.
+
+   OnBeforeGridEndObject asOutput ByRef sGridIndent
+       Called once just before the grid's own End_Object is emitted.
+       Subclasses flush any buffered column objects here.
+
+ Shared transformations applied to each grid object found:
+   - "Object X is a <OldGridClass>"    ->  "Object X is a <NewGridClass>"
+   - Commented out: Set Main_File (hints which DDO to wire up)
+   - Removed: Set Wrap_State, Set psColumnsID
+   - Removed: Define <constant> N (column index constants)
+   - Removed: Set Child_Table_State, Set Item_Limit, Set Base_Item,
+              Set pbComboNavigation, Set Move_Value_Out_State,
+              Set Auto_Export_State, Set Auto_Index_State, Set Auto_Column_State
+   - Commented out: Entry_Display procedure block
+   - Translated: Set peResizeColumn        -> Set pbAllowColumnResize
+   - Translated: Set Prompt_Button_Mode    -> Set pbHeaderPrompts
+   - Translated: Set Allow_Top_Add_State   -> Set pbAllowAppendRow
+   - Translated: Set Allow_Bottom_Add_State-> Set pbAllowAppendRow
+   - Translated: Set Allow_Insert_Add_State-> Set pbAllowInsertRow
+   - Translated: Set Auto_Save_State       -> Set pbAutoSave
+   - Translated: Set Auto_Regenerate_State -> Set pbAutoRegenerate
+   - Translated: Set No_Create_State       -> Set pbAllowAppendRow + Set pbAllowInsertRow (inverted)
+   - Translated: Set No_Delete_State       -> Set pbAllowDeleteRow (inverted)
+   - Translated: Set Read_Only_State       -> Set pbReadOnly
+   - Translated: Set Header_Visible_State  -> Set pbShowHeader
+   - Translated: Set Resize_Column_State   -> Set pbAllowColumnResize
+   - Translated: Set Highlight_Row_State   -> Set pbShowRowFocus
+   - Translated: Set Gridline_Mode         -> Set peHorizontalGridStyle / peVerticalGridStyle
+   - Translated: Set CurrentRowColor       -> Set piHighlightBackColor
+   - Translated: Set CurrentRowTextColor   -> Set piHighlightForeColor
+   - Translated: Set CurrentCellColor      -> Set piFocusCellBackColor
+   - Translated: Set CurrentCellTextColor  -> Set piFocusCellForeColor
+
+ Method override handling (Procedure/Function blocks inside the grid body):
+   - Renamed:    Goto_Top_Row    -> MoveToFirstRow   (Forward Send/Get also renamed)
+   - Renamed:    Goto_Bottom_Row -> MoveToLastRow     (Forward Send/Get also renamed)
+   - Renamed:    Up_Row          -> MoveUpRow         (Forward Send/Get also renamed)
+   - Renamed:    Down_Row        -> MoveDownRow       (Forward Send/Get also renamed)
+   - Commented out with TODO hint: Fill_List, Refresh_Page, Request_New_Index, Move_to_Column
+   - Commented out (no equivalent): Beginning_of_Data, End_of_Data, CheckBox_Item,
+     Reorder_List, Auto_Reorder_List, Scroll, Clear_Current_Record, Col_Index, Display,
+     DoCheckDisplayableRows, DoToggleColumnOrdering, Find_Current_Buffer, Find_Init,
+     Find_Record, Find_RowId, ReadByRowId, Read_By_Recnum, ServerOrderingOverride,
+     Activate_Column, Activate_Item, DoAdjustGridWidths, Column_Combo_*,
+     DoMakeColumnVisible, Request_Superfind, SuperFind, SuperFind_Next,
+     SuperFind_Previous, Validate_Items, Exec_Entry, Exec_Exit, Exec_Validate,
+     Change_Row_Color (-> consider OnSetRowColor),
+     Mouse_Click (-> consider OnComRowDblClick)
+   - All other procedure/function overrides are preserved unchanged.
+
+ All other content (other Set properties, nested objects, etc.) is preserved unchanged.
+
+ The sParameter passed to TransformFiles must be a comma-separated string of 2 or 3
+ class names:  "OldGridClass,NewGridClass[,NewColumnClass]"
+ If sParameter is empty, the old class is detected by the subclass IsGridDeclaration
+ override, and the default class names set in the subclass constructor are used.
+*/
+
+Use vWin32fh.pkg
+Use RefactorConstants.h.pkg
+Use WsGlobalFunctions.pkg
+Use GlobalFunctionsProcedures.pkg
+Use cEncodingHelpers.pkg
+
+#IFNDEF phoEditorRefactored
+    Register_Function phoEditorRefactored Returns Handle
+#ENDIF
+
+Class cGridToCJGridBase is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Property String[]  pasSource
+        Property String    psFileName          ""
+        Property Integer   piChangedFiles       0
+        Property Integer   piChangedGrids       0
+        // Class name parameters (set by ParseAndSetParameter).
+        // psLegacyGridClass: "" means pattern-based detection (defined by subclass).
+        Property String    psLegacyGridClass   ""
+        Property String    psTargetGridClass   ""
+        Property String    psTargetColumnClass ""
+    End_Procedure
+
+    // *** File I/O ***
+
+    // Reads a source file using the byte-safe OEM helper so that legacy
+    // CP850-encoded files are decoded correctly into Unicode strings.
+    Procedure ReadFile String sFileName
+        String[] asSource
+        Set psFileName to sFileName
+        Move (ReadOemFileAsStringArray(sFileName)) to asSource
+        Set pasSource to asSource
+    End_Procedure
+
+    // Writes the source array back to disk using the byte-safe OEM helper
+    // so that non-ASCII characters survive the round-trip.
+    Procedure WriteFile
+        String   sFileName
+        String[] asSource
+        Boolean  bOK
+
+        Get psFileName to sFileName
+        Get pasSource  to asSource
+        Move (WriteOemFileFromStringArray(asSource, sFileName, CS_CRLF)) to bOK
+        If (bOK = False) Begin
+            Error DFERR_PROGRAM ("Write failed:" * sFileName * "(cGridToCJGridBase WriteFile)")
+        End
+    End_Procedure
+
+    // *** Parameter parsing ***
+
+    // Parses sParameter ("OldClass,NewGridClass[,NewColumnClass]") and sets the
+    // three class name properties.
+    // - Empty sParameter: use defaults set by the subclass constructor.
+    // - 2 parts: exact old-class match and new grid class; column stays as-is.
+    // - 3 parts: all three specified.
+    // Returns False (and sets an Error) when sParameter is invalid.
+    Function ParseAndSetParameter String sParameter Returns Boolean
+        String[]  asParts
+        String    sOld sNewGrid sNewCol
+        Integer   iParts
+
+        // Empty -> leave defaults from constructor unchanged.
+        If (sParameter = "") Begin
+            Set psLegacyGridClass to ""
+            Function_Return True
+        End
+
+        Move (StrSplitToArray(sParameter, ",")) to asParts
+        Move (SizeOfArray(asParts)) to iParts
+
+        If (iParts < 2 or iParts > 3) Begin
+            Error DFERR_PROGRAM ('RefactorGridToCJGrid: sParameter must be "OldGridClass,NewGridClass[,NewColumnClass]".')
+            Function_Return False
+        End
+
+        Move (Trim(asParts[0])) to sOld
+        Move (Trim(asParts[1])) to sNewGrid
+
+        If (sOld = "" or sNewGrid = "") Begin
+            Error DFERR_PROGRAM ("RefactorGridToCJGrid: OldGridClass and NewGridClass must not be empty.")
+            Function_Return False
+        End
+
+        If (iParts = 3) Begin
+            Move (Trim(asParts[2])) to sNewCol
+        End
+        If (sNewCol <> "") Begin
+            Set psTargetColumnClass to sNewCol
+        End
+
+        // Store old class name as lowercase for case-insensitive comparison.
+        Set psLegacyGridClass to (Lowercase(sOld))
+        Set psTargetGridClass to sNewGrid
+        Function_Return True
+    End_Function
+
+    // *** Detection helpers ***
+
+    // Override in subclasses to detect the specific legacy grid class.
+    // When psLegacyGridClass is set, should do an exact (case-insensitive) match.
+    // When psLegacyGridClass is empty, should fall back to a pattern check.
+    // Base implementation always returns False.
+    Function IsGridDeclaration String sTrimLower Returns Boolean
+        Function_Return False
+    End_Function
+
+    // Returns True when sTrimLower is an Object declaration of any kind.
+    Function IsObjectDeclaration String sTrimLower Returns Boolean
+        Function_Return (Pos("object ", sTrimLower) = 1 and Pos(" is a ", sTrimLower) <> 0)
+    End_Function
+
+    // Returns True when sTrimLower is an Entry_Display procedure start.
+    Function IsEntryDisplayProcedure String sTrimLower Returns Boolean
+        Function_Return (Pos("procedure ", sTrimLower) = 1 and Pos("entry_display", sTrimLower) <> 0)
+    End_Function
+
+    // Returns True when sTrimLower is a legacy grid-only Set property to remove.
+    Function IsLegacyGridProperty String sTrimLower Returns Boolean
+        If (Left(sTrimLower, 4) <> "set ") Begin
+            Function_Return False
+        End
+        If (sTrimLower contains "wrap_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "pscolumnsid") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "child_table_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "item_limit") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "base_item") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "pbcombonavigation") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "move_value_out_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "auto_export_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "auto_index_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "auto_column_state") Begin
+            Function_Return True
+        End
+        Function_Return False
+    End_Function
+
+    // Returns True when sTrimLower is a legacy grid Set property that should be
+    // commented out rather than removed, so the programmer retains it as a hint.
+    //   Set Main_File — tells the programmer which DDO to wire up on the new grid.
+    Function IsCommentOutGridProperty String sTrimLower Returns Boolean
+        If (Left(sTrimLower, 4) <> "set ") Begin
+            Function_Return False
+        End
+        If (sTrimLower contains "main_file") Begin
+            Function_Return True
+        End
+        Function_Return False
+    End_Function
+
+    // Returns the line with its indentation preserved but content prefixed with "// ".
+    // Example: "    Set Main_File to Orders" -> "    // Set Main_File to Orders"
+    Function CommentOutLine String sLine Returns String
+        String sIndent sTrim
+        Move (Trim(sLine)) to sTrim
+        Move (Left(sLine, (Length(sLine) - Length(sTrim)))) to sIndent
+        Function_Return (sIndent + "// " + sTrim)
+    End_Function
+
+    // Extracts the method name (second word) from a trimmed-lowercase procedure or
+    // function declaration line.  Returns "" when the line is not a declaration.
+    Function ParseProcFuncName String sTrimLower Returns String
+        Integer iStart iSpace
+        String  sRest
+
+        If (Left(sTrimLower, 10) = "procedure ") Begin
+            Move 11 to iStart
+        End
+        Else If (Left(sTrimLower, 9) = "function ") Begin
+            Move 10 to iStart
+        End
+        Else Begin
+            Function_Return ""
+        End
+        Move (Trim(Mid(sTrimLower, CI_EOL, iStart))) to sRest
+        Move (Pos(CS_S, sRest)) to iSpace
+        If (iSpace > 0) Begin
+            Function_Return (Left(sRest, iSpace - 1))
+        End
+        Function_Return sRest
+    End_Function
+
+    // Case-insensitive replacement of sOldLower (already lowercase) with sNewName
+    // in sLine.  Finds the first occurrence only.
+    Function ReplaceMethodName String sLine String sOldLower String sNewName Returns String
+        Integer iPos iLen
+        String  sLower
+
+        Move (Lowercase(sLine)) to sLower
+        Move (Pos(sOldLower, sLower)) to iPos
+        If (iPos = 0) Begin
+            Function_Return sLine
+        End
+        Move (Length(sOldLower)) to iLen
+        Function_Return (Left(sLine, iPos - 1) + sNewName + Mid(sLine, CI_EOL, iPos + iLen))
+    End_Function
+
+    // Returns the cDbCJGrid replacement name for a legacy grid method that has a
+    // clean 1-to-1 rename, or "" when the method is not in the rename list.
+    Function RenameGridMethod String sMethodLower Returns String
+        If (sMethodLower = "goto_top_row") Begin
+            Function_Return "MoveToFirstRow"
+        End
+        If (sMethodLower = "goto_bottom_row") Begin
+            Function_Return "MoveToLastRow"
+        End
+        If (sMethodLower = "up_row") Begin
+            Function_Return "MoveUpRow"
+        End
+        If (sMethodLower = "down_row") Begin
+            Function_Return "MoveDownRow"
+        End
+        Function_Return ""
+    End_Function
+
+    // Returns True when sMethodLower is a legacy grid method that does not exist
+    // in cCJGrid (or whose behaviour differs enough that it must be reviewed).
+    // The four clean-rename methods are NOT included here.
+    Function IsLegacyOnlyGridMethod String sMethodLower Returns Boolean
+        If (sMethodLower = "beginning_of_data") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "end_of_data") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "checkbox_item") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "reorder_list") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "auto_reorder_list") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "scroll") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "clear_current_record") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "col_index") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "display") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "docheckdisplayablerows") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "dotogglecolumnordering") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "fill_list") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "find_current_buffer") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "find_init") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "find_record") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "find_rowid") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "readbyrowid") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "read_by_recnum") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "refresh_page") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "request_new_index") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "serverorderingoverride") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "move_to_column") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "activate_column") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "activate_item") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "doadjustgridwidths") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "column_combo_add_item") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "column_combo_delete_data") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "column_combo_delete_item") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "column_combo_find") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "column_combo_item_count") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "column_combo_refresh") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "column_combo_value") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "domakecolumnvisible") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "request_superfind") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "superfind") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "superfind_next") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "superfind_previous") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "validate_items") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "exec_entry") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "exec_exit") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "exec_validate") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "change_row_color") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "mouse_click") Begin
+            Function_Return True
+        End
+        Function_Return False
+    End_Function
+
+    // Returns a hint naming the closest cCJGrid equivalent of a legacy grid method,
+    // or "" when no close equivalent exists.
+    Function LegacyOnlyGridMethodHint String sMethodLower Returns String
+        If (sMethodLower = "fill_list") Begin
+            Function_Return "InitializeData (note: parameters and calling convention differ)"
+        End
+        If (sMethodLower = "refresh_page") Begin
+            Function_Return "RefreshDataFromDD (note: parameters differ)"
+        End
+        If (sMethodLower = "request_new_index") Begin
+            Function_Return "ChangeOrdering"
+        End
+        If (sMethodLower = "move_to_column") Begin
+            Function_Return "MoveToColumnObject (note: takes a column object handle, not a column number)"
+        End
+        If (sMethodLower = "change_row_color") Begin
+            Function_Return "OnSetRowColor on the grid object (note: per-row color logic moves into OnSetRowColor)"
+        End
+        If (sMethodLower = "mouse_click") Begin
+            Function_Return "OnComRowDblClick (note: receives Variant llRow, Variant llItem instead of window/position)"
+        End
+        Function_Return ""
+    End_Function
+
+    // Returns True when sTrimLower is a legacy grid property that needs translation
+    // into a CJGrid equivalent rather than simple removal.
+    Function IsTranslatableGridProperty String sTrimLower Returns Boolean
+        If (Left(sTrimLower, 4) <> "set ") Begin
+            Function_Return False
+        End
+        If (sTrimLower contains "peresizecolumn") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "prompt_button_mode") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "allow_top_add_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "allow_bottom_add_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "allow_insert_add_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "auto_save_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "auto_regenerate_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "no_create_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "no_delete_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "read_only_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "header_visible_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "resize_column_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "highlight_row_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "gridline_mode") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "currentrowcolor") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "currentrowtextcolor") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "currentcellcolor") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "currentcelltextcolor") Begin
+            Function_Return True
+        End
+        Function_Return False
+    End_Function
+
+    // Translates a recognised legacy grid property line into its CJGrid equivalent(s).
+    // Returns an array of replacement lines; an empty array means drop the line.
+    Function TranslateGridProperty String sLine String sTrimLower Returns String[]
+        String[]  asResult
+        String    sIndent sValue sValLower sBoolVal sNegBool
+        Boolean   bBoolValue
+
+        Move (Left(sLine, (Length(sLine) - Length(Trim(sLine))))) to sIndent
+        Get ParseValueAfterTo sLine to sValue
+        Move (Lowercase(Trim(sValue))) to sValLower
+
+        Move (sValLower = "true" or sValLower = "1") to bBoolValue
+        Move (If(bBoolValue, "True", "False")) to sBoolVal
+        Move (If(bBoolValue, "False", "True")) to sNegBool
+
+        If (sTrimLower contains "peresizecolumn") Begin
+            If (sValLower = "rcnone" or sValLower = "0") Begin
+                Move (sIndent + "Set pbAllowColumnResize to False") to asResult[0]
+            End
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "prompt_button_mode") Begin
+            If (sValLower = "pb_prompton" or sValLower = "pb_promptauto") Begin
+                Move (sIndent + "Set pbHeaderPrompts to True")  to asResult[0]
+            End
+            Else Begin
+                Move (sIndent + "Set pbHeaderPrompts to False") to asResult[0]
+            End
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "allow_top_add_state") Begin
+            Move (sIndent + "Set pbAllowAppendRow to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "allow_bottom_add_state") Begin
+            Move (sIndent + "Set pbAllowAppendRow to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "allow_insert_add_state") Begin
+            Move (sIndent + "Set pbAllowInsertRow to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "auto_save_state") Begin
+            Move (sIndent + "Set pbAutoSave to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "auto_regenerate_state") Begin
+            Move (sIndent + "Set pbAutoRegenerate to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "no_create_state") Begin
+            Move (sIndent + "Set pbAllowAppendRow to " + sNegBool) to asResult[0]
+            Move (sIndent + "Set pbAllowInsertRow to " + sNegBool) to asResult[1]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "no_delete_state") Begin
+            Move (sIndent + "Set pbAllowDeleteRow to " + sNegBool) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "read_only_state") Begin
+            Move (sIndent + "Set pbReadOnly to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "header_visible_state") Begin
+            Move (sIndent + "Set pbShowHeader to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "resize_column_state") Begin
+            Move (sIndent + "Set pbAllowColumnResize to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "highlight_row_state") Begin
+            Move (sIndent + "Set pbShowRowFocus to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "gridline_mode") Begin
+            If (sValLower = "grid_visible_none" or sValLower = "0") Begin
+                Move (sIndent + "Set peHorizontalGridStyle to xtpGridNoLines") to asResult[0]
+                Move (sIndent + "Set peVerticalGridStyle   to xtpGridNoLines") to asResult[1]
+            End
+            Else If (sValLower = "grid_visible_horz" or sValLower = "1") Begin
+                Move (sIndent + "Set peHorizontalGridStyle to xtpGridSolid") to asResult[0]
+            End
+            Else If (sValLower = "grid_visible_vert" or sValLower = "2") Begin
+                Move (sIndent + "Set peVerticalGridStyle to xtpGridSolid") to asResult[0]
+            End
+            Else If (sValLower = "grid_visible_both" or sValLower = "3") Begin
+                Move (sIndent + "Set peHorizontalGridStyle to xtpGridSolid") to asResult[0]
+                Move (sIndent + "Set peVerticalGridStyle   to xtpGridSolid") to asResult[1]
+            End
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "currentrowcolor") Begin
+            Move (sIndent + "Set piHighlightBackColor to " + sValue) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "currentrowtextcolor") Begin
+            Move (sIndent + "Set piHighlightForeColor to " + sValue) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "currentcellcolor") Begin
+            Move (sIndent + "Set piFocusCellBackColor to " + sValue) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "currentcelltextcolor") Begin
+            Move (sIndent + "Set piFocusCellForeColor to " + sValue) to asResult[0]
+            Function_Return asResult
+        End
+
+        Function_Return asResult  // Unrecognised translatable — drop.
+    End_Function
+
+    // *** Parsing helpers ***
+
+    // Replace the class name in sLine with the target grid class from psTargetGridClass.
+    Function ReplaceGridClassName String sLine String sTrimLower Returns String
+        Integer iIsA
+        String  sLeading sTargetClass
+
+        Move (Pos(" is a ", Lowercase(sLine))) to iIsA
+        If (iIsA = 0) Begin
+            Function_Return sLine
+        End
+        Move (Left(sLine, (iIsA + 5))) to sLeading
+        Get psTargetGridClass to sTargetClass
+        Function_Return (sLeading + sTargetClass)
+    End_Function
+
+    // Parse the item index N from a line like "set form_width   item N to ..."
+    Function ParseItemIndex String sTrimLower Returns Integer
+        Integer iItem iSpace
+        String  sRest sToken
+
+        Move (Pos(" item ", sTrimLower)) to iItem
+        If (iItem = 0) Begin
+            Function_Return -1
+        End
+        Move (Trim(Mid(sTrimLower, CI_EOL, (iItem + 6)))) to sRest
+        Move (Pos(CS_S, sRest)) to iSpace
+        If (iSpace > 0) Begin
+            Move (Left(sRest, iSpace - 1)) to sToken
+        End
+        Else Begin
+            Move sRest to sToken
+        End
+        Function_Return (Integer(Trim(sToken)))
+    End_Function
+
+    // Extract the raw value after " to " from a line (uses original casing).
+    Function ParseValueAfterTo String sOrigLine Returns String
+        Integer iTo
+        String  sLower
+
+        Move (Lowercase(sOrigLine)) to sLower
+        Move (Pos(" to ", sLower)) to iTo
+        If (iTo = 0) Begin
+            Function_Return ""
+        End
+        Function_Return (Trim(Mid(sOrigLine, CI_EOL, (iTo + 4))))
+    End_Function
+
+    // Build an indentation string of one tab-size worth of spaces.
+    Function MakeSingleIndent Returns String
+        String  sIndent
+        Integer iTabSize iCount
+
+        Get piTabSize of ghoRefactorFuncLib to iTabSize
+        Move "" to sIndent
+        For iCount from 1 to iTabSize
+            Append sIndent CS_S
+        Loop
+        Function_Return sIndent
+    End_Function
+
+    // *** Subclass hooks — override in derived classes ***
+
+    // Called when a grid declaration is detected and processed.
+    // Subclasses reset their per-grid state (column arrays etc.) here.
+    Procedure OnGridStarted String sGridIndent
+    End_Procedure
+
+    // Called for each source line at nesting level 1 (direct grid body content)
+    // before the base class dispatches properties/methods.
+    // Set bSkip True to consume the line; leave False to pass through to base processing.
+    // asOutput may be written to (e.g. to flush buffered column objects).
+    Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
+    End_Procedure
+
+    // Called just before the grid's own End_Object is emitted.
+    // Subclasses flush any buffered column objects into asOutput here.
+    Procedure OnBeforeGridEndObject String[] ByRef asOutput String sGridIndent
+    End_Procedure
+
+    // *** Main transformation that operates on pasSource ***
+
+    // Scans pasSource, transforms every matching grid object it finds, writes
+    // the result back to pasSource.  Returns the number of grids transformed.
+    Function TransformSource Returns Integer
+        String[] asSource asOutput asTranslated
+        String  sLine sTrimLine sLower sGridIndent sValue
+        String  sMethodName sOldMethodName sNewMethodName sHint sLineIndent
+        Integer iCount iSize iGridsChanged iGridInnerNest iTr iTrSize
+        Boolean bInEntryDisplay bSkip bFound bOK
+        Boolean bInRenameProcedure bInLegacyOnlyMethod
+
+        Get pasSource to asSource
+        Move 0 to iGridsChanged
+        Move 0 to iGridInnerNest
+        Move False to bInEntryDisplay
+        Move False to bInRenameProcedure
+        Move False to bInLegacyOnlyMethod
+
+        Move (SizeOfArray(asSource)) to iSize
+        Decrement iSize
+
+        For iCount from 0 to iSize
+            Move asSource[iCount] to sLine
+            Move (Trim(sLine))          to sTrimLine
+            Move (Lowercase(sTrimLine)) to sLower
+            Move False to bSkip
+
+            // NOT inside any grid
+            If (iGridInnerNest = 0) Begin
+                Get IsGridDeclaration sLower to bFound
+                If (bFound = True) Begin
+                    Move (Replace(sTrimLine, sLine, "")) to sGridIndent
+                    Get ReplaceGridClassName sLine sLower to sLine
+                    Move 1 to iGridInnerNest
+                    Increment iGridsChanged
+                    Move False to bInEntryDisplay
+                    Move False to bInRenameProcedure
+                    Move False to bInLegacyOnlyMethod
+                    Send OnGridStarted sGridIndent
+                End
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+            End
+
+            // Entry_Display sub-state: comment out every line including End_Procedure
+            If (bSkip = False and bInEntryDisplay = True) Begin
+                If (Left(sLower, 13) = "end_procedure" or Left(sLower, 12) = "end_function") Begin
+                    Move False to bInEntryDisplay
+                End
+                Get CommentOutLine sLine to sLine
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+            End
+
+            // Renamed procedure/function body: rename Forward Send/Get calls
+            If (bSkip = False and bInRenameProcedure = True) Begin
+                If (Left(sLower, 13) = "end_procedure" or Left(sLower, 12) = "end_function") Begin
+                    Move False to bInRenameProcedure
+                End
+                Else Begin
+                    If (sLower contains ("forward send " + sOldMethodName) or ;
+                        sLower contains ("forward get "  + sOldMethodName)) Begin
+                        Get ReplaceMethodName sLine sOldMethodName sNewMethodName to sLine
+                    End
+                End
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+            End
+
+            // Legacy-only method body sub-state: comment out every line
+            If (bSkip = False and bInLegacyOnlyMethod = True) Begin
+                If (Left(sLower, 13) = "end_procedure" or Left(sLower, 12) = "end_function") Begin
+                    Move False to bInLegacyOnlyMethod
+                End
+                Get CommentOutLine sLine to sLine
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+            End
+
+            // Subclass first crack at direct grid content (iGridInnerNest = 1 only)
+            If (bSkip = False and iGridInnerNest = 1) Begin
+                Send OnHandleGridLine sLine sTrimLine sLower (&asOutput) sGridIndent (&bSkip)
+            End
+
+            // End_Object — applies at every nesting level inside the grid
+            If (bSkip = False and Left(sLower, 10) = "end_object") Begin
+                Decrement iGridInnerNest
+                If (iGridInnerNest = 0) Begin
+                    Send OnBeforeGridEndObject (&asOutput) sGridIndent
+                End
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+            End
+
+            // Nested objects (iGridInnerNest > 1): pass all content through
+            If (bSkip = False and iGridInnerNest > 1) Begin
+                Get IsObjectDeclaration sLower to bFound
+                If (bFound = True) Begin
+                    Increment iGridInnerNest
+                End
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+            End
+
+            // Direct grid content: Define constant removal
+            If (bSkip = False) Begin
+                If (Left(sLower, 7) = "define ") Begin
+                    Move True to bSkip
+                End
+            End
+
+            // Direct grid content: Object / Procedure / Function / Property dispatch
+            If (bSkip = False) Begin
+                Get IsObjectDeclaration sLower to bOK
+                If (bOK = True) Begin
+                    // Nested Object starts; subclass already flushed pending columns in hook.
+                    Increment iGridInnerNest
+                    Move sLine to asOutput[SizeOfArray(asOutput)]
+                    Move True to bSkip
+                End
+                Else Begin
+                    Get ParseProcFuncName sLower to sMethodName
+                    If (sMethodName <> "") Begin
+                        // Ensure one blank line before any procedure/function block.
+                        If (SizeOfArray(asOutput) > 0 and Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
+                            Move "" to asOutput[SizeOfArray(asOutput)]
+                        End
+                        Get IsEntryDisplayProcedure sLower to bInEntryDisplay
+                        If (bInEntryDisplay = True) Begin
+                            Get CommentOutLine sLine to sLine
+                            Move sLine to asOutput[SizeOfArray(asOutput)]
+                            Move True to bSkip
+                        End
+                        Else Begin
+                            Get RenameGridMethod sMethodName to sNewMethodName
+                            If (sNewMethodName <> "") Begin
+                                Move sMethodName to sOldMethodName
+                                Get ReplaceMethodName sLine sOldMethodName sNewMethodName to sLine
+                                Move sLine to asOutput[SizeOfArray(asOutput)]
+                                Move True to bInRenameProcedure
+                                Move True to bSkip
+                            End
+                            Else Begin
+                                Get IsLegacyOnlyGridMethod sMethodName to bOK
+                                If (bOK = True) Begin
+                                    Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+                                    Get LegacyOnlyGridMethodHint sMethodName to sHint
+                                    If (sHint <> "") Begin
+                                        Move (sLineIndent + "// TODO: Legacy grid method -- consider using " + sHint + ".") to asOutput[SizeOfArray(asOutput)]
+                                    End
+                                    Else Begin
+                                        Move (sLineIndent + "// TODO: Legacy grid method -- no direct equivalent in cCJGrid.") to asOutput[SizeOfArray(asOutput)]
+                                    End
+                                    Get CommentOutLine sLine to sLine
+                                    Move sLine to asOutput[SizeOfArray(asOutput)]
+                                    Move True to bInLegacyOnlyMethod
+                                    Move True to bSkip
+                                End
+                                // else: unknown override — falls through to emit unchanged.
+                            End
+                        End
+                    End
+                    Else Begin
+                        Get IsTranslatableGridProperty sLower to bOK
+                        If (bOK = True) Begin
+                            Get TranslateGridProperty sLine sLower to asTranslated
+                            Move (SizeOfArray(asTranslated)) to iTrSize
+                            Decrement iTrSize
+                            For iTr from 0 to iTrSize
+                                Move asTranslated[iTr] to asOutput[SizeOfArray(asOutput)]
+                            Loop
+                            Move True to bSkip
+                        End
+                        Else Begin
+                            Get IsCommentOutGridProperty sLower to bOK
+                            If (bOK = True) Begin
+                                Get CommentOutLine sLine to sLine
+                                Move sLine to asOutput[SizeOfArray(asOutput)]
+                                Move True to bSkip
+                            End
+                            Else Begin
+                                Get IsLegacyGridProperty sLower to bSkip
+                            End
+                        End
+                    End
+                End
+            End
+
+            // Emit line if not consumed
+            If (bSkip = False) Begin
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+            End
+        Loop
+
+        Set pasSource to asOutput
+        Function_Return iGridsChanged
+    End_Function
+
+    // *** Generic file-loop interface — call from subclass public interface ***
+    //
+    // Validates sParameter, loops over asFiles, calls ReadFile / TransformSource /
+    // WriteFile for each, accumulates counts.
+    Function TransformFiles String[] asFiles String sParameter Returns Integer
+        String  sFilePath
+        Integer iCount iSize iGrids iTotalGrids iTotalFiles
+        Boolean bOK
+
+        Get ParseAndSetParameter sParameter to bOK
+        If (bOK = False) Begin
+            Function_Return 0
+        End
+
+        Move 0 to iTotalGrids
+        Move 0 to iTotalFiles
+        Move (SizeOfArray(asFiles)) to iSize
+        Set piMaximumTot of ghoStatusPanel to iSize
+
+        If (iSize > 0) Begin
+            Decrement iSize
+            For iCount from 0 to iSize
+                Move asFiles[iCount] to sFilePath
+                Set Title_Text   of ghoStatusPanel to ("Converting Grid objects in:" * sFilePath)
+                Set Message_Text of ghoStatusPanel to (ParseFileName(sFilePath))
+
+                Send ReadFile sFilePath
+                Get TransformSource to iGrids
+
+                If (iGrids > 0) Begin
+                    If (pbReadOnly(ghoRefactorFuncLib) = False) Begin
+                        Send WriteFile
+                    End
+                    Increment iTotalFiles
+                    Add iGrids to iTotalGrids
+                End
+
+                Send DoAdvanceTot of ghoStatusPanel
+            Loop
+        End
+
+        Set Title_Text   of ghoStatusPanel to ""
+        Set Message_Text of ghoStatusPanel to ""
+        Set piChangedFiles to iTotalFiles
+        Set piChangedGrids to iTotalGrids
+        Function_Return iTotalGrids
+    End_Function
+
+End_Class
