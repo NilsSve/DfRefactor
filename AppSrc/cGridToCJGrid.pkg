@@ -1,0 +1,328 @@
+﻿/* cGridToCJGrid.pkg
+
+ Non-data-aware subclass of cGridToCJGridBase.
+ Converts legacy Grid objects (Grid, cGrid, or any subclass) to cCJGrid,
+ with individual cCJGridColumn child objects generated from the legacy
+ Set Form_Width / Set Header_Label per-column properties.
+
+ Unlike cDbGridTocDbCJGrid, there is no Begin_Row / Entry_Item / End_Row
+ structure to drive column discovery.  Instead the column index is inferred
+ directly from the [Item] N index used in the per-column Set statements.
+
+ Transformation rules applied on top of the shared base class logic:
+   - "Object X is a <OldGridClass>"     ->  "Object X is a <NewGridClass>"
+   - "Set Form_Width   [Item] N to W"   ->  "Set piWidth to W"    on column N+1
+   - "Set Header_Label [Item] N to "L"" ->  "Set psCaption to "L"" on column N+1
+   - "Set Line_Width   to N M"          ->  removed (no CJ equivalent)
+   - "Set Select_Mode  to Multi_Select" ->  "Set pbMultipleSelection to True"
+   - Other Set Select_Mode values       ->  removed
+   - Bare "Send <Name>" at grid level   ->  commented out
+   - Procedure LoadData stub            ->  always generated
+   - Procedure Activating stub          ->  always generated
+
+ Column objects are named oCol1, oCol2, ... (1-based sequential).
+ The column count equals (max item index seen + 1) across all Form_Width
+ and Header_Label statements found in the grid body.
+ Columns with no explicit width default to 100; with no explicit caption
+ default to an empty string.
+
+ All cCJGrid-level transformations (property removal, translation, method
+ renaming, Entry_Display commenting, legacy method commenting, etc.) are
+ provided by the base class cGridToCJGridBase.
+
+ The sParameter passed to TransformGridToCJGrid must be a comma-separated
+ string of 2 or 3 class names:  "OldGridClass,NewGridClass,[,NewGridColumnClass]"
+ If sParameter is empty, any class whose name ends in "grid" (but NOT in
+ "dbgrid") is detected, and the standard DataFlex classes cCJGrid and cCJGridColumn are used as
+ the target.  Classes ending in "dbgrid" are intentionally excluded so that
+ they continue to be handled by cDbGridTocDbCJGrid.
+*/
+
+Use cGridToCJGridBase.pkg
+
+Class cGridToCJGrid is a cGridToCJGridBase
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // Default: convert the standard DataFlex "Grid" class to cCJGrid.
+        // Pass an explicit sParameter to target a custom legacy class.
+        Set psLegacyGridClass   to "Grid"
+        Set psTargetGridClass   to "cCJGrid"
+        Set psTargetColumnClass to "cCJGridColumn"
+        // Per-grid column collection state (reset by OnGridStarted).
+        Property Integer[] paiNdColFormWidths
+        Property String[]  pasNdColHeaderLabels
+        Property Boolean   pbNdPendingColumns  False
+    End_Procedure
+
+    // *** Parameter parsing (override) ***
+
+    // Intercepts empty sParameter to restore the default legacy class name ("Grid")
+    // without touching psTargetGridClass / psTargetColumnClass, which are set once
+    // in the constructor and never change.  Non-empty parameters are delegated to
+    // the base class, which stores psLegacyGridClass as lowercase.
+    Function ParseAndSetParameter String sParameter Returns Boolean
+        Boolean bOK
+        If (sParameter = "") Begin
+            Set psLegacyGridClass to "Grid"
+            Function_Return True
+        End
+        Forward Get ParseAndSetParameter sParameter to bOK
+        Function_Return bOK
+    End_Function
+
+    // *** IsGridDeclaration override ***
+
+    // Returns True when sTrimLower looks like "object X is a <OldGridClass>".
+    // Default: case-insensitive exact match against psLegacyGridClass ("Grid").
+    // When psLegacyGridClass is empty (set directly or via a future API), falls back to
+    // the pattern: any class name ending in "grid" but NOT ending in "dbgrid".
+    Function IsGridDeclaration String sTrimLower Returns Boolean
+        Integer iIsA
+        String  sClassName sLegacy
+
+        If (Pos("object ", sTrimLower) <> 1) Begin
+            Function_Return False
+        End
+        Move (Pos(" is a ", sTrimLower)) to iIsA
+        If (iIsA = 0) Begin
+            Function_Return False
+        End
+        // Class name starts 6 chars after the start of " is a ".
+        Move (Trim(Mid(sTrimLower, CI_EOL, (iIsA + 6)))) to sClassName
+        // Strip any trailing content (e.g. metadata tags after a space).
+        Move (Pos(CS_S, sClassName)) to iIsA
+        If (iIsA > 0) Begin
+            Move (Left(sClassName, iIsA - 1)) to sClassName
+        End
+
+        Get psLegacyGridClass to sLegacy
+        If (sLegacy = "") Begin
+            // Pattern-based: any class ending in "grid" but not "dbgrid".
+            Function_Return (Right(sClassName, 4) = "grid" and Right(sClassName, 6) <> "dbgrid")
+        End
+        // Case-insensitive exact match: lowercase both sides for comparison.
+        Function_Return (sClassName = Lowercase(sLegacy))
+    End_Function
+
+    // *** Subclass hook implementations ***
+
+    // Called when a grid declaration is detected.
+    // Resets all per-grid column collection state.
+    Procedure OnGridStarted String sGridIndent
+        String[]  asEmpty
+        Integer[] aiEmpty
+        Set paiNdColFormWidths  to aiEmpty
+        Set pasNdColHeaderLabels to asEmpty
+        Set pbNdPendingColumns  to False
+    End_Procedure
+
+    // Called for each source line at grid body level (iGridInnerNest = 1),
+    // before the base class dispatches properties and methods.
+    //
+    // Handles:
+    //   - Set Line_Width     -> remove silently (no cCJGrid equivalent)
+    //   - Set Select_Mode    -> translate Multi_Select or remove silently
+    //   - Set Form_Width     -> collect per-column width
+    //   - Set Header_Label   -> collect per-column caption
+    //   - Bare "Send <name>" -> comment out with original line preserved
+    //   - Proc/Function with pending columns -> flush column objects first
+    //
+    // Set bSkip True to consume the line; leave False to pass to base processing.
+    Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
+        String    sLineIndent sLabel
+        Integer   iItemIdx iWidth
+        Integer[] aiWidths
+        String[]  asLabels
+        Boolean   bPending
+
+        // Remove Set Line_Width silently (no CJ equivalent).
+        If (Left(sLower, 4) = "set " and sLower contains "line_width") Begin
+            Move True to bSkip
+            Procedure_Return
+        End
+
+        // Translate Set Select_Mode.
+        If (Left(sLower, 4) = "set " and sLower contains "select_mode") Begin
+            If (sLower contains "multi_select") Begin
+                Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+                Move (sLineIndent + "Set pbMultipleSelection to True") to asOutput[SizeOfArray(asOutput)]
+            End
+            // Other Select_Mode values have no direct CJ equivalent; remove silently.
+            Move True to bSkip
+            Procedure_Return
+        End
+
+        // Collect Set Form_Width [Item] N to W.
+        If (Left(sLower, 4) = "set " and sLower contains "form_width") Begin
+            Get ParseColumnItemIndex sLower "form_width" to iItemIdx
+            If (iItemIdx >= 0) Begin
+                Get ParseFormWidth sLower to iWidth
+                Get paiNdColFormWidths to aiWidths
+                Move iWidth to aiWidths[iItemIdx]
+                Set paiNdColFormWidths to aiWidths
+                Set pbNdPendingColumns to True
+            End
+            Move True to bSkip
+            Procedure_Return
+        End
+
+        // Collect Set Header_Label [Item] N to "Label".
+        If (Left(sLower, 4) = "set " and sLower contains "header_label") Begin
+            Get ParseColumnItemIndex sLower "header_label" to iItemIdx
+            If (iItemIdx >= 0) Begin
+                Get ParseHeaderLabel sLine to sLabel
+                Get pasNdColHeaderLabels to asLabels
+                Move sLabel to asLabels[iItemIdx]
+                Set pasNdColHeaderLabels to asLabels
+                Set pbNdPendingColumns to True
+            End
+            Move True to bSkip
+            Procedure_Return
+        End
+
+        // Comment out bare Send statements at grid body level.
+        // These are typically legacy calls (e.g. "Send Fill_the_List") that have
+        // no direct equivalent after conversion; kept commented for reference.
+        If (Left(sLower, 5) = "send ") Begin
+            Get CommentOutLine sLine to sLine
+            Move sLine to asOutput[SizeOfArray(asOutput)]
+            Move True to bSkip
+            Procedure_Return
+        End
+
+        // Flush pending column objects before the first Procedure or Function so
+        // that column sub-objects precede method overrides in the output.
+        Get pbNdPendingColumns to bPending
+        If (bPending = True) Begin
+            If (Left(sLower, 10) = "procedure " or Left(sLower, 9) = "function ") Begin
+                Send AppendColumnObjects (&asOutput) sGridIndent
+                Set pbNdPendingColumns to False
+                // bSkip stays False: let the base class handle the proc/func declaration.
+            End
+        End
+    End_Procedure
+
+    // Called just before the grid's End_Object is emitted.
+    // Emits any not-yet-flushed column objects, then always appends the
+    // LoadData and Activating stubs that every cCJGrid needs.
+    Procedure OnBeforeGridEndObject String[] ByRef asOutput String sGridIndent
+        Boolean bPending
+        Get pbNdPendingColumns to bPending
+        If (bPending = True) Begin
+            Send AppendColumnObjects (&asOutput) sGridIndent
+            Set pbNdPendingColumns to False
+        End
+        Send AppendLoadDataStub (&asOutput) sGridIndent
+    End_Procedure
+
+    // *** Column object emission ***
+
+    // Appends cCJGridColumn child objects (oCol1, oCol2, ...) derived from the
+    // per-column Form_Width and Header_Label values collected during the scan.
+    // Also flushes any Entry_Display-extracted grid properties before emitting
+    // the first column, so they appear together with the other grid Set properties.
+    Procedure AppendColumnObjects String[] ByRef asOutput String sGridIndent
+        String[]  asHeaderLabels
+        Integer[] aiFormWidths
+        String    sSingle sColIndent sColProp sLabel sTargetCol
+        Integer   iCount iMaxIdx iWidth
+
+        // Flush Entry_Display translated properties before the first column object.
+        Send FlushEntryDisplayExtracted (&asOutput) sGridIndent
+
+        Get pasNdColHeaderLabels to asHeaderLabels
+        Get paiNdColFormWidths   to aiFormWidths
+        Get psTargetColumnClass  to sTargetCol
+        Get MakeSingleIndent     to sSingle
+        Move (sGridIndent + sSingle)           to sColIndent
+        Move (sGridIndent + sSingle + sSingle) to sColProp
+
+        // Column count = max item index seen across widths and labels, plus one.
+        Move (SizeOfArray(aiFormWidths) - 1) to iMaxIdx
+        If (SizeOfArray(asHeaderLabels) - 1 > iMaxIdx) Begin
+            Move (SizeOfArray(asHeaderLabels) - 1) to iMaxIdx
+        End
+        If (iMaxIdx < 0) Begin
+            Procedure_Return  // No columns collected; nothing to emit.
+        End
+
+        For iCount from 0 to iMaxIdx
+            // Width: use collected value; default 100 if not set.
+            If (iCount < SizeOfArray(aiFormWidths) and aiFormWidths[iCount] > 0) Begin
+                Move aiFormWidths[iCount] to iWidth
+            End
+            Else Begin
+                Move 100 to iWidth
+            End
+
+            // Caption: use collected label; default to empty string.
+            If (iCount < SizeOfArray(asHeaderLabels)) Begin
+                Move asHeaderLabels[iCount] to sLabel
+            End
+            Else Begin
+                Move "" to sLabel
+            End
+
+            // Blank separator before each column object.
+            If (SizeOfArray(asOutput) = 0 or Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
+                Move "" to asOutput[SizeOfArray(asOutput)]
+            End
+            Move (sColIndent + "Object oCol" + String(iCount + 1) + " is a " + sTargetCol) to asOutput[SizeOfArray(asOutput)]
+            Move (sColProp   + "Set piWidth to "   + String(iWidth))                        to asOutput[SizeOfArray(asOutput)]
+            Move (sColProp   + "Set psCaption to " + '"' + sLabel + '"')                    to asOutput[SizeOfArray(asOutput)]
+            Move (sColIndent + "End_Object")                                                 to asOutput[SizeOfArray(asOutput)]
+        Loop
+    End_Procedure
+
+    // Appends a LoadData stub and an Activating procedure to asOutput.
+    // These are always generated for every converted non-data-aware CJ grid;
+    // the developer fills in the data-loading logic in LoadData.
+    Procedure AppendLoadDataStub String[] ByRef asOutput String sGridIndent
+        String  sSingle sColIndent sColProp sFirstColName
+
+        Get MakeSingleIndent     to sSingle
+        Move (sGridIndent + sSingle)           to sColIndent
+        Move (sGridIndent + sSingle + sSingle) to sColProp
+
+        // First column is always named oCol1 (1-based sequential naming).
+        Move "oCol1" to sFirstColName
+
+        // Blank separator before LoadData.
+        If (SizeOfArray(asOutput) > 0 and Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
+            Move "" to asOutput[SizeOfArray(asOutput)]
+        End
+
+        Move (sColIndent + "Procedure LoadData")                                            to asOutput[SizeOfArray(asOutput)]
+        Move (sColProp   + "// tDataSourceRow[] TheData TheDataEmpty")                     to asOutput[SizeOfArray(asOutput)]
+        Move (sColProp   + "// Integer iRow iColId")                                       to asOutput[SizeOfArray(asOutput)]
+        Move (sColProp   + "// TODO: Populate this grid. Example pattern:")                to asOutput[SizeOfArray(asOutput)]
+        Move (sColProp   + "//   Get piColumnId of " + sFirstColName + " to iColId")      to asOutput[SizeOfArray(asOutput)]
+        Move (sColProp   + "//   Move someValue to TheData[iRow].sValue[iColId]")          to asOutput[SizeOfArray(asOutput)]
+        Move (sColProp   + "//   Increment iRow")                                          to asOutput[SizeOfArray(asOutput)]
+        Move (sColProp   + "//   Send ReInitializeData TheData False")                     to asOutput[SizeOfArray(asOutput)]
+        Move (sColIndent + "End_Procedure")                                                to asOutput[SizeOfArray(asOutput)]
+        Move "" to asOutput[SizeOfArray(asOutput)]
+        Move (sColIndent + "Procedure Activating")                                         to asOutput[SizeOfArray(asOutput)]
+        Move (sColProp   + "Forward Send Activating")                                      to asOutput[SizeOfArray(asOutput)]
+        Move (sColProp   + "Send LoadData")                                                to asOutput[SizeOfArray(asOutput)]
+        Move (sColIndent + "End_Procedure")                                                to asOutput[SizeOfArray(asOutput)]
+    End_Procedure
+
+    // *** Public interface ***
+
+    // Transforms all non-data-aware Grid objects in asFiles from the legacy
+    // Grid class to cCJGrid with individual cCJGridColumn children.
+    //
+    // sParameter: comma-separated class names "OldGridClass[,NewGridClass]"
+    // Empty sParameter uses pattern detection (any class ending in "grid" but
+    // not "dbgrid") and the standard DataFlex cCJGrid class as the target.
+    //
+    // Returns the total number of grid objects transformed across all files.
+    Function TransformGridToCJGrid String[] asFiles String sParameter Returns Integer
+        Integer iResult
+        Get TransformFiles asFiles sParameter to iResult
+        Function_Return iResult
+    End_Function
+
+End_Class

@@ -28,7 +28,8 @@
  Shared transformations applied to each grid object found:
    - "Object X is a <OldGridClass>"    ->  "Object X is a <NewGridClass>"
    - Commented out: Set Main_File (hints which DDO to wire up)
-   - Removed: Set Wrap_State, Set psColumnsID
+   - Commented out: Set Dynamic_Update_State (Grid-only; no cCJGrid equivalent; kept as context hint)
+   - Removed: Set Wrap_State, Set psColumnsID, Set Visible_State
    - Removed: Define <constant> N (column index constants)
    - Removed: Set Child_Table_State, Set Item_Limit, Set Base_Item,
               Set pbComboNavigation, Set Move_Value_Out_State,
@@ -101,6 +102,10 @@ Class cGridToCJGridBase is a cObject
         Property String    psLegacyGridClass   "DbGrid"
         Property String    psTargetGridClass   "cCJGrid"
         Property String    psTargetColumnClass "cCJGridColumn"
+        // Per-grid state: translatable Entry_Display properties collected during
+        // grid pre-scan, flushed by FlushEntryDisplayExtracted before column objects.
+        Property String[]  pasEntryDisplayExtracted
+        Property Boolean   pbEntryDisplayFlushed  False
     End_Procedure
 
     // *** File I/O ***
@@ -232,17 +237,24 @@ Class cGridToCJGridBase is a cObject
         If (sTrimLower contains "auto_column_state") Begin
             Function_Return True
         End
+        If (sTrimLower contains "visible_state") Begin
+            Function_Return True
+        End
         Function_Return False
     End_Function
 
     // Returns True when sTrimLower is a legacy grid Set property that should be
     // commented out rather than removed, so the programmer retains it as a hint.
-    //   Set Main_File ÔÇö tells the programmer which DDO to wire up on the new grid.
+    //   Set Main_File          ÔÇö tells the programmer which DDO to wire up on the new grid.
+    //   Set Dynamic_Update_State ÔÇö Grid-only; no cCJGrid equivalent; kept as context hint.
     Function IsCommentOutGridProperty String sTrimLower Returns Boolean
         If (Left(sTrimLower, 4) <> "set ") Begin
             Function_Return False
         End
         If (sTrimLower contains "main_file") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "dynamic_update_state") Begin
             Function_Return True
         End
         Function_Return False
@@ -701,6 +713,60 @@ Class cGridToCJGridBase is a cObject
         Function_Return (Integer(Trim(sToken)))
     End_Function
 
+    // Extract a quoted label string from "Set Header_Label [Item] N to "Label"".
+    // Strips the surrounding double-quotes from the value.
+    Function ParseHeaderLabel String sOrigLine Returns String
+        String sVal
+        Get ParseValueAfterTo sOrigLine to sVal
+        If (Left(sVal, 1) = '"' and Length(sVal) >= 2) Begin
+            Move (Mid(sVal, (Length(sVal) - 2), 2)) to sVal
+        End
+        Function_Return sVal
+    End_Function
+
+    // Extract an integer column width from "Set Form_Width [Item] N to W".
+    Function ParseFormWidth String sTrimLower Returns Integer
+        String sVal
+        Get ParseValueAfterTo sTrimLower to sVal
+        Function_Return (Integer(Trim(sVal)))
+    End_Function
+
+    // Parse the item index N from a per-column Set line, handling both:
+    //   "set <propname> item N to value"  (with  Item keyword)
+    //   "set <propname> N to value"       (without Item keyword)
+    // sPropName is the lowercase property name to locate in the line.
+    // Returns -1 when the index cannot be parsed.
+    Function ParseColumnItemIndex String sTrimLower String sPropName Returns Integer
+        Integer iProp iAfter iSpace
+        String  sRest
+
+        // Try the "item N" form first.
+        Move (Pos(" item ", sTrimLower)) to iProp
+        If (iProp <> 0) Begin
+            Move (Trim(Mid(sTrimLower, CI_EOL, (iProp + 6)))) to sRest
+            Move (Pos(CS_S, sRest)) to iSpace
+            If (iSpace > 0) Begin
+                Function_Return (Integer(Left(sRest, iSpace - 1)))
+            End
+            Function_Return (Integer(Trim(sRest)))
+        End
+
+        // No "item" keyword: N sits directly after the property name.
+        Move (Pos(sPropName, sTrimLower)) to iProp
+        If (iProp = 0) Begin
+            Function_Return -1
+        End
+        // Skip past the property name + one space; then read N from the rest.
+        Move (iProp + Length(sPropName)) to iAfter
+        Move (Trim(Mid(sTrimLower, CI_EOL, (iAfter + 1)))) to sRest
+        // sRest = "N to value"
+        Move (Pos(CS_S, sRest)) to iSpace
+        If (iSpace > 0) Begin
+            Function_Return (Integer(Left(sRest, iSpace - 1)))
+        End
+        Function_Return (Integer(Trim(sRest)))
+    End_Function
+
     // Extract the raw value after " to " from a line (uses original casing).
     Function ParseValueAfterTo String sOrigLine Returns String
         Integer iTo
@@ -746,17 +812,62 @@ Class cGridToCJGridBase is a cObject
     Procedure OnBeforeGridEndObject String[] ByRef asOutput String sGridIndent
     End_Procedure
 
+    // Emits translatable grid properties collected from Entry_Display during
+    // the grid pre-scan (see TransformSource grid detection section).
+    // Idempotent: after the first call it is a no-op, so it is safe to call
+    // from both AppendColumnObjects (primary — emits before first column object)
+    // and from TransformSource before OnBeforeGridEndObject (safety net for grids
+    // that produce no column sub-objects).
+    Procedure FlushEntryDisplayExtracted String[] ByRef asOutput String sGridIndent
+        String[]  asProps asEmpty
+        String    sSingleIndent
+        Integer   iTr iTrSize
+        Boolean   bFlushed
+
+        Get pbEntryDisplayFlushed to bFlushed
+        If (bFlushed = True) Begin
+            Procedure_Return
+        End
+        Set pbEntryDisplayFlushed to True
+
+        Get pasEntryDisplayExtracted to asProps
+        Set pasEntryDisplayExtracted to asEmpty
+
+        If (SizeOfArray(asProps) = 0) Begin
+            Procedure_Return
+        End
+
+        // Blank separator before the translated block (if needed).
+        If (SizeOfArray(asOutput) > 0 and Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
+            Move "" to asOutput[SizeOfArray(asOutput)]
+        End
+
+        Get MakeSingleIndent to sSingleIndent
+        Move (sGridIndent + sSingleIndent + "// Translated from Entry_Display to grid level:") to asOutput[SizeOfArray(asOutput)]
+
+        Move (SizeOfArray(asProps)) to iTrSize
+        Decrement iTrSize
+        For iTr from 0 to iTrSize
+            Move asProps[iTr] to asOutput[SizeOfArray(asOutput)]
+        Loop
+
+        Move "" to asOutput[SizeOfArray(asOutput)]
+    End_Procedure
+
     // *** Main transformation that operates on pasSource ***
 
     // Scans pasSource, transforms every matching grid object it finds, writes
     // the result back to pasSource.  Returns the number of grids transformed.
     Function TransformSource Returns Integer
-        String[] asSource asOutput asTranslated
-        String  sLine sTrimLine sLower sGridIndent sValue
+        String[] asSource asOutput asTranslated asEntryDisplayProps asEmpty
+        String  sLine sTrimLine sLower sGridIndent sValue sSingleIndent
         String  sMethodName sOldMethodName sNewMethodName sHint sLineIndent
+        String  sScanLine sScanLower
         Integer iCount iSize iGridsChanged iGridInnerNest iTr iTrSize
-        Boolean bInEntryDisplay bSkip bFound bOK
+        Integer iScan iScanSize iScanNest
+        Boolean bInEntryDisplay bSkip bFound bOK bScanFound
         Boolean bInRenameProcedure bInLegacyOnlyMethod
+        Boolean bScanInEntryDisplay bScanDone
 
         Get pasSource to asSource
         Move 0 to iGridsChanged
@@ -786,12 +897,75 @@ Class cGridToCJGridBase is a cObject
                     Move False to bInRenameProcedure
                     Move False to bInLegacyOnlyMethod
                     Send OnGridStarted sGridIndent
+                    // Pre-scan: search ahead through this grid's body for a Procedure
+                    // Entry_Display block and collect any translatable grid-level Set
+                    // properties (e.g. Set CurrentRowColor) within it.  Results are
+                    // stored in pasEntryDisplayExtracted and flushed by
+                    // FlushEntryDisplayExtracted before the first column sub-object
+                    // (or at End_Object for grids with no columns).
+                    Move asEmpty to asEntryDisplayProps
+                    Set pbEntryDisplayFlushed to False
+                    Move (iCount + 1) to iScan
+                    Move (SizeOfArray(asSource) - 1) to iScanSize
+                    Move 0 to iScanNest
+                    Move False to bScanInEntryDisplay
+                    Move False to bScanDone
+                    If (iScan <= iScanSize) Begin
+                        Repeat
+                            Move asSource[iScan]             to sScanLine
+                            Move (Lowercase(Trim(sScanLine))) to sScanLower
+                            // Track object nesting so we stay within this grid's boundary.
+                            Get IsObjectDeclaration sScanLower to bScanFound
+                            If (bScanFound = True) Begin
+                                Increment iScanNest
+                            End
+                            Else If (Left(sScanLower, 10) = "end_object") Begin
+                                If (iScanNest = 0) Begin
+                                    Move True to bScanDone  // reached grid End_Object
+                                End
+                                Else Begin
+                                    Decrement iScanNest
+                                End
+                            End
+                            // Only inspect direct grid body lines (nesting level 0).
+                            If (bScanDone = False and iScanNest = 0) Begin
+                                If (bScanInEntryDisplay = True) Begin
+                                    If (Left(sScanLower, 13) = "end_procedure" or ;
+                                        Left(sScanLower, 12) = "end_function") Begin
+                                        Move False to bScanInEntryDisplay
+                                    End
+                                    Else Begin
+                                        Get IsTranslatableGridProperty sScanLower to bScanFound
+                                        If (bScanFound = True) Begin
+                                            Get TranslateGridProperty sScanLine sScanLower to asTranslated
+                                            Move (SizeOfArray(asTranslated)) to iTrSize
+                                            Decrement iTrSize
+                                            For iTr from 0 to iTrSize
+                                                Get MakeSingleIndent to sSingleIndent
+                                                Move (sGridIndent + sSingleIndent + Trim(asTranslated[iTr])) to asEntryDisplayProps[SizeOfArray(asEntryDisplayProps)]
+                                            Loop
+                                        End
+                                    End
+                                End
+                                Else Begin
+                                    Get IsEntryDisplayProcedure sScanLower to bScanFound
+                                    If (bScanFound = True) Begin
+                                        Move True to bScanInEntryDisplay
+                                    End
+                                End
+                            End
+                            Increment iScan
+                        Until (bScanDone = True or iScan > iScanSize)
+                    End
+                    Set pasEntryDisplayExtracted to asEntryDisplayProps
                 End
                 Move sLine to asOutput[SizeOfArray(asOutput)]
                 Move True to bSkip
             End
 
-            // Entry_Display sub-state: comment out every line including End_Procedure
+            // Entry_Display sub-state: comment out every line including End_Procedure.
+            // Translatable properties were pre-scanned at grid detection time and
+            // will be flushed by FlushEntryDisplayExtracted before column objects.
             If (bSkip = False and bInEntryDisplay = True) Begin
                 If (Left(sLower, 13) = "end_procedure" or Left(sLower, 12) = "end_function") Begin
                     Move False to bInEntryDisplay
@@ -835,6 +1009,9 @@ Class cGridToCJGridBase is a cObject
             If (bSkip = False and Left(sLower, 10) = "end_object") Begin
                 Decrement iGridInnerNest
                 If (iGridInnerNest = 0) Begin
+                    // Safety flush: emit Entry_Display extracted properties if they have
+                    // not yet been flushed by AppendColumnObjects (i.e. no column objects).
+                    Send FlushEntryDisplayExtracted (&asOutput) sGridIndent
                     Send OnBeforeGridEndObject (&asOutput) sGridIndent
                 End
                 Move sLine to asOutput[SizeOfArray(asOutput)]
@@ -876,6 +1053,13 @@ Class cGridToCJGridBase is a cObject
                         End
                         Get IsEntryDisplayProcedure sLower to bInEntryDisplay
                         If (bInEntryDisplay = True) Begin
+                            // Translatable properties were pre-scanned at grid detection time.
+                            // Primary flush path: AppendColumnObjects calls FlushEntryDisplayExtracted
+                            // before the first column sub-object.
+                            // Fallback path (no columns yet, e.g. grids without Begin_Row): flush
+                            // here so translated properties appear just above the commented block.
+                            // FlushEntryDisplayExtracted is idempotent; if already flushed this is a no-op.
+                            Send FlushEntryDisplayExtracted (&asOutput) sGridIndent
                             Get CommentOutLine sLine to sLine
                             Move sLine to asOutput[SizeOfArray(asOutput)]
                             Move True to bSkip
