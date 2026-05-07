@@ -1,4 +1,4 @@
-﻿/* cGridToCJGrid.pkg
+/* cGridToCJGrid.pkg
 
  Non-data-aware subclass of cGridToCJGridBase.
  Converts legacy Grid objects (Grid, cGrid, or any subclass) to cCJGrid,
@@ -18,7 +18,29 @@
    - Other Set Select_Mode values       ->  removed
    - Bare "Send <Name>" at grid level   ->  commented out
    - Procedure LoadData stub            ->  always generated
-   - Procedure Activating stub          ->  always generated
+
+ Per-column properties set in each cCJGridColumn object (from pre-scan):
+   - Item_Shadow_State True on that column  ->  Set pbReadOnly  to True
+   - Checkbox_Item_State True on that column -> Set pbCheckbox  to True
+
+ Data-loading procedure conversion:
+   If a Procedure containing "Send Add_Item" is found in the grid body,
+   it is renamed to LoadData and its body is converted in-place:
+   - Procedure <name> [params]          ->  Procedure LoadData [params]
+   - Variable declarations are merged:
+       tDataSourceRow[] TheData TheDataEmpty is prepended,
+       Integer line is extended with iRow iCol1..iColN,
+       other type declarations are kept unchanged.
+   - Get piColumnId of oColN to iColN   inserted after declarations.
+   - Send Add_Item Msg_None <val>       ->  Move <val> to TheData[iRow].sValue[iColN]
+   - After every N-th Add_Item (= one full row): Increment iRow is emitted.
+   - Get Item_Count  to <var>           ->  removed silently
+   - Set Item_Shadow_State  ...         ->  removed (handled in column object)
+   - Set Checkbox_Item_State ...        ->  removed (handled in column object)
+   - Set Select_State ...               ->  commented out
+   - Send Delete_Data                   ->  removed silently
+   - Before End_Procedure: If/Else ReInitializeData / InitializeData block appended.
+   If no data-loading procedure is found, a rich LoadData stub is generated.
 
  Column objects are named oCol1, oCol2, ... (1-based sequential).
  The column count equals (max item index seen + 1) across all Form_Width
@@ -31,11 +53,12 @@
  provided by the base class cGridToCJGridBase.
 
  The sParameter passed to TransformGridToCJGrid must be a comma-separated
- string of 2 or 3 class names:  "OldGridClass,NewGridClass,[,NewGridColumnClass]"
+ string of 2 or 3 class names:  "OldGridClass,NewGridClass[,NewGridColumnClass]"
  If sParameter is empty, any class whose name ends in "grid" (but NOT in
- "dbgrid") is detected, and the standard DataFlex classes cCJGrid and cCJGridColumn are used as
- the target.  Classes ending in "dbgrid" are intentionally excluded so that
- they continue to be handled by cDbGridTocDbCJGrid.
+ "dbgrid") is detected, and the standard DataFlex classes cCJGrid and
+ cCJGridColumn are used as the target.  Classes ending in "dbgrid" are
+ intentionally excluded so that they continue to be handled by
+ cDbGridTocDbCJGrid.
 */
 
 Use cGridToCJGridBase.pkg
@@ -52,7 +75,16 @@ Class cGridToCJGrid is a cGridToCJGridBase
         // Per-grid column collection state (reset by OnGridStarted).
         Property Integer[] paiNdColFormWidths
         Property String[]  pasNdColHeaderLabels
-        Property Boolean   pbNdPendingColumns  False
+        Property Boolean   pbNdPendingColumns   False
+        // Per-grid data-loading procedure state (reset by OnGridStarted).
+        Property String    psNdDataLoadProcName  ""
+        Property Boolean[] pabNdColReadOnly
+        Property Boolean[] pabNdColCheckbox
+        Property Boolean   pbNdInDataLoadProc    False
+        Property Integer   piNdAddItemColIdx     0
+        Property Boolean   pbNdDataLoadConverted False
+        Property Boolean   pbNdInProcVarDecl     False
+        Property String[]  pasNdProcVarDecls
     End_Procedure
 
     // *** Parameter parsing (override) ***
@@ -108,33 +140,400 @@ Class cGridToCJGrid is a cGridToCJGridBase
     // *** Subclass hook implementations ***
 
     // Called when a grid declaration is detected.
-    // Resets all per-grid column collection state.
-    Procedure OnGridStarted String sGridIndent
+    // Resets all per-grid state, then pre-scans the grid body for the data-loading
+    // procedure name and per-column Item_Shadow / Checkbox flags.
+    Procedure OnGridStarted String sGridIndent Integer iGridStartLine
         String[]  asEmpty
         Integer[] aiEmpty
-        Set paiNdColFormWidths  to aiEmpty
-        Set pasNdColHeaderLabels to asEmpty
-        Set pbNdPendingColumns  to False
+        Boolean[] abEmpty
+        Set paiNdColFormWidths    to aiEmpty
+        Set pasNdColHeaderLabels  to asEmpty
+        Set pbNdPendingColumns    to False
+        Set psNdDataLoadProcName  to ""
+        Set pabNdColReadOnly      to abEmpty
+        Set pabNdColCheckbox      to abEmpty
+        Set pbNdInDataLoadProc    to False
+        Set piNdAddItemColIdx     to 0
+        Set pbNdDataLoadConverted to False
+        Set pbNdInProcVarDecl     to False
+        Set pasNdProcVarDecls     to asEmpty
+        Send PreScanForDataLoadProc sGridIndent iGridStartLine
     End_Procedure
+
+    // *** Pre-scan: data-loading procedure detection ***
+
+    // Scans the grid body starting at iGridStartLine+1 to locate the procedure
+    // that fills the grid with data (identified by containing "send add_item").
+    // Records: procedure name, and per-column pbReadOnly / pbCheckbox flags derived
+    // from Set Item_Shadow_State / Set Checkbox_Item_State lines following Add_Items.
+    Procedure PreScanForDataLoadProc String sGridIndent Integer iGridStartLine
+        String[]  asSource
+        String    sScanLine sScanLower sProcName
+        Integer   iScan iScanSize iScanNest iAddItemIdx iMaxColIdx iColCount iCol
+        Boolean   bScanDone bInProc bFoundAddItem bIsObj
+        Boolean[] abReadOnly abCheckbox
+
+        Get pasSource to asSource
+        Move (SizeOfArray(asSource) - 1) to iScanSize
+        Move (iGridStartLine + 1) to iScan
+        Move 0 to iScanNest
+        Move False to bScanDone
+        Move False to bInProc
+        Move False to bFoundAddItem
+        Move -1 to iMaxColIdx
+        Move 0 to iAddItemIdx
+        Move 0 to iColCount
+
+        If (iScan > iScanSize) Procedure_Return
+
+        Repeat
+            Move asSource[iScan] to sScanLine
+            Move (Lowercase(Trim(sScanLine))) to sScanLower
+
+            Get IsObjectDeclaration sScanLower to bIsObj
+            If (bIsObj) Begin
+                Increment iScanNest
+            End
+            Else If (Left(sScanLower, 10) = "end_object") Begin
+                If (iScanNest = 0) Begin
+                    Move True to bScanDone
+                End
+                Else Begin
+                    Decrement iScanNest
+                End
+            End
+
+            If (bScanDone = False and iScanNest = 0) Begin
+                If (bInProc = False) Begin
+                    // Collect column count from Form_Width lines.
+                    If (Left(sScanLower, 4) = "set " and sScanLower contains "form_width") Begin
+                        Get ParseColumnItemIndex sScanLower "form_width" to iCol
+                        If (iCol > iMaxColIdx) Move iCol to iMaxColIdx
+                    End
+                    // Detect the start of any procedure.
+                    If (Left(sScanLower, 10) = "procedure ") Begin
+                        Get ParseProcFuncName sScanLower to sProcName
+                        Move True to bInProc
+                        Move 0 to iAddItemIdx
+                    End
+                End
+                Else Begin
+                    If (Left(sScanLower, 13) = "end_procedure") Begin
+                        If (bFoundAddItem = False) Move "" to sProcName
+                        Move False to bInProc
+                        Move False to bFoundAddItem
+                        Move 0 to iAddItemIdx
+                    End
+                    Else Begin
+                        // Identify data-loading procedure by presence of Send Add_Item.
+                        If (sScanLower contains "send add_item") Begin
+                            If (bFoundAddItem = False) Begin
+                                Move True to bFoundAddItem
+                                Set psNdDataLoadProcName to sProcName
+                            End
+                            Move (iMaxColIdx + 1) to iColCount
+                            If (iColCount < 1) Move 1 to iColCount
+                            Move (Mod(iAddItemIdx, iColCount)) to iCol
+                            Increment iAddItemIdx
+                        End
+                        // Item_Shadow_State True -> pbReadOnly on preceding column.
+                        If (bFoundAddItem and sScanLower contains "item_shadow_state" and ;
+                            sScanLower contains " to true") Begin
+                            Move (iMaxColIdx + 1) to iColCount
+                            If (iColCount < 1) Move 1 to iColCount
+                            Move (Mod(iAddItemIdx - 1, iColCount)) to iCol
+                            Move True to abReadOnly[iCol]
+                        End
+                        // Checkbox_Item_State True -> pbCheckbox on preceding column.
+                        If (bFoundAddItem and sScanLower contains "checkbox_item_state" and ;
+                            sScanLower contains " to true") Begin
+                            Move (iMaxColIdx + 1) to iColCount
+                            If (iColCount < 1) Move 1 to iColCount
+                            Move (Mod(iAddItemIdx - 1, iColCount)) to iCol
+                            Move True to abCheckbox[iCol]
+                        End
+                    End
+                End
+            End
+
+            Increment iScan
+        Until (bScanDone = True or iScan > iScanSize)
+
+        Set pabNdColReadOnly to abReadOnly
+        Set pabNdColCheckbox to abCheckbox
+    End_Procedure
+
+    // *** Parsing helpers ***
+
+    // Returns True when sTrimLower begins with a DataFlex variable declaration type.
+    // Recognises: Integer String Boolean Handle Number Date Decimal Variant,
+    // and any type token ending with "[]" (struct / array types).
+    Function IsVarDeclLine String sTrimLower Returns Boolean
+        Integer iSpace
+        String  sFirst
+        If (Left(sTrimLower, 8) = "integer ") Function_Return True
+        If (Left(sTrimLower, 7) = "string ") Function_Return True
+        If (Left(sTrimLower, 8) = "boolean ") Function_Return True
+        If (Left(sTrimLower, 7) = "handle ") Function_Return True
+        If (Left(sTrimLower, 7) = "number ") Function_Return True
+        If (Left(sTrimLower, 5) = "date ") Function_Return True
+        If (Left(sTrimLower, 8) = "decimal ") Function_Return True
+        If (Left(sTrimLower, 8) = "variant ") Function_Return True
+        // Array/struct types: first token ends with "[]".
+        Move (Pos(CS_S, sTrimLower)) to iSpace
+        If (iSpace > 2) Begin
+            Move (Left(sTrimLower, iSpace - 1)) to sFirst
+            If (Right(sFirst, 2) = "[]") Function_Return True
+        End
+        Function_Return False
+    End_Function
+
+    // Extracts the value argument from "Send Add_Item Msg_None <value>".
+    Function ParseAddItemValue String sLine Returns String
+        Integer iPos
+        String  sLower
+        Move (Lowercase(sLine)) to sLower
+        Move (Pos("msg_none ", sLower)) to iPos
+        If (iPos = 0) Function_Return ""
+        Function_Return (Trim(Mid(sLine, CI_EOL, (iPos + 9))))
+    End_Function
+
+    // *** Data-loading procedure helpers ***
+
+    // Emits merged variable declarations when the declaration section ends.
+    //   - Prepends:  tDataSourceRow[] TheData TheDataEmpty
+    //   - Merges:    all existing Integer vars with new iRow iCol1..iColN
+    //   - Keeps:     all other type declarations unchanged
+    //   - Appends:   Get piColumnId of oColN to iColN  for each column
+    //                Move 0 to iRow
+    Procedure EmitMergedVarDecls String[] ByRef asOutput String sGridIndent
+        String[]  asProcVarDecls
+        Integer[] aiWidths
+        String    sLine sLower sIndent sSingle sMergedInt sExistingIntVars
+        Integer   iIdx iSize iColCount iColIdx
+
+        Get pasNdProcVarDecls to asProcVarDecls
+        Get paiNdColFormWidths to aiWidths
+        Move (SizeOfArray(aiWidths)) to iColCount
+        Set pbNdInProcVarDecl to False
+
+        Get MakeSingleIndent to sSingle
+        Move (sGridIndent + sSingle + sSingle) to sIndent
+        If (SizeOfArray(asProcVarDecls) > 0) Begin
+            Move asProcVarDecls[0] to sLine
+            Move (Left(sLine, (Length(sLine) - Length(Trim(sLine))))) to sIndent
+        End
+
+        // Gather existing Integer variable names into one string.
+        Move "" to sExistingIntVars
+        Move (SizeOfArray(asProcVarDecls) - 1) to iSize
+        For iIdx from 0 to iSize
+            Move asProcVarDecls[iIdx] to sLine
+            Move (Lowercase(Trim(sLine))) to sLower
+            If (Left(sLower, 8) = "integer ") Begin
+                Move (Trim(Mid(Trim(sLine), CI_EOL, 9))) to sLower
+                If (sExistingIntVars <> "") Begin
+                    Append sExistingIntVars " "
+                    Append sExistingIntVars sLower
+                End
+                Else Move sLower to sExistingIntVars
+            End
+        Loop
+
+        // tDataSourceRow[] declaration.
+        Move (sIndent + "tDataSourceRow[] TheData TheDataEmpty") to asOutput[SizeOfArray(asOutput)]
+
+        // Merged Integer: new vars first, then all existing Integer vars.
+        Move (sIndent + "Integer iRow") to sMergedInt
+        For iColIdx from 1 to iColCount
+            Append sMergedInt (" iCol" + String(iColIdx))
+        Loop
+        If (sExistingIntVars <> "") Begin
+            Append sMergedInt " "
+            Append sMergedInt sExistingIntVars
+        End
+        Move sMergedInt to asOutput[SizeOfArray(asOutput)]
+
+        // Non-Integer declarations kept unchanged.
+        If (iSize >= 0) Begin
+            For iIdx from 0 to iSize
+                Move asProcVarDecls[iIdx] to sLine
+                If (Lowercase(Left(Trim(sLine), 8)) <> "integer ") Begin
+                    Move sLine to asOutput[SizeOfArray(asOutput)]
+                End
+            Loop
+        End
+
+        // Blank separator, Get piColumnId calls, Move 0 to iRow.
+        Move "" to asOutput[SizeOfArray(asOutput)]
+        For iColIdx from 1 to iColCount
+            Move (sIndent + "Get piColumnId of oCol" + String(iColIdx) + " to iCol" + String(iColIdx)) to asOutput[SizeOfArray(asOutput)]
+        Loop
+        Move (sIndent + "Move 0 to iRow") to asOutput[SizeOfArray(asOutput)]
+        Move "" to asOutput[SizeOfArray(asOutput)]
+    End_Procedure
+
+    // Appends the standard If/Else ReInitializeData / InitializeData block.
+    // The If/Else sits at procedure-body level (grid + 2 indents); inner lines
+    // are one further level in (grid + 3 indents).
+    Procedure AppendLoadDataIfElse String[] ByRef asOutput String sGridIndent
+        String sSingle sOuter sInner
+        Get MakeSingleIndent to sSingle
+        Move (sGridIndent + sSingle + sSingle)           to sOuter
+        Move (sGridIndent + sSingle + sSingle + sSingle) to sInner
+        If (SizeOfArray(asOutput) > 0 and Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
+            Move "" to asOutput[SizeOfArray(asOutput)]
+        End
+        Move (sOuter + "If (iRow <> 0) Begin")                   to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + "Send ReInitializeData TheData False")     to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + "Send MoveToFirstRow")                     to asOutput[SizeOfArray(asOutput)]
+        Move (sOuter + "End")                                     to asOutput[SizeOfArray(asOutput)]
+        Move (sOuter + "Else Begin")                              to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + "Send InitializeData TheDataEmpty")        to asOutput[SizeOfArray(asOutput)]
+        Move (sOuter + "End")                                     to asOutput[SizeOfArray(asOutput)]
+    End_Procedure
+
+    // *** Main line handler ***
 
     // Called for each source line at grid body level (iGridInnerNest = 1),
     // before the base class dispatches properties and methods.
     //
-    // Handles:
-    //   - Set Line_Width     -> remove silently (no cCJGrid equivalent)
+    // When pbNdInDataLoadProc = True (inside the data-loading procedure body),
+    // handles all conversion and always consumes the line (bSkip = True).
+    //
+    // Otherwise handles:
+    //   - Set Line_Width     -> remove silently
     //   - Set Select_Mode    -> translate Multi_Select or remove silently
     //   - Set Form_Width     -> collect per-column width
     //   - Set Header_Label   -> collect per-column caption
-    //   - Bare "Send <name>" -> comment out with original line preserved
+    //   - Bare "Send <name>" -> comment out
     //   - Proc/Function with pending columns -> flush column objects first
-    //
-    // Set bSkip True to consume the line; leave False to pass to base processing.
+    //   - Data-loading Procedure declaration -> rename + activate conversion state
     Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
-        String    sLineIndent sLabel
-        Integer   iItemIdx iWidth
+        String    sLineIndent sLabel sValue sProcName sDataLoadName sMergedInt sSingle
+        Integer   iItemIdx iWidth iAddIdx iColN iColCount
         Integer[] aiWidths
-        String[]  asLabels
-        Boolean   bPending
+        String[]  asLabels asProcVarDecls asEmpty
+        Boolean   bPending bInDataLoad bIsVarDecl
+
+        // =====================================================================
+        // CASE A: Inside the data-loading procedure body
+        // =====================================================================
+        Get pbNdInDataLoadProc to bInDataLoad
+        If (bInDataLoad = True) Begin
+
+            // End_Procedure: flush pending var decls (if any), emit If/Else, then End_Procedure.
+            If (Left(sLower, 13) = "end_procedure") Begin
+                If (pbNdInProcVarDecl(Self) = True) Begin
+                    Send EmitMergedVarDecls (&asOutput) sGridIndent
+                End
+                Send AppendLoadDataIfElse (&asOutput) sGridIndent
+                // Emit End_Procedure at the correct indent level (grid + 1), not the
+                // original source indentation which may be inconsistent.
+                Get MakeSingleIndent to sSingle
+                Move (sGridIndent + sSingle + "End_Procedure") to asOutput[SizeOfArray(asOutput)]
+                Set pbNdInDataLoadProc    to False
+                Set pbNdDataLoadConverted to True
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Variable declaration section: collect or flush.
+            If (pbNdInProcVarDecl(Self) = True) Begin
+                If (sTrimLine = "") Begin
+                    Send EmitMergedVarDecls (&asOutput) sGridIndent
+                    Move True to bSkip
+                    Procedure_Return
+                End
+                Get IsVarDeclLine sLower to bIsVarDecl
+                If (bIsVarDecl = True) Begin
+                    Get pasNdProcVarDecls to asProcVarDecls
+                    Move sLine to asProcVarDecls[SizeOfArray(asProcVarDecls)]
+                    Set pasNdProcVarDecls to asProcVarDecls
+                    Move True to bSkip
+                    Procedure_Return
+                End
+                // First non-declaration line: flush collected declarations before it.
+                Send EmitMergedVarDecls (&asOutput) sGridIndent
+            End
+
+            // Get Item_Count: remove silently.
+            If (sLower contains "get item_count") Begin
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Item_Shadow_State: remove (handled as pbReadOnly on column object).
+            If (sLower contains "item_shadow_state") Begin
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Checkbox_Item_State: remove (handled as pbCheckbox on column object).
+            If (sLower contains "checkbox_item_state") Begin
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Set Select_State: comment out (no direct cCJGrid equivalent).
+            If (Left(sLower, 4) = "set " and sLower contains "select_state") Begin
+                Get CommentOutLine sLine to sLine
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Send Delete_Data: remove silently.
+            If (Left(sLower, 5) = "send " and sLower contains "delete_data") Begin
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Send Add_Item Msg_None <value>: convert to TheData row assignment.
+            If (sLower contains "send add_item") Begin
+                Get piNdAddItemColIdx to iAddIdx
+                Get ParseAddItemValue sLine to sValue
+                Get paiNdColFormWidths to aiWidths
+                Move (SizeOfArray(aiWidths)) to iColCount
+                If (iColCount < 1) Move 1 to iColCount
+                Move (Mod(iAddIdx, iColCount)) to iColN
+                Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+                Move (sLineIndent + "Move " + sValue + " to TheData[iRow].sValue[iCol" + String(iColN + 1) + "]") to asOutput[SizeOfArray(asOutput)]
+                Increment iAddIdx
+                Set piNdAddItemColIdx to iAddIdx
+                // After the last column in a row, emit Increment iRow.
+                If (Mod(iAddIdx, iColCount) = 0) Begin
+                    Move (sLineIndent + "Increment iRow") to asOutput[SizeOfArray(asOutput)]
+                End
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Dynamic_Update_State: remove silently (no cCJGrid equivalent).
+            If (sLower contains "dynamic_update_state") Begin
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // All other lines inside the proc body: emit unchanged.
+            // (bSkip = True prevents the outer bare-Send rule from firing.)
+            Move sLine to asOutput[SizeOfArray(asOutput)]
+            Move True to bSkip
+            Procedure_Return
+        End
+
+        // =====================================================================
+        // CASE B: Normal grid body line
+        // =====================================================================
+
+        // Suppress blank lines while column definitions are being collected to
+        // prevent multiple blank lines from accumulating before the first column
+        // object block.
+        Get pbNdPendingColumns to bPending
+        If (bPending = True and sTrimLine = "") Begin
+            Move True to bSkip
+            Procedure_Return
+        End
 
         // Remove Set Line_Width silently (no CJ equivalent).
         If (Left(sLower, 4) = "set " and sLower contains "line_width") Begin
@@ -148,7 +547,6 @@ Class cGridToCJGrid is a cGridToCJGridBase
                 Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
                 Move (sLineIndent + "Set pbMultipleSelection to True") to asOutput[SizeOfArray(asOutput)]
             End
-            // Other Select_Mode values have no direct CJ equivalent; remove silently.
             Move True to bSkip
             Procedure_Return
         End
@@ -182,8 +580,6 @@ Class cGridToCJGrid is a cGridToCJGridBase
         End
 
         // Comment out bare Send statements at grid body level.
-        // These are typically legacy calls (e.g. "Send Fill_the_List") that have
-        // no direct equivalent after conversion; kept commented for reference.
         If (Left(sLower, 5) = "send ") Begin
             Get CommentOutLine sLine to sLine
             Move sLine to asOutput[SizeOfArray(asOutput)]
@@ -198,115 +594,177 @@ Class cGridToCJGrid is a cGridToCJGridBase
             If (Left(sLower, 10) = "procedure " or Left(sLower, 9) = "function ") Begin
                 Send AppendColumnObjects (&asOutput) sGridIndent
                 Set pbNdPendingColumns to False
-                // bSkip stays False: let the base class handle the proc/func declaration.
+            End
+        End
+
+        // Detect the data-loading procedure declaration and activate conversion.
+        If (Left(sLower, 10) = "procedure ") Begin
+            Get ParseProcFuncName sLower to sProcName
+            Get psNdDataLoadProcName to sDataLoadName
+            If (sDataLoadName <> "" and sProcName = sDataLoadName) Begin
+                // Ensure exactly one blank line before Procedure LoadData.
+                If (SizeOfArray(asOutput) > 0 and Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
+                    Move "" to asOutput[SizeOfArray(asOutput)]
+                End
+                Get ReplaceMethodName sLine sProcName "LoadData" to sLine
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                // One blank line after the declaration (before variable declarations).
+                Move "" to asOutput[SizeOfArray(asOutput)]
+                Set pbNdInDataLoadProc   to True
+                Set piNdAddItemColIdx    to 0
+                Set pbNdInProcVarDecl    to True
+                Set pasNdProcVarDecls    to asEmpty
+                Move True to bSkip
             End
         End
     End_Procedure
 
     // Called just before the grid's End_Object is emitted.
-    // Emits any not-yet-flushed column objects, then always appends the
-    // LoadData and Activating stubs that every cCJGrid needs.
+    // Flushes any pending column objects, then generates stubs:
+    //   - If the data-loading procedure was converted: Activating stub only.
+    //   - If no data-loading procedure was found: rich LoadData stub + Activating.
     Procedure OnBeforeGridEndObject String[] ByRef asOutput String sGridIndent
-        Boolean bPending
-        Get pbNdPendingColumns to bPending
+        Boolean bPending bConverted
+        Get pbNdPendingColumns    to bPending
+        Get pbNdDataLoadConverted to bConverted
         If (bPending = True) Begin
             Send AppendColumnObjects (&asOutput) sGridIndent
             Set pbNdPendingColumns to False
         End
-        Send AppendLoadDataStub (&asOutput) sGridIndent
+        If (bConverted = False) Begin
+            Send AppendLoadDataStub (&asOutput) sGridIndent
+        End
+        Else Begin
+            Send AppendActivatingStub (&asOutput) sGridIndent
+        End
     End_Procedure
 
     // *** Column object emission ***
 
     // Appends cCJGridColumn child objects (oCol1, oCol2, ...) derived from the
-    // per-column Form_Width and Header_Label values collected during the scan.
+    // per-column Form_Width, Header_Label, pbReadOnly, and pbCheckbox values.
     // Also flushes any Entry_Display-extracted grid properties before emitting
-    // the first column, so they appear together with the other grid Set properties.
+    // the first column.
     Procedure AppendColumnObjects String[] ByRef asOutput String sGridIndent
         String[]  asHeaderLabels
         Integer[] aiFormWidths
+        Boolean[] abReadOnly abCheckbox
         String    sSingle sColIndent sColProp sLabel sTargetCol
         Integer   iCount iMaxIdx iWidth
 
-        // Flush Entry_Display translated properties before the first column object.
         Send FlushEntryDisplayExtracted (&asOutput) sGridIndent
 
         Get pasNdColHeaderLabels to asHeaderLabels
         Get paiNdColFormWidths   to aiFormWidths
+        Get pabNdColReadOnly     to abReadOnly
+        Get pabNdColCheckbox     to abCheckbox
         Get psTargetColumnClass  to sTargetCol
         Get MakeSingleIndent     to sSingle
         Move (sGridIndent + sSingle)           to sColIndent
         Move (sGridIndent + sSingle + sSingle) to sColProp
 
-        // Column count = max item index seen across widths and labels, plus one.
         Move (SizeOfArray(aiFormWidths) - 1) to iMaxIdx
         If (SizeOfArray(asHeaderLabels) - 1 > iMaxIdx) Begin
             Move (SizeOfArray(asHeaderLabels) - 1) to iMaxIdx
         End
-        If (iMaxIdx < 0) Begin
-            Procedure_Return  // No columns collected; nothing to emit.
-        End
+        If (iMaxIdx < 0) Procedure_Return
 
         For iCount from 0 to iMaxIdx
-            // Width: use collected value; default 100 if not set.
             If (iCount < SizeOfArray(aiFormWidths) and aiFormWidths[iCount] > 0) Begin
                 Move aiFormWidths[iCount] to iWidth
             End
-            Else Begin
-                Move 100 to iWidth
-            End
+            Else Move 100 to iWidth
 
-            // Caption: use collected label; default to empty string.
             If (iCount < SizeOfArray(asHeaderLabels)) Begin
                 Move asHeaderLabels[iCount] to sLabel
             End
-            Else Begin
-                Move "" to sLabel
-            End
+            Else Move "" to sLabel
 
-            // Blank separator before each column object.
             If (SizeOfArray(asOutput) = 0 or Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
                 Move "" to asOutput[SizeOfArray(asOutput)]
             End
             Move (sColIndent + "Object oCol" + String(iCount + 1) + " is a " + sTargetCol) to asOutput[SizeOfArray(asOutput)]
-            Move (sColProp   + "Set piWidth to "   + String(iWidth))                        to asOutput[SizeOfArray(asOutput)]
+            Move (sColProp   + "Set piWidth to " + String(iWidth))                          to asOutput[SizeOfArray(asOutput)]
             Move (sColProp   + "Set psCaption to " + '"' + sLabel + '"')                    to asOutput[SizeOfArray(asOutput)]
-            Move (sColIndent + "End_Object")                                                 to asOutput[SizeOfArray(asOutput)]
+            If (iCount < SizeOfArray(abReadOnly) and abReadOnly[iCount] = True) Begin
+                Move (sColProp + "Set pbReadOnly to True")                                  to asOutput[SizeOfArray(asOutput)]
+            End
+            If (iCount < SizeOfArray(abCheckbox) and abCheckbox[iCount] = True) Begin
+                Move (sColProp + "Set pbCheckbox to True")                                  to asOutput[SizeOfArray(asOutput)]
+            End
+            Move (sColIndent + "End_Object")                                                to asOutput[SizeOfArray(asOutput)]
         Loop
     End_Procedure
 
-    // Appends a LoadData stub and an Activating procedure to asOutput.
-    // These are always generated for every converted non-data-aware CJ grid;
-    // the developer fills in the data-loading logic in LoadData.
+    // *** Stub generation ***
+
+    // Appends a rich LoadData stub when no data-loading procedure was found.
+    // Includes correct column variable declarations, Get piColumnId calls,
+    // a commented-out loop skeleton, and the final If/Else block.
     Procedure AppendLoadDataStub String[] ByRef asOutput String sGridIndent
-        String  sSingle sColIndent sColProp sFirstColName
+        String    sSingle sOuter sInner sMergedInt
+        Integer   iColIdx iColCount
+        Integer[] aiWidths
 
-        Get MakeSingleIndent     to sSingle
-        Move (sGridIndent + sSingle)           to sColIndent
-        Move (sGridIndent + sSingle + sSingle) to sColProp
+        Get MakeSingleIndent to sSingle
+        Move (sGridIndent + sSingle)           to sOuter
+        Move (sGridIndent + sSingle + sSingle) to sInner
+        Get paiNdColFormWidths to aiWidths
+        Move (SizeOfArray(aiWidths)) to iColCount
 
-        // First column is always named oCol1 (1-based sequential naming).
-        Move "oCol1" to sFirstColName
-
-        // Blank separator before LoadData.
         If (SizeOfArray(asOutput) > 0 and Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
             Move "" to asOutput[SizeOfArray(asOutput)]
         End
 
-        Move (sColIndent + "Procedure LoadData")                                            to asOutput[SizeOfArray(asOutput)]
-        Move (sColProp   + "// tDataSourceRow[] TheData TheDataEmpty")                     to asOutput[SizeOfArray(asOutput)]
-        Move (sColProp   + "// Integer iRow iColId")                                       to asOutput[SizeOfArray(asOutput)]
-        Move (sColProp   + "// TODO: Populate this grid. Example pattern:")                to asOutput[SizeOfArray(asOutput)]
-        Move (sColProp   + "//   Get piColumnId of " + sFirstColName + " to iColId")      to asOutput[SizeOfArray(asOutput)]
-        Move (sColProp   + "//   Move someValue to TheData[iRow].sValue[iColId]")          to asOutput[SizeOfArray(asOutput)]
-        Move (sColProp   + "//   Increment iRow")                                          to asOutput[SizeOfArray(asOutput)]
-        Move (sColProp   + "//   Send ReInitializeData TheData False")                     to asOutput[SizeOfArray(asOutput)]
-        Move (sColIndent + "End_Procedure")                                                to asOutput[SizeOfArray(asOutput)]
+        Move (sOuter + "Procedure LoadData") to asOutput[SizeOfArray(asOutput)]
         Move "" to asOutput[SizeOfArray(asOutput)]
-        Move (sColIndent + "Procedure Activating")                                         to asOutput[SizeOfArray(asOutput)]
-        Move (sColProp   + "Forward Send Activating")                                      to asOutput[SizeOfArray(asOutput)]
-        Move (sColProp   + "Send LoadData")                                                to asOutput[SizeOfArray(asOutput)]
-        Move (sColIndent + "End_Procedure")                                                to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + "tDataSourceRow[] TheData TheDataEmpty") to asOutput[SizeOfArray(asOutput)]
+
+        Move (sInner + "Integer iRow") to sMergedInt
+        For iColIdx from 1 to iColCount
+            Append sMergedInt (" iCol" + String(iColIdx))
+        Loop
+        Move sMergedInt to asOutput[SizeOfArray(asOutput)]
+        Move "" to asOutput[SizeOfArray(asOutput)]
+
+        For iColIdx from 1 to iColCount
+            Move (sInner + "Get piColumnId of oCol" + String(iColIdx) + " to iCol" + String(iColIdx)) to asOutput[SizeOfArray(asOutput)]
+        Loop
+        Move (sInner + "Move 0 to iRow") to asOutput[SizeOfArray(asOutput)]
+        Move "" to asOutput[SizeOfArray(asOutput)]
+
+        Move (sInner + "// TODO: Populate this grid with data. Loop and fill TheData, e.g.:") to asOutput[SizeOfArray(asOutput)]
+        For iColIdx from 1 to iColCount
+            Move (sInner + "//   Move someValue to TheData[iRow].sValue[iCol" + String(iColIdx) + "]") to asOutput[SizeOfArray(asOutput)]
+        Loop
+        Move (sInner + "//   Increment iRow") to asOutput[SizeOfArray(asOutput)]
+        Move "" to asOutput[SizeOfArray(asOutput)]
+
+        Move (sInner + "If (iRow <> 0) Begin")                             to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + sSingle + "Send ReInitializeData TheData False")    to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + sSingle + "Send MoveToFirstRow")                    to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + "End")                                               to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + "Else Begin")                                        to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + sSingle + "Send InitializeData TheDataEmpty")       to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + "End")                                               to asOutput[SizeOfArray(asOutput)]
+        Move (sOuter + "End_Procedure")                                     to asOutput[SizeOfArray(asOutput)]
+
+        Send AppendActivatingStub (&asOutput) sGridIndent
+    End_Procedure
+
+    // Appends a standard Activating procedure that calls LoadData.
+    Procedure AppendActivatingStub String[] ByRef asOutput String sGridIndent
+        String sSingle sOuter sInner
+        Get MakeSingleIndent to sSingle
+        Move (sGridIndent + sSingle)           to sOuter
+        Move (sGridIndent + sSingle + sSingle) to sInner
+        Move "" to asOutput[SizeOfArray(asOutput)]
+        Move (sOuter + "Procedure Activating")    to asOutput[SizeOfArray(asOutput)]
+        Move "" to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + "Forward Send Activating") to asOutput[SizeOfArray(asOutput)]
+        Move (sInner + "Send LoadData")           to asOutput[SizeOfArray(asOutput)]
+        Move (sOuter + "End_Procedure")           to asOutput[SizeOfArray(asOutput)]
+        Move "" to asOutput[SizeOfArray(asOutput)]
     End_Procedure
 
     // *** Public interface ***
@@ -314,9 +772,9 @@ Class cGridToCJGrid is a cGridToCJGridBase
     // Transforms all non-data-aware Grid objects in asFiles from the legacy
     // Grid class to cCJGrid with individual cCJGridColumn children.
     //
-    // sParameter: comma-separated class names "OldGridClass[,NewGridClass]"
+    // sParameter: comma-separated class names "OldGridClass,NewGridClass[,NewColumnClass]"
     // Empty sParameter uses pattern detection (any class ending in "grid" but
-    // not "dbgrid") and the standard DataFlex cCJGrid class as the target.
+    // not "dbgrid") and the standard DataFlex cCJGrid / cCJGridColumn classes.
     //
     // Returns the total number of grid objects transformed across all files.
     Function TransformGridToCJGrid String[] asFiles String sParameter Returns Integer
