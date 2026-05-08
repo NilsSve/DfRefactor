@@ -1,4 +1,4 @@
-/* cGridToCJGrid.pkg
+﻿/* cGridToCJGrid.pkg
 
  Non-data-aware subclass of cGridToCJGridBase.
  Converts legacy Grid objects (Grid, cGrid, or any subclass) to cCJGrid,
@@ -22,6 +22,8 @@
  Per-column properties set in each cCJGridColumn object (from pre-scan):
    - Item_Shadow_State True on that column  ->  Set pbReadOnly  to True
    - Checkbox_Item_State True on that column -> Set pbCheckbox  to True
+   - Entry_State False on that column        -> Set pbEditable  to False
+   - Form_Width 0 (hidden column)            -> Set pbVisible   to False
 
  Data-loading procedure conversion:
    If a Procedure containing "Send Add_Item" is found in the grid body,
@@ -37,9 +39,20 @@
    - Get Item_Count  to <var>           ->  removed silently
    - Set Item_Shadow_State  ...         ->  removed (handled in column object)
    - Set Checkbox_Item_State ...        ->  removed (handled in column object)
+   - Set Entry_State ...                ->  removed (handled as pbEditable on column)
+   - Set Form_Bitmap ...                ->  TODO comment + commented out
    - Set Select_State ...               ->  commented out
    - Send Delete_Data                   ->  removed silently
    - Before End_Procedure: If/Else ReInitializeData / InitializeData block appended.
+
+ Legacy row-access pattern conversion (inside any method override in the grid body):
+   - Get Line_Size to <var>                       ->  removed silently
+   - Get Current_Item [of <grid>] to <var>        ->  Get phoDataSource / SelectedRow / DataSource
+                                                       (injects Handle hoDataSource and
+                                                        tDataSourceRow[] TheData into the method's
+                                                        var declaration section automatically)
+   - Move (<var> / N * N) to <var>  (normalise)   ->  removed silently
+   - Get Value of <grid> (<var> + N) to <result>  ->  Move TheData[<var>].sValue[iCol<N+1>] to <result>
    If no data-loading procedure is found, a rich LoadData stub is generated.
 
  Column objects are named oCol1, oCol2, ... (1-based sequential).
@@ -80,11 +93,24 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Property String    psNdDataLoadProcName  ""
         Property Boolean[] pabNdColReadOnly
         Property Boolean[] pabNdColCheckbox
+        Property Boolean[] pabNdColEntryOff
         Property Boolean   pbNdInDataLoadProc    False
         Property Integer   piNdAddItemColIdx     0
         Property Boolean   pbNdDataLoadConverted False
         Property Boolean   pbNdInProcVarDecl     False
         Property String[]  pasNdProcVarDecls
+        // Row-access pattern state: tracks Get Current_Item conversion.
+        Property Boolean   pbNdSawCurrentItem    False
+        Property String    psNdCurrentItemVar    ""
+        // Var-injection state: injects Handle/tDataSourceRow decls into methods
+        // that contain Get Current_Item (populated by PreScanForDataLoadProc).
+        Property Boolean   pbNdInVarInjectMethod False
+        Property Boolean   pbNdInMethodVarDecl   False
+        Property String[]  pasNdMethodVarDecls
+        Property String[]  pasNdCurrentItemMethods
+        Property String[]  pasNdCurrentItemVars      // parallel: row-var name per method (lowercase)
+        Property String    psNdRowOrigVar        ""  // old row var for the method being processed
+        Property Boolean   pbNdRowVarInjected   False  // True after FlushMethodVarDecls injects Integer iRow
     End_Procedure
 
     // *** Parameter parsing (override) ***
@@ -152,11 +178,21 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Set psNdDataLoadProcName  to ""
         Set pabNdColReadOnly      to abEmpty
         Set pabNdColCheckbox      to abEmpty
+        Set pabNdColEntryOff      to abEmpty
         Set pbNdInDataLoadProc    to False
         Set piNdAddItemColIdx     to 0
         Set pbNdDataLoadConverted to False
         Set pbNdInProcVarDecl     to False
         Set pasNdProcVarDecls     to asEmpty
+        Set pbNdSawCurrentItem    to False
+        Set psNdCurrentItemVar    to ""
+        Set pbNdInVarInjectMethod to False
+        Set pbNdInMethodVarDecl   to False
+        Set pasNdMethodVarDecls   to asEmpty
+        Set pasNdCurrentItemMethods to asEmpty
+        Set pasNdCurrentItemVars    to asEmpty
+        Set psNdRowOrigVar          to ""
+        Set pbNdRowVarInjected      to False
         Send PreScanForDataLoadProc sGridIndent iGridStartLine
     End_Procedure
 
@@ -167,11 +203,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
     // Records: procedure name, and per-column pbReadOnly / pbCheckbox flags derived
     // from Set Item_Shadow_State / Set Checkbox_Item_State lines following Add_Items.
     Procedure PreScanForDataLoadProc String sGridIndent Integer iGridStartLine
-        String[]  asSource
-        String    sScanLine sScanLower sProcName
+        String[]  asSource asCurrentItemMethods asCurrentItemVars
+        String    sScanLine sScanLower sProcName sTempVar
         Integer   iScan iScanSize iScanNest iAddItemIdx iMaxColIdx iColCount iCol
-        Boolean   bScanDone bInProc bFoundAddItem bIsObj
-        Boolean[] abReadOnly abCheckbox
+        Boolean   bScanDone bInProc bFoundAddItem bFoundCurrentItem bIsObj
+        Boolean[] abReadOnly abCheckbox abEntryOff
 
         Get pasSource to asSource
         Move (SizeOfArray(asSource) - 1) to iScanSize
@@ -180,6 +216,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Move False to bScanDone
         Move False to bInProc
         Move False to bFoundAddItem
+        Move False to bFoundCurrentItem
         Move -1 to iMaxColIdx
         Move 0 to iAddItemIdx
         Move 0 to iColCount
@@ -215,6 +252,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
                         Get ParseProcFuncName sScanLower to sProcName
                         Move True to bInProc
                         Move 0 to iAddItemIdx
+                        Move False to bFoundCurrentItem
                     End
                 End
                 Else Begin
@@ -222,6 +260,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
                         If (bFoundAddItem = False) Move "" to sProcName
                         Move False to bInProc
                         Move False to bFoundAddItem
+                        Move False to bFoundCurrentItem
                         Move 0 to iAddItemIdx
                     End
                     Else Begin
@@ -252,6 +291,22 @@ Class cGridToCJGrid is a cGridToCJGridBase
                             Move (Mod(iAddItemIdx - 1, iColCount)) to iCol
                             Move True to abCheckbox[iCol]
                         End
+                        // Entry_State False -> pbEditable=False on preceding column.
+                        If (bFoundAddItem and sScanLower contains "entry_state" and ;
+                            sScanLower contains " to false") Begin
+                            Move (iMaxColIdx + 1) to iColCount
+                            If (iColCount < 1) Move 1 to iColCount
+                            Move (Mod(iAddItemIdx - 1, iColCount)) to iCol
+                            Move True to abEntryOff[iCol]
+                        End
+                        // Get Current_Item: record proc name + row-var name for var injection (once per proc).
+                        If (bFoundCurrentItem = False and sScanLower contains "get current_item") Begin
+                            Move True to bFoundCurrentItem
+                            Move sProcName to asCurrentItemMethods[SizeOfArray(asCurrentItemMethods)]
+                            Get ParseValueAfterTo sScanLine to sTempVar
+                            Move (Lowercase(Trim(sTempVar))) to sTempVar
+                            Move sTempVar to asCurrentItemVars[SizeOfArray(asCurrentItemVars)]
+                        End
                     End
                 End
             End
@@ -259,8 +314,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
             Increment iScan
         Until (bScanDone = True or iScan > iScanSize)
 
-        Set pabNdColReadOnly to abReadOnly
-        Set pabNdColCheckbox to abCheckbox
+        Set pabNdColReadOnly         to abReadOnly
+        Set pabNdColCheckbox         to abCheckbox
+        Set pabNdColEntryOff         to abEntryOff
+        Set pasNdCurrentItemMethods  to asCurrentItemMethods
+        Set pasNdCurrentItemVars     to asCurrentItemVars
     End_Procedure
 
     // *** Parsing helpers ***
@@ -287,6 +345,204 @@ Class cGridToCJGrid is a cGridToCJGridBase
         End
         Function_Return False
     End_Function
+
+    // Returns True when sProcName (already lowercase) appears in the list of
+    // procedures that contain Get Current_Item, as collected by PreScanForDataLoadProc.
+    Function IsInCurrentItemMethods String sProcName Returns Boolean
+        String[]  asMethods
+        Integer   iIdx iSize
+        Get pasNdCurrentItemMethods to asMethods
+        Move (SizeOfArray(asMethods) - 1) to iSize
+        For iIdx from 0 to iSize
+            If (asMethods[iIdx] = sProcName) Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    // Returns the original (lowercase) row variable name captured during the pre-scan for
+    // the procedure named sProcName, or "" if the procedure is not in the list.
+    Function GetCurrentItemVar String sProcName Returns String
+        String[]  asMethods asVars
+        Integer   iIdx iSize
+        Get pasNdCurrentItemMethods to asMethods
+        Get pasNdCurrentItemVars    to asVars
+        Move (SizeOfArray(asMethods) - 1) to iSize
+        For iIdx from 0 to iSize
+            If (asMethods[iIdx] = sProcName) Begin
+                If (iIdx < SizeOfArray(asVars)) Function_Return asVars[iIdx]
+                Function_Return ""
+            End
+        Loop
+        Function_Return ""
+    End_Function
+
+    // Replaces ALL whole-word occurrences of sOldWord (already lowercase) with sNewWord in sLine.
+    // A "word boundary" means the character immediately before/after the match must not be a
+    // letter (a-z in the lowercase version), digit (0-9), or underscore.
+    // Uses a scan loop to handle multiple occurrences correctly.
+    Function ReplaceWordOccurrences String sLine String sOldWord String sNewWord Returns String
+        String  sLower sChar sBuf
+        Integer iLen iLineLen iScanPos iAbsPos iPos
+        Boolean bLB bRB bDone
+
+        Move (Lowercase(sLine)) to sLower
+        Move (Length(sOldWord)) to iLen
+        Move (Length(sLower))   to iLineLen
+        If (iLen = 0) Function_Return sLine
+        Move "" to sBuf
+        Move 1  to iScanPos
+        Move False to bDone
+
+        Repeat
+            If (iScanPos > iLineLen) Begin
+                Move True to bDone
+            End
+            Else Begin
+                Move (Pos(sOldWord, Mid(sLower, CI_EOL, iScanPos))) to iPos
+                If (iPos = 0) Begin
+                    // No more matches: append remaining original text.
+                    Append sBuf (Mid(sLine, CI_EOL, iScanPos))
+                    Move True to bDone
+                End
+                Else Begin
+                    // Absolute position of the match in the full string (1-based).
+                    Move (iScanPos + iPos - 1) to iAbsPos
+
+                    // Check left word boundary.
+                    Move True to bLB
+                    If (iAbsPos > 1) Begin
+                        Move (Mid(sLower, 1, iAbsPos - 1)) to sChar
+                        If (sChar >= "a" and sChar <= "z") Move False to bLB
+                        If (sChar >= "0" and sChar <= "9") Move False to bLB
+                        If (sChar = "_") Move False to bLB
+                    End
+
+                    // Check right word boundary.
+                    Move True to bRB
+                    If ((iAbsPos + iLen - 1) < iLineLen) Begin
+                        Move (Mid(sLower, 1, iAbsPos + iLen)) to sChar
+                        If (sChar >= "a" and sChar <= "z") Move False to bRB
+                        If (sChar >= "0" and sChar <= "9") Move False to bRB
+                        If (sChar = "_") Move False to bRB
+                    End
+
+                    // Append the text before this match (original case).
+                    If (iPos > 1) Append sBuf (Mid(sLine, iPos - 1, iScanPos))
+
+                    If (bLB and bRB) Begin
+                        // Word boundary matched: replace.
+                        Append sBuf sNewWord
+                    End
+                    Else Begin
+                        // Not a word boundary: keep the original (case-preserved) matched text.
+                        Append sBuf (Mid(sLine, iLen, iAbsPos))
+                    End
+
+                    Move (iAbsPos + iLen) to iScanPos
+                End
+            End
+        Until (bDone = True)
+
+        Function_Return sBuf
+    End_Function
+
+    // Flushes buffered var decl lines, then appends the declarations needed for
+    // the phoDataSource / SelectedRow / DataSource pattern.
+    //
+    // Rename: if the pre-scan recorded that the method's row variable is not already
+    // "iRow", renames it to "iRow" in every buffered Integer declaration (word-boundary
+    // safe, so iItemCount is never corrupted).
+    //
+    // Injection: after emitting the (possibly renamed) buffered decls, appends:
+    //   Handle hoDataSource
+    //   tDataSourceRow[] TheData
+    //   Integer iRow iCol   (only those not already present after renaming)
+    //
+    // Indentation is inferred from the first buffered line, defaulting to
+    // sGridIndent + 2 levels.  Clears pbNdInMethodVarDecl and pasNdMethodVarDecls.
+    // Always appends a blank line after the injected declarations.
+    Procedure FlushMethodVarDecls String[] ByRef asOutput String sGridIndent
+        String[]  asDecls asEmpty
+        String    sLine sLower sIndent sSingle sOldVar sTest
+        Integer   iIdx iSize
+        Boolean   bHasIRow bHasICol bCanRename
+
+        Get pasNdMethodVarDecls to asDecls
+        Get psNdRowOrigVar to sOldVar           // e.g. "iitem" (lowercase), may be ""
+        Get MakeSingleIndent to sSingle
+        Move (sGridIndent + sSingle + sSingle) to sIndent
+        If (SizeOfArray(asDecls) > 0) Begin
+            Move asDecls[0] to sLine
+            Move (Left(sLine, (Length(sLine) - Length(Trim(sLine))))) to sIndent
+        End
+
+        Move (SizeOfArray(asDecls) - 1) to iSize
+
+        // --- Rename pass: old row var -> iRow in buffered declarations ---
+        // Guard: only rename if the variable is not already called iRow, and iRow is
+        // not already separately declared (which would create a duplicate).
+        Move False to bCanRename
+        If (sOldVar <> "" and sOldVar <> "irow") Begin
+            Move True to bCanRename
+            // If irow is already declared, skip rename to avoid duplicate.
+            If (iSize >= 0) Begin
+                For iIdx from 0 to iSize
+                    Move (Lowercase(Trim(asDecls[iIdx]))) to sLower
+                    If (Left(sLower, 8) = "integer ") Begin
+                        Move (" " + sLower + " ") to sTest
+                        If (sTest contains " irow ") Move False to bCanRename
+                    End
+                Loop
+            End
+        End
+        If (bCanRename) Begin
+            For iIdx from 0 to iSize
+                Get ReplaceWordOccurrences asDecls[iIdx] sOldVar "iRow" to sLine
+                Move sLine to asDecls[iIdx]
+            Loop
+        End
+
+        // --- Scan for existing iRow / iCol after rename ---
+        Move False to bHasIRow
+        Move False to bHasICol
+        If (iSize >= 0) Begin
+            For iIdx from 0 to iSize
+                Move (Lowercase(Trim(asDecls[iIdx]))) to sLower
+                If (Left(sLower, 8) = "integer ") Begin
+                    Move (" " + sLower + " ") to sTest
+                    If (sTest contains " irow ") Move True to bHasIRow
+                    If (sTest contains " icol ") Move True to bHasICol
+                End
+            Loop
+        End
+
+        // --- Emit buffered (possibly renamed) declarations ---
+        If (iSize >= 0) Begin
+            For iIdx from 0 to iSize
+                Move asDecls[iIdx] to asOutput[SizeOfArray(asOutput)]
+            Loop
+        End
+
+        // --- Inject missing Integer declarations ---
+        If (bHasIRow = False and bHasICol = False) Begin
+            Move (sIndent + "Integer iRow iCol") to asOutput[SizeOfArray(asOutput)]
+            Set pbNdRowVarInjected to True
+        End
+        Else If (bHasIRow = False) Begin
+            Move (sIndent + "Integer iRow") to asOutput[SizeOfArray(asOutput)]
+            Set pbNdRowVarInjected to True
+        End
+        Else If (bHasICol = False) Begin
+            Move (sIndent + "Integer iCol") to asOutput[SizeOfArray(asOutput)]
+        End
+
+        // --- Always inject Handle and tDataSourceRow ---
+        Move (sIndent + "Handle hoDataSource") to asOutput[SizeOfArray(asOutput)]
+        Move (sIndent + "tDataSourceRow[] TheData") to asOutput[SizeOfArray(asOutput)]
+        Move "" to asOutput[SizeOfArray(asOutput)]
+        Set pbNdInMethodVarDecl to False
+        Set pasNdMethodVarDecls to asEmpty
+    End_Procedure
 
     // Extracts the value argument from "Send Add_Item Msg_None <value>".
     Function ParseAddItemValue String sLine Returns String
@@ -410,11 +666,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
     //   - Proc/Function with pending columns -> flush column objects first
     //   - Data-loading Procedure declaration -> rename + activate conversion state
     Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
-        String    sLineIndent sLabel sValue sProcName sDataLoadName sMergedInt sSingle
+        String    sLineIndent sLabel sValue sProcName sDataLoadName sMergedInt sSingle sRowOrigVar
         Integer   iItemIdx iWidth iAddIdx iColN iColCount
         Integer[] aiWidths
         String[]  asLabels asProcVarDecls asEmpty
-        Boolean   bPending bInDataLoad bIsVarDecl
+        Boolean   bPending bInDataLoad bIsVarDecl bNeedInject
 
         // =====================================================================
         // CASE A: Inside the data-loading procedure body
@@ -471,6 +727,22 @@ Class cGridToCJGrid is a cGridToCJGridBase
 
             // Checkbox_Item_State: remove (handled as pbCheckbox on column object).
             If (sLower contains "checkbox_item_state") Begin
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Entry_State: remove (handled as pbEditable to False on column object).
+            If (sLower contains "entry_state") Begin
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Form_Bitmap: no direct cCJGrid equivalent; comment out with a TODO.
+            If (sLower contains "form_bitmap") Begin
+                Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+                Move (sLineIndent + "// TODO: Set Form_Bitmap -- cCJGrid uses OnSetDisplayMetrics on the column for per-row bitmap images.") to asOutput[SizeOfArray(asOutput)]
+                Get CommentOutLine sLine to sLine
+                Move sLine to asOutput[SizeOfArray(asOutput)]
                 Move True to bSkip
                 Procedure_Return
             End
@@ -579,12 +851,178 @@ Class cGridToCJGrid is a cGridToCJGridBase
             Procedure_Return
         End
 
+        // Translate Set Floating_Menu_Object to phoHeaderContextMenu.
+        If (Left(sLower, 4) = "set " and sLower contains "floating_menu_object") Begin
+            Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+            Get ParseValueAfterTo sLine to sValue
+            Move (sLineIndent + "Set phoHeaderContextMenu to " + Trim(sValue)) to asOutput[SizeOfArray(asOutput)]
+            Move True to bSkip
+            Procedure_Return
+        End
+
         // Comment out bare Send statements at grid body level.
         If (Left(sLower, 5) = "send ") Begin
             Get CommentOutLine sLine to sLine
             Move sLine to asOutput[SizeOfArray(asOutput)]
             Move True to bSkip
             Procedure_Return
+        End
+
+        // Detect Procedure declaration for a method that needs var injection
+        // (contains Get Current_Item, as identified in PreScanForDataLoadProc).
+        // Guard: not the data-loading procedure (handled separately below).
+        If (Left(sLower, 10) = "procedure ") Begin
+            Get ParseProcFuncName sLower to sProcName
+            Get psNdDataLoadProcName to sDataLoadName
+            If (not (sDataLoadName <> "" and sProcName = sDataLoadName)) Begin
+                Get IsInCurrentItemMethods sProcName to bNeedInject
+                If (bNeedInject) Begin
+                    Set pbNdInVarInjectMethod to True
+                    Set pbNdInMethodVarDecl   to True
+                    Set pasNdMethodVarDecls   to asEmpty
+                    Get GetCurrentItemVar sProcName to sRowOrigVar
+                    Set psNdRowOrigVar to sRowOrigVar
+                    // Do not consume: let the Procedure declaration line through.
+                End
+            End
+        End
+
+        // Var decl buffering: when inside a method needing Handle/tDataSourceRow injection,
+        // collect existing var declarations so we can append the two new ones after them.
+        // Guard: skip the Procedure declaration line itself (already handled above).
+        If (pbNdInMethodVarDecl(Self) = True and Left(sLower, 10) <> "procedure ") Begin
+            If (sTrimLine = "") Begin
+                // A blank line before any var decl has been buffered (e.g. a blank line
+                // between the Procedure declaration and the first var decl) must NOT
+                // trigger a premature flush -- just skip it silently.
+                If (SizeOfArray(pasNdMethodVarDecls(Self)) = 0) Begin
+                    Move True to bSkip
+                    Procedure_Return
+                End
+                // Blank line after at least one buffered decl: ends the var decl section.
+                Send FlushMethodVarDecls (&asOutput) sGridIndent
+                Move True to bSkip
+                Procedure_Return
+            End
+            Get IsVarDeclLine sLower to bIsVarDecl
+            If (bIsVarDecl = True) Begin
+                // Buffer this var decl line; it will be emitted by FlushMethodVarDecls.
+                Get pasNdMethodVarDecls to asProcVarDecls
+                Move sLine to asProcVarDecls[SizeOfArray(asProcVarDecls)]
+                Set pasNdMethodVarDecls to asProcVarDecls
+                Move True to bSkip
+                Procedure_Return
+            End
+            // First non-blank, non-decl line: flush buffered declarations, then fall through.
+            Send FlushMethodVarDecls (&asOutput) sGridIndent
+        End
+
+        // Reset row-access pattern state when a method ends.
+        If (Left(sLower, 13) = "end_procedure" or Left(sLower, 12) = "end_function") Begin
+            Set pbNdSawCurrentItem to False
+            Set psNdCurrentItemVar to ""
+            // Flush any remaining buffered var decls (method body contained only decls).
+            If (pbNdInVarInjectMethod(Self) = True) Begin
+                If (pbNdInMethodVarDecl(Self) = True) Begin
+                    Send FlushMethodVarDecls (&asOutput) sGridIndent
+                End
+                Set pbNdInVarInjectMethod to False
+                Set psNdRowOrigVar        to ""
+                Set pbNdRowVarInjected    to False
+            End
+            // Do not consume; let base class emit the line unchanged.
+        End
+
+        // Get Line_Size to <var>: remove silently (column count is known from the grid definition).
+        If (sLower contains "get line_size") Begin
+            Move True to bSkip
+            Procedure_Return
+        End
+
+        // Get Current_Item [of <grid>] to <var>: convert to phoDataSource / SelectedRow.
+        If (sLower contains "get current_item") Begin
+            Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+            Get ParseValueAfterTo sLine to sValue
+            Move (Trim(sValue)) to sValue
+            If (pbNdInVarInjectMethod(Self) = True) Begin
+                // Var injection is active: always target iRow (declaration is injected by FlushMethodVarDecls).
+                Move "iRow" to sValue
+            End
+            Else Begin
+                // Not active: emit a TODO comment reminding the developer to add the declarations manually.
+                Move (sLineIndent + "// TODO: Add to var decls:  Integer iRow iCol  |  Handle hoDataSource  |  tDataSourceRow[] TheData") to asOutput[SizeOfArray(asOutput)]
+            End
+            Move (sLineIndent + "Get phoDataSource to hoDataSource") to asOutput[SizeOfArray(asOutput)]
+            Move (sLineIndent + "Get SelectedRow of hoDataSource to " + sValue) to asOutput[SizeOfArray(asOutput)]
+            Move (sLineIndent + "Get DataSource of hoDataSource to TheData") to asOutput[SizeOfArray(asOutput)]
+            Set pbNdSawCurrentItem to True
+            Set psNdCurrentItemVar to sValue
+            Move True to bSkip
+            Procedure_Return
+        End
+
+        // Move (<var> / N * N) to <var>: row normalisation -- not needed in cCJGrid; remove silently.
+        // Only fires immediately after a Get Current_Item replacement (guarded by pbNdSawCurrentItem).
+        If (pbNdSawCurrentItem(Self) = True and Left(sLower, 5) = "move " and ;
+            sLower contains "/" and sLower contains "*") Begin
+            Set pbNdSawCurrentItem to False
+            Move True to bSkip
+            Procedure_Return
+        End
+
+        // Get Value of <grid> (<rowvar> + N) to <result>: convert to TheData array access.
+        If (sLower contains "get value of " and sLower contains " + ") Begin
+            Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+            Get ParseValueAfterTo sLine to sValue       // result variable (original case)
+            Move (Trim(sValue)) to sValue
+            // Extract offset N: find " + " then read until ")" to get the column offset number.
+            Move (Pos(" + ", sLower)) to iItemIdx
+            Move (Trim(Mid(sLower, CI_EOL, (iItemIdx + 3)))) to sMergedInt
+            Move (Pos(")", sMergedInt)) to iColN
+            If (iColN > 0) Move (Left(sMergedInt, iColN - 1)) to sMergedInt
+            Move (Integer(Trim(sMergedInt))) to iColCount
+            // Row variable: prefer the one stored from Get Current_Item; otherwise
+            // extract it from the expression "(rowvar + N)".
+            Get psNdCurrentItemVar to sDataLoadName
+            If (sDataLoadName = "") Begin
+                Move (Pos("(", sLower)) to iWidth
+                Move (Trim(Mid(sLower, CI_EOL, (iWidth + 1)))) to sDataLoadName
+                Move (Pos(" + ", sDataLoadName)) to iItemIdx
+                If (iItemIdx > 0) Move (Trim(Left(sDataLoadName, iItemIdx - 1))) to sDataLoadName
+                If (sDataLoadName = "") Move "iItem" to sDataLoadName
+            End
+            Move (sLineIndent + "Get piColumnId of oCol" + String(iColCount + 1) + " to iCol") to asOutput[SizeOfArray(asOutput)]
+            Move (sLineIndent + "Move TheData[" + sDataLoadName + "].sValue[iCol] to " + sValue) to asOutput[SizeOfArray(asOutput)]
+            Set psNdCurrentItemVar to ""
+            Move True to bSkip
+            Procedure_Return
+        End
+
+        // When var injection is active and the old row variable differs from iRow,
+        // rename every fall-through line (word-boundary safe) so the output uses iRow
+        // consistently.  This handles lines not consumed by the specific handlers above
+        // (e.g. "If (iItem > 0) Begin", "Send pAlert iItem", etc.).
+        If (pbNdInVarInjectMethod(Self) = True) Begin
+            Get psNdRowOrigVar to sRowOrigVar
+            If (sRowOrigVar <> "" and sRowOrigVar <> "irow") Begin
+                // Guard: if iRow was already injected by FlushMethodVarDecls, drop any
+                // mid-procedure var decl that declares the old row variable (e.g.
+                // "Integer iItem" appearing after code statements).  Renaming it would
+                // produce a duplicate "Integer iRow" in the output.
+                If (pbNdRowVarInjected(Self) = True) Begin
+                    Get IsVarDeclLine sLower to bIsVarDecl
+                    If (bIsVarDecl = True) Begin
+                        Move (" " + sLower + " ") to sMergedInt
+                        If (sMergedInt contains (" " + sRowOrigVar + " ")) Begin
+                            Move True to bSkip
+                            Procedure_Return
+                        End
+                    End
+                End
+                Get ReplaceWordOccurrences sLine sRowOrigVar "iRow" to sLine
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+            End
         End
 
         // Flush pending column objects before the first Procedure or Function so
@@ -648,7 +1086,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
     Procedure AppendColumnObjects String[] ByRef asOutput String sGridIndent
         String[]  asHeaderLabels
         Integer[] aiFormWidths
-        Boolean[] abReadOnly abCheckbox
+        Boolean[] abReadOnly abCheckbox abEntryOff
         String    sSingle sColIndent sColProp sLabel sTargetCol
         Integer   iCount iMaxIdx iWidth
 
@@ -658,6 +1096,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Get paiNdColFormWidths   to aiFormWidths
         Get pabNdColReadOnly     to abReadOnly
         Get pabNdColCheckbox     to abCheckbox
+        Get pabNdColEntryOff     to abEntryOff
         Get psTargetColumnClass  to sTargetCol
         Get MakeSingleIndent     to sSingle
         Move (sGridIndent + sSingle)           to sColIndent
@@ -667,30 +1106,44 @@ Class cGridToCJGrid is a cGridToCJGridBase
         If (SizeOfArray(asHeaderLabels) - 1 > iMaxIdx) Begin
             Move (SizeOfArray(asHeaderLabels) - 1) to iMaxIdx
         End
-        If (iMaxIdx < 0) Procedure_Return
+        If (iMaxIdx < 0) ;
+            Procedure_Return
 
         For iCount from 0 to iMaxIdx
-            If (iCount < SizeOfArray(aiFormWidths) and aiFormWidths[iCount] > 0) Begin
+            // Use the explicit Form_Width value when present (including 0 = hidden);
+            // default to 100 only when no Form_Width statement was seen for this column.
+            If (iCount < SizeOfArray(aiFormWidths)) Begin
                 Move aiFormWidths[iCount] to iWidth
             End
-            Else Move 100 to iWidth
+            Else ;
+                Move 100 to iWidth
 
             If (iCount < SizeOfArray(asHeaderLabels)) Begin
                 Move asHeaderLabels[iCount] to sLabel
             End
-            Else Move "" to sLabel
+            Else ;
+                Move "" to sLabel
 
             If (SizeOfArray(asOutput) = 0 or Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
                 Move "" to asOutput[SizeOfArray(asOutput)]
             End
             Move (sColIndent + "Object oCol" + String(iCount + 1) + " is a " + sTargetCol) to asOutput[SizeOfArray(asOutput)]
-            Move (sColProp   + "Set piWidth to " + String(iWidth))                          to asOutput[SizeOfArray(asOutput)]
-            Move (sColProp   + "Set psCaption to " + '"' + sLabel + '"')                    to asOutput[SizeOfArray(asOutput)]
+            // Width 0 in a legacy Grid means hidden; translate to pbVisible to False.
+            If (iWidth = 0) Begin
+                Move (sColProp + "Set pbVisible to False")                                  to asOutput[SizeOfArray(asOutput)]
+            End
+            Else Begin
+                Move (sColProp + "Set piWidth to " + String(iWidth))                       to asOutput[SizeOfArray(asOutput)]
+            End
+            Move (sColProp   + "Set psCaption to " + '"' + sLabel + '"')                   to asOutput[SizeOfArray(asOutput)]
             If (iCount < SizeOfArray(abReadOnly) and abReadOnly[iCount] = True) Begin
                 Move (sColProp + "Set pbReadOnly to True")                                  to asOutput[SizeOfArray(asOutput)]
             End
             If (iCount < SizeOfArray(abCheckbox) and abCheckbox[iCount] = True) Begin
                 Move (sColProp + "Set pbCheckbox to True")                                  to asOutput[SizeOfArray(asOutput)]
+            End
+            If (iCount < SizeOfArray(abEntryOff) and abEntryOff[iCount] = True) Begin
+                Move (sColProp + "Set pbEditable to False")                                 to asOutput[SizeOfArray(asOutput)]
             End
             Move (sColIndent + "End_Object")                                                to asOutput[SizeOfArray(asOutput)]
         Loop
