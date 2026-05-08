@@ -111,6 +111,15 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Property String[]  pasNdCurrentItemVars      // parallel: row-var name per method (lowercase)
         Property String    psNdRowOrigVar        ""  // old row var for the method being processed
         Property Boolean   pbNdRowVarInjected   False  // True after FlushMethodVarDecls injects Integer iRow
+        // Mouse_Click / Mouse_Down2 subclass conversion state.
+        // These methods are handled entirely in OnHandleGridLine (not via bInRenameProcedure)
+        // so that the body lines go through the full Case B machinery: var injection,
+        // Current_Item conversion, Get Value conversion, etc.
+        Property Boolean   pbNdInMouseBody    False
+        Property String    psNdMouseOldName   ""  // lowercase legacy name (e.g. "mouse_down2")
+        Property String    psNdMouseNewName   ""  // new name (e.g. "OnRowRightClick")
+        Property String    psNdMouseOldP1     ""  // first legacy param name (lowercase)
+        Property String    psNdMouseOldP2     ""  // second legacy param name (lowercase)
     End_Procedure
 
     // *** Parameter parsing (override) ***
@@ -193,6 +202,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Set pasNdCurrentItemVars    to asEmpty
         Set psNdRowOrigVar          to ""
         Set pbNdRowVarInjected      to False
+        Set pbNdInMouseBody         to False
+        Set psNdMouseOldName        to ""
+        Set psNdMouseNewName        to ""
+        Set psNdMouseOldP1          to ""
+        Set psNdMouseOldP2          to ""
         Send PreScanForDataLoadProc sGridIndent iGridStartLine
     End_Procedure
 
@@ -496,10 +510,20 @@ Class cGridToCJGrid is a cGridToCJGridBase
             End
         End
         If (bCanRename) Begin
-            For iIdx from 0 to iSize
-                Get ReplaceWordOccurrences asDecls[iIdx] sOldVar "iRow" to sLine
-                Move sLine to asDecls[iIdx]
-            Loop
+            // Mouse_Click / Mouse_Down2: iRow is already a procedure parameter, so
+            // removing the old row var from the decl is correct (not renaming to iRow).
+            If (pbNdInMouseBody(Self) = True) Begin
+                For iIdx from 0 to iSize
+                    Get ReplaceWordOccurrences asDecls[iIdx] sOldVar "" to sLine
+                    Move sLine to asDecls[iIdx]
+                Loop
+            End
+            Else Begin
+                For iIdx from 0 to iSize
+                    Get ReplaceWordOccurrences asDecls[iIdx] sOldVar "iRow" to sLine
+                    Move sLine to asDecls[iIdx]
+                Loop
+            End
         End
 
         // --- Scan for existing iRow / iCol after rename ---
@@ -517,10 +541,23 @@ Class cGridToCJGrid is a cGridToCJGridBase
         End
 
         // --- Emit buffered (possibly renamed) declarations ---
+        // Skip any decl that became a bare type keyword after the removal pass
+        // (e.g. "Integer iItem" -> "Integer " when iItem was removed because it is
+        // now a procedure parameter).  Pos(" ", Trim) = 0 means no variable name left.
         If (iSize >= 0) Begin
             For iIdx from 0 to iSize
-                Move asDecls[iIdx] to asOutput[SizeOfArray(asOutput)]
+                Move (Trim(asDecls[iIdx])) to sTest
+                If (sTest <> "" and Pos(CS_S, sTest) > 0) Begin
+                    Move asDecls[iIdx] to asOutput[SizeOfArray(asOutput)]
+                End
             Loop
+        End
+
+        // Mouse_Click / Mouse_Down2: iRow and iCol are already procedure parameters --
+        // suppress injection regardless of what the scan found.
+        If (pbNdInMouseBody(Self) = True) Begin
+            Move True to bHasIRow
+            Move True to bHasICol
         End
 
         // --- Inject missing Integer declarations ---
@@ -860,21 +897,97 @@ Class cGridToCJGrid is a cGridToCJGridBase
             Procedure_Return
         End
 
+        // Mouse_Click / Mouse_Down2 body sub-handler.
+        // When inside a converted Mouse_Click or Mouse_Down2 body, rewrite Forward
+        // Send/Get and substitute the old parameter names (word-boundary-safe), then
+        // fall through so that the standard handlers below (Current_Item, GetValue,
+        // var-decl buffering, etc.) can further transform the line.
+        If (pbNdInMouseBody(Self) = True) Begin
+            Get psNdMouseOldName to sProcName     // lowercase old name
+            Get psNdMouseNewName to sDataLoadName // new name
+            If (sLower contains ("forward send " + sProcName) or ;
+                sLower contains ("forward get "  + sProcName)) Begin
+                Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+                Move (sLineIndent + "Forward Send " + sDataLoadName + " iRow iCol") to sLine
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+                Procedure_Return
+            End
+            // Substitute old parameter names with iRow / iCol throughout the body.
+            Get psNdMouseOldP1 to sProcName
+            If (sProcName <> "") Get ReplaceWordOccurrences sLine sProcName "iRow" to sLine
+            Get psNdMouseOldP2 to sProcName
+            If (sProcName <> "") Get ReplaceWordOccurrences sLine sProcName "iCol" to sLine
+            // Do NOT return here: fall through so Current_Item, GetValue, etc. fire too.
+        End
+
         // Comment out bare Send statements at grid body level.
-        If (Left(sLower, 5) = "send ") Begin
+        // Guard: do not comment out Sends inside a converted Mouse_Click/Mouse_Down2 body.
+        If (pbNdInMouseBody(Self) = False and Left(sLower, 5) = "send ") Begin
             Get CommentOutLine sLine to sLine
             Move sLine to asOutput[SizeOfArray(asOutput)]
             Move True to bSkip
             Procedure_Return
         End
 
-        // Detect Procedure declaration for a method that needs var injection
-        // (contains Get Current_Item, as identified in PreScanForDataLoadProc).
+        // Detect Procedure declaration for a method that needs var injection or that
+        // is a Mouse_Click / Mouse_Down2 needing full subclass-side conversion.
         // Guard: not the data-loading procedure (handled separately below).
         If (Left(sLower, 10) = "procedure ") Begin
             Get ParseProcFuncName sLower to sProcName
             Get psNdDataLoadProcName to sDataLoadName
             If (not (sDataLoadName <> "" and sProcName = sDataLoadName)) Begin
+                // Mouse_Click -> OnRowDoubleClick / Mouse_Down2 -> OnRowRightClick.
+                // Handle entirely here so body lines flow through OnHandleGridLine
+                // and get Current_Item conversion, var injection, etc.
+                If (sProcName = "mouse_click" or sProcName = "mouse_down2") Begin
+                    Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+                    // Parse the two legacy parameter names (e.g. "Integer iWin Integer iPos").
+                    Move "" to sRowOrigVar
+                    Move "" to sMergedInt
+                    Move (Pos("integer ", sLower)) to iItemIdx
+                    If (iItemIdx > 0) Begin
+                        Move (Trim(Mid(sTrimLine, CI_EOL, (iItemIdx + 8)))) to sRowOrigVar
+                        Move (Pos(CS_S, sRowOrigVar)) to iColN
+                        If (iColN > 0) Move (Left(sRowOrigVar, iColN - 1)) to sRowOrigVar
+                        Move (iItemIdx + 8 + Length(sRowOrigVar)) to iItemIdx
+                        Move (Pos("integer ", Mid(sLower, CI_EOL, (iItemIdx + 1)))) to iColN
+                        If (iColN > 0) Begin
+                            Move (iItemIdx + iColN + 8) to iItemIdx
+                            Move (Trim(Mid(sTrimLine, CI_EOL, iItemIdx))) to sMergedInt
+                            Move (Pos(CS_S, sMergedInt)) to iColN
+                            If (iColN > 0) Move (Left(sMergedInt, iColN - 1)) to sMergedInt
+                        End
+                    End
+                    // Emit conversion comment and renamed declaration.
+                    If (sProcName = "mouse_click") Begin
+                        Move (sLineIndent + "// Converted from Mouse_Click: iRow = row index, iCol = column index.") to asOutput[SizeOfArray(asOutput)]
+                        Move (sLineIndent + "Procedure OnRowDoubleClick Integer iRow Integer iCol") to asOutput[SizeOfArray(asOutput)]
+                        Set psNdMouseNewName to "OnRowDoubleClick"
+                    End
+                    Else Begin
+                        Move (sLineIndent + "// Converted from Mouse_Down2: iRow = row index, iCol = column index.") to asOutput[SizeOfArray(asOutput)]
+                        Move (sLineIndent + "Procedure OnRowRightClick Integer iRow Integer iCol") to asOutput[SizeOfArray(asOutput)]
+                        Set psNdMouseNewName to "OnRowRightClick"
+                    End
+                    Set pbNdInMouseBody  to True
+                    Set psNdMouseOldName to sProcName
+                    Set psNdMouseOldP1   to (Lowercase(sRowOrigVar))
+                    Set psNdMouseOldP2   to (Lowercase(sMergedInt))
+                    // If the method also contains Get Current_Item, activate var injection
+                    // so the var decl section is augmented automatically.
+                    Get IsInCurrentItemMethods sProcName to bNeedInject
+                    If (bNeedInject) Begin
+                        Set pbNdInVarInjectMethod to True
+                        Set pbNdInMethodVarDecl   to True
+                        Set pasNdMethodVarDecls   to asEmpty
+                        Get GetCurrentItemVar sProcName to sRowOrigVar
+                        Set psNdRowOrigVar to sRowOrigVar
+                    End
+                    Move True to bSkip
+                    Procedure_Return
+                End
+                // Regular method: activate var injection if it contains Get Current_Item.
                 Get IsInCurrentItemMethods sProcName to bNeedInject
                 If (bNeedInject) Begin
                     Set pbNdInVarInjectMethod to True
@@ -930,6 +1043,12 @@ Class cGridToCJGrid is a cGridToCJGridBase
                 Set psNdRowOrigVar        to ""
                 Set pbNdRowVarInjected    to False
             End
+            // Reset mouse body state (Mouse_Click / Mouse_Down2 subclass handling).
+            Set pbNdInMouseBody    to False
+            Set psNdMouseOldName   to ""
+            Set psNdMouseNewName   to ""
+            Set psNdMouseOldP1     to ""
+            Set psNdMouseOldP2     to ""
             // Do not consume; let base class emit the line unchanged.
         End
 
@@ -1002,7 +1121,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
         // rename every fall-through line (word-boundary safe) so the output uses iRow
         // consistently.  This handles lines not consumed by the specific handlers above
         // (e.g. "If (iItem > 0) Begin", "Send pAlert iItem", etc.).
-        If (pbNdInVarInjectMethod(Self) = True) Begin
+        // Guard: pbNdInMethodVarDecl is True from the moment the procedure declaration
+        // is detected (block above) until FlushMethodVarDecls resets it.  Do not rename
+        // the declaration line itself -- that would emit it here and prevent the base
+        // class dispatch from converting it (e.g. Mouse_Down2 -> OnRowRightClick).
+        If (pbNdInVarInjectMethod(Self) = True and pbNdInMethodVarDecl(Self) = False) Begin
             Get psNdRowOrigVar to sRowOrigVar
             If (sRowOrigVar <> "" and sRowOrigVar <> "irow") Begin
                 // Guard: if iRow was already injected by FlushMethodVarDecls, drop any
@@ -1054,6 +1177,16 @@ Class cGridToCJGrid is a cGridToCJGridBase
                 Set pasNdProcVarDecls    to asEmpty
                 Move True to bSkip
             End
+        End
+
+        // Mouse body catch-all: sLine is passed by VALUE into OnHandleGridLine, so any
+        // param substitutions done in the mouse body sub-handler above are invisible to
+        // the base class.  If we are still inside a mouse body and nothing else consumed
+        // the line (bSkip = False), emit the (already-substituted) sLine here and set
+        // bSkip so the base class does not re-emit the original unmodified line.
+        If (pbNdInMouseBody(Self) = True and bSkip = False) Begin
+            Move sLine to asOutput[SizeOfArray(asOutput)]
+            Move True to bSkip
         End
     End_Procedure
 
