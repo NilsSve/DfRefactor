@@ -120,6 +120,13 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Property String    psNdMouseNewName   ""  // new name (e.g. "OnRowRightClick")
         Property String    psNdMouseOldP1     ""  // first legacy param name (lowercase)
         Property String    psNdMouseOldP2     ""  // second legacy param name (lowercase)
+        Property String    psNdMouseItemCountVar    ""  // var assigned by "Get Item_Count to <var>" (lowercase)
+        Property Integer   piNdMouseItemCountIfDepth 0  // Begin/End nesting depth inside the removed guard
+        // Prescan results: parallel arrays mapping method names -> item-count var names.
+        // Populated by PreScanForDataLoadProc; consumed when a Mouse_Click/Mouse_Down2
+        // declaration is processed so psNdMouseItemCountVar is known before any body line.
+        Property String[]  pasNdMouseItemCountMethods
+        Property String[]  pasNdMouseItemCountVars
     End_Procedure
 
     // *** Parameter parsing (override) ***
@@ -207,6 +214,10 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Set psNdMouseNewName        to ""
         Set psNdMouseOldP1          to ""
         Set psNdMouseOldP2          to ""
+        Set psNdMouseItemCountVar       to ""
+        Set piNdMouseItemCountIfDepth   to 0
+        Set pasNdMouseItemCountMethods  to asEmpty
+        Set pasNdMouseItemCountVars     to asEmpty
         Send PreScanForDataLoadProc sGridIndent iGridStartLine
     End_Procedure
 
@@ -218,9 +229,10 @@ Class cGridToCJGrid is a cGridToCJGridBase
     // from Set Item_Shadow_State / Set Checkbox_Item_State lines following Add_Items.
     Procedure PreScanForDataLoadProc String sGridIndent Integer iGridStartLine
         String[]  asSource asCurrentItemMethods asCurrentItemVars
+        String[]  asItemCountMethods asItemCountVars
         String    sScanLine sScanLower sScanNoStr sProcName sTempVar
         Integer   iScan iScanSize iScanNest iAddItemIdx iMaxColIdx iColCount iCol
-        Boolean   bScanDone bInProc bFoundAddItem bFoundCurrentItem bIsObj
+        Boolean   bScanDone bInProc bFoundAddItem bFoundCurrentItem bFoundItemCount bIsObj
         Boolean[] abReadOnly abCheckbox abEntryOff
 
         Get pasSource to asSource
@@ -231,6 +243,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Move False to bInProc
         Move False to bFoundAddItem
         Move False to bFoundCurrentItem
+        Move False to bFoundItemCount
         Move -1 to iMaxColIdx
         Move 0 to iAddItemIdx
         Move 0 to iColCount
@@ -276,6 +289,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
                         Move False to bInProc
                         Move False to bFoundAddItem
                         Move False to bFoundCurrentItem
+                        Move False to bFoundItemCount
                         Move 0 to iAddItemIdx
                     End
                     Else If (Left(sScanLower, 2) <> "//") Begin
@@ -324,6 +338,16 @@ Class cGridToCJGrid is a cGridToCJGridBase
                             Move (Lowercase(Trim(sTempVar))) to sTempVar
                             Move sTempVar to asCurrentItemVars[SizeOfArray(asCurrentItemVars)]
                         End
+                        // Get Item_Count: record proc name + item-count-var name (once per proc).
+                        // Used to pre-seed psNdMouseItemCountVar before Mouse body lines are processed,
+                        // so the var can be removed from Integer declarations at flush time.
+                        If (bFoundItemCount = False and sScanNoStr contains "get item_count") Begin
+                            Move True to bFoundItemCount
+                            Move sProcName to asItemCountMethods[SizeOfArray(asItemCountMethods)]
+                            Get ParseValueAfterTo sScanLine to sTempVar
+                            Move (Lowercase(Trim(sTempVar))) to sTempVar
+                            Move sTempVar to asItemCountVars[SizeOfArray(asItemCountVars)]
+                        End
                     End
                 End
             End
@@ -331,11 +355,13 @@ Class cGridToCJGrid is a cGridToCJGridBase
             Increment iScan
         Until (bScanDone = True or iScan > iScanSize)
 
-        Set pabNdColReadOnly         to abReadOnly
-        Set pabNdColCheckbox         to abCheckbox
-        Set pabNdColEntryOff         to abEntryOff
-        Set pasNdCurrentItemMethods  to asCurrentItemMethods
-        Set pasNdCurrentItemVars     to asCurrentItemVars
+        Set pabNdColReadOnly            to abReadOnly
+        Set pabNdColCheckbox            to abCheckbox
+        Set pabNdColEntryOff            to abEntryOff
+        Set pasNdCurrentItemMethods     to asCurrentItemMethods
+        Set pasNdCurrentItemVars        to asCurrentItemVars
+        Set pasNdMouseItemCountMethods  to asItemCountMethods
+        Set pasNdMouseItemCountVars     to asItemCountVars
     End_Procedure
 
     // *** Parsing helpers ***
@@ -383,6 +409,23 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Integer   iIdx iSize
         Get pasNdCurrentItemMethods to asMethods
         Get pasNdCurrentItemVars    to asVars
+        Move (SizeOfArray(asMethods) - 1) to iSize
+        For iIdx from 0 to iSize
+            If (asMethods[iIdx] = sProcName) Begin
+                If (iIdx < SizeOfArray(asVars)) Function_Return asVars[iIdx]
+                Function_Return ""
+            End
+        Loop
+        Function_Return ""
+    End_Function
+
+    // Returns the item-count variable name (lowercase) captured during the pre-scan for
+    // the procedure named sProcName, or "" if the procedure is not in the list.
+    Function GetItemCountVar String sProcName Returns String
+        String[]  asMethods asVars
+        Integer   iIdx iSize
+        Get pasNdMouseItemCountMethods to asMethods
+        Get pasNdMouseItemCountVars    to asVars
         Move (SizeOfArray(asMethods) - 1) to iSize
         For iIdx from 0 to iSize
             If (asMethods[iIdx] = sProcName) Begin
@@ -480,7 +523,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
     // Always appends a blank line after the injected declarations.
     Procedure FlushMethodVarDecls String[] ByRef asOutput String sGridIndent
         String[]  asDecls asEmpty
-        String    sLine sLower sIndent sSingle sOldVar sTest
+        String    sLine sLower sIndent sSingle sOldVar sTest sItemCountVar
         Integer   iIdx iSize
         Boolean   bHasIRow bHasICol bCanRename
 
@@ -488,7 +531,12 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Get psNdRowOrigVar to sOldVar           // e.g. "iitem" (lowercase), may be ""
         Get MakeSingleIndent to sSingle
         Move (sGridIndent + sSingle + sSingle) to sIndent
-        If (SizeOfArray(asDecls) > 0) Begin
+        // For regular methods, derive the indent from the first buffered declaration so
+        // that the injected Handle / tDataSourceRow lines match the existing code style.
+        // For Mouse_Click / Mouse_Down2 bodies, always use the calculated indent: the
+        // source may have inconsistent indentation (e.g. a var decl with only 1 leading
+        // space) and we normalise everything to grid-level + 2 indents.
+        If (pbNdInMouseBody(Self) = False and SizeOfArray(asDecls) > 0) Begin
             Move asDecls[0] to sLine
             Move (Left(sLine, (Length(sLine) - Length(Trim(sLine))))) to sIndent
         End
@@ -515,10 +563,17 @@ Class cGridToCJGrid is a cGridToCJGridBase
         If (bCanRename) Begin
             // Mouse_Click / Mouse_Down2: iRow is already a procedure parameter, so
             // removing the old row var from the decl is correct (not renaming to iRow).
+            // Also remove the item-count variable (e.g. iItems) because the guard that
+            // used it is commented out and the variable becomes unused.
             If (pbNdInMouseBody(Self) = True) Begin
+                Get psNdMouseItemCountVar to sItemCountVar
                 For iIdx from 0 to iSize
                     Get ReplaceWordOccurrences asDecls[iIdx] sOldVar "" to sLine
                     Get TrimInsideSpaces of ghoFuncLib sLine to sLine
+                    If (sItemCountVar <> "") Begin
+                        Get ReplaceWordOccurrences sLine sItemCountVar "" to sLine
+                        Get TrimInsideSpaces of ghoFuncLib sLine to sLine
+                    End
                     Move sLine to asDecls[iIdx]
                 Loop
             End
@@ -548,11 +603,19 @@ Class cGridToCJGrid is a cGridToCJGridBase
         // Skip any decl that became a bare type keyword after the removal pass
         // (e.g. "Integer iItem" -> "Integer " when iItem was removed because it is
         // now a procedure parameter).  Pos(" ", Trim) = 0 means no variable name left.
+        // For Mouse body methods, re-indent every emitted declaration to sIndent so that
+        // a poorly-indented source line (e.g. " String sRowId" with 1 leading space) is
+        // normalised to the correct method-body indentation level.
         If (iSize >= 0) Begin
             For iIdx from 0 to iSize
                 Move (Trim(asDecls[iIdx])) to sTest
                 If (sTest <> "" and Pos(CS_S, sTest) > 0) Begin
-                    Move asDecls[iIdx] to asOutput[SizeOfArray(asOutput)]
+                    If (pbNdInMouseBody(Self) = True) Begin
+                        Move (sIndent + sTest) to asOutput[SizeOfArray(asOutput)]
+                    End
+                    Else Begin
+                        Move asDecls[iIdx] to asOutput[SizeOfArray(asOutput)]
+                    End
                 End
             Loop
         End
@@ -939,6 +1002,74 @@ Class cGridToCJGrid is a cGridToCJGridBase
             If (sProcName <> "") Get ReplaceWordOccurrences sLine sProcName "iRow" to sLine
             Get psNdMouseOldP2 to sProcName
             If (sProcName <> "") Get ReplaceWordOccurrences sLine sProcName "iCol" to sLine
+
+            // Get Item_Count is not available in cCJGrid.
+            // OnRowDoubleClick / OnRowRightClick only fires when a valid row is selected,
+            // so the item-count guard is always redundant.  Comment out the line and track
+            // the variable name so the subsequent If guard can be detected and removed.
+            If (sSafeSearch contains "get item_count") Begin
+                Move (Pos("get item_count to ", sLower)) to iItemIdx
+                If (iItemIdx > 0) Begin
+                    // Extract var name from sLower (already trimmed+lowercased) so the
+                    // offset is correct.  sLine has leading spaces; sLower does not.
+                    Move (Trim(Mid(sLower, CI_EOL, iItemIdx + 18))) to sProcName
+                    Move (Pos(CS_S, sProcName)) to iWidth
+                    If (iWidth > 0) Move (Left(sProcName, iWidth - 1)) to sProcName
+                    Set psNdMouseItemCountVar to sProcName
+                End
+                Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+                Move (sLineIndent + "// " + Trim(sLine)) to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Detect the "If (<itemCountVar> <> 0) Begin" guard and comment it out.
+            // Set the depth counter so the matching End can be found and skipped.
+            Get psNdMouseItemCountVar to sProcName
+            If (sProcName <> "" and Left(sLower, 3) = "if ") Begin
+                If (sSafeSearch contains ("(" + sProcName + " ") or ;
+                    sSafeSearch contains ("(" + sProcName + ")")) Begin
+                    Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+                    Move (sLineIndent + "// " + Trim(sLine)) to asOutput[SizeOfArray(asOutput)]
+                    Set piNdMouseItemCountIfDepth to 1
+                    Move True to bSkip
+                    Procedure_Return
+                End
+            End
+
+            // Inside the removed guard block: track Begin/End nesting to locate the
+            // closing End (which is skipped).  All other lines fall through for normal
+            // conversion (Current_Item, GetValue, etc.) and are emitted by the catch-all.
+            // Non-Begin/End lines are dedented by one level to compensate for the extra
+            // indentation added by the now-removed If ... Begin block.
+            Get piNdMouseItemCountIfDepth to iItemIdx
+            If (iItemIdx > 0) Begin
+                If (Right(sLower, 5) = "begin" and Left(sLower, 2) <> "//") Begin
+                    Increment iItemIdx
+                    Set piNdMouseItemCountIfDepth to iItemIdx
+                End
+                Else If (sLower = "end" or Left(sLower, 4) = "end ") Begin
+                    Decrement iItemIdx
+                    Set piNdMouseItemCountIfDepth to iItemIdx
+                    If (iItemIdx = 0) Begin
+                        // Comment out the closing End of the guard (mirrors the If comment above).
+                        Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
+                        Move (sLineIndent + "// " + Trim(sLine)) to asOutput[SizeOfArray(asOutput)]
+                        Move True to bSkip
+                        Procedure_Return
+                    End
+                End
+                Else Begin
+                    // Body line inside the guard: remove one indent level (the If-block indent)
+                    // so that after the guard is removed the code sits at method-body level.
+                    Get MakeSingleIndent to sSingle
+                    If (Length(sLine) > Length(sSingle) and Left(sLine, Length(sSingle)) = sSingle) Begin
+                        Move (Mid(sLine, CI_EOL, Length(sSingle) + 1)) to sLine
+                    End
+                End
+                // Other lines: fall through for normal conversion.
+            End
+
             // Do NOT return here: fall through so Current_Item, GetValue, etc. fire too.
         End
 
@@ -1009,6 +1140,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
                         Get GetCurrentItemVar sProcName to sRowOrigVar
                         Set psNdRowOrigVar to sRowOrigVar
                     End
+                    // Pre-seed the item-count variable from the prescan so that
+                    // FlushMethodVarDecls can remove it from Integer declarations even
+                    // when Get Item_Count appears AFTER the var-decl section in the source.
+                    Get GetItemCountVar sProcName to sMergedInt
+                    Set psNdMouseItemCountVar to sMergedInt
                     Move True to bSkip
                     Procedure_Return
                 End
@@ -1069,11 +1205,13 @@ Class cGridToCJGrid is a cGridToCJGridBase
                 Set pbNdRowVarInjected    to False
             End
             // Reset mouse body state (Mouse_Click / Mouse_Down2 subclass handling).
-            Set pbNdInMouseBody    to False
-            Set psNdMouseOldName   to ""
-            Set psNdMouseNewName   to ""
-            Set psNdMouseOldP1     to ""
-            Set psNdMouseOldP2     to ""
+            Set pbNdInMouseBody             to False
+            Set psNdMouseOldName            to ""
+            Set psNdMouseNewName            to ""
+            Set psNdMouseOldP1              to ""
+            Set psNdMouseOldP2              to ""
+            Set psNdMouseItemCountVar       to ""
+            Set piNdMouseItemCountIfDepth   to 0
             // Do not consume; let base class emit the line unchanged.
         End
 
@@ -1189,10 +1327,19 @@ Class cGridToCJGrid is a cGridToCJGridBase
                         If (sMergedInt contains (" " + sRowOrigVar + " ")) Begin
                             Get ReplaceWordOccurrences sLine sRowOrigVar "" to sLine
                             Get TrimInsideSpaces of ghoFuncLib sLine to sLine
+                            // Also remove the Item_Count var from this declaration if already known.
+                            Get psNdMouseItemCountVar to sDataLoadName
+                            If (sDataLoadName <> "") Begin
+                                Get ReplaceWordOccurrences sLine sDataLoadName "" to sLine
+                                Get TrimInsideSpaces of ghoFuncLib sLine to sLine
+                            End
                             If (Pos(CS_S, Trim(sLine)) = 0) Begin
                                 Move True to bSkip
                                 Procedure_Return
                             End
+                            // Normalise to proper body indentation.
+                            Get MakeSingleIndent to sSingle
+                            Move (sGridIndent + sSingle + sSingle + Trim(sLine)) to sLine
                             Move sLine to asOutput[SizeOfArray(asOutput)]
                             Move True to bSkip
                             Procedure_Return
@@ -1200,6 +1347,27 @@ Class cGridToCJGrid is a cGridToCJGridBase
                     End
                 End
                 Get ReplaceWordOccurrences sLine sRowOrigVar "iRow" to sLine
+                // In a Mouse body: also remove the Item_Count var from declarations
+                // if it is already known, and normalise indentation to body level.
+                If (pbNdInMouseBody(Self) = True) Begin
+                    Get psNdMouseItemCountVar to sDataLoadName
+                    If (sDataLoadName <> "") Begin
+                        Get IsVarDeclLine sLower to bIsVarDecl
+                        If (bIsVarDecl = True) Begin
+                            Get ReplaceWordOccurrences sLine sDataLoadName "" to sLine
+                            Get TrimInsideSpaces of ghoFuncLib sLine to sLine
+                            If (Pos(CS_S, Trim(sLine)) = 0) Begin
+                                Move True to bSkip
+                                Procedure_Return
+                            End
+                        End
+                    End
+                    Get IsVarDeclLine sLower to bIsVarDecl
+                    If (bIsVarDecl = True) Begin
+                        Get MakeSingleIndent to sSingle
+                        Move (sGridIndent + sSingle + sSingle + Trim(sLine)) to sLine
+                    End
+                End
                 Move sLine to asOutput[SizeOfArray(asOutput)]
                 Move True to bSkip
             End
@@ -1226,8 +1394,6 @@ Class cGridToCJGrid is a cGridToCJGridBase
                 End
                 Get ReplaceMethodName sLine sProcName "LoadData" to sLine
                 Move sLine to asOutput[SizeOfArray(asOutput)]
-                // One blank line after the declaration (before variable declarations).
-                Move "" to asOutput[SizeOfArray(asOutput)]
                 Set pbNdInDataLoadProc   to True
                 Set piNdAddItemColIdx    to 0
                 Set pbNdInProcVarDecl    to True
@@ -1360,7 +1526,6 @@ Class cGridToCJGrid is a cGridToCJGridBase
         End
 
         Move (sOuter + "Procedure LoadData") to asOutput[SizeOfArray(asOutput)]
-        Move "" to asOutput[SizeOfArray(asOutput)]
         Move (sInner + "tDataSourceRow[] TheData TheDataEmpty") to asOutput[SizeOfArray(asOutput)]
 
         Move (sInner + "Integer iRow") to sMergedInt
@@ -1403,7 +1568,6 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Move (sGridIndent + sSingle + sSingle) to sInner
         Move "" to asOutput[SizeOfArray(asOutput)]
         Move (sOuter + "Procedure Activating")    to asOutput[SizeOfArray(asOutput)]
-        Move "" to asOutput[SizeOfArray(asOutput)]
         Move (sInner + "Forward Send Activating") to asOutput[SizeOfArray(asOutput)]
         Move (sInner + "Send LoadData")           to asOutput[SizeOfArray(asOutput)]
         Move (sOuter + "End_Procedure")           to asOutput[SizeOfArray(asOutput)]
