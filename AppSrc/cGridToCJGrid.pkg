@@ -218,7 +218,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
     // from Set Item_Shadow_State / Set Checkbox_Item_State lines following Add_Items.
     Procedure PreScanForDataLoadProc String sGridIndent Integer iGridStartLine
         String[]  asSource asCurrentItemMethods asCurrentItemVars
-        String    sScanLine sScanLower sProcName sTempVar
+        String    sScanLine sScanLower sScanNoStr sProcName sTempVar
         Integer   iScan iScanSize iScanNest iAddItemIdx iMaxColIdx iColCount iCol
         Boolean   bScanDone bInProc bFoundAddItem bFoundCurrentItem bIsObj
         Boolean[] abReadOnly abCheckbox abEntryOff
@@ -240,6 +240,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Repeat
             Move asSource[iScan] to sScanLine
             Move (Lowercase(Trim(sScanLine))) to sScanLower
+            Get RemoveStringsFromLine of ghoFuncLib sScanLower to sScanNoStr
 
             Get IsObjectDeclaration sScanLower to bIsObj
             If (bIsObj) Begin
@@ -277,9 +278,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
                         Move False to bFoundCurrentItem
                         Move 0 to iAddItemIdx
                     End
-                    Else Begin
+                    Else If (Left(sScanLower, 2) <> "//") Begin
+                        // Comment lines are skipped entirely so that patterns like
+                        // "// Send Add_Item ..." never trigger false data-load detection.
                         // Identify data-loading procedure by presence of Send Add_Item.
-                        If (sScanLower contains "send add_item") Begin
+                        If (sScanNoStr contains "send add_item") Begin
                             If (bFoundAddItem = False) Begin
                                 Move True to bFoundAddItem
                                 Set psNdDataLoadProcName to sProcName
@@ -314,7 +317,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
                             Move True to abEntryOff[iCol]
                         End
                         // Get Current_Item: record proc name + row-var name for var injection (once per proc).
-                        If (bFoundCurrentItem = False and sScanLower contains "get current_item") Begin
+                        If (bFoundCurrentItem = False and sScanNoStr contains "get current_item") Begin
                             Move True to bFoundCurrentItem
                             Move sProcName to asCurrentItemMethods[SizeOfArray(asCurrentItemMethods)]
                             Get ParseValueAfterTo sScanLine to sTempVar
@@ -515,6 +518,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
             If (pbNdInMouseBody(Self) = True) Begin
                 For iIdx from 0 to iSize
                     Get ReplaceWordOccurrences asDecls[iIdx] sOldVar "" to sLine
+                    Get TrimInsideSpaces of ghoFuncLib sLine to sLine
                     Move sLine to asDecls[iIdx]
                 Loop
             End
@@ -704,10 +708,27 @@ Class cGridToCJGrid is a cGridToCJGridBase
     //   - Data-loading Procedure declaration -> rename + activate conversion state
     Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
         String    sLineIndent sLabel sValue sProcName sDataLoadName sMergedInt sSingle sRowOrigVar
+        String    sSafeSearch
         Integer   iItemIdx iWidth iAddIdx iColN iColCount
         Integer[] aiWidths
         String[]  asLabels asProcVarDecls asEmpty
         Boolean   bPending bInDataLoad bIsVarDecl bNeedInject
+
+        // sSafeSearch is sLower with all quoted string content stripped.
+        // Using it for "contains" keyword checks prevents false positives when a
+        // string literal on the line happens to contain the keyword being searched for.
+        Get RemoveStringsFromLine of ghoFuncLib sLower to sSafeSearch
+
+        // Comment lines always pass through unchanged.  Without this early exit,
+        // "contains"-based keyword checks below (e.g. "send add_item", "get current_item",
+        // "forward send ...") could fire on code examples written inside comments, producing
+        // wrong output.  This also prevents a comment in the var-decl section of a
+        // data-loading procedure from prematurely flushing the collected declarations.
+        Move (Left(sLower, 2) = "//") to bSkip
+        If (bSkip = True) Begin
+            Move sLine to asOutput[SizeOfArray(asOutput)]
+            Procedure_Return
+        End
 
         // =====================================================================
         // CASE A: Inside the data-loading procedure body
@@ -751,7 +772,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
             End
 
             // Get Item_Count: remove silently.
-            If (sLower contains "get item_count") Begin
+            If (sSafeSearch contains "get item_count") Begin
                 Move True to bSkip
                 Procedure_Return
             End
@@ -799,7 +820,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
             End
 
             // Send Add_Item Msg_None <value>: convert to TheData row assignment.
-            If (sLower contains "send add_item") Begin
+            If (sSafeSearch contains "send add_item") Begin
                 Get piNdAddItemColIdx to iAddIdx
                 Get ParseAddItemValue sLine to sValue
                 Get paiNdColFormWidths to aiWidths
@@ -905,8 +926,8 @@ Class cGridToCJGrid is a cGridToCJGridBase
         If (pbNdInMouseBody(Self) = True) Begin
             Get psNdMouseOldName to sProcName     // lowercase old name
             Get psNdMouseNewName to sDataLoadName // new name
-            If (sLower contains ("forward send " + sProcName) or ;
-                sLower contains ("forward get "  + sProcName)) Begin
+            If (sSafeSearch contains ("forward send " + sProcName) or ;
+                sSafeSearch contains ("forward get "  + sProcName)) Begin
                 Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
                 Move (sLineIndent + "Forward Send " + sDataLoadName + " iRow iCol") to sLine
                 Move sLine to asOutput[SizeOfArray(asOutput)]
@@ -1057,13 +1078,13 @@ Class cGridToCJGrid is a cGridToCJGridBase
         End
 
         // Get Line_Size to <var>: remove silently (column count is known from the grid definition).
-        If (sLower contains "get line_size") Begin
+        If (sSafeSearch contains "get line_size") Begin
             Move True to bSkip
             Procedure_Return
         End
 
         // Get Row_Count [of <grid>] to <var>: convert to piRowCount.
-        If (sLower contains "get row_count") Begin
+        If (sSafeSearch contains "get row_count") Begin
             Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
             Get ParseValueAfterTo sLine to sValue
             Move (Trim(sValue)) to sValue
@@ -1073,7 +1094,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
         End
 
         // Get Current_Item [of <grid>] to <var>: convert to phoDataSource / SelectedRow.
-        If (sLower contains "get current_item") Begin
+        If (sSafeSearch contains "get current_item") Begin
             Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
             Get ParseValueAfterTo sLine to sValue
             Move (Trim(sValue)) to sValue
@@ -1097,14 +1118,14 @@ Class cGridToCJGrid is a cGridToCJGridBase
         // Move (<var> / N * N) to <var>: row normalisation -- not needed in cCJGrid; remove silently.
         // Only fires immediately after a Get Current_Item replacement (guarded by pbNdSawCurrentItem).
         If (pbNdSawCurrentItem(Self) = True and Left(sLower, 5) = "move " and ;
-            sLower contains "/" and sLower contains "*") Begin
+            sSafeSearch contains "/" and sSafeSearch contains "*") Begin
             Set pbNdSawCurrentItem to False
             Move True to bSkip
             Procedure_Return
         End
 
         // Get Value of <grid> (<rowvar> + N) to <result>: convert to TheData array access.
-        If (sLower contains "get value of " and sLower contains " + ") Begin
+        If (sSafeSearch contains "get value of " and sSafeSearch contains " + ") Begin
             Move (Left(sLine, (Length(sLine) - Length(sTrimLine)))) to sLineIndent
             Get ParseValueAfterTo sLine to sValue       // result variable (original case)
             Move (Trim(sValue)) to sValue
@@ -1167,6 +1188,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
                         Move (" " + sLower + " ") to sMergedInt
                         If (sMergedInt contains (" " + sRowOrigVar + " ")) Begin
                             Get ReplaceWordOccurrences sLine sRowOrigVar "" to sLine
+                            Get TrimInsideSpaces of ghoFuncLib sLine to sLine
                             If (Pos(CS_S, Trim(sLine)) = 0) Begin
                                 Move True to bSkip
                                 Procedure_Return

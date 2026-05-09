@@ -184,7 +184,7 @@ Object DFUnitTestRunner_vw is a View
         Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
         Set peAnchors to anBottomLeftRight     
         Set pbExternalModifyCheck to False
-        Set phoEditor of ghoRefactorFuncLib to Self 
+        Set phoEditor of ghoFuncLib to Self 
         Procedure FindNextError
             Send FindNextError of oOutputBox
         End_Procedure
