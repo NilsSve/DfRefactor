@@ -1,0 +1,255 @@
+﻿// DF26-compatible replacement for cFilesystem functions.
+// The reason was that some of them made the Df 26 debugger to crash,
+// and I was unable to contact the author (Alan) of cFilesystem.pkg to get an update.
+// This rewrite fixes all problems under DF 26.
+// Author: Nils Svedmyr - RDC Tools International
+//
+Use cWorkspace.pkg    // winFindFirstFile, winFindNextFile, winFindClose,
+                      // INVALID_HANDLE_VALUE, tWin32FindData, tWinFileTime,
+                      // tWinSystemTime, MAX_PATH, MAX_ALTPATH
+
+External_Function winFileTimeToSystemTime "FileTimeToSystemTime" Kernel32.dll ;
+    Pointer lpFiletime ;
+    Pointer lpSystemtime ;
+    Returns Integer
+
+External_Function winSystemTimeToTzSpecificLocalTime "SystemTimeToTzSpecificLocalTime" Kernel32.dll ;
+    Pointer lpTimeZone ;
+    Pointer lpUniversalTime ;
+    Pointer lpLocalTime ;
+    Returns Integer
+
+External_Function winGetSystemTimeAsFileTime "GetSystemTimeAsFileTime" Kernel32.dll ;
+    Pointer lpSystemTimeAsFileTime ;
+    Returns Integer
+
+#IFDEF get_rfCreateFileW
+#ELSE
+External_Function rfCreateFileW "CreateFileW" Kernel32.dll ;
+    WString lpFileName ;
+    DWord   dwDesiredAccess ;
+    DWord   dwShareMode ;
+    Pointer lpSecurityAttributes ;
+    DWord   dwCreationDisposition ;
+    DWord   dwFlagsAndAttributes ;
+    Handle  hTemplateFile ;
+    Returns Handle
+#ENDIF
+
+#IFDEF get_rfSetFileTime
+#ELSE
+External_Function rfSetFileTime "SetFileTime" Kernel32.dll ;
+    Handle  hFile ;
+    Pointer lpCreationTime ;
+    Pointer lpLastAccessTime ;
+    Pointer lpLastWriteTime ;
+    Returns Integer
+#ENDIF
+
+#IFDEF get_rfCloseHandle
+#ELSE
+External_Function rfCloseHandle "CloseHandle" Kernel32.dll ;
+    Handle hObject ;
+    Returns Integer
+#ENDIF
+
+#IFDEF FILE_ATTRIBUTE_DIRECTORY
+#ELSE
+    #DEFINE FILE_ATTRIBUTE_DIRECTORY      |CI$10
+#ENDIF
+#IFDEF DIRMODE_FILES_ONLY
+#ELSE
+    #DEFINE DIRMODE_FILES_ONLY            1
+    #DEFINE DIRMODE_DIRECTORIES_ONLY      2
+    #DEFINE DIRMODE_FILES_AND_DIRECTORIES 3
+#ENDIF
+#IFDEF GENERIC_READ
+#ELSE
+    #DEFINE GENERIC_READ                  |CI$80000000
+    #DEFINE GENERIC_WRITE                 |CI$40000000
+#ENDIF
+#IFDEF OPEN_EXISTING
+#ELSE
+    #DEFINE OPEN_EXISTING                 |CI$00000003
+#ENDIF
+#IFDEF FILE_ATTRIBUTE_NORMAL
+#ELSE
+    #DEFINE FILE_ATTRIBUTE_NORMAL         |CI$00000080
+#ENDIF
+
+Struct tRFFileTime
+    DWord dwLowDateTime
+    DWord dwHighDateTime
+End_Struct
+
+Struct tRFSearchResult
+    String      sFilename
+    String      sPath
+    DateTime    dtLastWriteDateTime
+End_Struct
+
+Function _RFFileTimeToLocalDateTime Global Pointer pFileTime Returns DateTime
+    tWinSystemTime lsSystemTime lsLocalTime
+    Integer        iVoid
+    DateTime       dtResult
+
+    Move (winFileTimeToSystemTime(pFileTime, AddressOf(lsSystemTime))) to iVoid
+    If iVoid Begin
+        Move (winSystemTimeToTzSpecificLocalTime(FNULL, AddressOf(lsSystemTime), AddressOf(lsLocalTime))) to iVoid
+        If iVoid Begin
+            Move (DateSetYear(dtResult,        lsLocalTime.wYear))         to dtResult
+            Move (DateSetMonth(dtResult,       lsLocalTime.wMonth))        to dtResult
+            Move (DateSetDay(dtResult,         lsLocalTime.wDay))          to dtResult
+            Move (DateSetHour(dtResult,        lsLocalTime.wHour))         to dtResult
+            Move (DateSetMinute(dtResult,      lsLocalTime.wMinute))       to dtResult
+            Move (DateSetSecond(dtResult,      lsLocalTime.wSecond))       to dtResult
+            Move (DateSetMillisecond(dtResult, lsLocalTime.wMilliseconds)) to dtResult
+        End
+    End
+    Function_Return dtResult
+End_Function
+
+// DF26-compatible replacement for cFilesystem FileSearch.
+// Returns a tRFSearchResult[] where sFilename is the bare filename (no path).
+Function RFFileSearch Global String sFilePathMask Integer iFileDirMode Boolean bReturnOnlyOne Returns tRFSearchResult[]
+    tWin32FindData    lsFindData
+    tWinFileTime      ftWrite
+    Handle            hFindFile
+    Integer           iSizeNoStrings iCount iAttrib iVoid
+    Boolean           bOk bFound
+    String            sFilename
+    tRFSearchResult[] asResult
+
+    Move (SizeOfType(tWin32FindData) - MAX_PATH - MAX_ALTPATH) to iSizeNoStrings
+    Move (winFindFirstFile(sFilePathMask, AddressOf(lsFindData))) to hFindFile
+    If (hFindFile = INVALID_HANDLE_VALUE) ;
+        Function_Return asResult
+
+    Move True to bOk
+    Move 0 to iCount
+    While bOk
+        Move lsFindData.dwFileAttributes to iAttrib
+        Move (PointerToString(AddressOf(lsFindData) + iSizeNoStrings)) to sFilename
+
+        If (sFilename <> "." and sFilename <> "..") Begin
+            Move False to bFound
+            Case Begin
+                Case (iFileDirMode = DIRMODE_FILES_ONLY)
+                    If ((iAttrib iand FILE_ATTRIBUTE_DIRECTORY) = 0) ;
+                        Move True to bFound
+                    Case Break
+                Case (iFileDirMode = DIRMODE_DIRECTORIES_ONLY)
+                    If ((iAttrib iand FILE_ATTRIBUTE_DIRECTORY) = FILE_ATTRIBUTE_DIRECTORY) ;
+                        Move True to bFound
+                    Case Break
+                Case Else
+                    Move True to bFound
+                    Case Break
+            Case End
+            If bFound Begin
+                Move sFilename to asResult[iCount].sFilename
+                Move lsFindData.ftLastWriteTime to ftWrite
+                Get _RFFileTimeToLocalDateTime (AddressOf(ftWrite)) to asResult[iCount].dtLastWriteDateTime
+                Increment iCount
+                If bReturnOnlyOne ;
+                    Move False to bOk
+            End
+        End
+
+        If bOk Begin
+            Move (winFindNextFile(hFindFile, AddressOf(lsFindData))) to bOk
+        End
+    Loop
+
+    Move (winFindClose(hFindFile)) to iVoid
+    Function_Return asResult
+End_Function
+
+// DF26-compatible replacement for cFilesystem FileSearchRecursive.
+// sFilename in returned results contains the full path.
+Function RFFileSearchRecursive Global String sFilePathMask Integer iFileDirMode Boolean bReturnOnlyOne Returns tRFSearchResult[]
+    tRFSearchResult[] asResult asDirs asFiles
+    Integer           iLast iMax iCnt iFinalMax
+    String            sSearchInDir sFileMask
+    Boolean           bStop
+
+    Move (RightPos("\", sFilePathMask)) to iLast
+    If (iLast > 0) Begin
+        Move (Left(sFilePathMask, iLast - 1)) to sSearchInDir
+        Move (Mid(sFilePathMask, Length(sFilePathMask), iLast + 1)) to sFileMask
+    End
+
+    // Recurse into subdirectories first.
+    Get RFFileSearch (sSearchInDir + "\*.*") DIRMODE_DIRECTORIES_ONLY bReturnOnlyOne to asDirs
+    Move (SizeOfArray(asDirs)) to iMax
+    Move 0 to iCnt
+    While (iCnt < iMax and bStop = False)
+        Get RFFileSearchRecursive (sSearchInDir + "\" + asDirs[iCnt].sFilename + "\" + sFileMask) iFileDirMode bReturnOnlyOne to asFiles
+        Move (AppendArray(asResult, asFiles)) to asResult
+        Increment iCnt
+        If (bReturnOnlyOne = True and SizeOfArray(asResult) > 0) ;
+            Move True to bStop
+    Loop
+
+    // Collect matching entries in the current directory, prepending the full path.
+    If (bStop = False) Begin
+        Get RFFileSearch sFilePathMask iFileDirMode bReturnOnlyOne to asFiles
+        Move (SizeOfArray(asFiles)) to iMax
+        Move (SizeOfArray(asResult)) to iFinalMax
+        Move 0 to iCnt
+        While (iCnt < iMax and bStop = False)
+            Move asFiles[iCnt] to asResult[iFinalMax]
+            Move (sSearchInDir + "\" + asFiles[iCnt].sFilename) to asResult[iFinalMax].sFilename
+            Increment iFinalMax
+            Increment iCnt
+            If (bReturnOnlyOne = True and SizeOfArray(asResult) > 0) ;
+                Move True to bStop
+        Loop
+    End
+
+    Function_Return asResult
+End_Function
+
+// DF26-compatible replacement for cFilesystem CurrentSystemTimeAsFileTime.
+// Returns the current system time as a tRFFileTime value.
+Function RFCurrentSystemTimeAsFileTime Global Returns tRFFileTime
+    tRFFileTime ftCurrentTime
+    Integer     iVoid
+
+    Move (winGetSystemTimeAsFileTime(AddressOf(ftCurrentTime))) to iVoid
+    Function_Return ftCurrentTime
+End_Function
+
+// DF26-compatible replacement for cFilesystem Set FileLastWriteTime.
+// Sets the last-write timestamp of sFileName to ftLastWrite. Returns 0 on success.
+Function RFSetFileLastWriteTime Global String sFileName tRFFileTime ftLastWrite Returns Integer
+    Handle  hFile
+    Integer iRetVal
+
+    Move (rfCreateFileW(sFileName, (GENERIC_READ ior GENERIC_WRITE), (FILE_SHARE_READ ior FILE_SHARE_WRITE), FNULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, FNULL)) to hFile
+    If (hFile = INVALID_HANDLE_VALUE) Begin
+        Function_Return -1
+    End
+    Move (rfSetFileTime(hFile, FNULL, FNULL, AddressOf(ftLastWrite))) to iRetVal
+    Move (rfCloseHandle(hFile)) to iRetVal
+    Function_Return 0
+End_Function
+
+// DF26-compatible replacement for cFilesystem FileDate.
+// Returns the last-write DateTime of a file; returns 0 if the file is not found.
+Function RFFileDate Global String sFilename Returns DateTime
+    tWin32FindData   lsFindData
+    tWinFileTime     ftWrite
+    Handle           hFindFile
+    Integer          iVoid
+    DateTime         dtResult
+
+    Move (winFindFirstFile(sFilename, AddressOf(lsFindData))) to hFindFile
+    If (hFindFile = INVALID_HANDLE_VALUE) ;
+        Function_Return dtResult
+    Move (winFindClose(hFindFile)) to iVoid
+
+    Move lsFindData.ftLastWriteTime to ftWrite
+    Get _RFFileTimeToLocalDateTime (AddressOf(ftWrite)) to dtResult
+    Function_Return dtResult
+End_Function
