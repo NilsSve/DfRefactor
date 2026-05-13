@@ -441,15 +441,15 @@ Object oRefactorTestBench is a cRefactorDbView
         Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
         Get psCodeFile          of hoLegacyEditor     to sLegacyFileName 
 
-// File format test:        
+// File format test:
 //    Boolean bIsFileUTF8
-//    Get IsFileUTF8 of ghorefactorengine sLegacyFileName to bIsFileUTF8
+//    Move (FileHasBOM(sLegacyFileName)) to bIsFileUTF8
 
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
         // We need to copy the legacy file to the refactor file before we start our work,
         // because else the ghoRefactorEngine would overwrite the sLegacyFileName with
         // changes:
-        Get vCopyFile sLegacyFileName sRefactoredFileName to bOK
+        Move (vCopyFile(sLegacyFileName, sRefactoredFileName)) to bOK
         Set psCurrentSourceFileName of ghoApplication to sRefactoredFileName
         
         Get CollectFileData of ghoApplication (oFolderSelDtl_DD(Self)) to RefactorFiles

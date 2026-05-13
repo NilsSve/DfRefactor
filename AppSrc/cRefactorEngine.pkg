@@ -868,7 +868,7 @@ Class cRefactorEngine is a BusinessProcess
         End
         Else If (SysFile.bCountSourceLines = False) Begin
             Get psCurrentSourceFileName of ghoApplication to sFileName
-            Get DoesFileExist sFileName to bFileExists
+            Move (DoesFileExist(sFileName)) to bFileExists
             If (bFileExists = False) Begin
                 Move "The specified source file couldn't be found." to sText
                 If (pbBatchMode(Self) = False) Begin
@@ -911,7 +911,7 @@ Class cRefactorEngine is a BusinessProcess
         Else If (eResponse = eEngineUserCancel) Begin
             Move "The process was cancelled by the user" to sText
             Get psHomePath of ghoApplication to sPath
-            Get vFolderFormat sPath to sPath
+            Move (vFolderFormat(sPath)) to sPath
             Move (sPath + CS_BackupFolder + CS_DirSeparator + CS_SummaryLogfileName) to sLogFile
             Get OpenAppendOutput sLogFile to iCh
             If (iCh >= 0) Begin
@@ -1157,7 +1157,7 @@ Class cRefactorEngine is a BusinessProcess
             Get psTotalTime to sTotalTime    
             Move ("Process completed without errors. Elapsed Time:" * String(sTotalTime)) to sTotalTime
             Get psHomePath of ghoApplication to sPath
-            Get vFolderFormat sPath to sPath
+            Move (vFolderFormat(sPath)) to sPath
             Move (sPath + CS_BackupFolder + CS_DirSeparator + CS_SummaryLogfileName) to sLogFile
             
             Get OpenAppendOutput sLogFile to iCh
@@ -1191,17 +1191,17 @@ Class cRefactorEngine is a BusinessProcess
 
     Function ReadFileToStringArray String sSourceFile Returns String[]
         Boolean bLastLineBreak bEndOfFile bFirstLine bHasBom bIsUtf8
-        Integer iLine iCh iFileSize iEncoding iSniffLen iJ
+        Integer iLine iCh iFileSize
         String sLine sLastLine sLineBreak sFileNameOnly
         String[] asSourceFile
-        UChar[] ucSniff
         Handle hoEditor
 
-        Move 0 to iLine
+        Move 0     to iLine
         Move True  to bFirstLine
         Move False to bEndOfFile
         Move False to bLastLineBreak
         Move ""    to sLastLine
+        Move CS_CRLF to sLineBreak                // Overwritten by DetectFileLineBreak below.
 
         Get phoEditor to hoEditor
         Get ParseFileName sSourceFile to sFileNameOnly
@@ -1212,7 +1212,10 @@ Class cRefactorEngine is a BusinessProcess
         // on a "binary:" channel silently interprets the byte stream as UTF-8, which
         // "eats" OEM bytes in the 0x80..0xFF range that are not valid UTF-8 leads.
         // See cEncodingHelpers.pkg for the full explanation.
-        Get IsFileUTF8 sSourceFile to bIsUtf8
+        // A UTF-8 BOM is what tells us "treat this file as UTF-8"; BOM-less
+        // files go through the OEM/legacy path. FileHasBOM lives in
+        // cEncodingHelpers.pkg.
+        Move (FileHasBOM(sSourceFile)) to bIsUtf8
         If (bIsUtf8 = False) Begin
             Move (ReadEncodedFileAsStringArray(sSourceFile)) to asSourceFile
             // Configure the Scintilla editor for OEM display, matching what
@@ -1221,34 +1224,11 @@ Class cRefactorEngine is a BusinessProcess
             Set pbUtf8Mode   of hoEditor to False
             Set pbHasUtf8BOM of hoEditor to False
             Send ShowTextEncoding   of hoEditor eTE_OEM
-            Send ChangeTextEncoding of hoEditor 
-            // ToDo: Break out logic to decide line ending in a global function
-            //       in cEncodingHelpers.pkg?
-            // Determine line break from the raw file so psLineBreak matches the
-            // original. Sniff the first occurrence of LF and check the preceding
-            // byte for CR. Default to CRLF if not determinable.
-            Move CS_CRLF to sLineBreak
-            Get vWin32_APIFileSize sSourceFile to iFileSize
-            Move (Seq_New_Channel()) to iCh
-            If (iCh >= 0) Begin
-                Move 4096 to iSniffLen
-                If (iFileSize < iSniffLen) ;
-                    Move iFileSize to iSniffLen
-                Direct_Input channel iCh ("binary:" + sSourceFile)
-                If (Err = False) Begin
-                    Read_Block channel iCh ucSniff iSniffLen
-                    Close_Input channel iCh
-                    Move CS_LF to sLineBreak
-                    For iJ from 0 to (SizeOfArray(ucSniff) - 1)
-                        If (ucSniff[iJ] = 10) Begin
-                            If (iJ > 0 and ucSniff[iJ - 1] = 13) ;
-                                Move CS_CRLF to sLineBreak
-                            Move (SizeOfArray(ucSniff)) to iJ  // break
-                        End
-                    Loop
-                End
-                Send Seq_Release_Channel iCh
-            End
+            Send ChangeTextEncoding of hoEditor
+            // Determine line break from the raw file so psLineBreak matches
+            // the original. DetectFileLineBreak (in cEncodingHelpers.pkg)
+            // sniffs the first 4 KB of bytes -- encoding-agnostic.
+            Move (DetectFileLineBreak(sSourceFile)) to sLineBreak
             Set psLineBreak to sLineBreak
             // No reliable way to infer "file ended without trailing newline" here;
             // WriteStringArrayToFile honors pbLastLineBreak, so default False matches
@@ -1257,12 +1237,20 @@ Class cRefactorEngine is a BusinessProcess
             Function_Return asSourceFile
         End
 
-        // UTF8 (BOM) file:
+        // UTF8 (BOM) file: detect the line-break up front via the shared
+        // byte-sniffer, then publish it. The read loop no longer cares.
+        Move (DetectFileLineBreak(sSourceFile)) to sLineBreak
+        Set psLineBreak to sLineBreak
+
         Get OpenInput ("binary:" + sSourceFile) to iCh
         If (iCh < 0) Begin
+            // Open failed -- psLineBreak is already published; default
+            // pbLastLineBreak so the subsequent write path doesn't
+            // inherit a stale value.
+            Set pbLastLineBreak to False
             Function_Return asSourceFile
         End
-        Get vWin32_APIFileSize sSourceFile to iFileSize
+        Move (vWin32_APIFileSize(sSourceFile)) to iFileSize
         Move (ResizeArray(asSourceFile, iFileSize)) to asSourceFile
 
         // Need to use binary read mode if we want to preserve tab characters and not have automatic tab replacement
@@ -1276,26 +1264,23 @@ Class cRefactorEngine is a BusinessProcess
                 End
             End
             Move sLine to sLastLine
-            If (bFirstLine = True) Begin
-                // This also sets the Scintilla editor's UTF8/OEM mode.
-                Get DetectBOMCharacter sLine to bHasBom
 
-                // Determine the linebreak character to use for the file based on what is in the first line
-                // The readline automatically reads Until LF, but does not report LF back in the string
-                If (Length(sLine) > 0 and Right(sLine, 1) = CS_CR) Begin
-                    Move CS_CRLF to sLineBreak
-                End
-                Else Begin
-                    Move CS_LF to sLineBreak
-                End
-                Set psLineBreak to sLineBreak
+            // BOM detection runs on the literal first line only; it also
+            // configures the Scintilla editor's UTF8/OEM mode.
+            If (bFirstLine = True) Begin
+                Get DetectBOMCharacter sLine to bHasBom
                 Move False to bFirstLine
             End
-            If (sLineBreak = CS_CRLF) Begin
-                If (Right(sLine, 1) = CS_CR) Begin
-                    Move (Left(sLine, Length(sLine) - 1)) to sLine
-                End
+
+            // Strip a trailing CR whenever the line carries one. Readln
+            // reads up to and including the LF and strips the LF, so a
+            // CRLF terminator leaves a trailing CR. Source code files
+            // don't legitimately contain bare CRs as data, so the strip
+            // is always safe.
+            If (Right(sLine, 1) = CS_CR) Begin
+                Move (Left(sLine, Length(sLine) - 1)) to sLine
             End
+
             Get EditorFormatToUtf8 of hoEditor sLine to sLine
             If (bEndOfFile = False) Begin
                 Move sLine to asSourceFile[iLine]
@@ -1308,7 +1293,7 @@ Class cRefactorEngine is a BusinessProcess
         Set pbLastLineBreak to bLastLineBreak
 
         Function_Return asSourceFile
-    End_Function  
+    End_Function
 
     Function WriteStringArrayToFile String[] asCode String sSourceFile Returns Boolean
         Boolean bLastLineBreak bIsUtf8 bIsOem bOK
@@ -1317,7 +1302,12 @@ Class cRefactorEngine is a BusinessProcess
         Handle  hoEditor
 
         Move False to Err
-        Move CS_CRLF to sLineBreak
+        // Use the line break detected by ReadFileToStringArray so the file
+        // round-trips with its original convention (LF stays LF, CRLF stays
+        // CRLF). Fall back to CRLF only when the property is unset.
+        Get psLineBreak to sLineBreak
+        If (sLineBreak = "") ;
+            Move CS_CRLF to sLineBreak
         Get phoEditor      to hoEditor
         Get pbLastLineBreak to bLastLineBreak
         Get pbUtf8Mode of hoEditor to bIsUtf8
@@ -1369,25 +1359,6 @@ Class cRefactorEngine is a BusinessProcess
 
         Send CloseOutput iCh
         Function_Return (Err = False)
-    End_Function
-    
-    Function IsFileUTF8 String sFilename Returns Boolean
-        String sLine
-        UChar[] ucLine
-        Integer iCh
-        
-        Move (Seq_New_Channel()) to iCh    
-        Direct_Input channel iCh sFilename
-        Read_Block channel iCh ucLine 3
-        Close_Input channel iCh
-        Send Seq_Release_Channel iCh
-        
-        If (SizeOfArray(ucLine) > 2) ;
-            If (ucLine[0]=C_BOM_UTF8c1 and ucLine[1]=C_BOM_UTF8c2 and ucLine[2]=C_BOM_UTF8c3) Begin
-                Function_Return True
-            End
-    
-        Function_Return False
     End_Function
 
     // Detects if a sLine has an UTF8 "BOM" file start.

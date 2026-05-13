@@ -345,7 +345,7 @@ Object oJSONExportImport is a cRDCDbView
                 Move (SortArray(asFunctions)) to asFunctions             
                 Get psExpFileJson of ghoApplication to sFileName
                 Get ParseFolderName sFileName to sFolder
-                Get vFolderExists sFolder to bExists
+                Move (vFolderExists(sFolder)) to bExists
                 If (bExists = False) Begin
                     Send Info_Box ("The folder:\n" * String(sFolder) * "\ndoesn't exist. Please adjust and try again.")
                     Procedure_Return
@@ -434,7 +434,7 @@ Object oJSONExportImport is a cRDCDbView
                 String sPath sFile
                 Boolean bExists
                 Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                Get vFolderFormat sPath to sPath
+                Move (vFolderFormat(sPath)) to sPath
                 Move CS_ImpExpFileJson to sFile
                 Get vFilePathExists (sPath + sFile) to bExists
                 Function_Return (bExists = True)
@@ -488,7 +488,7 @@ Object oJSONExportImport is a cRDCDbView
                 Get ExtractFilePath sFileName to sPath
                 If (sPath = "") Begin
                     Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                    Get vFolderFormat sPath to sPath   
+                    Move (vFolderFormat(sPath)) to sPath   
                     Move (CS_ExportJsonFile + ".json") to sFileName
                     Move (sPath + String(sFileName)) to sFileName  
                 End
@@ -577,7 +577,7 @@ Object oJSONExportImport is a cRDCDbView
                 Get ExtractFilePath sFileName to sPath
                 If (sPath = "") Begin
                     Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                    Get vFolderFormat sPath to sPath
+                    Move (vFolderFormat(sPath)) to sPath
                     Move (CS_ImportJsonFile + ".json") to sFileName
                     Move (sPath + String(sFileName)) to sFileName  
                 End

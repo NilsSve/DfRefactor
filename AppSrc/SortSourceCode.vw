@@ -372,7 +372,7 @@ Object oSortSourceCode_vw is a dbView
             Get Value of oSourceFileName_fm to sSourceFile
             Get psBackupSourceFile of ho to sBackupFile
             Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
-            Get vFolderFormat sPath to sPath
+            Move (vFolderFormat(sPath)) to sPath
             Get ParseFileName sBackupFile to sSourceFile
             Get ParseFileExtension sSourceFile to sExt
             Move (Replace("." + sExt, sSourceFile, "")) to sSourceFile
@@ -380,7 +380,7 @@ Object oSortSourceCode_vw is a dbView
             Move (Replace(sDateStamp, sSourceFile, "")) to sSourceFile
             Append sSourceFile sExt
             
-            Get vCopyFile sBackupFile (sPath + sSourceFile) to iRetVal
+            Move (vCopyFile(sBackupFile, (sPath + sSourceFile))) to iRetVal
             If (iRetVal <> 0) Begin
                 Send Info_Box "The restore failed! The backup file still exists in the backup folder."
             End                                                                                      

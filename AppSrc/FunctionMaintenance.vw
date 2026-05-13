@@ -227,7 +227,7 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
                 Move "    [Found] Reread // End comment" to sLine
                 Move sLine to asSource[0]                   
                 Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
-                Get vFolderFormat sPath to sPath
+                Move (vFolderFormat(sPath)) to sPath
                 Move CS_LegacyCode to sSourceFile
                 Move (sPath + String(sSourceFile)) to asSourceFiles[0]
                 Constraint_Set (Self) Clear  
