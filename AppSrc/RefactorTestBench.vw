@@ -443,7 +443,7 @@ Object oRefactorTestBench is a cRefactorDbView
 
 // File format test:
 //    Boolean bIsFileUTF8
-//    Move (FileHasBOM(sLegacyFileName)) to bIsFileUTF8
+//    Move (RFFileHasBOM(sLegacyFileName)) to bIsFileUTF8
 
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
         // We need to copy the legacy file to the refactor file before we start our work,

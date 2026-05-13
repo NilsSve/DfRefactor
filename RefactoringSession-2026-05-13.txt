@@ -1,0 +1,362 @@
+================================================================================
+  DFRefactor - Refactoring Session Report
+  Date:   2026-05-13
+  Author: Nils Svedmyr, RDC Tools International (with Claude assist)
+================================================================================
+
+OVERVIEW
+--------
+The day's work was driven by two overlapping goals:
+
+  1. Make DFRefactor's file-handling code DataFlex 26 compatible. The legacy
+     cFilesystem.pkg uses ANSI Win32 wrappers that crash the DF 26 debugger
+     (Readln/fsFindNextFile on a "binary:" channel silently misinterprets
+     OEM bytes as UTF-8, the fsFindFirstFile ANSI API crashes, etc.).
+
+  2. Use the cleanup as an opportunity to tighten the workspace's
+     architecture: remove dead code paths, consolidate duplicated logic,
+     enforce naming conventions, and retire the cFilesystem submodule
+     entirely once nothing in the project still depended on it.
+
+All three programs (DFRefactor.exe, TestBench.exe, DFUnit_TestRunner.exe)
+compile and run under DataFlex 25 throughout. The codebase should drop
+into DataFlex 26 without the file-handling crashes that originally
+triggered this work.
+
+
+================================================================================
+  PART 1 - DF26-COMPATIBLE FILE OPERATIONS
+================================================================================
+
+A new self-contained package AppSrc/cRefactorFileSearch.pkg was authored to
+host all the DF26-safe replacement functions. It uses Unicode Win32 APIs
+(CreateFileW, FindFirstFileW, etc.) plus self-defined structs and
+constants under #IFDEF guards, so it is fully usable standalone.
+
+Functions added / replaced:
+
+  cFilesystem function           ->  Replacement
+  ----------------------------------------------------------------------
+  FileSearch                     ->  RFFileSearch
+  FileSearchRecursive            ->  RFFileSearchRecursive
+  FileDate                       ->  RFFileDate
+  FileExists  (DIRMODE_FILES)    ->  DoesFileExist  (from cWorkspace.pkg)
+  FileExists  (DIRMODE_DIRS)     ->  vFolderExists  (from vwin32fh.pkg)
+  FileCopy                       ->  vCopyFile      (from vwin32fh.pkg)
+  CurrentSystemTimeAsFileTime    ->  RFCurrentSystemTimeAsFileTime
+  Set FileLastWriteTime          ->  RFSetFileLastWriteTime
+  DirectoryCreateEx (recursive)  ->  RFDirectoryCreateEx
+  fsDeleteFile                   ->  RFDeleteFile
+  vDeleteFile                    ->  RFDeleteFile  (also covered)
+  RemoveFolderSeperator          ->  local helper in cRefactorApplication
+  FileSize (TestBench)           ->  vWin32_APIFileSize
+
+Structures and constants:
+
+  tsSearchResult     ->  tRFSearchResult   (sFilename, sPath, dtLastWriteDateTime)
+  tFileTime          ->  tRFFileTime       (DWord dwLowDateTime, dwHighDateTime)
+  FILE_ATTRIBUTE_*, DIRMODE_*, GENERIC_*, OPEN_EXISTING, FILE_SHARE_*,
+  FNULL  -- all defined locally in cRefactorFileSearch.pkg under
+  #IFDEF guards so the package is self-contained.
+
+cRefactorFileSearch.pkg helper / external function declarations are all
+gated by #IFDEF get_<name> guards to allow co-existence with other
+packages that may declare the same Win32 wrappers.
+
+cFilesystem.pkg dropped from:
+  - cRefactorApplication.pkg  (Use statement, ghoFileSystem global, the
+                               Get Create (RefClass(cFilesystem)) call,
+                               and the legacy header comment paragraph)
+  - RefactorConstants.h.pkg   (Use statement -- was unused already)
+  - DFUnit_TestRunner.src     (had its own local cFilesystem instance;
+                               rewritten to call RFFileSearch instead)
+
+
+================================================================================
+  PART 2 - GIT SUBMODULE REMOVAL
+================================================================================
+
+With every source-code reference to cFilesystem.pkg eliminated, the
+Library-cFilesystem submodule was retired:
+
+  - git submodule deinit -f Libraries/cFilesystem
+  - git rm -f Libraries/cFilesystem
+  - rm -rf .git/modules/Libraries/cFilesystem
+  - DFRefactor25.0.sws  --  [Libraries] section renumbered: the gap left
+                            by the earlier half-removal (Lib1, Lib2, Lib4)
+                            was closed to Lib1, Lib2, Lib3.
+
+State after the operation:
+  - .gitmodules               cFilesystem entry removed
+  - .git/config               cFilesystem submodule entry removed
+  - .git/modules/Libraries/   cFilesystem directory removed
+  - Libraries/                cFilesystem directory removed
+
+Changes are staged but not committed -- left for the user to review and
+commit when ready.
+
+
+================================================================================
+  PART 3 - JSON EXPORT / IMPORT REWORK
+================================================================================
+
+The export / import pipeline in cExportImportFunctions.pkg was reworked
+to match the new per-fixture file layout of oUnit_Tests.pkg (which now
+contains only "Use o<X>-Tests.pkg" directives -- the actual fixtures
+live in their own o<X>-Tests.pkg files).
+
+Export-side fixes:
+
+  - False "missing unit tests" warning eliminated.
+    A new global helper BuildFixtureLocationIndex scans every Use
+    directive in oUnit_Tests.pkg, opens each referenced file, and records
+    a (function-name -> fixture-file) map. The export check no longer
+    looks for fixtures in oUnit_Tests.pkg itself.
+
+  - CopyUnitCode rewritten with whole-file semantics. It now reads the
+    entire o<X>-Tests.pkg file rather than trying to extract a single
+    fixture block. This sidesteps the brace-matching problem for nested
+    cTestFixture objects (which caused the very large
+    oRefactorDbGridToCJGrid-Tests.pkg to be truncated on export) and
+    makes the round-trip via JSON lossless: header comments, helper Use
+    directives, and nested fixtures all survive.
+
+  - Functions.bPrivate now honored end-to-end.
+    Partitioning happens upstream in FillExportImportStruct: private
+    functions are dropped from Data, Code, and Unit arrays in one pass,
+    iNoOfFunctions reflects the public count, and the user is informed
+    via an info-box which functions were excluded and why.
+
+  - { Private = True } meta-tag introduced (option A: fully declarative).
+    Added ePrivate to the meta-tag enum, bPrivate to the tFuncLib struct,
+    matching parsing in IsMetaTag and ParseComment, and synchronization
+    into FunctionsA.bPrivate at app startup (both CreateNewRecordFromMetaTag
+    and UpdateRecordFromMetaTag).
+    Documented the new convention in UserDefinedRefactorFunctions.pkg.
+
+Import-side rewrite:
+
+  - SaveImportData restructured. The legacy "strip last End_Object, append
+    fixtures into oUnit_Tests.pkg" dance is gone. Each imported fixture
+    is now written to its own o<X>-Tests.pkg file via a new
+    WriteFixtureFile helper. The destination is determined by:
+      1. Looking up the function name in BuildFixtureLocationIndex
+      2. Falling back to the convention "o<FuncName>-Tests.pkg" if new
+    EnsureUseDirective adds a Use line to oUnit_Tests.pkg only when a
+    brand-new fixture file is created.
+
+  - WriteUnitTestsFile simplified -- writes the array verbatim, no more
+    decrement / re-append End_Object hack.
+
+  - Dead code removed: UpdateUnitCodeArray, RemoveUnitCode, AddUnitCode,
+    UnitCodeExists, ReadAllUnitTestsCode all deleted -- replaced by the
+    new index + whole-file approach.
+
+
+================================================================================
+  PART 4 - cRefactorEngine: ENCODING / LINE-BREAK HANDLING
+================================================================================
+
+ReadFileToStringArray and WriteStringArrayToFile had several latent bugs
+in their handling of psLineBreak. All addressed:
+
+  - WriteStringArrayToFile no longer hardcodes CS_CRLF. It reads
+    psLineBreak (with a safe CRLF fallback) so files round-trip with
+    their original convention preserved.
+
+  - The early-return path in ReadFileToStringArray (when OpenInput on
+    the binary channel fails) now publishes CS_CRLF + pbLastLineBreak
+    = False instead of leaving psLineBreak holding stale state from a
+    previous read.
+
+  - Line-break detection in the UTF-8 read loop used to commit on the
+    literal first line. For files with a blank first line, or whose
+    first line was just a BOM that DetectBOMCharacter stripped, that
+    yielded CS_LF for what was really a CRLF file. The detector was
+    initially patched to look for the first non-empty line, then
+    consolidated (see next bullet) into a byte-level helper.
+
+  - DetectFileLineBreak added to cEncodingHelpers.pkg.
+    Operates on raw bytes via a "binary:" channel, sniffs the first
+    4 KB looking for the first LF and checking the preceding byte for
+    CR. Encoding-agnostic: works for UTF-8 (BOM or not) and OEM/legacy
+    files alike. Both code paths in ReadFileToStringArray now call this
+    function up front; the UTF-8 read loop no longer cares about line
+    breaks at all.
+
+  - IsFileUTF8 retired.
+    The local function in cRefactorEngine.pkg had two flaws: it opened
+    the file in text mode rather than "binary:" (subject to Unicode-mode
+    decoding) and the name was misleading (BOM-less UTF-8 returns False).
+    Replaced by the correctly-implemented FileHasBOM from
+    cEncodingHelpers.pkg.
+
+
+================================================================================
+  PART 5 - STYLE / CONVENTION SWEEP
+================================================================================
+
+Project-wide pass to enforce the DataFlex idiom:
+
+  Object method / property    Get psHomePath of ghoApplication to sPath
+  Global function             Move (DetectFileLineBreak(sSourceFile)) to sLineBreak
+
+Files updated (47 call sites in total, conservatively counted):
+
+  cRefactorEngine.pkg          DoesFileExist, FileHasBOM, DetectFileLineBreak,
+                               vFolderFormat, vWin32_APIFileSize
+  cRefactorFileSearch.pkg      _RFFileTimeToLocalDateTime, _RFDirectoryExists,
+                               RFFileSearch, RFFileSearchRecursive (internal)
+  cRefactorApplication.pkg     RF*, vFolderFormat, vFolderExists, vCopyFile,
+                               DoesFileExist, RFFileDate, RFCurrentSystemTimeAsFileTime,
+                               RFSetFileLastWriteTime, RFDirectoryCreateEx
+  DFUnit_TestRunner.src        RFFileSearch
+  cExportImportFunctions.pkg   vFolderFormat, vFolderExists, vCreateDirectory,
+                               vCopyFile, vWin32_APIFileSize
+  cSortSourceCode.pkg          vFolderFormat, vFolderExists, vCreateDirectory,
+                               vCopyFile
+  cUnusedSourceFiles.pkg       vFolderFormat
+  oRefactorFuncLib.pkg         vFolderFormat
+  TestBench.src                vFolderFormat x11, vWin32_APIFileSize
+  DFRefactor.src               vFolderFormat, vFolderExists
+  BackupFiles.dg               vMoveFile
+  CompilerOutput.dg            vWin32_APIFileSize
+  ProgramSetup.dg              vFolderFormat
+  JSONExportImport.vw          vFolderFormat, vFolderExists
+  SortSourceCode.vw            vFolderFormat, vCopyFile
+  RefactorTestBench.vw         vCopyFile (+ comment)
+  FunctionMaintenance.vw       vFolderFormat
+  cFileNameForm.pkg            vFolderFormat
+  cCmdLinkButton.pkg           vFolderFormat
+  oEncodingHelpers-Tests.pkg   RFDeleteFile (5 sites)
+
+Also along the way: standardized the rf*/RF* naming inside
+cRefactorFileSearch.pkg (winFileTimeToSystemTime ->
+rfFileTimeToSystemTime, etc.) and converted #DEFINE to Define X for Y
+for runtime constants (the file had been using the C-preprocessor form
+by mistake).
+
+
+================================================================================
+  PART 6 - MISCELLANEOUS FIXES
+================================================================================
+
+  - ReadSwsJsonFile: corrected the JSON key from "defaultFormSpacing" to
+    "DefaultFormHeight" and the corresponding struct field name in
+    RefactorConstants.h.pkg (DataFlex 26 .sws workspace files).
+
+  - cRefactorEngine.SummaryText: added a code path that writes a
+    "*** SESSION WAS CANCELLED BY THE USER ***" line to the summary log
+    file when the engine exits via eEngineUserCancel. Previously the
+    cancellation was visible in the UI but absent from the log file.
+
+  - DataFlex idiom captured: when one function in the same package calls
+    another, all parameters must be passed explicitly even if the callee
+    treats some as optional via num_arguments. Discovered the hard way
+    with RFFileSearchRecursive -> RFFileSearch.
+
+  - oUnit_Tests.pkg layout: ensured every per-function fixture file uses
+    the registered function name in its psFunctionName, so the export
+    "missing tests" check matches correctly. Fixed a pre-existing
+    mismatch in oRefactorDbGridToCJGrid-Tests.pkg
+    (RefactorDbGridToCJGrid -> RefactorDbGridTocDbCJGrid). A stale
+    Functions.dat record under the old name was also identified and
+    deleted via the Edit Functions view.
+
+
+================================================================================
+  PART 7 - cEncodingHelpers.pkg: STANDALONE PORTABILITY
+================================================================================
+
+After the main work landed, cEncodingHelpers.pkg was tightened so it can
+be copied into any DataFlex workspace without dragging in workspace-
+specific dependencies.
+
+  - Dropped Use vwin32fh.pkg.
+    The only function cEncodingHelpers.pkg consumed from vwin32fh.pkg
+    was vWin32_APIFileSize. Replaced inline by declaring a fresh
+    External_Function for GetFileAttributesExW (Kernel32.dll) plus a
+    36-byte struct that mirrors WIN32_FILE_ATTRIBUTE_DATA byte-for-byte.
+    GetFileAttributesExW is a single-call replacement for the
+    FindFirstFile/FindClose pair vWin32_APIFileSize uses internally --
+    no handle to track or close.
+
+  - New global function RFFileSize.
+    Returns the size in bytes of a file, or 0 on any failure.
+    Encoding-agnostic; works for any file regardless of UTF-8 BOM,
+    OEM, etc.
+
+  - Project-wide swap: every remaining call site that previously used
+    vWin32_APIFileSize now uses RFFileSize:
+      * cEncodingHelpers.pkg     (RFFileHasBOM, RFDetectFileLineBreak,
+                                  RFReadEncodedFileAsStringArray)
+      * cExportImportFunctions.pkg
+      * CompilerOutput.dg
+      * cRefactorEngine.pkg
+      * TestBench.src
+
+  - cEncodingHelpers.pkg's Use chain reduced to three DataFlex platform
+    packages only (VDFBase, CharTranslate, GlobalFunctionsProcedures) --
+    no third-party submodules or project-specific dependencies. Any
+    DataFlex workspace can drop the file in and have a working encoding
+    helper out of the box.
+
+Naming convention applied to all globals in cEncodingHelpers.pkg, in
+line with the rf*/RF* pattern established in cRefactorFileSearch.pkg:
+
+  External_Function (raw Win32 wrapper)  ->  lowercase rf* prefix
+  Public Global function                 ->  uppercase RF* prefix
+
+Renames:
+  winGetFileAttributesExW          ->  rfGetFileAttributesExW
+  FileSize                         ->  RFFileSize
+  Utf8LineToOemBytes               ->  RFUtf8LineToOemBytes
+  StringToUtf8Bytes                ->  RFStringToUtf8Bytes
+  FileHasBOM                       ->  RFFileHasBOM
+  OemBytesToUtf8                   ->  RFOemBytesToUtf8
+  Utf8BytesToString                ->  RFUtf8BytesToString
+  ReadEncodedFileAsStringArray     ->  RFReadEncodedFileAsStringArray
+  WriteEncodedFileFromStringArray  ->  RFWriteEncodedFileFromStringArray
+  DetectFileLineBreak              ->  RFDetectFileLineBreak
+
+Callers updated across 13 files:
+  cBaseFuncLib.pkg, cDDOReStyler.pkg, cEncodingHelpers.pkg,
+  cExportImportFunctions.pkg, cGridToCJGridBase.pkg, CompilerOutput.dg,
+  cRefactorEngine.pkg, cSortSourceCode.pkg, cUnusedSourceFiles.pkg,
+  cUnusedUseStatements.pkg, oChangeLegacyIndicators-Tests.pkg,
+  oEncodingHelpers-Tests.pkg, RefactorTestBench.vw, TestBench.src.
+
+Side effect: test procedure names in oEncodingHelpers-Tests.pkg that
+contained the renamed function as a literal prefix (e.g.
+"Procedure FileHasBOM_True", "Procedure Utf8LineToOemBytes_AsciiRoundTrip")
+were swept along to "Procedure RFFileHasBOM_True" etc. They are
+identified by the {Published = True} meta-tag, not by name pattern, so
+DFUnit_TestRunner picks them up unchanged -- the names remain
+accurate to what they test.
+
+
+================================================================================
+  FINAL STATE
+================================================================================
+
+  - cFilesystem.pkg no longer Used anywhere in the main app.
+  - cFilesystem submodule unregistered; .gitmodules / .git/config /
+    .git/modules / working tree all cleaned up.
+  - cEncodingHelpers.pkg is now standalone-portable; its only Use
+    statements are three DataFlex platform packages (VDFBase,
+    CharTranslate, GlobalFunctionsProcedures).
+  - All globals exposed by cEncodingHelpers.pkg and
+    cRefactorFileSearch.pkg follow a consistent rf*/RF* naming
+    convention: lowercase rf for raw Win32 External_Functions,
+    uppercase RF for the DataFlex-level public API.
+  - DFRefactor.exe, TestBench.exe, DFUnit_TestRunner.exe all compile and
+    run under DataFlex 25.
+  - Expected to compile and run under DataFlex 26 once that is released,
+    because every code path that hit fsFindNextFile / fsFindFirstFile is
+    now routed through the Unicode (winFindFirstFile / winFindNextFile)
+    API surface available since DataFlex 22.
+
+  Changes are committed across multiple working sessions; the
+  cFilesystem submodule removal is staged but not yet committed.
+
+================================================================================
