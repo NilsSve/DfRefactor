@@ -460,7 +460,7 @@ Object oRefactorTestBench is a cRefactorDbView
         // Start the Engine!
         Send StartEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor
         // Reload the refactored file into the editor. This is necessary for
-        // eOtherFunctionAll functions (e.g. RefactorDbGridToCJGrid) which write
+        // eOtherFunctionAll functions (e.g. cDbGridTocDbCJGrid) which write
         // their output directly to disk and bypass the in-memory editor content.
         // For all other function types this is a harmless reload of the same content.
         Send LoadFile of hoRefactoredEditor sRefactoredFileName

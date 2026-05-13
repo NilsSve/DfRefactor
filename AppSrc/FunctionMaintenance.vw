@@ -238,14 +238,14 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
                     Move (Trim(FunctionsA.Function_Name)) to sFunctionName
                     If (Lowercase(sFunctionName) <> Lowercase(CS_EditorDropSelf)) Begin
                         Move (Eval("get_" - (sFunctionName))) to iFunctionID   
-                        If (FunctionsA.Type = eAll_Functions or FunctionsA.Type = eStandard_Function or FunctionsA.Type = eRemove_Function) Begin
+                        If (FunctionsA.Type = eAllFunctions or FunctionsA.Type = eStandardFunction or FunctionsA.Type = eRemoveFunction) Begin
                             Get iFunctionID of ghoFuncLib (&sLine) sParameter to bChanged
                         End
                         // ToDo: We need a visible pho<Editor object (scintilla) for this to work, so skip for now:
 //                        If (FunctionsA.Type = eEditor_Function or FunctionsA.Type = eReport_Function or FunctionsA.Type = eOther_Function) Begin
 //                            Get iFunctionID of ghoFuncLib (&asSource) sParameter to bChanged
 //                        End
-                        If (FunctionsA.Type = eOther_FunctionAll or FunctionsA.Type = eReport_FunctionAll) Begin                                    
+                        If (FunctionsA.Type = eOtherFunctionAll or FunctionsA.Type = eReportFunctionAll) Begin                                    
                             Get iFunctionID of ghoFuncLib (&asSourceFiles) sParameter to bChanged
                         End
 

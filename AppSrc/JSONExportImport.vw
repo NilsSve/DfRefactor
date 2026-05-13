@@ -280,7 +280,6 @@ Object oJSONExportImport is a cRDCDbView
             Procedure AddItem String sDataValue String sFunctionName
                 Handle hoDataSource
                 tDataSourceRow[] TheData
-                tsSearchResult[] asFolderArray
                 Integer iSize iData_Col iCheckbox_Col iID_Col
         
                 If (not(IsComObjectCreated(Self))) Begin
