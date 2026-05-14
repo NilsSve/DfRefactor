@@ -1,5 +1,21 @@
 # DFRefactor - An Automated Refactoring Tool for DataFlex
 
+**Inspired by Martin Fowler's *Refactoring: Improving the Design of Existing Code* (2019 - Second Edition).**
+
+## What is this?
+
+DFRefactor is an open-source, automated refactoring tool for **DataFlex** — a business application language dating to the 1980s, still in active commercial use today. The tool implements both **canonical refactorings from Fowler's book** (Remove Dead Code, Replace Class, the spirit of Decompose Conditional) and **DataFlex-specific transformations** for legacy syntax that no general-purpose IDE would know how to modernize — like the 1980s square-bracket `[Found]` indicators, which the tool mechanically rewrites into modern expressions.
+
+## Demo
+
+A short video walkthrough (4 minutes): **[YouTube URL — to be added once recorded]**
+
+For a mapping of DFRefactor functions to refactorings from Fowler's book, see [RefactoringCatalogMap.md](RefactoringCatalogMap.md).
+
+---
+
+## Installation and use
+
 It is highly recommended to download and install the GitHub Desktop app, as it will significantly simplify your work. You can download it via this link: https://desktop.github.com/download/.
 
 Once installed use **the Edge browser**, click the "<> Code" button at this GitHub page and select "Open with GitHub Desktop." This will install the complete repository in your chosen download location. 

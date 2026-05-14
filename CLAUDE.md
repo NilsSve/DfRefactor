@@ -19,14 +19,14 @@ There are four compiled programs in `AppSrc/`:
 | `DFRefactor.src` | Main production application |
 | `TestBench.src` | Interactive test bench for developing/testing refactoring functions |
 | `DFUnit_TestRunner.src` | Automated unit test runner (uses DFUnit framework) |
-| `CompiledRefactoredCode.src` | View for compiled/refactored output |
+| `CompiledRefactoredCode.src` | Wrapper for the refactored output of LegacyCode.pkg to RefactoredCode.pkg |
 
 ## Running Tests
 
 - **Unit tests**: Run `DFUnit_TestRunner.exe` (compiled from `DFUnit_TestRunner.src`). Test fixtures are defined in `AppSrc/oUnit_Tests.pkg` and additional test packages under `AppSrc/Tests/`. Each test procedure must have the `{Published = True}` meta-tag to be discovered.
-- **Interactive testing**: Run `TestBench.exe`. It processes the code in `AppSrc/LegacyCode.pkg` (gitignored working file) through refactoring functions and shows results side-by-side.
+- **Interactive testing**: Run `TestBench.exe`. It processes the code in `AppSrc/LegacyCode.pkg` (gitignored working file) through refactoring functions and shows results side-by-side, in `AppSrc/RefactoredCode.pkg`(gitignored working file).
 
-To run a single test fixture, the `TearDown` procedure calls `Send _InitializeFuncLib of ghoRefactorFuncLib` to reset state between tests.
+To run a single test fixture, the `TearDown` procedure calls `Send _InitializeFuncLib of ghoFuncLib` to reset state between tests.
 
 ## Architecture
 
@@ -39,14 +39,36 @@ cRefactorApplication  (AppSrc/cRefactorApplication.pkg)
 
 cRefactorEngine       (AppSrc/cRefactorEngine.pkg)
     └── Extends BusinessProcess
-    └── Global handle: ghoRefactorEngine
+    └── Global handle: ghoEngine
     └── Orchestrates running refactoring functions against source files
-    └── Calls into ghoRefactorFuncLib for each function
+    └── Calls into ghoFuncLib for each function
+
+The refactor function-library inheritance chain (bottom to top):
+
+cRefactorUtilities    (AppSrc/cRefactorUtilities.pkg)
+    └── Low-level reusable primitives: stack helpers, string/array utilities,
+        scope-keyword detection (Class/Procedure/Function/Struct/Object decls),
+        keyword-array lookups, command/file-filter classification
+
+cRefactorLexer        (AppSrc/cRefactorLexer.pkg)
+    └── Extends cRefactorUtilities
+    └── Comment & string-literal detection (DF 23 block-comments, multi-line
+        strings, single/double quote tracking)
+    └── Tokenizer pipeline (_OverstrikeStrings, _SplitSourceLineToTokens) +
+        the Tokenizer entry point and HandleMultiLineString
+    └── Owns lexer-state properties (pbInProcedure, pbInFunction, pbInClass,
+        piMultiLineStringType, etc.)
+
+cRefactorExpressionParser (AppSrc/cRefactorExpressionParser.pkg)
+    └── Extends cRefactorLexer
+    └── Expression extraction (parenthesised + legacy gt/ge/lt/le/eq/ne)
+    └── Boolean indicator parsing ([brackets], Indicate statements,
+        Found/FindErr) and legacy operator transformation
 
 cBaseFuncLib          (AppSrc/cBaseFuncLib.pkg)
-    └── All low-level/private refactoring primitives (prefixed with "_")
-    └── Includes _ExpressionExtractor, _ExtractParenthesisExpression, tokenizer, etc.
-    └── Global handle: ghoRefactorFuncLib (shared with cRefactorFuncLib)
+    └── Extends cRefactorExpressionParser
+    └── Init/error plumbing: _InitializeFuncLib, _AddAllKeyWords,
+        _ClearRefactoringProperties, pbIgnoreErrorState
 
 cRefactorFuncLib      (AppSrc/cRefactorFuncLib.pkg)
     └── Extends cBaseFuncLib
@@ -55,6 +77,7 @@ cRefactorFuncLib      (AppSrc/cRefactorFuncLib.pkg)
 
 oRefactorFuncLib      (AppSrc/oRefactorFuncLib.pkg)
     └── Instantiates cRefactorFuncLib
+    └── Global handle: ghoFuncLib
     └── Contains ALL public refactoring functions, decorated with meta-tags
     └── This is where new refactoring functions are added
 ```
@@ -63,8 +86,8 @@ oRefactorFuncLib      (AppSrc/oRefactorFuncLib.pkg)
 
 | Handle | Type | Set in |
 |---|---|---|
-| `ghoRefactorEngine` | `cRefactorEngine` | `cRefactorEngine.pkg` constructor |
-| `ghoRefactorFuncLib` | `cRefactorFuncLib` | `oRefactorFuncLib.pkg` object creation |
+| `ghoEngine` | `cRefactorEngine` | `cRefactorEngine.pkg` constructor |
+| `ghoFuncLib` | `cRefactorFuncLib` | `oRefactorFuncLib.pkg` object creation |
 | `ghoFileSystem` | `cFilesystem` | `cRefactorApplication.pkg` |
 | `ghoStatusLog` | `cRefactorStatusLog` | `cRefactorEngine.pkg` constructor |
 | `ghoStatusPanel` | `cRefactorStatusPanel` | `RefactorStatusPanel.pkg` |
@@ -96,13 +119,13 @@ Every refactoring function in `oRefactorFuncLib.pkg` must declare its type via `
        """ }
    ```
 3. Optional: add `{EnumList}`, `{InitialValue}`, and `{HelpTopic}` meta-tags inside `{Description}` if the function takes an `sParameter` enum argument.
-4. **Note**: DataFlex Studio breaks Code Explorer and Code Completion when triple-quote strings are used in `{Description}`. Develop and test new functions in a separate package, then copy the finished function into `oRefactorFuncLib.pkg`.
+4. Optional: add `{ Private = True }` inside `{Description}` for functions defined in `UserDefinedRefactorFunctions.pkg` that should *not* be included in the JSON Export/Import file. The export skips private functions and warns which ones were excluded.
+5. **Note**: Earlier versions of DataFlex Studio had Code Explorer and Code Completion issues with triple-quote strings in `{Description}`. This is resolved in DF 26.
 
 ### Git Submodules (Libraries/)
 
 | Submodule | Purpose |
 |---|---|
-| `Libraries/cFilesystem` | File system utilities |
 | `Libraries/DFUnit` | Unit testing framework (provides `cTestFixture`) |
 | `Libraries/DUF` | DbUpdateFramework — database schema migrations |
 | `Libraries/SciControlLib` | Scintilla editor control integration |
