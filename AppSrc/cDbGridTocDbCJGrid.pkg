@@ -23,6 +23,10 @@
    - "Set Form_Justification_Mode [Item] N to V" ->  "Set peTextAlignment to V" on column N
      (JMode_Left/0->xtpAlignLeft, JMode_Right/1->xtpAlignRight, JMode_Center/2->xtpAlignCenter)
    - The [Item] keyword is optional in all per-column Set statements above.
+   - "Entry_Item (expr)"                        ->  no Entry_Item in column object; instead
+                                                     a Procedure OnSetCalculatedValue block
+                                                     is emitted with "Move (expr) to sValue".
+                                                     Column is named oCalcColN (1-based index).
    - "Set Column_Prompt_Object  [Item] N to SL"  ->  "Set Prompt_Button_Mode to PB_PromptOn" +
                                                      "Set Prompt_Object to SL" on column N
    - "Set Form_Mask             [Item] N to V"   ->  "Set psMask to V"         on column N
@@ -74,6 +78,10 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Property String[]  pasColMask
         Property String[]  pasColDataType
         Property String[]  pasColFocusable
+        // Per-column expression flag: True when the Entry_Item held a calculated
+        // expression (e.g. "(Table.A * String(Table.B))") rather than a plain
+        // "Table.Field" reference.  Drives OnSetCalculatedValue emission.
+        Property Boolean[] pabColIsExpression
         // True once Begin_Row has been seen for the current grid.
         // Used to distinguish pre-Begin_Row (pre-collect) from post-flush (remove).
         Property Boolean   pbBeginRowSeen     False
@@ -86,22 +94,24 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     Procedure ResetColumnCollections
         String[]  asEmpty
         Integer[] aiEmpty
+        Boolean[] abEmpty
         Set pbInBeginRow     to False
         Set pbPendingColumns to False
-        Set pasColEntryItems   to asEmpty
-        Set pasColHeaderLabels to asEmpty
-        Set paiColFormWidths   to aiEmpty
-        Set pasColCheckbox     to asEmpty
-        Set pasColEditable     to asEmpty
-        Set pasColComboButton  to asEmpty
-        Set pasColComboSort    to asEmpty
-        Set pasColCapslock     to asEmpty
-        Set pasColTextAlign    to asEmpty
-        Set pasColPromptObject to asEmpty
-        Set pasColMask         to asEmpty
-        Set pasColDataType     to asEmpty
-        Set pasColFocusable    to asEmpty
-        Set pbBeginRowSeen     to False
+        Set pasColEntryItems    to asEmpty
+        Set pasColHeaderLabels  to asEmpty
+        Set paiColFormWidths    to aiEmpty
+        Set pasColCheckbox      to asEmpty
+        Set pasColEditable      to asEmpty
+        Set pasColComboButton   to asEmpty
+        Set pasColComboSort     to asEmpty
+        Set pasColCapslock      to asEmpty
+        Set pasColTextAlign     to asEmpty
+        Set pasColPromptObject  to asEmpty
+        Set pasColMask          to asEmpty
+        Set pasColDataType      to asEmpty
+        Set pasColFocusable     to asEmpty
+        Set pabColIsExpression  to abEmpty
+        Set pbBeginRowSeen      to False
     End_Procedure
 
     // *** Parameter parsing (override) ***
@@ -224,6 +234,17 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     Procedure OnGridStarted String sGridIndent Integer iGridStartLine
         Send ResetColumnCollections
     End_Procedure
+
+    // Returns True when sFieldSpec is a calculated expression rather than a plain
+    // "Table.Field" binding.  An expression is identified by a leading "(" or by
+    // the presence of a space (plain field references never contain spaces).
+    Function IsEntryItemExpression String sFieldSpec Returns Boolean
+        String sTrimmed
+        Move (Trim(sFieldSpec)) to sTrimmed
+        If (Left(sTrimmed, 1) = "(")       Function_Return True
+        If (Pos(CS_S, sTrimmed) > 0)       Function_Return True
+        Function_Return False
+    End_Function
 
     // Attempts to match sLine/sLower against any known per-column Set property.
     // When a match is found, updates the relevant array property and sets bHandled True.
@@ -417,7 +438,8 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     //
     // Set bSkip True to consume the line; leave False to let base processing run.
     Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
-        Boolean  bInBeginRow bPendingColumns bBeginRowSeen
+        Boolean  bInBeginRow bPendingColumns bBeginRowSeen bIsExpr
+        Boolean[] abIsExpression
         String   sFieldSpec
         String[] asItems asEmpty
 
@@ -429,11 +451,16 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
                 Set pbPendingColumns to True
             End
             Else If (Pos("entry_item ", sLower) = 1) Begin
-                // Collect the field spec ("Table.Field"), original casing.
+                // Collect the field spec or expression, original casing.
                 Get pasColEntryItems to asItems
                 Move (Trim(Mid(sTrimLine, CI_EOL, 12))) to sFieldSpec
                 Move sFieldSpec to asItems[SizeOfArray(asItems)]
                 Set pasColEntryItems to asItems
+                // Flag whether this column is a calculated expression.
+                Get IsEntryItemExpression sFieldSpec to bIsExpr
+                Get pabColIsExpression to abIsExpression
+                Move bIsExpr to abIsExpression[SizeOfArray(asItems) - 1]
+                Set pabColIsExpression to abIsExpression
             End
             // Skip the Begin_Row line itself, all Entry_Item lines, and End_Row.
             Move True to bSkip
@@ -523,7 +550,7 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         String  sIndent sValue sTableName sDDOName
         Integer iDot
 
-        Move (Left(sLine, (Length(sLine) - Length(Trim(sLine))))) to sIndent
+        Get GetIndent sLine to sIndent
         Get ParseValueAfterTo sLine to sValue
         Move (Trim(sValue)) to sValue
 
@@ -643,23 +670,26 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     Procedure AppendColumnObjects String[] ByRef asOutput String sGridIndent
         String[]  asEntryItems asHeaderLabels asCheckbox asEditable asComboButton asComboSort
         String[]  asCapslock asTextAlign asPromptObject asMask asDataType asFocusable
+        Boolean[] abIsExpression
         Integer[] aiFormWidths
         String    sSingle sColIndent sColProp sColName sFieldSpec sLabel sTargetCol
         Integer   iCount iSize iWidth
+        Boolean   bIsExpr
 
-        Get pasColEntryItems   to asEntryItems
-        Get pasColHeaderLabels to asHeaderLabels
-        Get paiColFormWidths   to aiFormWidths
-        Get pasColCheckbox     to asCheckbox
-        Get pasColEditable     to asEditable
-        Get pasColComboButton  to asComboButton
-        Get pasColComboSort    to asComboSort
-        Get pasColCapslock     to asCapslock
-        Get pasColTextAlign    to asTextAlign
-        Get pasColPromptObject to asPromptObject
-        Get pasColMask         to asMask
-        Get pasColDataType     to asDataType
-        Get pasColFocusable    to asFocusable
+        Get pasColEntryItems    to asEntryItems
+        Get pasColHeaderLabels  to asHeaderLabels
+        Get paiColFormWidths    to aiFormWidths
+        Get pasColCheckbox      to asCheckbox
+        Get pasColEditable      to asEditable
+        Get pasColComboButton   to asComboButton
+        Get pasColComboSort     to asComboSort
+        Get pasColCapslock      to asCapslock
+        Get pasColTextAlign     to asTextAlign
+        Get pasColPromptObject  to asPromptObject
+        Get pasColMask          to asMask
+        Get pasColDataType      to asDataType
+        Get pasColFocusable     to asFocusable
+        Get pabColIsExpression  to abIsExpression
 
         // Flush Entry_Display translated properties before the first column object,
         // so they appear together with the other grid-level Set properties above.
@@ -675,6 +705,12 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         For iCount from 0 to iSize
             Move asEntryItems[iCount] to sFieldSpec
 
+            // Determine whether this column is a calculated expression.
+            Move False to bIsExpr
+            If (iCount < SizeOfArray(abIsExpression)) Begin
+                Move abIsExpression[iCount] to bIsExpr
+            End
+
             // Width: use collected value; default 100 if not set.
             If (iCount < SizeOfArray(aiFormWidths)) Begin
                 Move aiFormWidths[iCount] to iWidth
@@ -683,15 +719,25 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
                 Move 100 to iWidth
             End
 
-            // Caption: use collected label; default to the bare field name.
+            // Caption: use collected label; default to bare field name (or empty for expressions).
             If (iCount < SizeOfArray(asHeaderLabels) and asHeaderLabels[iCount] <> "") Begin
                 Move asHeaderLabels[iCount] to sLabel
+            End
+            Else If (bIsExpr) Begin
+                Move "" to sLabel
             End
             Else Begin
                 Get ExtractFieldName sFieldSpec to sLabel
             End
 
-            Get DeriveColumnName sFieldSpec to sColName
+            // Column object name: derive from Table.Field for plain columns;
+            // use a positional name for calculated expressions.
+            If (bIsExpr) Begin
+                Move ("oCalcCol" + String(iCount + 1)) to sColName
+            End
+            Else Begin
+                Get DeriveColumnName sFieldSpec to sColName
+            End
 
             // Blank separator before each column object.
             // Only add one if the last emitted line is not already blank,
@@ -700,9 +746,12 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
                 Move "" to asOutput[SizeOfArray(asOutput)]
             End
             Move (sColIndent + "Object " + sColName + " is a " + sTargetCol) to asOutput[SizeOfArray(asOutput)]
-            Move (sColProp   + "Entry_Item " + sFieldSpec)                    to asOutput[SizeOfArray(asOutput)]
-            Move (sColProp   + "Set piWidth to " + String(iWidth))            to asOutput[SizeOfArray(asOutput)]
-            Move (sColProp   + "Set psCaption to " + '"' + sLabel + '"')      to asOutput[SizeOfArray(asOutput)]
+            // Plain columns get an Entry_Item binding; expression columns do not.
+            If (bIsExpr = False) Begin
+                Move (sColProp + "Entry_Item " + sFieldSpec)       to asOutput[SizeOfArray(asOutput)]
+            End
+            Move (sColProp   + "Set piWidth to " + String(iWidth)) to asOutput[SizeOfArray(asOutput)]
+            Move (sColProp   + "Set psCaption to " + '"' + sLabel + '"') to asOutput[SizeOfArray(asOutput)]
 
             // Optional per-column translated properties.
             If (iCount < SizeOfArray(asCheckbox) and asCheckbox[iCount] <> "") Begin
@@ -735,6 +784,14 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
             End
             If (iCount < SizeOfArray(asDataType) and asDataType[iCount] <> "") Begin
                 Move (sColProp + "Set peDataType to " + asDataType[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+
+            // Calculated columns: emit OnSetCalculatedValue with the original expression.
+            If (bIsExpr) Begin
+                Move "" to asOutput[SizeOfArray(asOutput)]
+                Move (sColProp + "Procedure OnSetCalculatedValue tDataSourceRow TheRow String ByRef sValue") to asOutput[SizeOfArray(asOutput)]
+                Move (sColProp + sSingle + "Move " + sFieldSpec + " to sValue") to asOutput[SizeOfArray(asOutput)]
+                Move (sColProp + "End_Procedure") to asOutput[SizeOfArray(asOutput)]
             End
 
             Move (sColIndent + "End_Object") to asOutput[SizeOfArray(asOutput)]
