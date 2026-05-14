@@ -1059,7 +1059,7 @@ Object oRefactorView is a cRDCDbView
         End
 
         // Start the Engine!
-        Send StartEngine of ghoRefactorEngine RefactorFiles hoEditor
+        Send StartEngine of ghoEngine RefactorFiles hoEditor
     End_Procedure
 
     Function pbShouldSave Returns Boolean

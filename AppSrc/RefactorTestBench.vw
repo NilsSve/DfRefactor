@@ -353,7 +353,7 @@ Object oRefactorTestBench is a cRefactorDbView
                     Procedure OnClick   
                         Set Value of oRefactoredCode_Time_fm to ""
                         Delegate Send RefactorCode
-                        Set Value of oRefactoredCode_Time_fm to (psTotalTime(ghoRefactorEngine))
+                        Set Value of oRefactoredCode_Time_fm to (psTotalTime(ghoEngine))
                     End_Procedure 
                     
                     Function IsEnabled Returns Boolean   
@@ -447,7 +447,7 @@ Object oRefactorTestBench is a cRefactorDbView
 
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
         // We need to copy the legacy file to the refactor file before we start our work,
-        // because else the ghoRefactorEngine would overwrite the sLegacyFileName with
+        // because else the ghoEngine would overwrite the sLegacyFileName with
         // changes:
         Move (vCopyFile(sLegacyFileName, sRefactoredFileName)) to bOK
         Set psCurrentSourceFileName of ghoApplication to sRefactoredFileName
@@ -458,7 +458,7 @@ Object oRefactorTestBench is a cRefactorDbView
         End
 
         // Start the Engine!
-        Send StartEngine of ghoRefactorEngine RefactorFiles hoRefactoredEditor
+        Send StartEngine of ghoEngine RefactorFiles hoRefactoredEditor
         // Reload the refactored file into the editor. This is necessary for
         // eOtherFunctionAll functions (e.g. cDbGridTocDbCJGrid) which write
         // their output directly to disk and bypass the in-memory editor content.
