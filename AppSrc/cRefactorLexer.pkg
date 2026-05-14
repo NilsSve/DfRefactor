@@ -40,6 +40,15 @@ Use Windows.pkg
 Use RefactorConstants.h.pkg
 Use cRefactorUtilities.pkg
 
+// State enumeration for the _OverstrikeStrings character-scan loop. Guarded
+// so re-includes from other packages won't clash with these values.
+#IFDEF eOverstrikeStateOutside
+#ELSE
+    Define eOverstrikeStateOutside       for 0
+    Define eOverstrikeStateInDoubleQuote for 1
+    Define eOverstrikeStateInSingleQuote for 2
+#ENDIF
+
 Class cRefactorLexer is a cRefactorUtilities
     Procedure Construct_Object
         Forward Send Construct_Object
@@ -300,21 +309,122 @@ Class cRefactorLexer is a cRefactorUtilities
         Function_Return (iArrayItem + 1) // Increase array item for next call.
     End_Function
 
-    // ToDo: I do not like the multi-line string logic used here at all. It seems overcomplicated and
-    //       it should be possible to simplify, but how?
-    // This will replace the string literals in a line with overstrike characters
-    // E.g. all string literals are now underscores, eg. "abc" becomes "___"
-    //                              or plus symbols  eg. 'abc' becomes '+++'
-    // It overstrikes DF 23 multi-line string literals with hash-marks '###'
-    // It will also remove any end comment like; "Move x to y // Some comment",
-    // and trim the return string.
-    // If no quotes ("" or '') were found, the untouched TokenizerData.sLine is returned.
+    // Helper for _OverstrikeStrings: handles the case where the current source line is
+    // content inside an already-open DF 23 multi-line string (started by triple-quote /
+    // @SQL triple-quote / @") or a legacy ; -continued multi-line string.
+    //
+    // Returns True if the line was wholesale overstriked (entire line is string content,
+    // no closing quote on it); TokenizerData.sOverstrikeLine is filled and the caller
+    // should return immediately.
+    //
+    // Returns False otherwise. iStartState is set to the state the caller's char-scan
+    // should begin in: eOverstrikeStateOutside for a normal (non-continuation) line, or
+    // eOverstrikeStateInDoubleQuote / eOverstrikeStateInSingleQuote for a continuation
+    // line that contains the closing quote.
+    {Visibility = Private}
+    Function _OverstrikeMultiLineContinuation tTokenizer ByRef TokenizerData String sText Boolean bHasEndSemiColon ;
+        Integer ByRef iStartState Returns Boolean
+
+        Boolean bInDF23MultiLine bInSemiColonMultiLine bIsSqlSingleFlavored
+        Integer iType iLength iString iSingleQuotes iDoubleQuotes
+        String  sContent sOverwrite
+
+        Move eOverstrikeStateOutside to iStartState
+
+        // Are we continuing an already-open multi-line string?
+        Get piMultiLineStringType to iType
+        Move (iType <> MLS_None) to bInDF23MultiLine
+        Get pbIsInSemiColonMultiLineString to bInSemiColonMultiLine
+
+        If (bInDF23MultiLine = False and bInSemiColonMultiLine = False) Begin
+            Function_Return False  // Not in a continuation; caller scans normally.
+        End
+
+        // Was the open multi-line started with an @SQL'...' marker (single-quote flavored)?
+        Move (iType = MLS_SQLSingleQuote) to bIsSqlSingleFlavored
+
+        Get _NumberOfStringQuotes sText eSingleQuotes to iSingleQuotes
+        Get _NumberOfStringQuotes sText eDoubleQuotes to iDoubleQuotes
+
+        // -- Wholesale branches: the entire line is string content. --
+        // Double-quote-flavored multi-line; no closing quote on this line.
+        If (bIsSqlSingleFlavored = False and iDoubleQuotes = 0 and iSingleQuotes < 2) Begin
+            Move sText to sContent
+            Move (Length(sText)) to iLength
+            Move (Repeat(CS_U, iLength)) to sOverwrite
+            If (bHasEndSemiColon = True) Begin
+                Move (Left(sOverwrite, (Length(sOverwrite) -1))) to sOverwrite
+                Append sOverwrite ";"
+            End
+            Move (SizeOfArray(TokenizerData.asStringConstant)) to iString
+            Move sContent   to TokenizerData.asStringConstant[iString].sContent
+            Move sOverwrite to TokenizerData.asStringConstant[iString].sOverwrite
+            Move 1          to TokenizerData.asStringConstant[iString].iStartPos
+            Move iLength    to TokenizerData.asStringConstant[iString].iEndPos
+            Move iLength    to TokenizerData.asStringConstant[iString].iLength
+            Move sOverwrite to TokenizerData.sOverstrikeLine
+            Function_Return True
+        End
+        // Single-quote-flavored (@SQL'...') multi-line; no closing quote on this line.
+        // NOTE: matches the original logic verbatim, which intentionally skipped the
+        //       bHasEndSemiColon trim for the single-quote case. Worth revisiting
+        //       whether the asymmetry is intentional (single-quoted SQL strings may
+        //       never legitimately span a semicolon-continued line in DataFlex).
+        If (bIsSqlSingleFlavored = True and iSingleQuotes = 0) Begin
+            Move sText to sContent
+            Move (Length(sText)) to iLength
+            Move (Repeat(CS_E, iLength)) to sOverwrite
+            Move (SizeOfArray(TokenizerData.asStringConstant)) to iString
+            Move sContent   to TokenizerData.asStringConstant[iString].sContent
+            Move sOverwrite to TokenizerData.asStringConstant[iString].sOverwrite
+            Move 1          to TokenizerData.asStringConstant[iString].iStartPos
+            Move iLength    to TokenizerData.asStringConstant[iString].iEndPos
+            Move iLength    to TokenizerData.asStringConstant[iString].iLength
+            Move sOverwrite to TokenizerData.sOverstrikeLine
+            Function_Return True
+        End
+
+        // -- Not wholesale: a closing quote sits on this line. Set the scan's --
+        // -- starting state and return False so caller proceeds to char-scan. --
+        If (bIsSqlSingleFlavored = False) Begin
+            If (iDoubleQuotes = 0) Begin
+                Move eOverstrikeStateInDoubleQuote to iStartState
+            End
+            Else If (Mod(iSingleQuotes, 2) = 0 and iSingleQuotes <> 0) Begin
+                Move eOverstrikeStateInDoubleQuote to iStartState
+            End
+            Else If (Mod(iDoubleQuotes, 2) = 0 and iDoubleQuotes <> 0) Begin
+                Move eOverstrikeStateInSingleQuote to iStartState
+            End
+            Else If (iDoubleQuotes = 1) Begin
+                Move eOverstrikeStateInDoubleQuote to iStartState
+            End
+        End
+        Function_Return False
+    End_Function
+
+    // Replaces string-literal content in a source line with overstrike characters so
+    // downstream refactoring functions can scan the line without quoting surprises:
+    //   "abc" -> "___"   (CS_U for double-quoted content)
+    //   'abc' -> '+++'   (CS_E for single-quoted content)
+    //   Lines that are content of an open DF 23 multi-line string are overstriked
+    //   wholesale via _OverstrikeMultiLineContinuation.
+    // Also: removes the end-comment, trims the line, and substitutes Character(9) tabs
+    // with a single space (preserving char positions).
+    // Returns TokenizerData.sLine unchanged when no quotes are present.
+    //
+    // Three branches in order:
+    //   1. Image-page or DF 23 block-comment line: pass through (no scanning).
+    //   2. Open multi-line string continuation: delegate to _OverstrikeMultiLineContinuation.
+    //   3. Normal line: explicit state-machine scan over each character. State is one of
+    //      eOverstrikeStateOutside / eOverstrikeStateInDoubleQuote / eOverstrikeStateInSingleQuote.
     Function _OverstrikeStrings tTokenizer ByRef TokenizerData Returns String
-        Boolean bDoubleQuote bSingleQuote bChanged bHasEndSemiColon bIsInDF23MultiLineString  bIsInSemiColonMultiLineString
-        Boolean bIsInSingleQuote bOK
-        Integer iChar iLength iPos iDoubleQuotes iSingleQuotes iString iStart iType
+        Boolean bChanged bHasEndSemiColon bHandled
+        Integer iChar iLength iStart iString iState iStartState
         String  sChar sText sTrippelDoubleQuote sContent sOverwrite
 
+        // 1. Image-page or DF 23 block-comment: no string scanning, pass through
+        //    (or fill with '#' for inside an open block comment).
         If (pbIsInPage(Self) = True or pbIsInDF23MultiLineComment(Self) = True) Begin
             If (pbIsInDF23MultiLineComment(Self) = True) Begin
                 Move TokenizerData.sLine to sText
@@ -327,189 +437,142 @@ Class cRefactorLexer is a cRefactorUtilities
             Function_Return sText
         End
 
-        // Does the sLine end with a semi-colon ";"?
+        // Strip end-comment and normalize the line.
         Get _HasLineEndSemiColon TokenizerData.sLine to bHasEndSemiColon
-        Get pbIsInSemiColonMultiLineString to bIsInSemiColonMultiLineString
-
-        // Are we already in an "open" multi-line string? An "open" string is a string constant
-        // spread out over several lines. So there may be *no* quotes or an uneven number of quotes
-        // in the sLine content, in which case we need to treat the line differently.
-        Get piMultiLineStringType to iType
-        Move (iType <> MLS_None) to bIsInDF23MultiLineString
-
         Move (Replace(TokenizerData.sEndComment, TokenizerData.sLine, "")) to sText
         Move (Trim(sText)) to sText
-        Move False to bChanged
         Move (Length(sText)) to iLength
-        If (bIsInDF23MultiLineString = False) Begin
-            Move (Pos('"', sText)) to iPos
-            If (iPos = 0) Begin
-                Move (Pos("'", sText)) to iPos
-                If (iPos = 0) Begin
-                    Function_Return (Trim(sText))
-                End
+
+        // 2. Continuation of an already-open multi-line string?
+        //    True  => helper filled TokenizerData.sOverstrikeLine; we're done.
+        //    False => iState may have been set to eOverstrikeStateInDoubleQuote /
+        //             eOverstrikeStateInSingleQuote to tell the scan loop where
+        //             to begin (only when continuing into a line that contains the
+        //             closing quote).
+        Move eOverstrikeStateOutside to iState
+        Get _OverstrikeMultiLineContinuation (&TokenizerData) sText bHasEndSemiColon (&iState) to bHandled
+        If (bHandled = True) Begin
+            Function_Return TokenizerData.sOverstrikeLine
+        End
+        Move iState to iStartState
+
+        // 3a. Fast path: a normal (non-continuation) line with no quote characters.
+        If (iStartState = eOverstrikeStateOutside) Begin
+            If (not(sText contains '"') and not(sText contains "'")) Begin
+                Function_Return sText
             End
         End
 
+        // 3b. Character-by-character state-machine scan.
         Move (SizeOfArray(TokenizerData.asStringConstant)) to iString
-        Move False to bDoubleQuote
-        Move False to bSingleQuote
-        Get _NumberOfStringQuotes sText eSingleQuotes to iSingleQuotes
-        Get _NumberOfStringQuotes sText eDoubleQuotes to iDoubleQuotes
-
-        // This property is set when a multi-line string is started, to indicate
-        // if the beginning of the string was a single- or double-quote character.
-        Move (iType = MLS_SQLSingleQuote) to bIsInSingleQuote
-        If (bIsInDF23MultiLineString = True or bIsInSemiColonMultiLineString = True) Begin
-            If (bIsInSingleQuote = False) Begin
-                If (iDoubleQuotes = 0 and iSingleQuotes < 2) Begin
-                    Move sText to sContent
-                    Move (Length(sText)) to iLength
-                    Move (Repeat(CS_U, iLength)) to sText
-                    If (bHasEndSemiColon = True) Begin
-                        Move (Left(sText, (Length(sText) -1))) to sText
-                        Append sText ";"
-                    End
-                    Move sContent to TokenizerData.asStringConstant[iString].sContent
-                    Move sText    to TokenizerData.asStringConstant[iString].sOverwrite
-                    Move 1        to TokenizerData.asStringConstant[iString].iStartPos
-                    Move iLength  to TokenizerData.asStringConstant[iString].iEndPos
-                    Move iLength  to TokenizerData.asStringConstant[iString].iLength
-                    Move sText to TokenizerData.sOverstrikeLine
-                    Function_Return TokenizerData.sOverstrikeLine
-                End
-            End
-            Else Begin
-                If (iSingleQuotes = 0) Begin
-                    Move sText to sContent
-                    Move (Length(sText)) to iLength
-                    Move (Repeat(CS_E, iLength)) to sText
-                    Move sContent to TokenizerData.asStringConstant[iString].sContent
-                    Move sText    to TokenizerData.asStringConstant[iString].sOverwrite
-                    Move 1        to TokenizerData.asStringConstant[iString].iStartPos
-                    Move iLength  to TokenizerData.asStringConstant[iString].iEndPos
-                    Move iLength  to TokenizerData.asStringConstant[iString].iLength
-                    Move sText to TokenizerData.sOverstrikeLine
-                    Function_Return TokenizerData.sOverstrikeLine
-                End
-            End
-            If (iDoubleQuotes = 0 and bIsInSingleQuote = False) Begin
-                Move True to bDoubleQuote
-            End
-            If (bDoubleQuote = False) Begin
-                Move (Mod(iSingleQuotes, 2) = 0 and iSingleQuotes <> 0) to bDoubleQuote
-            End
-            If (bDoubleQuote = False) Begin
-                Move (Mod(iDoubleQuotes, 2) = 0 and iDoubleQuotes <> 0) to bSingleQuote
-            End
-            If (bDoubleQuote = False) Begin
-                Move (iDoubleQuotes = 1) to bDoubleQuote
-            End
-        End
-        Else If (iSingleQuotes = 0 and iDoubleQuotes = 0) Begin
-            Function_Return sText
-        End
-
+        Move False to bChanged
         Move 0 to iStart
         For iChar from 1 to iLength
             Move (Mid(sText, 1, iChar)) to sChar
-            If (sChar = Character(9)) Begin                  // tab characters should be treated as a single space char, this keeps the
-                Move (Overstrike(CS_S,sText, iChar)) to sText // position in the string the same.
+            // Tab characters become a single space (preserves char positions).
+            If (sChar = Character(9)) Begin
+                Move (Overstrike(CS_S, sText, iChar)) to sText
                 Move True to bChanged
                 Move CS_S to sChar
             End
-            // If closing double quote:
-            If (bDoubleQuote and sChar= '"') Begin
-                Move True to bChanged
-                Append sContent sChar
-                Get _OverWriteStringAdd sContent ('"' + sOverwrite + '"') iStart iString (&TokenizerData) to iString
-                Move 0 to iStart
-                Move "" to sContent
-                Move "" to sOverwrite
-                Move "" to sChar
-                Move False to bDoubleQuote
-            End
-            // If closing single quote:
-            If (bSingleQuote and sChar = "'") Begin
-                Move True to bChanged
-                Append sContent sChar
-                Get _OverWriteStringAdd sContent ("'" + sOverwrite + "'") iStart iString (&TokenizerData) to iString
-                Move 0 to iStart
-                Move "" to sContent
-                Move "" to sOverwrite
-                Move "" to sChar
-                Move False to bSingleQuote
-            End
-            If (bIsInDF23MultiLineString = True) Begin
-                If (bDoubleQuote and sChar = "'") Begin
-                    Move False to bDoubleQuote
-                    Move True to bSingleQuote
-                End
-                Else If (bSingleQuote and sChar = '"') Begin
-                    Move False to bSingleQuote
-                    Move True to bDoubleQuote
-                End
-                Else If (bDoubleQuote = False and bSingleQuote = False) Begin
-                    Move (Mid(sText, 1, iChar)) to sChar
-                    If (sChar = "'") Begin
-                        Move True to bDoubleQuote
-                    End
-                    If (sChar = '"' and bHasEndSemiColon = True) Begin
-                        Move True to bSingleQuote
-                    End
-                    Move "" to sChar
-                End
-            End
 
-            If (bSingleQuote = False and sChar ='"') Begin
-                Move (Mid(sText, 3, iChar)) to sTrippelDoubleQuote
-                If (sTrippelDoubleQuote = '"""') Begin
-                    Move (iChar + 2) to iChar
-                End
-                Else Begin
-                    Move True to bDoubleQuote
-                End
-            End
-            If (bDoubleQuote = False and sChar = "'") Begin
-                Move True to bSingleQuote
-            End
-            If bDoubleQuote Begin
-                If (sChar <> '"') Begin
-                    Append sOverwrite CS_U
-                    Move (Overstrike(CS_U, sText, iChar)) to sText
-                    Append sContent sChar
-                End
-                If (iStart = 0) Begin
-                    Move iChar to iStart
-                    Append sContent sChar
-                End
-                Move True to bChanged
-            End
-            Else If bSingleQuote Begin
-                If (sChar <> "'") Begin
-                    Append sOverwrite CS_E
-                    Move (Overstrike(CS_E, sText, iChar)) to sText
-                    Append sContent sChar
-                End
-                If (iStart = 0) Begin
-                    Move iChar to iStart
-                    Append sContent sChar
-                End
-                Move True to bChanged
-            End
+            Case Begin
+                Case (iState = eOverstrikeStateInDoubleQuote)
+                    If (sChar = '"') Begin
+                        // Closing quote: emit captured "abc..." into asStringConstant.
+                        Append sContent sChar
+                        Get _OverWriteStringAdd sContent ('"' + sOverwrite + '"') iStart iString (&TokenizerData) to iString
+                        Move 0 to iStart
+                        Move "" to sContent
+                        Move "" to sOverwrite
+                        Move eOverstrikeStateOutside to iState
+                    End
+                    Else Begin
+                        // Content of "...": overstrike the char in sText with CS_U,
+                        // accumulate the original char in sContent.
+                        Append sOverwrite CS_U
+                        Move (Overstrike(CS_U, sText, iChar)) to sText
+                        Append sContent sChar
+                        If (iStart = 0) Begin
+                            // First content char of a multi-line continuation: the
+                            // helper set the starting state but iStart stayed 0.
+                            // Append sChar a second time so sContent's length matches
+                            // sOverwrite's after the caller wraps it as '"' + sOverwrite + '"'.
+                            // (The padding is intentional, not a bug.)
+                            Move iChar to iStart
+                            Append sContent sChar
+                        End
+                    End
+                    Move True to bChanged
+                    Case Break
+
+                Case (iState = eOverstrikeStateInSingleQuote)
+                    If (sChar = "'") Begin
+                        // Closing quote: emit captured '...' into asStringConstant.
+                        Append sContent sChar
+                        Get _OverWriteStringAdd sContent ("'" + sOverwrite + "'") iStart iString (&TokenizerData) to iString
+                        Move 0 to iStart
+                        Move "" to sContent
+                        Move "" to sOverwrite
+                        Move eOverstrikeStateOutside to iState
+                    End
+                    Else Begin
+                        Append sOverwrite CS_E
+                        Move (Overstrike(CS_E, sText, iChar)) to sText
+                        Append sContent sChar
+                        If (iStart = 0) Begin
+                            // Continuation-line first-content padding; see CS_U branch.
+                            Move iChar to iStart
+                            Append sContent sChar
+                        End
+                    End
+                    Move True to bChanged
+                    Case Break
+
+                Case Else
+                    // eOverstrikeStateOutside — looking for an opening quote.
+                    If (sChar = '"') Begin
+                        // Single-line triple-quoted literal """abc""" — skip past
+                        // the opening triple. The loop walks the content without
+                        // entering a string state, then skips the closing triple
+                        // the same way.
+                        Move (Mid(sText, 3, iChar)) to sTrippelDoubleQuote
+                        If (sTrippelDoubleQuote = '"""') Begin
+                            Move (iChar + 2) to iChar
+                        End
+                        Else Begin
+                            // Transition to InDoubleQuote; seed iStart and capture
+                            // the opening '"' in sContent.
+                            Move eOverstrikeStateInDoubleQuote to iState
+                            Move iChar to iStart
+                            Append sContent sChar
+                            Move True to bChanged
+                        End
+                    End
+                    Else If (sChar = "'") Begin
+                        Move eOverstrikeStateInSingleQuote to iState
+                        Move iChar to iStart
+                        Append sContent sChar
+                        Move True to bChanged
+                    End
+            Case End
         Loop
 
+        // 4. Finalize.
         If (bChanged = True) Begin
-            If (bIsInDF23MultiLineString = True) Begin
-                If (bDoubleQuote = True) Begin
+            // If the scan started inside a continuation string and ran off the end
+            // while still in-string (no closing quote on this line), flush what we
+            // captured so it isn't lost.
+            If (iStartState <> eOverstrikeStateOutside) Begin
+                If (iState = eOverstrikeStateInDoubleQuote) Begin
                     Get _OverWriteStringAdd sContent ('"' + sOverwrite + '"') iStart iString (&TokenizerData) to iString
                 End
-                Else If (bSingleQuote = True) Begin
+                Else If (iState = eOverstrikeStateInSingleQuote) Begin
                     Get _OverWriteStringAdd sContent ("'" + sOverwrite + "'") iStart iString (&TokenizerData) to iString
                 End
             End
 
-            // Add back the end-of-line semi-colon:
+            // Re-attach the trailing semicolon for legacy ;-continued lines.
             If (bHasEndSemiColon = True) Begin
                 Move (Left(sText, (Length(sText) -1))) to sText
                 Append sText ";"
