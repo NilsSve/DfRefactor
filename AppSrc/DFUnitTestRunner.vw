@@ -4,6 +4,13 @@ Use cUnitCommandBar.pkg
 Use DFUnit\Reporting\ReporterManager.pkg
 Use DFUnit\Reporting\Reporters\UIListReporter.pkg
 
+Use cRefactorFuncLib.pkg
+// No cRefactorFuncLib object is created here. The single instance is created
+// by oRefactorFuncLib.pkg (via oUnit_Tests.pkg, inside oTestApplication) and
+// owns ghoFuncLib. A second instance here bound the editor's phoEditor to the
+// wrong funclib, so the editor fixtures skipped and the editor stayed empty.
+
+//Use ScintillaParameters.dg
 // Comment out the next Define statement line to *not* use the
 // Scintilla Editor window.
 Define CS_UseScintillaEditor for "cRefactorScintillaEditor"
@@ -184,7 +191,10 @@ Object DFUnitTestRunner_vw is a View
         Set psCodeFile to (psAppSrcPath(phoWorkspace(ghoApplication)) + "\" + CS_LegacyCode)
         Set peAnchors to anBottomLeftRight     
         Set pbExternalModifyCheck to False
-        Set phoEditor of ghoFuncLib to Self 
+        // ghoFuncLib does not exist yet when this deferred view constructs, so
+        // carry the editor handle on ghoApplication; Startup binds it onto
+        // ghoFuncLib once the single funclib instance exists.
+        Set phoUnitTestEditor of ghoApplication to Self
         Procedure FindNextError
             Send FindNextError of oOutputBox
         End_Procedure

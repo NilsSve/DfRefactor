@@ -27,6 +27,11 @@
                                                      a Procedure OnSetCalculatedValue block
                                                      is emitted with "Move (expr) to sValue".
                                                      Column is named oCalcColN (1-based index).
+   - A trailing line comment on an Entry_Item ("Entry_Item Table.Field // note"
+     or "Entry_Item (expr) // note") is split off before classification/naming
+     (so a plain field is never misread as an expression) and re-attached to the
+     generated line: the Entry_Item line for a plain column, or the
+     "Move <expr> to sValue" line for a calculated column.
    - "Set Column_Prompt_Object  [Item] N to SL"  ->  "Set Prompt_Button_Mode to PB_PromptOn" +
                                                      "Set Prompt_Object to SL" on column N
    - "Set Form_Mask             [Item] N to V"   ->  "Set psMask to V"         on column N
@@ -66,6 +71,11 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Property Boolean   pbInBeginRow       False
         Property Boolean   pbPendingColumns   False
         Property String[]  pasColEntryItems
+        // Parallel to pasColEntryItems: the trailing line comment ("// ...")
+        // that was on the legacy Entry_Item line, or "" when there was none.
+        // Kept separate so it never pollutes expression classification or
+        // column-name derivation, but is re-attached to the generated line.
+        Property String[]  pasColEntryItemComments
         Property String[]  pasColHeaderLabels
         Property Integer[] paiColFormWidths
         Property String[]  pasColCheckbox
@@ -97,7 +107,8 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Boolean[] abEmpty
         Set pbInBeginRow     to False
         Set pbPendingColumns to False
-        Set pasColEntryItems    to asEmpty
+        Set pasColEntryItems        to asEmpty
+        Set pasColEntryItemComments to asEmpty
         Set pasColHeaderLabels  to asEmpty
         Set paiColFormWidths    to aiEmpty
         Set pasColCheckbox      to asEmpty
@@ -235,9 +246,43 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Send ResetColumnCollections
     End_Procedure
 
+    // Removes a trailing line comment ("// ...") from an Entry_Item field spec
+    // and returns the trimmed result.  This MUST run before IsEntryItemExpression
+    // and before the spec is stored: a plain "Table.Field // comment" would
+    // otherwise be misread as a calculated expression (the spaces inside the
+    // comment trip the space-test in IsEntryItemExpression) and the comment text
+    // would leak into the generated Entry_Item / OnSetCalculatedValue line.
+    // Mirrors the behaviour of ghoFuncLib.RemoveComments (first "//" wins); a
+    // "//" inside a string literal in an expression is a rare edge case that the
+    // rest of the tool treats the same way.
+    Function StripTrailingComment String sSpec Returns String
+        Integer iPos
+        Move (Pos(CS_CommentSymbol, sSpec)) to iPos
+        If (iPos > 0) Begin
+            Move (Left(sSpec, iPos - 1)) to sSpec
+        End
+        Function_Return (Trim(sSpec))
+    End_Function
+
+    // Companion to StripTrailingComment: returns the trailing line comment
+    // ("// ...", trimmed) of an Entry_Item field spec, or "" when there is
+    // none.  The comment is kept aside so it can be re-attached to the
+    // generated column line without ever participating in classification or
+    // column-name derivation.
+    Function ExtractTrailingComment String sSpec Returns String
+        Integer iPos
+        Move (Pos(CS_CommentSymbol, sSpec)) to iPos
+        If (iPos = 0) Begin
+            Function_Return ""
+        End
+        Function_Return (Trim(Mid(sSpec, CI_EOL, iPos)))
+    End_Function
+
     // Returns True when sFieldSpec is a calculated expression rather than a plain
     // "Table.Field" binding.  An expression is identified by a leading "(" or by
     // the presence of a space (plain field references never contain spaces).
+    // The caller is expected to have stripped any trailing comment first (see
+    // StripTrailingComment), so the space-test is not fooled by comment text.
     Function IsEntryItemExpression String sFieldSpec Returns Boolean
         String sTrimmed
         Move (Trim(sFieldSpec)) to sTrimmed
@@ -440,8 +485,8 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
         Boolean  bInBeginRow bPendingColumns bBeginRowSeen bIsExpr
         Boolean[] abIsExpression
-        String   sFieldSpec
-        String[] asItems asEmpty
+        String   sFieldSpec sFieldComment
+        String[] asItems asComments asEmpty
 
         // --- Sub-state 1: Inside Begin_Row / End_Row ---
         Get pbInBeginRow to bInBeginRow
@@ -452,10 +497,20 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
             End
             Else If (Pos("entry_item ", sLower) = 1) Begin
                 // Collect the field spec or expression, original casing.
-                Get pasColEntryItems to asItems
+                // Split off any trailing line comment first: the clean spec
+                // drives classification / naming / OnSetCalculatedValue (a
+                // plain "Table.Field // comment" must not be misread as a
+                // calculated expression), while the comment is kept in a
+                // parallel array and re-attached to the generated line.
+                Get pasColEntryItems        to asItems
+                Get pasColEntryItemComments to asComments
                 Move (Trim(Mid(sTrimLine, CI_EOL, 12))) to sFieldSpec
-                Move sFieldSpec to asItems[SizeOfArray(asItems)]
-                Set pasColEntryItems to asItems
+                Get ExtractTrailingComment sFieldSpec to sFieldComment
+                Get StripTrailingComment   sFieldSpec to sFieldSpec
+                Move sFieldSpec    to asItems[SizeOfArray(asItems)]
+                Move sFieldComment to asComments[SizeOfArray(asComments)]
+                Set pasColEntryItems        to asItems
+                Set pasColEntryItemComments to asComments
                 // Flag whether this column is a calculated expression.
                 Get IsEntryItemExpression sFieldSpec to bIsExpr
                 Get pabColIsExpression to abIsExpression
@@ -505,7 +560,8 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
                     // First Begin_Row: only reset the entry items and state flags.
                     // Preserve any per-column data pre-collected above this Begin_Row.
                     Set pbPendingColumns to False
-                    Set pasColEntryItems  to asEmpty
+                    Set pasColEntryItems        to asEmpty
+                    Set pasColEntryItemComments to asEmpty
                 End
                 Set pbInBeginRow   to True
                 Set pbBeginRowSeen to True
@@ -670,13 +726,15 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     Procedure AppendColumnObjects String[] ByRef asOutput String sGridIndent
         String[]  asEntryItems asHeaderLabels asCheckbox asEditable asComboButton asComboSort
         String[]  asCapslock asTextAlign asPromptObject asMask asDataType asFocusable
+        String[]  asComments
         Boolean[] abIsExpression
         Integer[] aiFormWidths
-        String    sSingle sColIndent sColProp sColName sFieldSpec sLabel sTargetCol
+        String    sSingle sColIndent sColProp sColName sFieldSpec sLabel sTargetCol sComment sSuffix
         Integer   iCount iSize iWidth
         Boolean   bIsExpr
 
-        Get pasColEntryItems    to asEntryItems
+        Get pasColEntryItems        to asEntryItems
+        Get pasColEntryItemComments to asComments
         Get pasColHeaderLabels  to asHeaderLabels
         Get paiColFormWidths    to aiFormWidths
         Get pasColCheckbox      to asCheckbox
@@ -704,6 +762,19 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Decrement iSize
         For iCount from 0 to iSize
             Move asEntryItems[iCount] to sFieldSpec
+
+            // Trailing comment from the legacy Entry_Item line, if any.
+            // sSuffix re-attaches it (space-separated) to whichever line the
+            // spec ends up on -- the Entry_Item line for a plain column, or
+            // the "Move <expr> to sValue" line for a calculated column.
+            Move "" to sComment
+            Move "" to sSuffix
+            If (iCount < SizeOfArray(asComments)) Begin
+                Move asComments[iCount] to sComment
+            End
+            If (sComment <> "") Begin
+                Move (" " + sComment) to sSuffix
+            End
 
             // Determine whether this column is a calculated expression.
             Move False to bIsExpr
@@ -747,8 +818,9 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
             End
             Move (sColIndent + "Object " + sColName + " is a " + sTargetCol) to asOutput[SizeOfArray(asOutput)]
             // Plain columns get an Entry_Item binding; expression columns do not.
+            // Any trailing comment from the legacy line is preserved here.
             If (bIsExpr = False) Begin
-                Move (sColProp + "Entry_Item " + sFieldSpec)       to asOutput[SizeOfArray(asOutput)]
+                Move (sColProp + "Entry_Item " + sFieldSpec + sSuffix) to asOutput[SizeOfArray(asOutput)]
             End
             Move (sColProp   + "Set piWidth to " + String(iWidth)) to asOutput[SizeOfArray(asOutput)]
             Move (sColProp   + "Set psCaption to " + '"' + sLabel + '"') to asOutput[SizeOfArray(asOutput)]
@@ -790,7 +862,7 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
             If (bIsExpr) Begin
                 Move "" to asOutput[SizeOfArray(asOutput)]
                 Move (sColProp + "Procedure OnSetCalculatedValue tDataSourceRow TheRow String ByRef sValue") to asOutput[SizeOfArray(asOutput)]
-                Move (sColProp + sSingle + "Move " + sFieldSpec + " to sValue") to asOutput[SizeOfArray(asOutput)]
+                Move (sColProp + sSingle + "Move " + sFieldSpec + " to sValue" + sSuffix) to asOutput[SizeOfArray(asOutput)]
                 Move (sColProp + "End_Procedure") to asOutput[SizeOfArray(asOutput)]
             End
 
