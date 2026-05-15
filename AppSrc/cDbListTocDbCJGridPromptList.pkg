@@ -1,0 +1,276 @@
+﻿/* Copyright (c) 2026 Nils Svedmyr, RDC Tools International
+
+   cDbListTocDbCJGridPromptList.pkg
+
+   Data-aware subclass of cDbGridTocDbCJGrid.
+   Converts legacy dbList selection lists (dbList or any subclass, e.g.
+   cMyDbList) to cDbCJGridPromptList, with individual cDbCJGridColumn child
+   objects for each Entry_Item column.
+
+   A legacy dbList is a *modal record-selection list* (it lives inside a
+   dbModalPanel and lets the user pick one or more records).  Structurally a
+   dbList is almost identical to a dbGrid -- same Begin_Row / Entry_Item /
+   End_Row column model, same Set Form_Width / Header_Label per-column
+   properties, same Set Main_File DDO binding -- so this class inherits the
+   entire dbGrid->cDbCJGrid conversion engine from cDbGridTocDbCJGrid and
+   only adds:
+
+     1. Different default target classes:
+          dbList  ->  cDbCJGridPromptList   (instead of cDbCJGrid)
+          columns ->  cDbCJGridColumn       (unchanged)
+        Pattern detection (empty sParameter) matches any class whose name
+        ends in "dblist" (instead of "dbgrid").
+
+     2. Translation of dbList-only selection-behaviour properties to their
+        nearest cDbCJGridPromptList equivalent, each accompanied by a TODO
+        comment because the semantics are not always 1:1:
+          Set Auto_Server_State   to V  ->  Set pbAutoServer to V
+          Set Auto_Column_State   to V  ->  Set pbAutoColumn to V
+          Set Popup_Search_State  to V  ->  Set pbAutoSearch to V
+          Set Find_Search_State   to V  ->  Set pbAutoSearch to V   (+ TODO)
+          Set Export_Item_State   to V  ->  Set peUpdateMode to
+                                            umPromptValue / umPromptRelational (+ TODO)
+          Set Auto_Export_State   to V  ->  TODO (review peUpdateMode)
+          Set Auto_Index_State    to V  ->  TODO (ordering is column-driven/automatic)
+          Set Move_Value_Out_State to V ->  TODO (display-only -> umPromptNonInvoking)
+          Set Auto_Shadow_State   to V  ->  TODO (no cDbCJGridPromptList equivalent)
+          Set Auto_Label_State    to V  ->  TODO (captions derive from the DD)
+        All other translatable grid properties (Highlight_Row_State,
+        CurrentRowColor, Gridline_Mode, Header_Visible_State, etc.) are
+        already handled by the shared base class cGridToCJGridBase.
+
+     3. A one-time TODO header comment emitted just inside each converted
+        list, reminding the developer that the *invoking* object needs a
+        Prompt_Callback handler and explaining the peUpdateMode options.
+        The surrounding dbModalPanel and the invoking object's callback are
+        intentionally NOT modified (they live in different objects/files);
+        only the list object itself is transformed.
+
+   The sParameter passed to TransformDbListTocDbCJGridPromptList is the same
+   comma-separated string of 2 or 3 class names used by the dbGrid converter:
+       "OldListClass,NewGridClass[,NewColumnClass]"
+   If sParameter is empty, the old class is detected by pattern (any class
+   name ending in "dblist") and the standard DataFlex classes
+   cDbCJGridPromptList / cDbCJGridColumn are used as targets.
+*/
+
+Use cDbGridTocDbCJGrid.pkg
+
+// Default target class names for dbList -> cDbCJGridPromptList conversion.
+// Used when sParameter is empty or when a column class is not supplied.
+Define CS_PromptList_TargetClass  for "cDbCJGridPromptList"
+Define CS_PromptList_TargetColumn for "cDbCJGridColumn"
+
+Class cDbListTocDbCJGridPromptList is a cDbGridTocDbCJGrid
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // Override the cDbCJGrid defaults set by cDbGridTocDbCJGrid with the
+        // cDbCJGridPromptList target classes.  psLegacyGridClass = "" enables
+        // pattern-based detection (any class name ending in "dblist").
+        Set psLegacyGridClass   to ""
+        Set psTargetGridClass   to CS_PromptList_TargetClass
+        Set psTargetColumnClass to CS_PromptList_TargetColumn
+        // True from the start of each converted list until the one-time
+        // Prompt_Callback TODO header has been emitted (see OnHandleGridLine).
+        Property Boolean pbPromptHintPending False
+    End_Procedure
+
+    // *** Parameter parsing (override) ***
+
+    // Mirrors cDbGridTocDbCJGrid.ParseAndSetParameter but resets to the
+    // cDbCJGridPromptList defaults (not cDbCJGrid) when sParameter is empty.
+    // Non-empty parameters are delegated to the ancestor implementation, which
+    // performs the 2-/3-part parse; the default column class is cDbCJGridColumn
+    // for both converters so no special handling is needed there.
+    Function ParseAndSetParameter String sParameter Returns Boolean
+        Boolean bOK
+        If (sParameter = "") Begin
+            Set psLegacyGridClass   to ""
+            Set psTargetGridClass   to CS_PromptList_TargetClass
+            Set psTargetColumnClass to CS_PromptList_TargetColumn
+            Function_Return True
+        End
+        Forward Get ParseAndSetParameter sParameter to bOK
+        Function_Return bOK
+    End_Function
+
+    // *** IsGridDeclaration override ***
+
+    // Returns True when sTrimLower looks like "object X is a <OldListClass>".
+    // When psLegacyGridClass is set, performs an exact (case-insensitive) match.
+    // When psLegacyGridClass is empty, falls back to the pattern: any class
+    // name ending in "dblist".
+    Function IsGridDeclaration String sTrimLower Returns Boolean
+        Integer iIsA
+        String  sClassName sLegacy
+
+        If (Pos("object ", sTrimLower) <> 1) Begin
+            Function_Return False
+        End
+        Move (Pos(" is a ", sTrimLower)) to iIsA
+        If (iIsA = 0) Begin
+            Function_Return False
+        End
+        // Class name starts 6 chars after the start of " is a ".
+        Move (Trim(Mid(sTrimLower, CI_EOL, (iIsA + 6)))) to sClassName
+        // Strip any trailing content (e.g. metadata tags after a space).
+        Move (Pos(CS_S, sClassName)) to iIsA
+        If (iIsA > 0) Begin
+            Move (Left(sClassName, iIsA - 1)) to sClassName
+        End
+
+        Get psLegacyGridClass to sLegacy
+        If (sLegacy = "") Begin
+            // Pattern-based: any class ending in "dblist".
+            Function_Return (Right(sClassName, 6) = "dblist")
+        End
+        // Exact match (psLegacyGridClass is stored as lowercase).
+        Function_Return (sClassName = sLegacy)
+    End_Function
+
+    // *** Subclass hook overrides ***
+
+    // Arm the one-time Prompt_Callback TODO header for this list.
+    Procedure OnGridStarted String sGridIndent Integer iGridStartLine
+        Forward Send OnGridStarted sGridIndent iGridStartLine
+        Set pbPromptHintPending to True
+    End_Procedure
+
+    // Emits a one-time TODO header (just inside the converted list, before the
+    // first body line / column objects) explaining the modal prompt-list
+    // selection pattern, then delegates all real line handling to the
+    // cDbGridTocDbCJGrid implementation.
+    Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
+        Boolean bPending
+        String  sSingle sPfx
+
+        Get pbPromptHintPending to bPending
+        If (bPending = True) Begin
+            Set pbPromptHintPending to False
+            Get MakeSingleIndent to sSingle
+            Move (sGridIndent + sSingle) to sPfx
+            Move (sPfx + "// TODO: dbList -> cDbCJGridPromptList (modal record-selection prompt list).") to asOutput[SizeOfArray(asOutput)]
+            Move (sPfx + "//   The INVOKING object (the form/field that opens this list) needs a") to asOutput[SizeOfArray(asOutput)]
+            Move (sPfx + "//   'Procedure Prompt_Callback Integer hoPrompt' to control selection, e.g.:") to asOutput[SizeOfArray(asOutput)]
+            Move (sPfx + "//       Set peUpdateMode of hoPrompt to umPromptValue") to asOutput[SizeOfArray(asOutput)]
+            Move (sPfx + "//   Update modes: umPromptRelational | umPromptValue | umPromptCustom | umPromptNonInvoking.") to asOutput[SizeOfArray(asOutput)]
+            Move (sPfx + "//   Verify the Set Server / Main_File DD wiring below.") to asOutput[SizeOfArray(asOutput)]
+        End
+
+        Forward Send OnHandleGridLine sLine sTrimLine sLower (&asOutput) sGridIndent (&bSkip)
+    End_Procedure
+
+    // *** dbList-specific selection-property translation ***
+
+    // Returns True for the dbList-only selection-behaviour properties this
+    // class translates, so they are intercepted before the base class can
+    // silently remove them (cGridToCJGridBase.IsLegacyGridProperty removes
+    // move_value_out_state / auto_export_state / auto_index_state /
+    // auto_column_state).  Everything else is delegated to the ancestor.
+    Function IsTranslatableGridProperty String sTrimLower Returns Boolean
+        Boolean bResult
+        If (Left(sTrimLower, 4) = "set ") Begin
+            If (sTrimLower contains "auto_server_state")    Function_Return True
+            If (sTrimLower contains "auto_column_state")    Function_Return True
+            If (sTrimLower contains "popup_search_state")   Function_Return True
+            If (sTrimLower contains "find_search_state")    Function_Return True
+            If (sTrimLower contains "export_item_state")    Function_Return True
+            If (sTrimLower contains "auto_export_state")    Function_Return True
+            If (sTrimLower contains "auto_index_state")     Function_Return True
+            If (sTrimLower contains "move_value_out_state") Function_Return True
+            If (sTrimLower contains "auto_shadow_state")    Function_Return True
+            If (sTrimLower contains "auto_label_state")     Function_Return True
+        End
+        Forward Get IsTranslatableGridProperty sTrimLower to bResult
+        Function_Return bResult
+    End_Function
+
+    // Translates the dbList-only selection properties to their nearest
+    // cDbCJGridPromptList equivalent (with a TODO where the mapping is
+    // approximate), and delegates all other translatable properties to the
+    // shared base implementation.
+    Function TranslateGridProperty String sLine String sTrimLower Returns String[]
+        String[] asResult asBase
+        String   sIndent sValue sValLower sBoolVal sMode
+        Boolean  bBoolValue
+
+        Get GetIndent sLine to sIndent
+        Get ParseValueAfterTo sLine to sValue
+        Move (Lowercase(Trim(sValue))) to sValLower
+        Move (sValLower = "true" or sValLower = "1") to bBoolValue
+        Move (If(bBoolValue, "True", "False")) to sBoolVal
+
+        // Direct boolean mappings
+        If (sTrimLower contains "auto_server_state") Begin
+            Move (sIndent + "Set pbAutoServer to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+        If (sTrimLower contains "auto_column_state") Begin
+            Move (sIndent + "Set pbAutoColumn to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+        If (sTrimLower contains "popup_search_state") Begin
+            Move (sIndent + "Set pbAutoSearch to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+        If (sTrimLower contains "find_search_state") Begin
+            Move (sIndent + "Set pbAutoSearch to " + sBoolVal) to asResult[0]
+            Move (sIndent + "// TODO: dbList Find_Search_State mapped to pbAutoSearch (verify search-on-type behaviour). Was: " + Trim(sLine)) to asResult[1]
+            Function_Return asResult
+        End
+
+        // peUpdateMode mappings
+        If (sTrimLower contains "export_item_state") Begin
+            // Export_Item_State True forces a non-relational (value) update;
+            // False forces a relational update.
+            Move (If(bBoolValue, "umPromptValue", "umPromptRelational")) to sMode
+            Move (sIndent + "Set peUpdateMode to " + sMode) to asResult[0]
+            Move (sIndent + "// TODO: dbList Export_Item_State -> peUpdateMode (verify relational vs value update). Was: " + Trim(sLine)) to asResult[1]
+            Function_Return asResult
+        End
+        If (sTrimLower contains "auto_export_state") Begin
+            Move (sIndent + "// TODO: dbList Auto_Export_State -> review peUpdateMode (umPromptRelational | umPromptValue). Was: " + Trim(sLine)) to asResult[0]
+            Function_Return asResult
+        End
+        If (sTrimLower contains "move_value_out_state") Begin
+            Move (sIndent + "// TODO: dbList Move_Value_Out_State -> for a display-only list set peUpdateMode to umPromptNonInvoking. Was: " + Trim(sLine)) to asResult[0]
+            Function_Return asResult
+        End
+
+        // No direct equivalent: TODO only
+        If (sTrimLower contains "auto_index_state") Begin
+            Move (sIndent + "// TODO: dbList Auto_Index_State has no direct cDbCJGridPromptList equivalent; column-driven ordering is automatic. Was: " + Trim(sLine)) to asResult[0]
+            Function_Return asResult
+        End
+        If (sTrimLower contains "auto_shadow_state") Begin
+            Move (sIndent + "// TODO: dbList Auto_Shadow_State has no cDbCJGridPromptList equivalent (non-findable rows are not auto-shadowed). Was: " + Trim(sLine)) to asResult[0]
+            Function_Return asResult
+        End
+        If (sTrimLower contains "auto_label_state") Begin
+            Move (sIndent + "// TODO: dbList Auto_Label_State -> column captions derive from the DD automatically; set psCaption per column if needed. Was: " + Trim(sLine)) to asResult[0]
+            Function_Return asResult
+        End
+
+        // Not a dbList-specific property: delegate to the shared base class.
+        Forward Get TranslateGridProperty sLine sTrimLower to asBase
+        Function_Return asBase
+    End_Function
+
+    // *** Public interface ***
+
+    // Transforms all dbList objects in asFiles from the legacy dbList class to
+    // cDbCJGridPromptList with individual cDbCJGridColumn children.
+    //
+    // sParameter: comma-separated class names "OldListClass,NewGridClass[,NewColumnClass]"
+    // Empty sParameter uses pattern detection (any class ending in "dblist") and
+    // the standard DataFlex cDbCJGridPromptList / cDbCJGridColumn class names.
+    //
+    // Returns the total number of list objects transformed across all files.
+    Function TransformDbListTocDbCJGridPromptList String[] asFiles String sParameter Returns Integer
+        Integer iResult
+        Get TransformFiles asFiles sParameter to iResult
+        Function_Return iResult
+    End_Function
+
+End_Class
