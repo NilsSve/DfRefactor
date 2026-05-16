@@ -8,7 +8,7 @@ DFRefactor is open source and MIT licensed. There are two paths for support, dep
 
 - **Bug reports and feature requests** — open an issue on the GitHub repository. Include the DataFlex version, a short code snippet that triggers the problem, and what you expected to happen.
 - **Pull requests** — welcome, especially for new refactoring functions. See [CLAUDE.md](CLAUDE.md) for the architecture overview and the meta-tag conventions a new refactoring function needs to follow.
-- **Direct contact** — email the maintainer at [nils.svedmyr@gmail.com](mailto:nils.svedmyr@gmail.com).
+- **Direct contact** — email [support@rdctools.com](mailto:support@rdctools.com).
 - **If DFRefactor saves you a week of manual refactoring**, the [Ko-fi link in `FUNDING.yml`](FUNDING.yml) keeps the maintainer caffeinated.
 
 ---
@@ -23,7 +23,7 @@ DFRefactor is a powerful tool, but it's still a tool. Bringing it into a real co
 
 - **Codebase audits** — run the report-only refactoring functions across your workspace and deliver a written report: legacy-syntax counts, dead code, unused source files, suspicious patterns. Useful as a first step before deciding what to refactor.
 - **Targeted refactor** — modernize a specific set of idioms across the codebase. E.g. *"rewrite all legacy comparison operators"*, *"modernize all `Indicate` statements"*, *"remove all unused locals"*. You pick the transformations; we run them, review the output, and deliver a clean diff.
-- **Custom refactoring function design** — when your codebase has a recurring idiom not covered by DFRefactor's built-in library, we design, implement, and unit-test a new refactoring function for it. You can keep it private to your team, or have it contributed back to the public DFRefactor codebase, where it benefits the community and gets ongoing maintenance from us at no further cost to you.
+- **Custom refactoring function design** — when your codebase has a recurring idiom not covered by DFRefactor's built-in library, we design, implement, and unit-test a new refactoring function for it. **This work is AI-assisted: we use AI to accelerate both the refactoring function and its unit tests, and every function and test is then reviewed and verified by the author against real code before delivery.** You can keep it private to your team, or have it contributed back to the public DFRefactor codebase, where it benefits the community and gets ongoing maintenance from us at no further cost to you.
 - **Full modernization** — multi-version migrations (DF 18 → DF 23, DF 23 → DF 26), full workspace passes with custom refactoring functions written for your codebase's specific idioms.
 - **Team training** — a one-day workshop covering DFRefactor: writing custom refactoring functions, integrating with CI, using the TestBench for safe iteration on legacy code.
 

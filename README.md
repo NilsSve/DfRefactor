@@ -10,8 +10,6 @@ DFRefactor is an open-source, automated refactoring tool for **DataFlex** — a 
 
 A short video walkthrough (4 minutes): **[YouTube URL — to be added once recorded]**
 
-For a mapping of DFRefactor functions to refactorings from Fowler's book, see [RefactoringCatalogMap.md](RefactoringCatalogMap.md).
-
 ---
 
 ## Installation and use
@@ -48,3 +46,51 @@ To use DFRefactor, you will need DataFlex Studio version 24.0 or later.
 ![This is a sample of the DFRefactor.src program:](Bitmaps/DFRefactor.png)
 
 ![This is a sample of the DFRefactorTestBench.src program:](Bitmaps/DFRefactorTestBench.png)
+
+---
+
+## Command-line and batch mode
+
+Both `DFRefactor.exe` and `DFUnit_TestRunner.exe` can run unattended from the command line, which makes them usable in scripts and CI pipelines.
+
+### DFRefactor
+
+Run a saved configuration (recommended):
+
+```
+DFRefactor.exe /c "DFRefactorCmdLineWS.ini"
+```
+
+The ini-file holds the workspace, folders, file filter, and the selected functions. Generate one from **Program Settings → Export to ini-file** rather than writing it by hand. The `/c` flag implies batch mode.
+
+Or pass explicit flags instead of an ini-file:
+
+```
+DFRefactor.exe /sws "C:\Proj\My.sws" /d AppSrc;DDSrc /batch
+```
+
+Common flags:
+
+| Flag(s) | Value | Meaning |
+|---|---|---|
+| `/h` `/help` `/?` | — | Show parameter help, then exit |
+| `/debug` | — | Echo all passed parameters, then exit |
+| `/sws` | `"file.sws"` | Workspace file (mandatory unless `/c` is used) |
+| `/f` `/file` | `"file"` | Single source file (takes precedence over `/sws`) |
+| `/d` `/dirs` `/folders` | `A;B;C` | Semicolon-separated folders, added to the workspace's saved folders |
+| `/b` `/batch` | — | Run automatically and silently (UI visible, no interaction) |
+| `/c` `-c` `--console` | `"file.ini"` | Use an ini-file; forces batch mode on |
+
+Flag and value are a space-separated pair; flags may appear in any order; paths must be quoted; flag spelling is case-insensitive. Run `DFRefactor.exe /help` for the authoritative list, or see the **Command-Line Usage** help topic.
+
+### DFUnit_TestRunner
+
+Run the unit tests headless (for CI):
+
+```
+DFUnit_TestRunner.exe -c
+```
+
+Writes results to the console and exits `0` if all tests pass or `-1` on any failure. Without `-c` (or `--console`) the runner starts in UI mode.
+
+> Note: `-c` / `--console` means *use a config ini-file* for `DFRefactor.exe`, but *console / CI mode* for `DFUnit_TestRunner.exe`. They are different programs with different argument handling.

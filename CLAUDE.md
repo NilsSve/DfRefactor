@@ -34,8 +34,11 @@ To run a single test fixture, the `TearDown` procedure calls `Send _InitializeFu
 
 ```
 cRefactorApplication  (AppSrc/cRefactorApplication.pkg)
-    └── Creates: ghoFileSystem (cFilesystem)
     └── Application-wide settings, workspace management
+    └── Uses cRefactorFileIO.pkg for file I/O — DF26-compatible global
+        functions that replaced the old cFilesystem submodule (removed,
+        along with its ghoFileSystem handle) and absorbed DUF's channel-based
+        file I/O (core code no longer routes file I/O through DUF)
 
 cRefactorEngine       (AppSrc/cRefactorEngine.pkg)
     └── Extends BusinessProcess
@@ -88,7 +91,6 @@ oRefactorFuncLib      (AppSrc/oRefactorFuncLib.pkg)
 |---|---|---|
 | `ghoEngine` | `cRefactorEngine` | `cRefactorEngine.pkg` constructor |
 | `ghoFuncLib` | `cRefactorFuncLib` | `oRefactorFuncLib.pkg` object creation |
-| `ghoFileSystem` | `cFilesystem` | `cRefactorApplication.pkg` |
 | `ghoStatusLog` | `cRefactorStatusLog` | `cRefactorEngine.pkg` constructor |
 | `ghoStatusPanel` | `cRefactorStatusPanel` | `RefactorStatusPanel.pkg` |
 
