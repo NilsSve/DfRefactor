@@ -14,6 +14,14 @@ Use cEncodingHelpers.pkg
 //       that is available from the DfRefactor.src toolbar.
 Define CS_UnusedSourceLogFile for "UnusedSourceFiles.log.txt"
 
+// Companion quarantine script written next to the .log.txt report. Running it
+// MOVES (never deletes) the listed files into the quarantine sub-folder below,
+// which lives inside the same DFRefactor_Backup folder. Not a ".log.txt" name
+// on purpose, so it is not listed in the "Other log files" dialog -- the
+// footnote in the .log.txt report is what points the user to it.
+Define CS_UnusedSourceBatFile          for "MoveUnusedSourceFiles.bat"
+Define CS_UnusedSourceQuarantineFolder for "UnusedSourceFiles"
+
 Struct tUnusedSourceFiles
     String sFileName
     String sPath
@@ -25,6 +33,7 @@ Class cUnusedSourceFiles is a cObject
         Forward Send Construct_Object
         
         Property String psLogFile
+        Property String psBatFile
         Property String[] pasAllFiles
         Property Integer piNoOfUnusedSourceFiles 0
         Property Boolean pbOK True
@@ -288,12 +297,48 @@ Class cUnusedSourceFiles is a cObject
         Get piNoOfUnusedSourceFiles to iFiles
         Function_Return iFiles
     End_Function
-    
+
+    // Returns sFileName unchanged, or with "_2"/"_3"/... inserted before the
+    // extension when a case-insensitive match already exists in
+    // asTakenLowerNames. Two unused files can share a name in different
+    // folders, so the generated quarantine .bat would otherwise overwrite one
+    // with the other. The chosen name (lowercased) is appended to
+    // asTakenLowerNames by ref so repeated calls within one run stay unique.
+    Function UniqueQuarantineName String sFileName String[] ByRef asTakenLowerNames Returns String
+        String  sBase sExt sCandidate sLower
+        Integer iDot iSeq iIdx
+
+        Move (RightPos(".", sFileName)) to iDot
+        If (iDot > 0) Begin
+            Move (Left(sFileName, iDot - 1)) to sBase
+            Move (Mid(sFileName, (Length(sFileName) - iDot + 1), iDot)) to sExt
+        End
+        Else Begin
+            Move sFileName to sBase
+            Move ""        to sExt
+        End
+
+        Move sFileName               to sCandidate
+        Move 1                       to iSeq
+        Move (Lowercase(sCandidate)) to sLower
+        Move (SearchArray(sLower, asTakenLowerNames)) to iIdx
+        While (iIdx <> -1)
+            Increment iSeq
+            Move (sBase + "_" + String(iSeq) + sExt) to sCandidate
+            Move (Lowercase(sCandidate))             to sLower
+            Move (SearchArray(sLower, asTakenLowerNames)) to iIdx
+        Loop
+
+        Move sLower to asTakenLowerNames[SizeOfArray(asTakenLowerNames)]
+        Function_Return sCandidate
+    End_Function
+
     Procedure RunUnusedSourceFiles
-        String[] asFiles asUsedFilenames
-        String sHomePath
+        String[] asFiles asUsedFilenames asTakenLowerNames
+        String sHomePath sBackupFolder sQuarantineFolder sBatPath sSrc sDest
         tUnusedSourceFiles[] asAllSourceFiles asUnusedSource
-        Integer iCh iSize iCount
+        Integer iCh iCh2 iSize iCount
+        Boolean bBatOK
 
         Get psHomePath of ghoApplication to sHomePath
         Get pasAllFiles                                          to asFiles
@@ -308,17 +353,79 @@ Class cUnusedSourceFiles is a cObject
             Procedure_Return
         End
 
+        // Same backup folder psLogFile was built from (FindUnusedSourceFiles),
+        // so the .bat is a true sibling of the .log.txt report.
+        Move (sHomePath + CS_BackupFolder + CS_DirSeparator) to sBackupFolder
+        Move (sBackupFolder + CS_UnusedSourceBatFile) to sBatPath
+        Move (sBackupFolder + CS_UnusedSourceQuarantineFolder + CS_DirSeparator) to sQuarantineFolder
+        Set psBatFile to sBatPath
+
         Move (SizeOfArray(asUnusedSource)) to iSize
-        If (iSize <> 0) Begin
-            Decrement iSize
-            Move (vFolderFormat(sHomePath)) to sHomePath
-            // Write unused source files to log file (CS_UnusedSourceLogFile):
-            For iCount from 0 to iSize
-                Writeln channel iCh (asUnusedSource[iCount].sPath + String(asUnusedSource[iCount].sFileName))
-            Loop
+        If (iSize = 0) Begin
+            Writeln channel iCh "No unused source files were found - no batch file was created."
+            Send RFCloseOutput iCh
+            Set pbOK to True
+            Procedure_Return
         End
+
+        Decrement iSize
+        // Write unused source files to log file (CS_UnusedSourceLogFile):
+        For iCount from 0 to iSize
+            Writeln channel iCh (asUnusedSource[iCount].sPath + String(asUnusedSource[iCount].sFileName))
+        Loop
+
+        // --- Companion quarantine batch file (CS_UnusedSourceBatFile) ------
+        // Moves (never deletes) the files listed above into sQuarantineFolder.
+        Move False to bBatOK
+        Get RFOpenOutput sBatPath to iCh2
+        If (iCh2 >= 0) Begin
+            Move True to bBatOK
+            Writeln channel iCh2 "@echo off"
+            Writeln channel iCh2 "REM ==========================================================================="
+            Writeln channel iCh2 ("REM  Generated by DFRefactor (ReportUnusedSourceFiles) on " + String(CurrentDateTime()))
+            Writeln channel iCh2 "REM  This MOVES (does NOT delete) the source files listed in"
+            Writeln channel iCh2 ("REM  " + CS_UnusedSourceLogFile + " into the quarantine folder below.")
+            Writeln channel iCh2 "REM  Review that report first. To undo, move the files back to their"
+            Writeln channel iCh2 "REM  original locations (the report lists every original full path)."
+            Writeln channel iCh2 "REM ==========================================================================="
+            Writeln channel iCh2 "echo."
+            Writeln channel iCh2 ('echo This will MOVE ' + String(iSize + 1) + ' unused source file(s) into:')
+            Writeln channel iCh2 ('echo   "' + sQuarantineFolder + '"')
+            Writeln channel iCh2 "echo."
+            Writeln channel iCh2 "pause"
+            Writeln channel iCh2 ('if not exist "' + sQuarantineFolder + '" md "' + sQuarantineFolder + '"')
+            For iCount from 0 to iSize
+                Move (asUnusedSource[iCount].sPath + String(asUnusedSource[iCount].sFileName)) to sSrc
+                Get UniqueQuarantineName (asUnusedSource[iCount].sFileName) (&asTakenLowerNames) to sDest
+                Writeln channel iCh2 ('echo Moving: "' + sSrc + '"')
+                Writeln channel iCh2 ('if exist "' + sSrc + '" move /Y "' + sSrc + '" "' + sQuarantineFolder + sDest + '"')
+            Loop
+            Writeln channel iCh2 "echo."
+            Writeln channel iCh2 ('echo Done. Files were moved to: "' + sQuarantineFolder + '"')
+            Writeln channel iCh2 "pause"
+            Send RFCloseOutput iCh2
+        End
+
+        // --- Footnote appended to the .log.txt report ----------------------
+        // ReadUnusedSourceLogFile filters every line through vFilePathExists,
+        // so these prose lines are safely ignored when the report is re-read.
+        Writeln channel iCh ""
+        Writeln channel iCh "-------------------------------------------------------------------------------"
+        If (bBatOK = True) Begin
+            Writeln channel iCh "A companion batch file was also created:"
+            Writeln channel iCh ("    " + sBatPath)
+            Writeln channel iCh "Running it MOVES (does not delete) the source files listed above into:"
+            Writeln channel iCh ("    " + sQuarantineFolder)
+            Writeln channel iCh "Whether to run it is entirely up to you. To undo, simply move the files"
+            Writeln channel iCh "back from the quarantine folder to their original locations listed above."
+        End
+        Else Begin
+            Writeln channel iCh "(A companion batch file could not be created - no output channel was"
+            Writeln channel iCh " available. The files listed above were left untouched.)"
+        End
+
         Send RFCloseOutput iCh
-        Set pbOK to True   
+        Set pbOK to True
     End_Procedure
     
     Function ReadUnusedSourceLogFile Returns String[]
