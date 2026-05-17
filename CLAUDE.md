@@ -132,6 +132,12 @@ Every refactoring function in `oRefactorFuncLib.pkg` must declare its type via `
 | `Libraries/DUF` | DbUpdateFramework — database schema migrations |
 | `Libraries/SciControlLib` | Scintilla editor control integration |
 
+Submodule remotes/branches (see `.gitmodules`): `DFUnit` → `NilsSve/Library-DFUnit.git` branch `release` (a maintained fork); `DUF` → `NilsSve/DbUpdateFramework.git` branch `main`; `SciControlLib` → `NilsSve/Library-SciControlLib.git` branch `main`.
+
+The superproject only records a pinned commit (gitlink) per submodule; it does not contain their files. **First-time setup: run `setup.bat` in the repo root once after cloning** — it runs `git submodule update --init --recursive` and sets local `submodule.recurse true` so future pulls keep the libraries in sync automatically. Re-run it if `Libraries\` looks empty/out of date or a submodule is added.
+
+**Pitfall:** GitHub Desktop pushes only the superproject, not new submodule commits. After committing inside a submodule, push it explicitly (e.g. `git -C Libraries/DFUnit push origin release`) before/with the superproject push, or collaborators' fetch fails with `not our ref <sha>`.
+
 ### Data & Configuration (gitignored)
 
 - `AppSrc/LegacyCode.pkg` — working file containing legacy DataFlex code snippets used as test input (gitignored)

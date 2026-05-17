@@ -26,6 +26,19 @@ and paste the path from above. Finally select your local path to install to, and
 
 **Note:** Do not select "Download ZIP," as GitHub will not include the libraries used by the workspace, and you would need to download them manually, which can be cumbersome!
 
+### First-time setup (libraries)
+
+DFRefactor uses three libraries — **DFUnit**, **DUF** and **SciControlLib** — that live under `Libraries\` as *git submodules*. They are not copied into the main repository; git only records which version of each to use.
+
+After cloning, **double-click `setup.bat` in the repository root once.** It will:
+
+1. Download/initialise the library submodules at the exact versions DFRefactor expects.
+2. Configure that clone so a normal **Pull** (in GitHub Desktop or `git pull`) keeps the libraries in sync automatically from then on — no extra steps later.
+
+`setup.bat` is safe to run any time: it never deletes anything. Re-run it if the `Libraries\` folders ever look empty or out of date, or whenever a new library is added to DFRefactor.
+
+> Cloning from the command line instead? Use `git clone --recurse-submodules https://github.com/NilsSve/DfRefactor.git`, then run `setup.bat` once to enable automatic library updates on future pulls.
+
 DFRefactor is a powerful and free tool written in DataFlex that assists with refactoring legacy DataFlex code. It specifically targets code that uses syntax that is no longer supported or recommended. Refactoring is the process of improving the structure and readability of existing code without altering its external behavior.
 
 The only supported versions of DataFlex Studio are the latest two: currently, DataFlex 2024 and 2025. While this means you need one of these two versions installed to compile and run the refactoring programs, it does not prevent you from using the tool on projects or workspaces created with earlier versions of DataFlex. An older version of the tool, compatible with versions prior to 2023, is available as a separate branch. However, please note that this branch is not maintained, so you would need to use it at your own risk.
