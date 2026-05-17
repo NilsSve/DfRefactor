@@ -106,7 +106,7 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Set peTextAlignment to xtpAlignmentCenter
                 Set pbComboButton to True
                 // pbEditable *must* be set after the pbComboButton setting.
-                Set pbEditable to False
+                Set pbEditable to True
                 Set pbComboEntryState to False
             End_Object                    
 
@@ -135,7 +135,7 @@ Object oSelectFunctions_vw is a cRDCDbView
                     End
                     Else If (sParameterList <> "") Begin
                         Set pbComboButton     to True
-                        Set pbComboEntryState to False
+                        Set pbComboEntryState to True
                         Send ComboDeleteData
                         Get StrSplitToArray sParameterList "," to asParameters
                         Move (SizeOfArray(asParameters)) to iSize

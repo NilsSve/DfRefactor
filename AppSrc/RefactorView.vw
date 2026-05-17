@@ -245,8 +245,14 @@ Object oRefactorView is a cRDCDbView
                             Integer iSize iCount
                             
                             Get Field_Current_Value of (Main_DD(Self)) Field Functions.ParameterValidation to sParameterList
-                            If (sParameterList <> "") Begin
+                            // "ANY" signals a free-text parameter: the user may type any value.
+                            If (Trim(Lowercase(sParameterList)) = "any") Begin
+                                Set pbComboButton     to False
+                                Set pbComboEntryState to True
+                            End
+                            Else If (sParameterList <> "") Begin
                                 Set pbComboButton to True
+                                Set pbComboEntryState to True
                                 Send ComboDeleteData
                                 Get StrSplitToArray  sParameterList "," to asParameters
                                 Move (SizeOfArray(asParameters)) to iSize
