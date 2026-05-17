@@ -120,7 +120,7 @@ Every refactoring function in `oRefactorFuncLib.pkg` must declare its type via `
        {SummaryText = Short post-run summary}
        """ }
    ```
-3. Optional: add `{EnumList}`, `{InitialValue}`, and `{HelpTopic}` meta-tags inside `{Description}` if the function takes an `sParameter` enum argument.
+3. Optional: add `{EnumList}`, `{InitialValue}`, and `{HelpTopic}` meta-tags inside `{Description}` if the function takes an `sParameter` enum argument. `{InitialValue}` is the **first-use default / fallback only** — a user's chosen parameter persists across program restarts and is *not* reset to `{InitialValue}` on every launch (the startup meta-data sync applies it only when the stored value is blank or is no longer one of the `{EnumList}` values).
 4. Optional: add `{ Private = True }` inside `{Description}` for functions defined in `UserDefinedRefactorFunctions.pkg` that should *not* be included in the JSON Export/Import file. The export skips private functions and warns which ones were excluded.
 5. **Note**: Earlier versions of DataFlex Studio had Code Explorer and Code Completion issues with triple-quote strings in `{Description}`. This is resolved in DF 26.
 
