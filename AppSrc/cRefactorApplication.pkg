@@ -46,6 +46,8 @@ Register_Procedure ActivateEngineLogFile
 Register_Procedure ShowOtherLogFilesDialog
 Register_Function SelectedFolders Returns String[]
 Register_Function psHomePath Returns String
+Register_Function ApplyTargetFilelist String sSWSFile Returns Boolean
+Register_Procedure RestoreActiveFilelist
 
 Define CS_BatchModeShort for "/bm"
 Define CS_BatchModeLong  for "/batch_mode"
@@ -111,6 +113,14 @@ Class cRefactorApplication is a cRDCApplication
         // to the target workspace's source folders.
         Property String psOrgOpenPath ""
 
+        // DFRefactor's own active filelist, captured at startup. Restored
+        // after a refactoring function temporarily redirects the filelist to
+        // the target workspace (RestyleDDOs) so DFRefactor's own Functions
+        // table reads and error logging keep working.
+        Property String psOrgFilelistName ""
+        Property String psOrgFileList     ""
+        Property String psOrgDataPath     ""
+
         Property Handle phoWorkspaceSelector_Menuitem
         Property Handle phoSwsOpenDialog
         Property Handle phoOpenSourceFileDialog
@@ -153,7 +163,7 @@ Class cRefactorApplication is a cRDCApplication
     End_Procedure         
                                   
     Procedure End_Construct_Object
-        String sOrgOpenPath
+        String sOrgOpenPath sOrgFilelistName sOrgFileList sOrgDataPath
         Forward Send End_Construct_Object
 
         Send InitUserName
@@ -168,6 +178,16 @@ Class cRefactorApplication is a cRDCApplication
         // a workspace is opened, and restores this value when it is closed.
         Get_Attribute DF_OPEN_PATH to sOrgOpenPath
         Set psOrgOpenPath to sOrgOpenPath
+
+        // Capture DFRefactor's own active filelist (its own tables were just
+        // opened above). RestoreActiveFilelist puts these back after a
+        // refactoring function redirects the filelist to a target workspace.
+        Get_Attribute DF_FILELIST_NAME to sOrgFilelistName
+        Get psFileList of (phoWorkspace(Self)) to sOrgFileList
+        Get psDataPath of (phoWorkspace(Self)) to sOrgDataPath
+        Set psOrgFilelistName to sOrgFilelistName
+        Set psOrgFileList     to sOrgFileList
+        Set psOrgDataPath     to sOrgDataPath
     End_Procedure
     
     Function SourceFilePath Returns String
@@ -744,7 +764,10 @@ Class cRefactorApplication is a cRDCApplication
 
     { MethodType=Property }
     Procedure Set psSWSFile String sSWSFile
-        String sPath sExt
+        String sPath sExt sOldSWSFile
+        String[] asEmpty
+
+        Get psSWSFile to sOldSWSFile
 
         Get ParseFoldername sSWSFile to sPath
         Get ParseFileExtension sSWSFile to sExt
@@ -765,6 +788,18 @@ Class cRefactorApplication is a cRDCApplication
         // that Get_File_Path resolves packages there instead of in DFRefactor's
         // own workspace.  Passing "" restores the original path.
         Send UpdateDFOpenPath sSWSFile
+
+        // The selected-folders list is per workspace (the FolderSel tables are
+        // keyed by WorkspaceHomeFolder, and OnWorkspaceLoaded re-keys the
+        // folder view to the new workspace). Drop the cached selection when
+        // the workspace actually changes so CollectFileData re-reads it from
+        // the re-keyed folder view; otherwise a run after switching workspace
+        // would scan the previous (e.g. DFRefactor's own) workspace's folders.
+        // Guarded on an actual change so redundant same-workspace setter calls
+        // (e.g. combo re-display) don't wipe the user's folder selection.
+        If (Lowercase(Trim(sSWSFile)) <> Lowercase(Trim(sOldSWSFile))) Begin
+            Set pasSelectedFolders to asEmpty
+        End
     End_Procedure
 
     { MethodType=Property }
@@ -857,7 +892,7 @@ Class cRefactorApplication is a cRDCApplication
 
         Function_Return sResult
     End_Function
-
+    
     // Collects all source folder paths for the target workspace indicated by
     // sSWSFile, covering AppSrc, DdSrc, and AppHtml, for both:
     //
@@ -963,6 +998,92 @@ Class cRefactorApplication is a cRDCApplication
 
         Function_Return sResult
     End_Function
+
+    // Resolves the target workspace's filelist.cfg path from its .sws/.ws.
+    //   JSON .sws (DataFlex 26+): paths.fileList from the parsed struct.
+    //   Old INI .ws (DataFlex 25-): [Workspace] Filelist from the config .ws.
+    // Returns "" if it cannot be resolved or the file does not exist.
+    { Visibility=Private }
+    Function GetTargetWorkspaceFilelistPath String sSWSFile Returns String
+        tSwsFile WsData
+        String sHomePath sRaw sFileList sWsFile
+        Handle hoIni
+        Boolean bExists
+
+        Get psHomePath to sHomePath
+        Move (vFolderFormat(sHomePath)) to sHomePath
+        Move "" to sRaw
+
+        #IF (!@ > 250)
+            // JSON format (DataFlex 26+).
+            Get ReadSwsJsonFile sSWSFile to WsData
+            If (WsData.nDfVersion > 0) Begin
+                Move WsData.Paths.sFileList to sRaw
+            End
+        #ENDIF
+
+        If (sRaw = "") Begin
+            // Old INI-format .ws workspace (DataFlex 25 and earlier).
+            Get WsFileNameFromSWSFileName sSWSFile to sWsFile
+            Get vFilePathExists sWsFile to bExists
+            If (bExists) Begin
+                Get Create (RefClass(cIniFile)) to hoIni
+                Set psFilename of hoIni to sWsFile
+                Get ReadString of hoIni CS_Workspace CS_FileList "" to sRaw
+                Send Destroy of hoIni
+            End
+        End
+
+        If (sRaw = "") Begin
+            Function_Return ""
+        End
+
+        Get ResolveWorkspacePath sRaw sHomePath to sFileList
+        Get vFilePathExists sFileList to bExists
+        If (bExists = False) Begin
+            Function_Return ""
+        End
+        Function_Return sFileList
+    End_Function
+
+    // Activates the target workspace's filelist so that the
+    // Get_Attribute DF_FILE_* enumeration in cDDOReStyler sees that
+    // workspace's tables. Returns True when applied — the caller MUST then
+    // call RestoreActiveFilelist, because DFRefactor's own Functions/StatLog
+    // tables and error logging depend on its own filelist being restored.
+    // No Close DF_ALL is done: the engine holds an open Constrained_Find
+    // over FunctionsA while this runs.
+    Function ApplyTargetFilelist String sSWSFile Returns Boolean
+        String sFileList sDataPath
+
+        Get GetTargetWorkspaceFilelistPath sSWSFile to sFileList
+        If (sFileList = "") Begin
+            Function_Return False
+        End
+        Get ParseFolderName sFileList to sDataPath
+        If (Right(sDataPath, 1) = CS_DirSeparator) Begin
+            Move (Left(sDataPath, (Length(sDataPath) - 1))) to sDataPath
+        End
+        Set psDataPath of (phoWorkspace(Self)) to sDataPath
+        Set psFileList of (phoWorkspace(Self)) to sFileList
+        Set_Attribute DF_FILELIST_NAME to sFileList
+        Function_Return True
+    End_Function
+
+    // Restores DFRefactor's own active filelist captured at
+    // End_Construct_Object. Pairs with ApplyTargetFilelist.
+    Procedure RestoreActiveFilelist
+        String sName sFileList sDataPath
+
+        Get psOrgFilelistName to sName
+        Get psOrgFileList     to sFileList
+        Get psOrgDataPath     to sDataPath
+        If (sName <> "") Begin
+            Set psDataPath of (phoWorkspace(Self)) to sDataPath
+            Set psFileList of (phoWorkspace(Self)) to sFileList
+            Set_Attribute DF_FILELIST_NAME to sName
+        End
+    End_Procedure
 
     // Updates DF_OPEN_PATH whenever a target workspace is opened or closed.
     // Called automatically from Set psSWSFile on every workspace change.
