@@ -12,7 +12,7 @@ Use cEncodingHelpers.pkg
 // Note: "Other" log files names (not CS_SummaryLogfileName) must end 
 //       with ".log.txt", to be shown in the "Other log files" dialog,
 //       that is available from the DfRefactor.src toolbar.
-Define CS_UnusedSourceLogFile for "UnusedSourceFiles.log.txt"
+//Define CS_UnusedSourceLogFile for "UnusedSourceFiles.log.txt"
 
 // Companion quarantine script written next to the .log.txt report. Running it
 // MOVES (never deletes) the listed files into the quarantine sub-folder below,
@@ -27,6 +27,16 @@ Struct tUnusedSourceFiles
     String sPath
 End_Struct
 
+// Adjacency model for the "is this file reachable from a project root
+// (.src)?" analysis. One entry per source file in the workspace.
+Struct tNodeEdges
+    String   sFull       // lowercased full path (sPath + sFileName) - node identity
+    String   sBare       // lowercased bare filename
+    String   sExt        // lowercased extension (no leading dot), e.g. "src"
+    Boolean  bVisited    // set once the node is reached during the root traversal
+    String[] asUses      // resolved Use/#Include targets (lowercased) - out-edges
+End_Struct
+
 Class cUnusedSourceFiles is a cObject
 
     Procedure Construct_Object
@@ -37,10 +47,6 @@ Class cUnusedSourceFiles is a cObject
         Property String[] pasAllFiles
         Property Integer piNoOfUnusedSourceFiles 0
         Property Boolean pbOK True
-        //
-        // Return array:
-        // ToDo: We probably don't need this.
-        // tUnusedSourceFiles[] pasUnusedSource
     End_Procedure
 
     Function FilesAsStructArray String[] asFiles Returns tUnusedSourceFiles[]
@@ -199,28 +205,117 @@ Class cUnusedSourceFiles is a cObject
         Function_Return sLine
     End_Function
 
-    // Scans all source files and returns a sorted String[] of the full resolved paths
-    // of every file referenced by a Use or #Include statement across the entire workspace.
-    // Uses index-based accumulation to avoid the O(n²) cost of repeated AppendArray calls.
-    Function UsedPackageFiles tUnusedSourceFiles[] asSourceAllFiles Returns String[]
-        String[] asUsedFilenames asSingleFile
-        Integer iCount iSize iItem iSingleCount iSingleSize
+    // Builds the adjacency model: one tNodeEdges per source file, with its
+    // resolved Use/#Include out-edges. This is the only disk-reading step
+    // (one read per file, as before); ReachableUsedNames is then pure.
+    Function BuildNodeGraph tUnusedSourceFiles[] asSourceAllFiles Returns tNodeEdges[]
+        tNodeEdges[] aNodes
+        Integer iCount iSize
+        String sFullName sExt
 
-        Move 0 to iItem
         Move (SizeOfArray(asSourceAllFiles)) to iSize
         Decrement iSize
-        For iCount From 0 to iSize
-            Get SingleFileUsedPackages (asSourceAllFiles[iCount].sPath + String(asSourceAllFiles[iCount].sFileName)) to asSingleFile
-            Move (SizeOfArray(asSingleFile)) to iSingleSize
-            If (iSingleSize > 0) Begin
-                Decrement iSingleSize
-                For iSingleCount from 0 to iSingleSize
-                    Move asSingleFile[iSingleCount] to asUsedFilenames[iItem]
+        For iCount from 0 to iSize
+            Move (asSourceAllFiles[iCount].sPath + String(asSourceAllFiles[iCount].sFileName)) to sFullName
+            Move (Lowercase(sFullName)) to aNodes[iCount].sFull
+            Move (Lowercase(asSourceAllFiles[iCount].sFileName)) to aNodes[iCount].sBare
+            Get ParseFileExtension sFullName to sExt
+            Move (Lowercase(sExt)) to aNodes[iCount].sExt
+            Move False to aNodes[iCount].bVisited
+            Get SingleFileUsedPackages sFullName to aNodes[iCount].asUses
+        Loop
+
+        Function_Return aNodes
+    End_Function
+
+    // Pure: returns every Use/#Include target name reachable from the project
+    // roots (.src files), transitively. Files that are only referenced by
+    // other UNREACHABLE files (e.g. an orphan DD that Uses other DDs/SLs while
+    // nothing Uses the orphan) are never visited, so their dependents are no
+    // longer masked as "used". Returned shape matches what UnusedPackages
+    // expects (lowercased; full-path entries contain CS_DirSeparator, bare
+    // names do not). The full-then-bare resolution mirrors UnusedPackages so
+    // reachability is at least as inclusive as its "used" test - it never
+    // under-reports a genuinely reachable file (the safe direction, since the
+    // companion .bat MOVES the files the report lists). Resolution is a linear
+    // scan per edge, which is fine for this user-triggered report (the
+    // dominant cost is the one-time file reads in BuildNodeGraph).
+    Function ReachableUsedNames tNodeEdges[] aNodes Returns String[]
+        String[] asUsedFilenames
+        Integer[] aiStack
+        Integer iCount iSize iItem iTop iNode iEdge iEdgeSize iScan
+        String sTarget sBareTarget
+        Boolean bMatch
+
+        Move 0 to iItem
+        Move (SizeOfArray(aNodes)) to iSize
+        If (iSize = 0) Begin
+            Function_Return asUsedFilenames
+        End
+        Decrement iSize
+
+        // Seed the worklist with every .src root.
+        Move 0 to iTop
+        For iCount from 0 to iSize
+            If (aNodes[iCount].sExt = "src") Begin
+                If (aNodes[iCount].bVisited = False) Begin
+                    Move True  to aNodes[iCount].bVisited
+                    Move iCount to aiStack[iTop]
+                    Increment iTop
+                End
+            End
+        Loop
+
+        // Depth-first reachability from the roots.
+        While (iTop > 0)
+            Decrement iTop
+            Move aiStack[iTop] to iNode
+            Move (SizeOfArray(aNodes[iNode].asUses)) to iEdgeSize
+            If (iEdgeSize > 0) Begin
+                Decrement iEdgeSize
+                For iEdge from 0 to iEdgeSize
+                    Move (Lowercase(aNodes[iNode].asUses[iEdge])) to sTarget
+                    // Accumulate into the used-name set (shape UnusedPackages expects).
+                    Move sTarget to asUsedFilenames[iItem]
                     Increment iItem
+                    // Resolve the target to workspace node(s) and recurse.
+                    Get ParseFileName sTarget to sBareTarget
+                    For iScan from 0 to iSize
+                        If (aNodes[iScan].bVisited = False) Begin
+                            Move False to bMatch
+                            If (aNodes[iScan].sFull = sTarget) Begin
+                                Move True to bMatch
+                            End
+                            Else If (aNodes[iScan].sBare = sTarget) Begin
+                                Move True to bMatch
+                            End
+                            Else If (aNodes[iScan].sBare = sBareTarget) Begin
+                                Move True to bMatch
+                            End
+                            If (bMatch = True) Begin
+                                Move True  to aNodes[iScan].bVisited
+                                Move iScan to aiStack[iTop]
+                                Increment iTop
+                            End
+                        End
+                    Loop
                 Loop
             End
         Loop
 
+        Function_Return asUsedFilenames
+    End_Function
+
+    // Returns every Use/#Include target reachable from the project roots
+    // (.src), transitively. Previously this scanned ALL files indiscriminately,
+    // so a cluster of unused files that only referenced each other masked each
+    // other as "used"; reachability from the roots fixes that.
+    Function UsedPackageFiles tUnusedSourceFiles[] asSourceAllFiles Returns String[]
+        tNodeEdges[] aNodes
+        String[] asUsedFilenames
+
+        Get BuildNodeGraph asSourceAllFiles to aNodes
+        Get ReachableUsedNames aNodes to asUsedFilenames
         Function_Return asUsedFilenames
     End_Function
 
@@ -298,44 +393,9 @@ Class cUnusedSourceFiles is a cObject
         Function_Return iFiles
     End_Function
 
-    // Returns sFileName unchanged, or with "_2"/"_3"/... inserted before the
-    // extension when a case-insensitive match already exists in
-    // asTakenLowerNames. Two unused files can share a name in different
-    // folders, so the generated quarantine .bat would otherwise overwrite one
-    // with the other. The chosen name (lowercased) is appended to
-    // asTakenLowerNames by ref so repeated calls within one run stay unique.
-    Function UniqueQuarantineName String sFileName String[] ByRef asTakenLowerNames Returns String
-        String  sBase sExt sCandidate sLower
-        Integer iDot iSeq iIdx
-
-        Move (RightPos(".", sFileName)) to iDot
-        If (iDot > 0) Begin
-            Move (Left(sFileName, iDot - 1)) to sBase
-            Move (Mid(sFileName, (Length(sFileName) - iDot + 1), iDot)) to sExt
-        End
-        Else Begin
-            Move sFileName to sBase
-            Move ""        to sExt
-        End
-
-        Move sFileName               to sCandidate
-        Move 1                       to iSeq
-        Move (Lowercase(sCandidate)) to sLower
-        Move (SearchArray(sLower, asTakenLowerNames)) to iIdx
-        While (iIdx <> -1)
-            Increment iSeq
-            Move (sBase + "_" + String(iSeq) + sExt) to sCandidate
-            Move (Lowercase(sCandidate))             to sLower
-            Move (SearchArray(sLower, asTakenLowerNames)) to iIdx
-        Loop
-
-        Move sLower to asTakenLowerNames[SizeOfArray(asTakenLowerNames)]
-        Function_Return sCandidate
-    End_Function
-
     Procedure RunUnusedSourceFiles
-        String[] asFiles asUsedFilenames asTakenLowerNames
-        String sHomePath sBackupFolder sQuarantineFolder sBatPath sSrc sDest
+        String[] asFiles asUsedFilenames
+        String sHomePath sBackupFolder sQuarantineFolder sBatPath sSrc sRel sDestFolder
         tUnusedSourceFiles[] asAllSourceFiles asUnusedSource
         Integer iCh iCh2 iSize iCount
         Boolean bBatOK
@@ -396,9 +456,15 @@ Class cUnusedSourceFiles is a cObject
             Writeln channel iCh2 ('if not exist "' + sQuarantineFolder + '" md "' + sQuarantineFolder + '"')
             For iCount from 0 to iSize
                 Move (asUnusedSource[iCount].sPath + String(asUnusedSource[iCount].sFileName)) to sSrc
-                Get UniqueQuarantineName (asUnusedSource[iCount].sFileName) (&asTakenLowerNames) to sDest
+                // Mirror the original sub-folder structure under the quarantine
+                // folder (same derivation the DFRefactor_Backup logic uses) so
+                // same-named files in different folders never collide and "move
+                // back to undo" is a structural no-brainer.
+                Get WorkspaceRelativeSubfolder of ghoApplication sSrc to sRel
+                Move (sQuarantineFolder + sRel) to sDestFolder
                 Writeln channel iCh2 ('echo Moving: "' + sSrc + '"')
-                Writeln channel iCh2 ('if exist "' + sSrc + '" move /Y "' + sSrc + '" "' + sQuarantineFolder + sDest + '"')
+                Writeln channel iCh2 ('if not exist "' + sDestFolder + '" md "' + sDestFolder + '"')
+                Writeln channel iCh2 ('if exist "' + sSrc + '" move /Y "' + sSrc + '" "' + sDestFolder + String(asUnusedSource[iCount].sFileName) + '"')
             Loop
             Writeln channel iCh2 "echo."
             Writeln channel iCh2 ('echo Done. Files were moved to: "' + sQuarantineFolder + '"')
