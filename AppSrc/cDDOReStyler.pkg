@@ -139,10 +139,11 @@ Class cDDOReStyler is a cObject
     End_Procedure
 
     Function StartDDORestyler Returns Integer
-        Boolean bOk bStop
-        Integer iCount iSize 
-        String[] asAllFiles 
-        
+        Boolean bOk bStop bSwapped
+        Integer iCount iSize
+        String[] asAllFiles
+        String sSWSFile
+
         Set piFileCount to 0
         Get pasAllFiles to asAllFiles
         Move (SizeOfArray(asAllFiles)) to iSize
@@ -150,6 +151,20 @@ Class cDDOReStyler is a cObject
         Set piPosition  of ghoProgressBar to 0
         Set piAdvanceBy of ghoProgressBar to 1
         Set piMaximum   of ghoProgressBar to (iSize + 1)
+
+        // Enumerate the TARGET workspace's tables exactly once here, with the
+        // active filelist redirected for ONLY this metadata call, then restore
+        // it immediately. The per-file loop below (ApplyNewStyle, WriteFile)
+        // can raise runtime errors; keeping the redirect window this tight
+        // guarantees those errors are logged to DFRefactor's OWN
+        // StatLog/Functions tables - a wider window corrupts that logging.
+        // ClassifyDDObjects reuses this cached oDataFiles.pFileList.
+        Get psSWSFile of ghoApplication to sSWSFile
+        Get ApplyTargetFilelist of ghoApplication sSWSFile to bSwapped
+        Send EnumerateAllFiles of oDataFiles
+        If (bSwapped) Begin
+            Send RestoreActiveFilelist of ghoApplication
+        End
 
         For iCount from 0 to iSize
             Send RestyleDDObjects asAllFiles[iCount] (peDDOStyle(Self))
@@ -268,7 +283,10 @@ Class cDDOReStyler is a cObject
         tFileListDDO SearchFile
         tFileListDDO[] FileList
 
-        Send EnumerateAllFiles of oDataFiles // not entirely optimal to run this in each source file but meh
+        // oDataFiles.pFileList was populated once by StartDDORestyler (with the
+        // filelist briefly redirected to the target workspace). Reuse it - do
+        // NOT re-enumerate here: that would require the redirect to be active
+        // during the error-prone per-file processing.
         Get pFileList of oDataFiles    to FileList
         Move (SizeOfArray(FileList)-1) to iListSize
         Get pDDObjects to DDObjects
@@ -432,21 +450,23 @@ Class cDDOReStyler is a cObject
                         If (DDObjects[iFile].bVerified=True) Begin
                             Move True to bReplace
                         End
-                        Else Begin
-                            Error DFErr_Program ("DDO" * DDObjects[iFile].sDDO * "was not found in the filelist. File" * sFileName)
-                        End
+                        // else: DDO not found in the filelist - cannot be
+                        // verified, so skip it. Do NOT raise a runtime Error:
+                        // these fire during the (former) filelist redirect and
+                        // on a re-run cascade into an error storm + corrupt the
+                        // run summary. "Skip" is the correct, safe behaviour.
                     End
                     Else Begin
                         // if you want to do non strict, you need to fill in ddobject.sTableName still!
                         Move True to bReplace
                     End
                     If (DDObjects[iFile].eDDOStyle = eDDUnknown) Begin
+                        // Style not recognised - skip quietly (not an error).
                         Move False to bReplace
-                        Error DFErr_Program ("DDO" * DDObjects[iFile].sDDO * "style is not recognized. File" * sFileName)
                     End
                     If (DDObjects[iFile].eDDOStyle = eStyle) Begin
+                        // Already in the requested style - nothing to do.
                         Move False to bReplace
-                        Error DFErr_Program ("DDO" * DDObjects[iFile].sDDO * "style already correct. File" * sFileName)
                     End
                     If (bReplace) Begin
                         Send ApplyNewStyleForTable DDObjects[iFile]
@@ -461,17 +481,24 @@ Class cDDOReStyler is a cObject
     // Code that handles the restyle on the DD Object in the source filename supplied
     // and changes it to the new style eDDStyle
     Procedure RestyleDDObjects String sFileName Integer eDDStyle
-        Integer iReplaced iChangedFiles
+        Integer iChangedFiles iVoid
+        String[] asBefore asAfter
         Send ReadFile sFilename
         Send FindCurrentDDObjects
         Send ClassifyDDObjects
         Set peDDOStyle to eDDStyle
-        Get ApplyNewStyle to iReplaced
-        // ApplyNewStyle returns the number of DDOs replaced in THIS file.
-        // piFileCount is the number of CHANGED files (what the run summary
-        // reports), so only count - and only rewrite - the file when at
-        // least one DDO was actually restyled in it.
-        If (iReplaced > 0) Begin
+        Get pasSource to asBefore
+        Get ApplyNewStyle to iVoid
+        Get pasSource to asAfter
+        // ApplyNewStyle's replace counter also counts NO-OP replacements - e.g.
+        // a DDO already in the target style but classified as a different enum
+        // (o<table>_DD is eDDStudioStyle, yet target eDDNewStyle also emits
+        // o<table>_DD), so the counter can't tell whether the file truly
+        // changed. Compare the source before/after instead (same approach the
+        // engine uses) - the only reliable signal. piFileCount is the number
+        // of CHANGED files the run summary reports; count and rewrite a file
+        // only when its content genuinely changed.
+        If (IsSameArray(asBefore, asAfter) = False) Begin
             Get piFileCount to iChangedFiles
             Set piFileCount to (iChangedFiles + 1)
             If (pbReadOnly(ghoFuncLib) = False) Begin
