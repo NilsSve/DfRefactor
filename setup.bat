@@ -66,6 +66,14 @@ echo Configuring this clone to keep libraries in sync on every "git pull"...
 git config submodule.recurse true
 
 echo.
+if exist "%~dp0skip-local-data.cmd" (
+    echo Protecting your local Data\ database from accidental commits...
+    call "%~dp0skip-local-data.cmd"
+) else (
+    echo [NOTE] skip-local-data.cmd not found - skipping local DB protection.
+)
+
+echo.
 echo === Setup complete ===
 echo.
 echo The Libraries\ folder now holds DFUnit, DUF and SciControlLib at the
