@@ -18,7 +18,6 @@ Use cFunctionsDataDictionary.dd
 Use cFunctionsADataDictionary.dd
 Use cFolderSelHeaDataDictionary.dd
 Use cFolderSelDtlDataDictionary.dd
-Use cRefactorEngine.pkg
 
 Activate_View Activate_oRefactorTestBench for oRefactorTestBench
 Object oRefactorTestBench is a cRefactorDbView

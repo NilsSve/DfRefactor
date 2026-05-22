@@ -4,13 +4,6 @@ Use cUnitCommandBar.pkg
 Use DFUnit\Reporting\ReporterManager.pkg
 Use DFUnit\Reporting\Reporters\UIListReporter.pkg
 
-Use cRefactorFuncLib.pkg
-// No cRefactorFuncLib object is created here. The single instance is created
-// by oRefactorFuncLib.pkg (via oUnit_Tests.pkg, inside oTestApplication) and
-// owns ghoFuncLib. A second instance here bound the editor's phoEditor to the
-// wrong funclib, so the editor fixtures skipped and the editor stayed empty.
-
-//Use ScintillaParameters.dg
 // Comment out the next Define statement line to *not* use the
 // Scintilla Editor window.
 Define CS_UseScintillaEditor for "cRefactorScintillaEditor"
@@ -48,6 +41,7 @@ Object DFUnitTestRunner_vw is a View
     Set Border_Style to Border_Thick 
     Set View_Mode to Viewmode_Normal 
     Set pbAutoActivate to True
+    Set phoRefactorView of ghoApplication to Self   
 
     Object oRunTestsButton is a Button
         Set Size to 30 87
@@ -122,7 +116,6 @@ Object DFUnitTestRunner_vw is a View
         End_Procedure
     
     End_Object
-    Set phoRefactorView of ghoApplication to Self   
 
     Object oOutputBox is a cDFUnitUIListReporter
         Set Size to 272 315
