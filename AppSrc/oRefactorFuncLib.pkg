@@ -524,6 +524,260 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Function_Return (sLine <> sOrg)
     End_Function
 
+// Text that was part of the Description, but was moved to here as it made the 
+// Description meta-tag to large, leading to a compilation problem.
+//        Not touched: `Find EQ <table>.<field>` (constant form), `-1` (recnum
+//        mode), integer literals outside these contexts, comments, and string
+//        literals (the tokenizer overlays string contents so they are immune),
+//        and any line that does not reference the named table.
+//
+    { Published = True }
+    { Description = """
+        Changes index-number references in Find / vFind / Constrained_Find /
+        Constrained_Clear / For_all commands from one index number to another,
+        SCOPED to a specific table. Useful after a table-index restructure
+        that renumbers indexes for one table.
+
+        Rewrites BOTH `Index.<N>` and bare-integer forms in these positions:
+            Find / Send Find / Get Find      : the <N> after a mode keyword
+                                               (EQ, GT, LT, GE, LE, NE,
+                                               FIRST, LAST, NEXT, PREV)
+            vFind <tbl> <N> <mode>           : the 2nd argument after vFind
+            Constrained_Find <mode> <tbl> by <N>
+            Constrained_Clear <mode> <tbl> by <N>
+            For_all <tbl> {by|down} <N>      : the <N> after by/down
+
+        Table identification (case-insensitive):
+            Direct token equal to the table name, OR
+            DDO form: object named exactly `o<TableName>_DD` or
+                      `o<TableName>_DataDictionary` (the two common
+                      DataFlex conventions). Other DDO naming conventions
+                      are NOT recognised - rewrite those manually.
+
+        sParameter format: "<TableName>,<from>,<to>" - three comma-separated
+        values; the table name and two positive (and unequal) integers.
+        Example: "Customer,3,5".
+        { MethodType = eStandardFunction }
+        { EnumList = "ANY" }
+        { SummaryText = Changed: index number in Find/Constrained/For_all commands }
+        { HelpTopic = Three comma-separated values: the table name, the FROM
+        \nindex number, and the TO index number. Example "Customer,3,5"
+        \nchanges every Index.3 / by 3 / vFind Customer.X 3 ... reference
+        \nfor the Customer table to use 5 instead. Both indexes must be
+        \npositive (DataFlex indexes are 1-based; -1 = recnum mode, which
+        \nis never modified). DDO form recognised: o<TableName>_DD and
+        \no<TableName>_DataDictionary (case-insensitive). Other DDO
+        \nnaming conventions need to be handled manually. }
+        """ }
+    Function ChangeIndexNumber String ByRef sLine String sParameter Returns Boolean
+        String sOrgLine sFromStr sToStr sToken sTokenLC sRebuilt sNewLine sLineLC sMode
+        String sKwLC sLineLCNow sNextChar sTableName sTableNameLC sRemainder
+        Integer iFromIndex iToIndex iPos iPos2 iSize iItem iNext iCandidateIdx
+        Integer iKwLen iSearchFrom iAbsPos iEndPos iPass
+        Boolean bChanged bIsForAll bFoundContext bDone bRunPass bTableMatch
+        tTokenizer TokenizerData
+
+        // ---- Parse and validate sParameter (expect "<TableName>,<from>,<to>") ----
+        Move (Trim(sParameter)) to sParameter
+        Move (Pos(",", sParameter)) to iPos
+        If (iPos = 0) Function_Return False
+        Move (Trim(Left(sParameter, iPos - 1)))         to sTableName
+        Move (Trim(Mid(sParameter, CI_EOL, iPos + 1))) to sRemainder
+        Move (Pos(",", sRemainder)) to iPos2
+        If (iPos2 = 0) Function_Return False
+        Move (Trim(Left(sRemainder, iPos2 - 1)))         to sFromStr
+        Move (Trim(Mid(sRemainder, CI_EOL, iPos2 + 1))) to sToStr
+        If (sTableName = "") Function_Return False
+        Move (Integer(sFromStr)) to iFromIndex
+        Move (Integer(sToStr))   to iToIndex
+        If (iFromIndex <= 0 or iToIndex <= 0 or iFromIndex = iToIndex) Function_Return False
+        // Normalize back to canonical digit strings (strips any "+03" oddities).
+        Move (String(iFromIndex)) to sFromStr
+        Move (String(iToIndex))   to sToStr
+        Move (Lowercase(sTableName)) to sTableNameLC
+
+        // ---- Guard: skip blank/comment/image/in-command/variable-decl lines ----
+        Get pTokenizer to TokenizerData
+        If (TokenizerData.bLineIsReady = True or TokenizerData.bIsInCommand = True or ;
+            TokenizerData.bIsInImage = True or TokenizerData.bIsVariableDeclaration = True) Begin
+            Function_Return False
+        End
+
+        // ---- Quick line filter: must contain at least one of the five trigger
+        //      keywords. Avoids accidentally renaming `Index.N` symbols in
+        //      unrelated lines. Listed explicitly (vfind / constrained_find are
+        //      technically redundant against `contains "find"` since "find" is a
+        //      substring of both, but listed for clarity of intent). ----
+        Move (Lowercase(TokenizerData.sOverstrikeLine)) to sLineLC
+        If (not(sLineLC contains "find")             and ;
+            not(sLineLC contains "vfind")            and ;
+            not(sLineLC contains "constrained_find") and ;
+            not(sLineLC contains "constrained_clear") and ;
+            not(sLineLC contains "for_all")) Begin
+            Function_Return False
+        End
+
+        // ---- Table scoping: line must reference sTableName as either a
+        //      direct token OR via the DDO naming convention. ----
+        Get _HasWordInLine sLineLC sTableNameLC to bTableMatch
+        If (bTableMatch = False) Begin
+            Get _HasWordInLine sLineLC ("o" + sTableNameLC + "_dd") to bTableMatch
+        End
+        If (bTableMatch = False) Begin
+            Get _HasWordInLine sLineLC ("o" + sTableNameLC + "_datadictionary") to bTableMatch
+        End
+        If (bTableMatch = False) Function_Return False
+
+        Move sLine to sOrgLine
+        Move False to bChanged
+        Move (SizeOfArray(TokenizerData.asLineTokens)) to iSize
+        Decrement iSize
+        If (iSize < 0) ;
+            Function_Return False
+
+        // ---- Walk tokens. Two independent checks per token: ----
+        //   (a) Token IS `Index.<from>` -> rewrite digit, preserve "Index." case.
+        //   (b) Token IS the leading keyword of a recognized context (Find /
+        //       vFind / Constrained_Find / Constrained_Clear / For_all)
+        //       whose index slot holds the bare integer <from>.
+        For iItem from 0 to iSize
+            Move TokenizerData.asLineTokens[iItem] to sToken
+            Move (Lowercase(sToken)) to sTokenLC
+
+            // (a) Index.<from>  ->  Index.<to>
+            If (sTokenLC = ("index." + sFromStr)) Begin
+                Move (Pos(".", sToken)) to iPos
+                Move (Left(sToken, iPos) + sToStr) to TokenizerData.asLineTokens[iItem]
+                Move True to bChanged
+            End
+
+            // (b1) Find (Send Find / Get Find / inline Find): walk forward to
+            //      a mode keyword; the token after the mode is the index slot.
+            If (sTokenLC = Lowercase(CS_Find)) Begin
+                Move 0     to iCandidateIdx
+                Move False to bFoundContext
+                Move (iItem + 1) to iNext
+                While (iNext <= iSize and bFoundContext = False)
+                    Move (Lowercase(TokenizerData.asLineTokens[iNext])) to sMode
+                    If (sMode = "eq"    or sMode = "gt"   or sMode = "lt"  or ;
+                        sMode = "ge"    or sMode = "le"   or sMode = "ne"  or ;
+                        sMode = "first" or sMode = "last" or ;
+                        sMode = "next"  or sMode = "prev") Begin
+                        Move True to bFoundContext
+                        If ((iNext + 1) <= iSize) Move (iNext + 1) to iCandidateIdx
+                    End
+                    Increment iNext
+                Loop
+                If (iCandidateIdx > 0) Begin
+                    If (TokenizerData.asLineTokens[iCandidateIdx] = sFromStr) Begin
+                        Move sToStr to TokenizerData.asLineTokens[iCandidateIdx]
+                        Move True to bChanged
+                    End
+                End
+            End
+
+            // (b2) vFind <tbl> <N> <mode>  -> index is exactly iItem+2.
+            If (sTokenLC = "vfind") Begin
+                If ((iItem + 2) <= iSize) Begin
+                    If (TokenizerData.asLineTokens[iItem + 2] = sFromStr) Begin
+                        Move sToStr to TokenizerData.asLineTokens[iItem + 2]
+                        Move True to bChanged
+                    End
+                End
+            End
+
+            // (b3) Constrained_Find / Constrained_Clear / For_all
+            //      -> walk forward for `by` (or `down` for For_all);
+            //         the token after is the index slot. -1 (recnum) is
+            //         never touched because the FROM check requires a
+            //         positive integer match.
+            If (sTokenLC = "constrained_find" or sTokenLC = "constrained_clear" or sTokenLC = "for_all") Begin
+                Move (sTokenLC = "for_all") to bIsForAll
+                Move 0     to iCandidateIdx
+                Move False to bFoundContext
+                Move (iItem + 1) to iNext
+                While (iNext <= iSize and bFoundContext = False)
+                    Move (Lowercase(TokenizerData.asLineTokens[iNext])) to sMode
+                    If (sMode = "by" or (bIsForAll = True and sMode = "down")) Begin
+                        Move True to bFoundContext
+                        If ((iNext + 1) <= iSize) Move (iNext + 1) to iCandidateIdx
+                    End
+                    Increment iNext
+                Loop
+                If (iCandidateIdx > 0) Begin
+                    If (TokenizerData.asLineTokens[iCandidateIdx] = sFromStr) Begin
+                        Move sToStr to TokenizerData.asLineTokens[iCandidateIdx]
+                        Move True to bChanged
+                    End
+                End
+            End
+        Loop
+
+        // ---- Reassemble line if anything actually changed via tokens ----
+        If (bChanged = True) Begin
+            Get RebuildLineFromTokens TokenizerData.asLineTokens 0 to sRebuilt
+            Get AssembleOutputLine sRebuilt TokenizerData to sNewLine
+            If (sNewLine <> sOrgLine) Begin
+                Move sNewLine to sLine
+            End
+        End
+
+        // ---- Textual fallback for `by <from>` / `down <from>` patterns. ----
+        // The framework tokenizer bundles legacy-operator expressions
+        // (e.g. on "Constrained_Clear EQ MyTable by 3" the EQ-mode causes
+        // "EQ MyTable by 3" to collapse into a single expression token),
+        // so the per-token walk above can't see `by` as a separate token.
+        // Find / vFind have a tokenizer-level exclusion so they aren't
+        // bundled; Constrained_Find / Constrained_Clear / For_all don't.
+        // We catch the missed cases here with a direct case-insensitive
+        // search on sLine, only for lines that already passed the
+        // Constrained_*/For_all line filter. Digit-boundary check on
+        // the trailing char prevents `by 30` from matching `by 3`.
+        If (sLineLC contains "constrained_find" or ;
+            sLineLC contains "constrained_clear" or ;
+            sLineLC contains "for_all") Begin
+            // Two passes: " by " always, then " down " only for For_all lines.
+            For iPass from 0 to 1
+                If (iPass = 0) Begin
+                    Move " by "         to sKwLC
+                    Move True           to bRunPass
+                End
+                Else Begin
+                    Move " down "                                 to sKwLC
+                    Move (sLineLC contains "for_all")             to bRunPass
+                End
+                If (bRunPass = True) Begin
+                    Move (Length(sKwLC)) to iKwLen
+                    Move (Lowercase(sLine)) to sLineLCNow
+                    Move 1 to iSearchFrom
+                    Move False to bDone
+                    While (iSearchFrom <= Length(sLineLCNow) and bDone = False)
+                        Move (Pos(sKwLC + sFromStr, Mid(sLineLCNow, CI_EOL, iSearchFrom))) to iAbsPos
+                        If (iAbsPos = 0) Begin
+                            Move True to bDone
+                        End
+                        Else Begin
+                            Move (iAbsPos + iSearchFrom - 1) to iAbsPos
+                            Move (iAbsPos + iKwLen + Length(sFromStr)) to iEndPos
+                            Move "" to sNextChar
+                            If (iEndPos <= Length(sLine)) Move (Mid(sLine, 1, iEndPos)) to sNextChar
+                            If (sNextChar = "" or not("0123456789" contains sNextChar)) Begin
+                                Move (Left(sLine, iAbsPos + iKwLen - 1) + sToStr + Mid(sLine, CI_EOL, iEndPos)) to sLine
+                                Move (Lowercase(sLine)) to sLineLCNow
+                                Move (iAbsPos + iKwLen + Length(sToStr)) to iSearchFrom
+                            End
+                            Else Begin
+                                Move (iAbsPos + 1) to iSearchFrom
+                            End
+                        End
+                    Loop
+                End
+            Loop
+        End
+
+        Function_Return (sLine <> sOrgLine)
+    End_Function
+
     { Published = True }
     { Description = """
         Changes legacy Left command with Left.
