@@ -1,0 +1,195 @@
+﻿//****************************************************************************
+// $Module type: Class
+// $Module name: cAsyncProcess
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : Launches an external process asynchronously (non-blocking)
+//               and lets the caller poll for completion. Designed for UI
+//               scenarios where a synchronous Send RunProgramWait would
+//               freeze the message pump and stop progress bars / cTimers
+//               from updating.
+//
+//               Built on top of StartProg.pkg's CreateProcess wrapper but
+//               keeps the process + thread handles open so the caller can
+//               poll via GetExitCodeProcess instead of immediately closing
+//               them like gStartProgram does in its fire-and-forget mode.
+//
+//               Typical usage from a UI:
+//                   Get StartProcess sCmd sParams sWorkDir False to bOK
+//                   Set pbEnabled of oPollTimer to True
+//                   ...
+//                   // in OnTimer:
+//                   Get IsProcessRunning of oCompileProcess to bRunning
+//                   If (bRunning = False) Begin
+//                       Get ProcessExitCode of oCompileProcess to iExitCode
+//                       Send CleanUp of oCompileProcess
+//                       Set pbEnabled of oPollTimer to False
+//                       // ...do post-mortem (read .err file etc)
+//                   End
+//
+// NOTE        : *Always call CleanUp once you're done* ; it's idempotent.
+//               Without it the process + thread handles leak until the
+//               program exits.
+//****************************************************************************
+Use VdfBase.pkg
+Use Winuser.pkg
+Use Winkern.pkg
+Use StartProg.pkg   // brings in tStartInfo, tProcessInfo,
+                    // tWinSecurityAttributes, CreateProcessEf,
+                    // GetExitCodeProcessEf, CloseHandleEf, GetLastError,
+                    // STILL_ACTIVE, STARTF_USESHOWWINDOW. All IFNDEF-guarded
+                    // so double-inclusion is safe.
+
+// CreateProcess dwCreationFlags. SW_HIDE in STARTUPINFO doesn't suppress
+// the console window for console-subsystem children (the compiler is one),
+// so we OR CREATE_NO_WINDOW into dwCreationFlags to tell Windows not to
+// allocate a console for the child at all.
+#IFNDEF CREATE_NO_WINDOW
+    Define CREATE_NO_WINDOW for |CI$08000000
+#ENDIF
+
+Class cAsyncProcess is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Property Handle  phProcess   0
+        Property Handle  phThread    0
+        Property Boolean pbActive    False
+        Property String  psLastError ""
+    End_Procedure
+
+    // Launches sCommand with sParams in sWorkDir and returns immediately.
+    // On success returns True; phProcess + phThread are populated and
+    // pbActive is True. On failure returns False with psLastError set.
+    //   bShowWindow  True  -> process window visible (e.g. a console).
+    //                False -> hidden; the usual case for background tools
+    //                         like the DataFlex compiler.
+    Function StartProcess String sCommand String sParams String sWorkDir Boolean bShowWindow Returns Boolean
+        String sCmd sWorkDirZ
+        Pointer pCmd pWorkDir pStartup pProcessInfo
+        Integer iRet iError iFlags
+        tWinSecurityAttributes aAttributes
+        tProcessInfo ProcessInfo
+        tStartInfo   StartInfo
+
+        // Drop any stale handle from a prior run before grabbing new ones.
+        Send CleanUp
+
+        // Quote the command if not already quoted (paths with spaces).
+        If (Left(sCommand, 1) <> '"' and (Left(sCommand, 1) <> "'")) Begin
+            Move ('"' + sCommand + '"') to sCommand
+        End
+
+        Move (sCommand + " " + sParams + (Character(0))) to sCmd
+        Move (sWorkDir + (Character(0)))                 to sWorkDirZ
+        Move (AddressOf(sCmd))      to pCmd
+        Move (AddressOf(sWorkDirZ)) to pWorkDir
+        Move (OemToAnsi(pCmd, pCmd))         to iRet
+        Move (OemToAnsi(pWorkDir, pWorkDir)) to iRet
+        If (Trim(sWorkDir) = "" or Trim(sWorkDir) = ".") Begin
+            Move 0 to pWorkDir
+        End
+
+        Move (SizeOfType(tStartInfo)) to StartInfo.cb
+        Move STARTF_USESHOWWINDOW     to StartInfo.dwFlags
+        Move 0                        to iFlags
+        If (bShowWindow = True) Begin
+            Move SW_SHOW to StartInfo.wShowWindow
+        End
+        Else Begin
+            Move SW_HIDE             to StartInfo.wShowWindow
+            // SW_HIDE alone leaves a console window for console-subsystem
+            // children. CREATE_NO_WINDOW is what actually suppresses it.
+            Move CREATE_NO_WINDOW    to iFlags
+        End
+
+        Move 0                        to ProcessInfo.hProcess
+        Move (AddressOf(StartInfo))   to pStartup
+        Move (AddressOf(ProcessInfo)) to pProcessInfo
+
+        Move (CreateProcessEf(0, pCmd, 0, 0, False, iFlags, 0, pWorkDir, pStartup, pProcessInfo)) to iRet
+        If (iRet = 0) Begin
+            Move (GetLastError()) to iError
+            Set psLastError to ("CreateProcess failed; GetLastError=" * String(iError))
+            Function_Return False
+        End
+
+        Set phProcess   to ProcessInfo.hProcess
+        Set phThread    to ProcessInfo.hThread
+        Set pbActive    to True
+        Set psLastError to ""
+        Function_Return True
+    End_Function
+
+    // True if the process started via StartProcess is still running.
+    // Returns False if no process was started, it has exited, or the exit
+    // code couldn't be retrieved (the caller should still Send CleanUp).
+    Function IsProcessRunning Returns Boolean
+        Boolean bActive
+        Handle  hProcess
+        Pointer pExitCode
+        String  sExitCode
+        Integer iRet iExitCode
+
+        Get pbActive  to bActive
+        Get phProcess to hProcess
+        If (bActive = False or hProcess = 0) Begin
+            Function_Return False
+        End
+
+        Move (Repeat(Character(0), 32)) to sExitCode
+        Move (AddressOf(sExitCode))     to pExitCode
+        Move (GetExitCodeProcessEf(hProcess, pExitCode)) to iRet
+        If (iRet = 0) Begin
+            Function_Return False
+        End
+        Move (BytesToDword(sExitCode, 1)) to iExitCode
+        Function_Return (iExitCode = STILL_ACTIVE)
+    End_Function
+
+    // Returns the process exit code, or -1 if still running / unavailable.
+    Function ProcessExitCode Returns Integer
+        Handle  hProcess
+        Pointer pExitCode
+        String  sExitCode
+        Integer iRet iExitCode
+
+        Get phProcess to hProcess
+        If (hProcess = 0) Begin
+            Function_Return -1
+        End
+
+        Move (Repeat(Character(0), 32)) to sExitCode
+        Move (AddressOf(sExitCode))     to pExitCode
+        Move (GetExitCodeProcessEf(hProcess, pExitCode)) to iRet
+        If (iRet = 0) Begin
+            Function_Return -1
+        End
+
+        Move (BytesToDword(sExitCode, 1)) to iExitCode
+        If (iExitCode = STILL_ACTIVE) Begin
+            Function_Return -1
+        End
+        Function_Return iExitCode
+    End_Function
+
+    // Closes process + thread handles and clears state. Idempotent.
+    Procedure CleanUp
+        Handle  hProcess hThread
+        Integer iRet
+
+        Get phProcess to hProcess
+        Get phThread  to hThread
+        If (hProcess <> 0) Begin
+            Move (CloseHandleEf(hProcess)) to iRet
+        End
+        If (hThread <> 0) Begin
+            Move (CloseHandleEf(hThread)) to iRet
+        End
+        Set phProcess to 0
+        Set phThread  to 0
+        Set pbActive  to False
+    End_Procedure
+
+End_Class

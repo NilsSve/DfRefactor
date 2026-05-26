@@ -1,0 +1,217 @@
+﻿//****************************************************************************
+// $Module type: Mixin
+// $Module name: cCompileMixin
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : Mixin that adds program-compilation primitives to the
+//               host class (intended for cRefactorApplication). Lets any
+//               program built on top of it compile an arbitrary .src file
+//               against the currently active workspace and check for the
+//               resulting .err file.
+//
+//               Originally lived inside TestBench.src as TestBench-only
+//               helpers (TestErrorFile / DeleteCompileErrorsFile /
+//               CompileProgram); lifted here so DFRefactor can use the
+//               same logic with a user-picked program name.
+//
+//               Public surface (callers pass a tWorkspacePaths struct
+//               describing which workspace to compile against - typically
+//               pOrgWS for TestBench-style "compile my own sample" or
+//               pTargetWS for the Test Compile dialog targeting the
+//               user-selected workspace):
+//                   Get CompileErrorFileForProgram sProgram   Returns String
+//                   Get DeleteCompileErrorsFile sProgram WS   Returns Boolean
+//                   Get CompileProgram sProgram WS (&sErrTxt) Returns Boolean
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS for a PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use WsGlobalFunctions.pkg
+Use vWin32fh.pkg
+
+// Host-class properties used by the mixin. The mixin lives in its own
+// class so the compiler needs these declared up-front; runtime dispatch
+// resolves them against the host (cRefactorApplication) instance.
+Register_Function psCompiler Returns String
+
+Class cCompileMixin is a Mixin
+
+    // No-op initializer. Kept for symmetry with other mixins in this
+    // project (the host calls Send Define_cCompileMixin in its
+    // Construct_Object - see cEditorHotKey_Mixin for the pattern).
+    Procedure Define_cCompileMixin
+    End_Procedure
+
+    // Returns the .err file name that the compiler will produce for the
+    // given program (just the file name, no path). Handles the x64 suffix.
+    //   sProgram - program name, with or without ".src" extension.
+    // Example:  "MyApp" or "MyApp.src" -> "MyApp.x64.err" (Win64)
+    //                                  or "MyApp.err"     (Win32)
+    Function CompileErrorFileForProgram String sProgram Returns String
+        String sErrFile
+        Integer iPos
+
+        // Strip any extension so we don't end up with "MyApp.src.err".
+        If (sProgram contains ".") Begin
+            Move (Pos(".", sProgram)) to iPos
+            Move (Left(sProgram, iPos - 1)) to sProgram
+        End
+        #IFDEF Is$Win64
+            Move (sProgram + ".x64" + ".err") to sErrFile
+        #ELSE
+            Move (sProgram + ".err") to sErrFile
+        #ENDIF
+        Function_Return sErrFile
+    End_Function
+
+    // Deletes any stale .err file for the given program from the given
+    // workspace's AppSrc folder, so the next compile starts clean.
+    //   sProgram - program name, with or without ".src" extension.
+    //   WS       - workspace describing where to look (typically pOrgWS
+    //              for TestBench's own sample compile, or pTargetWS for
+    //              compiles against the user-selected target).
+    // Returns False only when an existing .err file could not be deleted
+    // (True when the file did not exist OR was successfully removed).
+    Function DeleteCompileErrorsFile String sProgram tWorkspacePaths WS Returns Boolean
+        String sPath sErrFile
+        Boolean bExists bOK
+
+        Move True to bOK
+        Move (vFolderFormat(WS.sAppSrc)) to sPath
+        Get CompileErrorFileForProgram sProgram to sErrFile
+        Move (sPath + sErrFile) to sErrFile
+        Get vFilePathExists sErrFile to bExists
+        If (bExists = True) Begin
+            Move (RFDeleteFile(sErrFile)) to bOK
+        End
+        Function_Return bOK
+    End_Function
+
+    // Builds the command-line invocation for compiling sProgram against WS.
+    //   sProgram   - program name; ".src" optional, stripped if present.
+    //   WS         - workspace to compile against (WS.sSWSFile is passed
+    //                to the compiler via -x).
+    //   sErrorText - ByRef; populated with a human-readable error if the
+    //                compiler executable cannot be located.
+    //   sCmdPath   - ByRef; receives the compiler executable's full path.
+    //   sCmdArgs   - ByRef; receives the argument string for the compiler.
+    // Returns True when both ByRef outputs are populated; False (with
+    // sErrorText set) when the compiler executable can't be located.
+    //
+    // Split out of CompileProgram so callers that need to launch the
+    // compiler *asynchronously* (e.g. TestCompile.dg, which polls for
+    // completion from a cTimer to keep the UI / progress bar alive) can
+    // reuse the path-resolution + option-stripping logic without dragging
+    // in the blocking Send RunProgramWait below.
+    Function BuildCompileCommand String sProgram tWorkspacePaths WS ;
+            String ByRef sErrorText String ByRef sCmdPath String ByRef sCmdArgs ;
+            Returns Boolean
+        String sBinPath sCompPath sComOptions sSourceFile
+        Boolean bExists
+        Integer iPos
+
+        // ---- Locate the compiler executable ----
+        Get psCompiler to sCompPath
+        If (sCompPath = "") Begin
+            Get DFBinPath to sBinPath
+            Move (vFolderFormat(sBinPath)) to sBinPath
+            Move (sBinPath + CS_Compiler) to sCompPath
+        End
+        Move (Lowercase(sCompPath)) to sCompPath
+#IFDEF Is$Win64
+        Move (Replace("\bin\", sCompPath, "\bin64\")) to sCompPath
+#ENDIF
+        Get vFilePathExists sCompPath to bExists
+        If (bExists = False) Begin
+            Move ("The compiler program and path, that is setup with the 'Program Properties' dialog, cannot be found:\n" + sCompPath) to sErrorText
+            Function_Return False
+        End
+
+        // Strip ".src" (or any extension) from the program name.
+        If (Lowercase(sProgram) contains ".") Begin
+            Move (Pos(".", sProgram)) to iPos
+            Move (Left(sProgram, iPos - 1)) to sProgram
+        End
+
+        Get ReadString CS_Settings CS_Build_Options CS_CompOptions to sComOptions
+        Move (Replace("-x-", Lowercase(sComOptions), "")) to sComOptions
+        Move (Replace("-x",  Lowercase(sComOptions), "")) to sComOptions
+        Move (sProgram + ".src") to sSourceFile
+
+        Move sCompPath to sCmdPath
+        Move ("-x" + '"' + WS.sSWSFile + '"' * sComOptions * sSourceFile) to sCmdArgs
+        Function_Return True
+    End_Function
+
+    // Post-compile check: True when no .err file was produced (clean
+    // compile); False with sErrorText populated when the compiler dropped
+    // an .err file into WS.sAppSrc.
+    //
+    // Split out of CompileProgram so callers that launched the compiler
+    // asynchronously can run the same post-mortem once they observe the
+    // child process exit.
+    Function CheckCompileSucceeded String sProgram tWorkspacePaths WS ;
+            String ByRef sErrorText Returns Boolean
+        String sAppSrc sErrFile
+        Boolean bExists
+
+        Move (vFolderFormat(WS.sAppSrc)) to sAppSrc
+        Get CompileErrorFileForProgram sProgram to sErrFile
+        Get vFilePathExists (sAppSrc + sErrFile) to bExists
+        If (bExists = True) Begin
+            // Strip extension before composing the message, otherwise a
+            // caller that passed "MyApp.src" gets "MyApp.src.src program".
+            If (Lowercase(sProgram) contains ".") Begin
+                Move (Left(sProgram, Pos(".", sProgram) - 1)) to sProgram
+            End
+            Move ("The compilation of the" * (sProgram + ".src program") * "failed and can't be started. Please try to compile it from the Studio instead.") to sErrorText
+            Function_Return False
+        End
+
+        Function_Return True
+    End_Function
+
+    // Compiles sProgram (e.g. "MyApp" or "MyApp.src") against the workspace
+    // described by WS. *Blocking call* - the Send RunProgramWait inside
+    // freezes the UI message pump for the duration of the compile, so this
+    // is only appropriate for non-interactive contexts (e.g. TestBench's
+    // own self-compile checks). UIs that need to stay responsive should
+    // use BuildCompileCommand + cAsyncProcess + CheckCompileSucceeded
+    // instead - see TestCompile.dg for the canonical example.
+    //
+    //   sProgram   - program name; ".src" optional, stripped if present.
+    //   WS         - workspace to compile against. WS.sSWSFile is passed
+    //                to the compiler via -x; WS.sAppSrc is where the .err
+    //                file will appear if the compile fails. Pass pOrgWS
+    //                for a TestBench-style "compile my own sample" and
+    //                pTargetWS for compiles against the user-selected
+    //                target.
+    //   sErrorText - ByRef; receives a human-readable error message when
+    //                compilation cannot start or the compile failed. Empty
+    //                on success.
+    // Returns True when the compiler ran AND no .err file was produced
+    // (i.e. a clean compile). False on any of: compiler not found, or the
+    // compiler reported errors (=> .err file present in WS.sAppSrc).
+    Function CompileProgram String sProgram tWorkspacePaths WS String ByRef sErrorText Returns Boolean
+        String sCmdPath sCmdArgs
+        Boolean bOK
+
+        Get BuildCompileCommand sProgram WS (&sErrorText) (&sCmdPath) (&sCmdArgs) to bOK
+        If (bOK = False) Begin
+            Function_Return False
+        End
+
+        Send Cursor_Wait of Cursor_Control
+        Send RunProgramWait sCmdPath sCmdArgs
+        Send Cursor_Ready of Cursor_Control
+
+        Get CheckCompileSucceeded sProgram WS (&sErrorText) to bOK
+        Function_Return bOK
+    End_Function
+
+End_Class

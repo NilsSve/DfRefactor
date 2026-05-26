@@ -1,0 +1,401 @@
+﻿//****************************************************************************
+// $Module type: Dialog
+// $Module name: TestCompile.dg
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : Modal dialog that lets the user pick a program (.src) from
+//               the currently-selected workspace's [Projects] list and
+//               compile it. Shows a marquee progress bar while compiling
+//               and a green/red success/fail message + the .err file
+//               contents on failure.
+//
+//               Compile logic lives in cCompileMixin.pkg (imported by
+//               cRefactorApplication). This dialog only handles UI +
+//               persistence of the last-picked program per workspace.
+//****************************************************************************
+Use Windows.pkg
+Use seq_chnl.pkg
+Use cProgressBar.pkg
+Use cTimer.pkg
+Use cTextEdit.pkg
+Use cRDCModalPanel.pkg
+Use cRDCButton.pkg
+Use cRDCForm.pkg
+Use cRDCComboForm.pkg
+Use cRDCHeaderGroup.pkg
+Use cRefactorApplication.pkg
+Use RefactorConstants.h.pkg
+Use cAsyncProcess.pkg
+
+// Win32 progress-bar constants for marquee mode (not exposed by cProgressBar).
+//   PBS_MARQUEE     = 0x0008  - control style flag
+//   PBM_SETMARQUEE  = 0x040A  (WM_USER + 10) - start/stop animation
+#IFNDEF PBS_MARQUEE
+    Define PBS_MARQUEE    for |CI$08
+#ENDIF
+#IFNDEF PBM_SETMARQUEE
+    Define PBM_SETMARQUEE for |CI$40A
+#ENDIF
+
+// Key prefix used to persist the last-picked program per workspace.
+// Full key = CS_LastCompileKeyPrefix + <full path to .sws file>
+// Stored under the CS_Settings section in the program's INI.
+#IFNDEF CS_LastCompileKeyPrefix
+    Define CS_LastCompileKeyPrefix for "LastCompileProgram_"
+#ENDIF
+
+Object oTestCompile_dg is a cRDCModalPanel
+    Set Label to "Test Compile"
+    Set Size to 227 360
+    Set piMinSize to 200 360
+    Set Location to 6 6
+    Set Border_Style to Border_Thick
+    Set Locate_Mode to CENTER_ON_PARENT
+    Set Icon to "CompileProject.ico"
+
+    // -----------------------------------------------------------------
+    // Async-compile state
+    // -----------------------------------------------------------------
+    // The compiler runs as a child process launched non-blocking through
+    // cAsyncProcess, so the dialog's message pump keeps draining and the
+    // marquee + UI stay alive. oCompilePoll_tm polls IsProcessRunning
+    // every 100 ms and delegates FinishCompile to the dialog once the
+    // child process has exited. psCompilingProgram + pCompilingWS bridge
+    // StartCompile - which returns immediately after launching the compile -
+    // and FinishCompile, which fires later from the poll timer.
+
+    Property String psCompilingProgram ""
+    Property tWorkspacePaths pCompilingWS
+
+    // -----------------------------------------------------------------
+    // Selection group: program picker
+    // -----------------------------------------------------------------
+    Object oSelect_grp is a cRDCHeaderGroup
+        Set Location to 5 10
+        Set Size to 63 340
+        Set Label to "Program to compile"
+        Set psImage to "CompileProject.ico"
+
+        Object oInfo_tb is a TextBox
+            Set Location to 21 12
+            Set Size to 20 316
+            Set Auto_Size_State to False
+            Set Justification_Mode to JMode_Left
+            Set Label to "Programs are read from the current workspace's .sws [Projects] section. The last-picked program is remembered per workspace."
+        End_Object
+
+        Object oProgram_cmb is a cRDCComboForm
+            Set Location to 43 12
+            Set Size to 13 316
+            Set Label to ""
+            Set peAnchors to anTopLeftRight
+            Set psToolTip to "Pick a program from the current workspace's project list."
+            Set Entry_State to False     // combo-only (no free text)
+
+            Procedure Fill_List
+                String sSWSFile sProgram
+                String[] asProjects
+                Integer iCount iMax
+
+                Send Combo_Delete_Data
+                Get psSWSFile of ghoApplication to sSWSFile
+                If (sSWSFile = "") ;
+                    Procedure_Return
+
+                Get GetWorkspaceProjects of ghoApplication sSWSFile to asProjects
+                Move (SizeOfArray(asProjects)) to iMax
+                Decrement iMax
+                For iCount from 0 to iMax
+                    Move asProjects[iCount] to sProgram
+                    Send Combo_Add_Item sProgram
+                Loop
+            End_Procedure
+
+            Procedure OnChange
+                String sSWSFile sProgram
+                Forward Send OnChange
+                Get Value to sProgram
+                Get psSWSFile of ghoApplication to sSWSFile
+                If (sProgram <> "" and sSWSFile <> "") Begin
+                    Send WriteString of ghoApplication CS_Settings ;
+                        (CS_LastCompileKeyPrefix + sSWSFile) sProgram
+                End
+            End_Procedure
+        End_Object
+    End_Object
+
+    // -----------------------------------------------------------------
+    // Progress + result group
+    // -----------------------------------------------------------------
+    Object oResult_grp is a cRDCHeaderGroup
+        Set Location to 76 10
+        Set Size to 124 340
+        Set Label to "Result"
+        Set psImage to "ActionAbout.ico"
+        Set peAnchors to anAll
+
+        Object oResult_fm is a cRDCForm
+            Set Location to 22 12
+            Set Size to 13 296
+            Set Form_Border to Border_None
+            Set Enabled_State to False
+            Set FontWeight to FW_BOLD
+            Set peAnchors to anNone
+            Set Value to ""
+        End_Object
+
+        Object oProgress_pb is a cProgressBar
+            Set Location to 38 12
+            Set Size to 10 314
+            Set pbSmooth to True
+            Set piAdvanceBy to 1
+            Set peAnchors to anNone
+
+            // Apply the Win32 marquee style. Windows animates the moving
+            // block itself by posting WM_TIMER messages to the control,
+            // so the animation runs only while the UI thread is pumping
+            // messages - i.e. as long as the compile was launched async
+            // (see StartCompile). End_Construct_Object is the safe spot to
+            // call Set Window_Style from inside an inline Object body
+            // (Construct_Object would compile-error here: classes only).
+            Procedure End_Construct_Object
+                Forward Send End_Construct_Object
+                Set Window_Style to PBS_MARQUEE True
+            End_Procedure
+
+            // Turn the OS-driven marquee animation on. lParam 30 is the
+            // animation step interval in ms - lower = smoother but more
+            // WM_TIMER traffic.
+            Procedure StartMarquee
+                Set piPosition to 0
+                Send Windows_Message PBM_SETMARQUEE 1 30
+            End_Procedure
+
+            Procedure StopMarquee
+                Send Windows_Message PBM_SETMARQUEE 0 0
+                Set piPosition to 0
+            End_Procedure
+        End_Object
+
+        Object oDetails_edit is a cTextEdit
+            Set Location to 68 12
+            Set Size to 45 316
+            Set peAnchors to anAll
+            Set Border_Style to Border_StaticEdge
+            Set Read_Only_State to True
+            Set Value to ""
+            Set Label to "Error details (.err file contents):"
+        End_Object
+    End_Object
+
+    Object oCompile_btn is a cRDCButton
+        Set Location to 209 220
+        Set Size to 14 60
+        Set Label to "&Compile"
+        Set Default_State to True
+        Set peAnchors to anBottomRight
+        Set psImage to "CompileProject.ico"
+        Set piImageSize to 16
+
+        Procedure OnClick
+            Send StartCompile
+        End_Procedure
+
+        Function IsEnabled Returns Boolean
+            String sProgram
+            Get Value of oProgram_cmb to sProgram
+            Function_Return (sProgram <> "")
+        End_Function
+    End_Object
+
+    Object oClose_btn is a cRDCButton
+        Set Location to 209 290
+        Set Size to 14 60
+        Set Label to "C&lose"
+        Set peAnchors to anBottomRight
+
+        Procedure OnClick
+            Send Close_Panel
+        End_Procedure
+    End_Object
+
+    Object oCompileProcess is a cAsyncProcess
+    End_Object
+
+    Object oCompilePoll_tm is a cTimer
+        Set piTimeout to 100
+        Set pbEnabled to False
+
+        Procedure OnTimer
+            Boolean bRunning
+            Get IsProcessRunning of oCompileProcess to bRunning
+            If (bRunning = False) Begin
+                Set pbEnabled to False
+                Delegate Send FinishCompile
+            End
+        End_Procedure
+    End_Object
+
+    // *** Functions/Procedures ***
+
+    // Load the compiler's .err output into a single string. 
+    // Returns "" on failure. Kept local because the .err files are short; 
+    // if we ever need a general helper this should move to cRefactorFileIO.
+    Function LoadErrFileContents String sFilePath Returns String
+        String sLine sContent
+        Integer iCh
+        Boolean bExists
+
+        Get vFilePathExists sFilePath to bExists
+        If (bExists = False) ;
+            Function_Return ""
+
+        Get Seq_New_Channel to iCh
+        Direct_Input channel iCh sFilePath
+        While (not(SeqEof))
+            Readln channel iCh sLine
+            If (not(SeqEof)) ;
+                Move (sContent + sLine + Character(13) + Character(10)) to sContent
+        Loop
+        Close_Input channel iCh
+        Send Seq_Release_Channel iCh
+        Function_Return sContent
+    End_Function
+
+    // Kick off a compile and return immediately. The actual compiler
+    // runs as a hidden background process (cAsyncProcess) so the dialog's
+    // message pump keeps draining - which is what allows the PBS_MARQUEE
+    // progress bar (animated by Windows via WM_TIMER) and oCompilePoll_tm
+    // to do anything visible. The (success/fail message and
+    // .err file load) runs from FinishCompile, fired by oCompilePoll_tm
+    // once the child process has exited.
+    Procedure StartCompile
+        String sProgram sErrorText sCmdPath sCmdArgs
+        Boolean bOK
+        tWorkspacePaths TargetWS
+
+        Get Value of oProgram_cmb to sProgram
+        If (sProgram = "") Begin
+            Set Value of oResult_fm to "Please select a program first. (See: Program Properties)"
+            Set TextColor of oResult_fm to clRed
+            Procedure_Return
+        End
+
+        // Compile against the user-selected target workspace. The dialog
+        // is only enabled (see oTestCompile_btn.IsEnabled) when psSWSFile
+        // is set, so pTargetWS is populated here.
+        Get pTargetWS of ghoApplication to TargetWS
+
+        // Clean any old .err from the last attempt.
+        Get DeleteCompileErrorsFile of ghoApplication sProgram TargetWS to bOK
+        If (bOK = False) Begin
+            Set Value of oResult_fm to "Could not delete old .err file. Aborting."
+            Set TextColor of oResult_fm to clRed
+            Procedure_Return
+        End
+
+        // Resolve compiler exe + arg string up front. Catches the
+        // "compiler not found" case before any async machinery spins up.
+        Get BuildCompileCommand of ghoApplication sProgram TargetWS ;
+            (&sErrorText) (&sCmdPath) (&sCmdArgs) to bOK
+        If (bOK = False) Begin
+            Set Value of oResult_fm to sErrorText
+            Set TextColor of oResult_fm to clRed
+            Procedure_Return
+        End
+
+        // Lock UI, prime the result area, kick the marquee.
+        Set Enabled_State of oCompile_btn to False
+        Set Value of oResult_fm to ("Compiling " * sProgram * "...")
+        Set TextColor of oResult_fm to clBlack
+        Set Value of oDetails_edit to ""
+        Send StartMarquee of oProgress_pb
+
+        // Remember the in-flight compile so FinishCompile can finish it.
+        Set psCompilingProgram to sProgram
+        Set pCompilingWS       to TargetWS
+
+        // Launch hidden + non-blocking. The last arg (bShowWindow = False)
+        // keeps the compiler off-screen.
+        Get StartProcess of oCompileProcess sCmdPath sCmdArgs "" False to bOK
+        If (bOK = False) Begin
+            Get psLastError of oCompileProcess to sErrorText
+            Send StopMarquee of oProgress_pb
+            Set Enabled_State of oCompile_btn to True
+            Set Value of oResult_fm to ("Could not launch compiler: " + sErrorText)
+            Set TextColor of oResult_fm to clRed
+            Procedure_Return
+        End
+
+        // Hand off to the poll timer. StartCompile returns now; the UI is
+        // free to repaint and the marquee animates as Windows pumps
+        // WM_TIMER messages through the progress bar control.
+        Send Cursor_Wait of Cursor_Control
+        Set pbEnabled of oCompilePoll_tm to True
+    End_Procedure
+
+    // Fires from oCompilePoll_tm once the compiler process has exited.
+    // Check for an .err file, show success/failure
+    // in the result form, and surface the .err contents on failure.
+    Procedure FinishCompile
+        String sProgram sErrorText sErrFile sErrPath sAppSrc
+        Boolean bOK bExists
+        tWorkspacePaths TargetWS
+
+        Get psCompilingProgram to sProgram
+        Get pCompilingWS       to TargetWS
+
+        // Release process handles, reset cursor, stop the marquee, and
+        // re-enable the Compile button.
+        Send CleanUp of oCompileProcess
+        Send Cursor_Ready of Cursor_Control
+        Send StopMarquee of oProgress_pb
+        Set Enabled_State of oCompile_btn to True
+
+        Get CheckCompileSucceeded of ghoApplication sProgram TargetWS (&sErrorText) to bOK
+        If (bOK = True) Begin
+            Set Value of oResult_fm to ("Success: " * sProgram * "compiled cleanly.")
+            Set TextColor of oResult_fm to clGreen
+            Set Value of oDetails_edit to ""
+            Procedure_Return
+        End
+
+        // Failure path: short message + .err file contents.
+        Set Value of oResult_fm to ("Failed: " * sProgram * "did not compile.")
+        Set TextColor of oResult_fm to clRed
+
+        Get CompileErrorFileForProgram of ghoApplication sProgram to sErrFile
+        Move (vFolderFormat(TargetWS.sAppSrc)) to sAppSrc
+        Move (sAppSrc + sErrFile) to sErrPath
+        Get vFilePathExists sErrPath to bExists
+        If (bExists = True) Begin
+            Get LoadErrFileContents sErrPath to sErrorText
+        End
+        Set Value of oDetails_edit to sErrorText
+    End_Procedure
+
+    // Reset to a clean state and pre-select the last-used program for the
+    // current workspace (if any).
+    Procedure Popup
+        String sSWSFile sLastProgram
+
+        Send Fill_List of oProgram_cmb
+
+        Get psSWSFile of ghoApplication to sSWSFile
+        Get ReadString of ghoApplication CS_Settings ;
+            (CS_LastCompileKeyPrefix + sSWSFile) "" to sLastProgram
+        If (sLastProgram <> "") Begin
+            Set Value of oProgram_cmb to sLastProgram
+        End
+
+        // Clear the result/details area between invocations.
+        Set Value of oResult_fm to ""
+        Set Value of oDetails_edit to ""
+
+        Forward Send Popup
+    End_Procedure
+
+    On_Key Key_Alt+Key_C  Send KeyAction of oCompile_btn
+    On_Key Key_Alt+Key_L  Send KeyAction of oClose_btn
+End_Object

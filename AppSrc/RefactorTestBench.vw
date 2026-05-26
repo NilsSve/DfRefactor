@@ -423,10 +423,15 @@ Object oRefactorTestBench is a cRefactorDbView
         Integer iRetval
         Boolean bOK
         tRefactorFiles RefactorFiles
-        
-        Move False to Err                                  
-        Get TestErrorFile of ghoApplication to sErrFile
-        Get DeleteCompileErrorsFile of ghoApplication sErrFile to bOK
+        tWorkspacePaths OrgWS
+
+        Move False to Err
+        // RefactorTestBench compiles the test program in DFRefactor's
+        // own workspace, so pass pOrgWS regardless of any user-selected
+        // target.
+        Get pOrgWS of ghoApplication to OrgWS
+        Get CompileErrorFileForProgram of ghoApplication CS_TestProgram to sErrFile
+        Get DeleteCompileErrorsFile of ghoApplication CS_TestProgram OrgWS to bOK
         If (bOK = False) Begin
             Get YesNo_Box "Could not delete the compiler's error file. Continue?" to iRetval
             If (iRetval <> MBR_Yes) Begin
