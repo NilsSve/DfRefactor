@@ -1,6 +1,7 @@
 Use Windows.pkg
 Use DFClient.pkg
 Use File_dlg.pkg
+Use vWin32fh.pkg
 Use cCJGrid.pkg
 Use cCJGridColumn.pkg
 Use cCJGridColumnRowIndicator.pkg
@@ -73,8 +74,18 @@ Object oSortSourceCode_vw is a dbView
                 String sPath sFileName
                 Handle ho
                 Boolean bOpen
-                
-                Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
+                tWorkspacePaths TargetWS OrgWS
+
+                // Initial folder: target's AppSrc when refactoring against
+                // a user-selected workspace; DFRefactor's own otherwise.
+                Get pTargetWS of ghoApplication to TargetWS
+                If (TargetWS.sAppSrc <> "") Begin
+                    Move TargetWS.sAppSrc to sPath
+                End
+                Else Begin
+                    Get pOrgWS of ghoApplication to OrgWS
+                    Move OrgWS.sAppSrc to sPath
+                End
                 Get Create (RefClass(OpenDialog)) to ho
                 Set Filter_String  of ho to "Packages|;*.pkg|Include Files|*.inc|All Source|*.src;*.pkg;*.inc|All Files|*.*"
                 Set Initial_Folder of ho to sPath
@@ -318,7 +329,7 @@ Object oSortSourceCode_vw is a dbView
             Handle ho
             
             Get Value of oSourceFileName_fm to sFileName
-            File_Exist sFileName bExists
+            Get vFilePathExists sFileName to bExists
             If (bExists = False) Begin
                 Send Info_Box ("The file:" * String(sFileName) * "does not exist! Please adjust and try again.")
                 Procedure_Return
@@ -360,18 +371,28 @@ Object oSortSourceCode_vw is a dbView
         Procedure OnClick
             String sSourceFile sBackupFile sPath sExt sDateStamp
             Boolean bExists bSortFunction bSortProcedure bSortClassesOnly
-            Integer iRetval 
+            Integer iRetval
             Handle ho
-            
+            tWorkspacePaths TargetWS OrgWS
+
             Get YesNo_Box "This will restore the newly sorted source file with the copy from the backup folder.\n\nContinue?" to iRetval
             If (iRetval <> MBR_Yes) Begin
                 Procedure_Return
             End
-            
-            Move (oSortSourceCode(Self)) to ho  
+
+            Move (oSortSourceCode(Self)) to ho
             Get Value of oSourceFileName_fm to sSourceFile
             Get psBackupSourceFile of ho to sBackupFile
-            Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
+            // Restore destination: target's AppSrc if a workspace is
+            // selected, DFRefactor's own otherwise. Mirrors Prompt above.
+            Get pTargetWS of ghoApplication to TargetWS
+            If (TargetWS.sAppSrc <> "") Begin
+                Move TargetWS.sAppSrc to sPath
+            End
+            Else Begin
+                Get pOrgWS of ghoApplication to OrgWS
+                Move OrgWS.sAppSrc to sPath
+            End
             Move (vFolderFormat(sPath)) to sPath
             Get ParseFileName sBackupFile to sSourceFile
             Get ParseFileExtension sSourceFile to sExt
@@ -393,7 +414,7 @@ Object oSortSourceCode_vw is a dbView
             String sBackupFile
             Boolean bExists
             Get psBackupSourceFile of oSortSourceCode to sBackupFile
-            File_Exist sBackupFile bExists
+            Get vFilePathExists sBackupFile to bExists
             Function_Return (bExists = True)
         End_Function                        
         
@@ -426,7 +447,7 @@ Object oSortSourceCode_vw is a dbView
             String sBackupFile
             Boolean bExists
             Get psBackupSourceFile of oSortSourceCode to sBackupFile
-            File_Exist sBackupFile bExists
+            Get vFilePathExists sBackupFile to bExists
             Function_Return (bExists = True)
         End_Function                        
         

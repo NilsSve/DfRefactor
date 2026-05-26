@@ -17,7 +17,8 @@ Use cRDCDbForm.pkg
 Use cRDCDbSpinForm.pkg
 Use cRDCButton.pkg
 Use cRDCForm.pkg
- 
+Use TestCompile.dg
+
 Use cSysFileDataDictionary.dd
 Use cFunctionsDataDictionary.dd
 Use cFolderSelHeaDataDictionary.dd
@@ -847,9 +848,9 @@ Object oRefactorView is a cRDCDbView
     End_Object
 
     Object oRunNow_grp is a cRDCDbHeaderGroup
-        Set Size to 66 362
+        Set Size to 66 420
         Set Location to 203 270
-        Set piMinSize to 48 362
+        Set piMinSize to 48 420
         Set psLabel to "Refactor Code"
         Set psNote to "Apply functions for selected folders and filter" 
         Set psToolTip to "Calls the selected functions for the matching selected folders and file extensions."
@@ -1042,6 +1043,31 @@ Object oRefactorView is a cRDCDbView
                 Boolean bIsEnabled
                 Get IsEnabled of (oCompare_MenuItem(ghoCommandBars)) to bIsEnabled
                 Function_Return bIsEnabled
+            End_Function
+
+        End_Object
+
+        Object oTestCompile_btn is a cRDCButton
+            Set Size to 30 54
+            Set Location to 29 360
+            Set Label to "&Test Compile"
+            Set peAnchors to anBottomLeft
+            Set psImage to "CompileProject.ico"
+            Set piImageSize to 24
+            Set psToolTip to "Compile a program from the current workspace to verify the refactor did not break the build. Programs are read from the .sws [Projects] section; the last-picked program is remembered per workspace. (F5)"
+            Set MultiLineState to True
+
+            Procedure OnClick
+                Send Popup of (oTestCompile_dg(Client_Id(ghoCommandBars)))
+            End_Procedure
+
+            Function IsEnabled Returns Boolean
+                String sSWSFile
+                Get psSWSFile of ghoApplication to sSWSFile
+                Function_Return (sSWSFile <> "")
+//                Boolean bIsEnabled
+//                Get IsEnabled of (oCompare_MenuItem(ghoCommandBars)) to bIsEnabled
+//                Function_Return bIsEnabled
             End_Function
 
         End_Object

@@ -580,17 +580,21 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         // ---- Parse and validate sParameter (expect "<TableName>,<from>,<to>") ----
         Move (Trim(sParameter)) to sParameter
         Move (Pos(",", sParameter)) to iPos
-        If (iPos = 0) Function_Return False
+        If (iPos = 0) ;
+            Function_Return False
         Move (Trim(Left(sParameter, iPos - 1)))         to sTableName
         Move (Trim(Mid(sParameter, CI_EOL, iPos + 1))) to sRemainder
         Move (Pos(",", sRemainder)) to iPos2
-        If (iPos2 = 0) Function_Return False
+        If (iPos2 = 0) ;
+            Function_Return False
         Move (Trim(Left(sRemainder, iPos2 - 1)))         to sFromStr
         Move (Trim(Mid(sRemainder, CI_EOL, iPos2 + 1))) to sToStr
-        If (sTableName = "") Function_Return False
+        If (sTableName = "") ;
+            Function_Return False
         Move (Integer(sFromStr)) to iFromIndex
         Move (Integer(sToStr))   to iToIndex
-        If (iFromIndex <= 0 or iToIndex <= 0 or iFromIndex = iToIndex) Function_Return False
+        If (iFromIndex <= 0 or iToIndex <= 0 or iFromIndex = iToIndex) ;
+            Function_Return False
         // Normalize back to canonical digit strings (strips any "+03" oddities).
         Move (String(iFromIndex)) to sFromStr
         Move (String(iToIndex))   to sToStr
@@ -626,7 +630,8 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         If (bTableMatch = False) Begin
             Get _HasWordInLine sLineLC ("o" + sTableNameLC + "_datadictionary") to bTableMatch
         End
-        If (bTableMatch = False) Function_Return False
+        If (bTableMatch = False) ;
+            Function_Return False
 
         Move sLine to sOrgLine
         Move False to bChanged
@@ -739,12 +744,12 @@ Object oRefactorFuncLib is a cRefactorFuncLib
             // Two passes: " by " always, then " down " only for For_all lines.
             For iPass from 0 to 1
                 If (iPass = 0) Begin
-                    Move " by "         to sKwLC
-                    Move True           to bRunPass
+                    Move " by " to sKwLC
+                    Move True to bRunPass
                 End
                 Else Begin
-                    Move " down "                                 to sKwLC
-                    Move (sLineLC contains "for_all")             to bRunPass
+                    Move " down "                     to sKwLC
+                    Move (sLineLC contains "for_all") to bRunPass
                 End
                 If (bRunPass = True) Begin
                     Move (Length(sKwLC)) to iKwLen
@@ -1062,9 +1067,10 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         { SummaryText = Changed: lt, le, eq, ne, gt, ge to: <, <=, =, <>, >, >= }
         """ }
     Function ChangeLegacyOperators String ByRef sLine String sParameter Returns Boolean
-        String sExpression sOrg sOrgNS sOverStrikeLine sChar
+        String sExpression sOrg sOrgNS sOverStrikeLine sChar sToken
         Boolean bFound bChanged bHasEndComment
-        Integer iItem iPos iLeftParanthesis iRightParanthesis
+        Integer iItem iPos iLeftParanthesis iRightParanthesis iToken iBodyIdx iTokenMax iSearch iNotPos iIdentEnd iIfPos
+        String[] asCommands asScopeStart
         tTokenizer TokenizerData
         tOperatorsInfo OperatorInfo
 
@@ -1100,6 +1106,142 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         // The pattern ") If " (closing paren + If) uniquely identifies a secondary "If"
         // inside an expression; "Else If" and the leading "If" command are not affected.
         Move (Replaces(") " + CS_If + CS_S, sOrgNS, ") and ")) to sOrgNS
+
+        // The compiler rejects `If (a) and (b) Begin` and requires an outer pair of parens:
+        // `If ((a) and (b)) Begin`. Walk the parenthesised sub-expressions joined by " and "
+        // / " or " starting at the "If " keyword; if we found at least one such connector,
+        // wrap the whole chain with outer parens.
+        Move (Pos(CS_If + CS_S, sOrgNS)) to iPos
+        If (iPos > 0) Begin
+            Move (iPos + Length(CS_If) + 1) to iLeftParanthesis
+            If (Mid(sOrgNS, 1, iLeftParanthesis) = "(") Begin
+                Move iLeftParanthesis to iPos
+                Move 0 to iRightParanthesis
+                Move False to bFound
+                Move False to bChanged
+                While (bChanged = False)
+                    Move (Mid(sOrgNS, 1, iPos)) to sChar
+                    If (sChar <> "(") Begin
+                        Move True to bChanged
+                    End
+                    Else Begin
+                        Get _FindMatchingParentheses sOrgNS iPos to iRightParanthesis
+                        If (Lowercase(Mid(sOrgNS, 6, iRightParanthesis + 1)) = " and (") Begin
+                            Move True to bFound
+                            Move (iRightParanthesis + 6) to iPos
+                        End
+                        Else If (Lowercase(Mid(sOrgNS, 5, iRightParanthesis + 1)) = " or (") Begin
+                            Move True to bFound
+                            Move (iRightParanthesis + 5) to iPos
+                        End
+                        Else If (Lowercase(Mid(sOrgNS, 5, iRightParanthesis + 1)) = " and " ;
+                              or Lowercase(Mid(sOrgNS, 4, iRightParanthesis + 1)) = " or ") Begin
+                            // Compound chain whose second sub-expression is NOT parenthesised
+                            // (e.g. `If (X) and Not iType Set ...`). Use asLineTokens — still
+                            // unchanged here — to locate the body command, then wrap up to the
+                            // position just before that command.
+                            // Note: iTokenMax / iSearch are kept SEPARATE from iItem because the
+                            // For loop's `to` bound is re-evaluated each iteration, so reusing
+                            // the bound variable for SearchArray results would terminate the loop
+                            // prematurely the first time the result is -1.
+                            Get pasCommands   to asCommands
+                            Get pasScopeStart to asScopeStart
+                            Move -1 to iBodyIdx
+                            Move (SizeOfArray(TokenizerData.asLineTokens)) to iTokenMax
+                            Decrement iTokenMax
+                            For iToken from 1 to iTokenMax
+                                Move TokenizerData.asLineTokens[iToken] to sToken
+                                If (Lowercase(sToken) <> Lowercase(CS_If)) Begin
+                                    Move (SearchArray(sToken, asCommands, Desktop, RefFunc(DFSTRICMP))) to iSearch
+                                    If (iSearch = -1) Begin
+                                        Move (SearchArray(sToken, asScopeStart, Desktop, RefFunc(DFSTRICMP))) to iSearch
+                                    End
+                                    If (iSearch <> -1) Begin
+                                        Move iToken to iBodyIdx
+                                        Move (iTokenMax + 1) to iToken   // jump out of For loop
+                                    End
+                                End
+                            Loop
+                            If (iBodyIdx > 0) Begin
+                                Move TokenizerData.asLineTokens[iBodyIdx] to sToken
+                                Move (Pos(CS_S + sToken + CS_S, sOrgNS)) to iItem
+                                If (iItem = 0) Begin
+                                    Move (Pos(CS_S + sToken, sOrgNS)) to iItem
+                                End
+                                If (iItem > iRightParanthesis) Begin
+                                    // First, replace any remaining inner ` If ` with ` and ` in
+                                    // the boolean range. The earlier `) If ` -> `) and ` Replaces
+                                    // at line 1107 only catches Ifs that follow a `)`. A third
+                                    // compound If (DataFlex allows up to 3 on one line) preceded
+                                    // by a bare token, e.g. `If (a) If b If c body`, leaves the
+                                    // third ` If ` in place — and the compiler rejects ` If ` once
+                                    // we wrap the whole thing in outer parens. Case-insensitive so
+                                    // " If "/" if "/" IF " all qualify.
+                                    Move iLeftParanthesis to iIfPos
+                                    Repeat
+                                        Move 0 to iSearch
+                                        If (iIfPos < iItem) Begin
+                                            Move (Pos(" if ", Lowercase(Mid(sOrgNS, iItem - iIfPos, iIfPos)))) to iSearch
+                                        End
+                                        If (iSearch > 0) Begin
+                                            Move (iIfPos + iSearch - 1) to iIfPos
+                                            Move (Left(sOrgNS, iIfPos - 1) + " and " + Mid(sOrgNS, CI_EOL, iIfPos + 4)) to sOrgNS
+                                            Increment iItem   // body shifted by the inserted char
+                                            Move (iIfPos + 5) to iIfPos
+                                        End
+                                    Until (iSearch = 0)
+
+                                    // Then transform `not <ident>` -> `not(<ident>)` in the boolean
+                                    // range. DataFlex accepts `If Not X Begin` standalone, but
+                                    // inside a parenthesised compound (`If ((Y) and Not X) Begin`)
+                                    // the command-style `Not X` is rejected. Case-insensitive so
+                                    // both " Not " and " not " are caught; the original case is
+                                    // preserved in the output (just `(` and `)` inserted).
+                                    Move iLeftParanthesis to iNotPos
+                                    Repeat
+                                        Move 0 to iSearch
+                                        If (iNotPos < iItem) Begin
+                                            Move (Pos(" not ", Lowercase(Mid(sOrgNS, iItem - iNotPos, iNotPos)))) to iSearch
+                                        End
+                                        If (iSearch > 0) Begin
+                                            Move (iNotPos + iSearch - 1) to iNotPos
+                                            If (Mid(sOrgNS, 1, iNotPos + 5) <> "(") Begin
+                                                Move (iNotPos + 5) to iIdentEnd
+                                                While (iIdentEnd <= Length(sOrgNS) and Mid(sOrgNS, 1, iIdentEnd) <> CS_S)
+                                                    Increment iIdentEnd
+                                                Loop
+                                                Move (Left(sOrgNS, iNotPos + 3) + "(" + ;
+                                                      Mid(sOrgNS, iIdentEnd - iNotPos - 5, iNotPos + 5) + ")" + ;
+                                                      Mid(sOrgNS, CI_EOL, iIdentEnd)) to sOrgNS
+                                                Increment iItem   // body shifted by the inserted ')'
+                                                Move (iIdentEnd + 1) to iNotPos
+                                            End
+                                            Else Begin
+                                                Move (iNotPos + 5) to iNotPos
+                                            End
+                                        End
+                                    Until (iSearch = 0)
+
+                                    Move (iItem - 1) to iRightParanthesis   // last char of boolean expr
+                                    Move True to bFound
+                                End
+                            End
+                            Move True to bChanged
+                        End
+                        Else Begin
+                            Move True to bChanged
+                        End
+                    End
+                Loop
+                If (bFound = True) Begin
+                    Move (Left(sOrgNS, iLeftParanthesis - 1) + ;
+                          "(" + ;
+                          Mid(sOrgNS, iRightParanthesis - iLeftParanthesis + 1, iLeftParanthesis) + ;
+                          ")" + ;
+                          Mid(sOrgNS, CI_EOL, iRightParanthesis + 1)) to sOrgNS
+                End
+            End
+        End
 
         Move (TokenizerData.sIndentation + String(sOrgNS)) to sOrgNS
         If (sOrg <> sOrgNS) Begin
@@ -2140,6 +2282,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Handle ho
         Integer iRetval iSize iCount eDDOStyle
         tRefactorSettings RefactorSettings
+        tWorkspacePaths TargetWS OrgWS
 
         If (SizeOfArray(asFiles) <= 0) Begin
             Function_Return False
@@ -2155,10 +2298,16 @@ Object oRefactorFuncLib is a cRefactorFuncLib
             Move sParameter to eDDOStyle
         End
 
-        // Path for the workspace we are refactoring:
-        Get psHomePath of ghoApplication to sHomePath
-        If (sHomePath = "") Begin
-            Get psHome of (phoWorkspace(ghoApplication)) to sHomePath
+        // Path for the workspace we are refactoring: target if selected,
+        // otherwise DFRefactor's own (defensive - RestyleDDOs is normally
+        // invoked with a target workspace selected).
+        Get pTargetWS of ghoApplication to TargetWS
+        If (TargetWS.sHome <> "") Begin
+            Move TargetWS.sHome to sHomePath
+        End
+        Else Begin
+            Get pOrgWS of ghoApplication to OrgWS
+            Move OrgWS.sHome to sHomePath
         End
         Set psHomePath  of ho to sHomePath
         Set peDDOStyle  of ho to eDDOStyle

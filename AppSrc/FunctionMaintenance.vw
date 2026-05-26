@@ -208,7 +208,8 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
                 String sFunctionName sLine sPath sSourceFile sParameter
                 Boolean bChanged
                 String[] asSource asSourceFiles
-                
+                tWorkspacePaths OrgWS
+
                 Get YesNo_Box "Makes a call to all functions that has been added to the database. If e.g. a spelling error of the function name has been made, an error message will be shown. Each successful function call should return a zero (0). Continue?" to iRetval
                 If (iRetval <> MBR_Yes) Begin
                     Procedure_Return
@@ -216,7 +217,7 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
 
                 // Suspend all timers while we are working:
                 Send SuspendGUI of Desktop True
-                Move False to Err  
+                Move False to Err
                 Move False to bChanged
 
                 Showln
@@ -225,9 +226,10 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
                 //CONSOLE_FONTSIZE 6 0
 
                 Move "    [Found] Reread // End comment" to sLine
-                Move sLine to asSource[0]                   
-                Get psAppSrcPath of (phoWorkspace(ghoApplication)) to sPath
-                Move (vFolderFormat(sPath)) to sPath
+                Move sLine to asSource[0]
+                // LegacyCode.pkg lives in DFRefactor's own AppSrc.
+                Get pOrgWS of ghoApplication to OrgWS
+                Move (vFolderFormat(OrgWS.sAppSrc)) to sPath
                 Move CS_LegacyCode to sSourceFile
                 Move (sPath + String(sSourceFile)) to asSourceFiles[0]
                 Constraint_Set (Self) Clear  

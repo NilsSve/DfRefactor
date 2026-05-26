@@ -6,6 +6,7 @@ Use DFClient.pkg
 Use cRDCDbView.pkg
 Use DFEntry.pkg
 Use File_dlg.pkg
+Use vWin32fh.pkg
 Use cDbTextEdit.pkg
 Use cCJGridColumn.pkg
 Use cRDCCJSelectionGrid.pkg
@@ -389,7 +390,7 @@ Object oJSONExportImport is a cRDCDbView
                 Get ParseFolderName sFileName   to sPath
                 Get ParseFileName sFileName     to sFileName
                 
-                File_Exist (sPath + sFileName) bExists
+                Get vFilePathExists (sPath + sFileName) to bExists
                 If (bExists = True) Begin
                     Send vShellExecute "open" sFileName sPath ""
                 End 
@@ -402,7 +403,7 @@ Object oJSONExportImport is a cRDCDbView
                 String sPath sFileName 
                 Boolean bExists
                 Get Value of oExportFileName_fm to sFileName
-                File_Exist sFileName bExists
+                Get vFilePathExists sFileName to bExists
                 Function_Return  (bExists = True)
             End_Function
         
@@ -419,8 +420,10 @@ Object oJSONExportImport is a cRDCDbView
 
             Procedure OnClick
                 String sPath sFile
+                tWorkspacePaths OrgWS
 
-                Get psHome of (phoWorkspace(ghoApplication)) to sPath
+                Get pOrgWS of ghoApplication to OrgWS
+                Move OrgWS.sHome to sPath
                 Move CS_ImpExpFileJson to sFile
 
                 // We want to have that file to be selected in Windows Explorer
@@ -433,8 +436,9 @@ Object oJSONExportImport is a cRDCDbView
             Function IsEnabled Returns Boolean
                 String sPath sFile
                 Boolean bExists
-                Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                Move (vFolderFormat(sPath)) to sPath
+                tWorkspacePaths OrgWS
+                Get pOrgWS of ghoApplication to OrgWS
+                Move (vFolderFormat(OrgWS.sHome)) to sPath
                 Move CS_ImpExpFileJson to sFile
                 Get vFilePathExists (sPath + sFile) to bExists
                 Function_Return (bExists = True)
@@ -454,43 +458,45 @@ Object oJSONExportImport is a cRDCDbView
             Procedure Prompt
                 String sPath sFileName
                 String[] asSelectedFiles
-                Handle hoOpen 
-                Integer iSize 
+                Handle hoOpen
+                Integer iSize
                 Boolean bOpen
-                
+                tWorkspacePaths OrgWS
+
                 Get Create (RefClass(OpenDialog)) to hoOpen
-                Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                Set Initial_Folder of hoOpen to sPath       
-                Set MultiSelect_State of hoOpen to False   
+                Get pOrgWS of ghoApplication to OrgWS
+                Set Initial_Folder of hoOpen to OrgWS.sHome
+                Set MultiSelect_State of hoOpen to False
                 Set Dialog_Caption of hoOpen to "Select a refactor export file:"
-                Set Filter_String of hoOpen to "DFRefactor Export Files (.json)|*.json;|All Files|*.*" 
+                Set Filter_String of hoOpen to "DFRefactor Export Files (.json)|*.json;|All Files|*.*"
                 Set ShowFileTitle_State of hoOpen to True
-                Set File_Title of hoOpen to CS_ImpExpFileJson 
+                Set File_Title of hoOpen to CS_ImpExpFileJson
                 Set FileMustExist_State of hoOpen to True
                 Get Show_Dialog of hoOpen to bOpen
-                If (bOpen = True) Begin 
+                If (bOpen = True) Begin
                     Get Selected_Files of hoOpen to asSelectedFiles
                 End
-                Send Destroy of hoOpen  
-                Move (SizeOfArray(asSelectedFiles)) to iSize 
+                Send Destroy of hoOpen
+                Move (SizeOfArray(asSelectedFiles)) to iSize
                 If (iSize = 0) Begin
                     Function_Return False
-                End                      
+                End
                 Move asSelectedFiles[0] to sFileName
                 Set Value to sFileName
                 Set psExpFileJson of ghoApplication to sFileName
             End_Procedure
-            
-            Procedure Activating 
-                String sPath sFileName
 
-                Get psExpFileJson of ghoApplication to sFileName  
+            Procedure Activating
+                String sPath sFileName
+                tWorkspacePaths OrgWS
+
+                Get psExpFileJson of ghoApplication to sFileName
                 Get ExtractFilePath sFileName to sPath
                 If (sPath = "") Begin
-                    Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                    Move (vFolderFormat(sPath)) to sPath   
+                    Get pOrgWS of ghoApplication to OrgWS
+                    Move (vFolderFormat(OrgWS.sHome)) to sPath
                     Move (CS_ExportJsonFile + ".json") to sFileName
-                    Move (sPath + String(sFileName)) to sFileName  
+                    Move (sPath + String(sFileName)) to sFileName
                 End
                 Set Value to sFileName
             End_Procedure
@@ -546,40 +552,42 @@ Object oJSONExportImport is a cRDCDbView
             Procedure Prompt
                 String sPath
                 String[] asSelectedFiles
-                Handle hoOpen 
-                Integer iSize 
+                Handle hoOpen
+                Integer iSize
                 Boolean bOpen
-                
+                tWorkspacePaths OrgWS
+
                 Get Create (RefClass(OpenDialog)) to hoOpen
-                Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                Set Initial_Folder of hoOpen to sPath       
-                Set MultiSelect_State of hoOpen to False   
+                Get pOrgWS of ghoApplication to OrgWS
+                Set Initial_Folder of hoOpen to OrgWS.sHome
+                Set MultiSelect_State of hoOpen to False
                 Set Dialog_Caption of hoOpen to "Select a DFRefactor export/import file:"
-                Set Filter_String of hoOpen to "DFRefactor Import Files (.json)|*.json;|All Files|*.*" 
+                Set Filter_String of hoOpen to "DFRefactor Import Files (.json)|*.json;|All Files|*.*"
                 Set ShowFileTitle_State of hoOpen to True
                 Set FileMustExist_State of hoOpen to True
                 Get Show_Dialog of hoOpen to bOpen
-                If (bOpen = True) Begin 
+                If (bOpen = True) Begin
                     Get Selected_Files of hoOpen to asSelectedFiles
                 End
-                Send Destroy of hoOpen  
-                Move (SizeOfArray(asSelectedFiles)) to iSize 
+                Send Destroy of hoOpen
+                Move (SizeOfArray(asSelectedFiles)) to iSize
                 If (iSize = 0) Begin
                     Function_Return False
-                End                      
+                End
                 Set Value to asSelectedFiles[0]
             End_Procedure
-            
-            Procedure Activating 
-                String sPath sFileName
 
-                Get psImpFileJson of ghoApplication to sFileName  
+            Procedure Activating
+                String sPath sFileName
+                tWorkspacePaths OrgWS
+
+                Get psImpFileJson of ghoApplication to sFileName
                 Get ExtractFilePath sFileName to sPath
                 If (sPath = "") Begin
-                    Get psHome of (phoWorkspace(ghoApplication)) to sPath
-                    Move (vFolderFormat(sPath)) to sPath
+                    Get pOrgWS of ghoApplication to OrgWS
+                    Move (vFolderFormat(OrgWS.sHome)) to sPath
                     Move (CS_ImportJsonFile + ".json") to sFileName
-                    Move (sPath + String(sFileName)) to sFileName  
+                    Move (sPath + String(sFileName)) to sFileName
                 End
                 Set Value to sFileName
             End_Procedure
@@ -653,7 +661,7 @@ Object oJSONExportImport is a cRDCDbView
                 Boolean bExists
                 
                 Get Value of oImportFileName_fm to sFileName
-                File_Exist sFileName bExists
+                Get vFilePathExists sFileName to bExists
                 Function_Return (bExists = True)
             End_Function
         
@@ -681,7 +689,7 @@ Object oJSONExportImport is a cRDCDbView
                 Boolean bExists
                 
                 Get Value of oImportFileName_fm to sFileName
-                File_Exist sFileName bExists
+                Get vFilePathExists sFileName to bExists
                 Function_Return (bExists = True)
             End_Function
                 
