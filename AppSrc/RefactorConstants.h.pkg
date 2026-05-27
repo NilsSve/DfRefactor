@@ -185,6 +185,22 @@ End_Struct
 // ...) but is a snapshot, so it remains stable even if a refactoring
 // function temporarily repoints phoWorkspace.
 //
+// SINGLE PATH per field, by design. The DF 26+ .sws JSON spec lets AppSrc,
+// AppHtml, Data, DdSrc, Bitmap, Programs and Help each be a list, and
+// tSwsPaths preserves that (String[] members). tWorkspacePaths intentionally
+// flattens each to the FIRST entry because every current consumer needs a
+// single canonical directory:
+//   - cExportImportFunctions, cFileNameForm: vFolderFormat(OrgWS.sAppSrc)
+//     to build "<AppSrc>\<file>.json" — one folder, not a list.
+//   - cRefactorApplication.ApplyTargetFilelist: Set psDataPath / psFileList
+//     of phoWorkspace — those properties are scalars themselves.
+// The multi-path semantic that does matter (Get_File_Path resolution across
+// every AppSrc / DdSrc / AppHtml plus library deps) is handled separately by
+// GetTargetWorkspaceSourcePaths -> DF_OPEN_PATH; that path never collapses.
+// If a future caller genuinely needs the full list for some non-DF_OPEN_PATH
+// reason, expose a String[] helper (e.g. TargetWorkspaceAppSrcPaths) rather
+// than duplicating arrays into this snapshot.
+//
 // IMPORTANT: callers must READ from these struct fields but never write
 // them directly. To change the target workspace, call Set psSWSFile on
 // the application - that orchestrates the side effects (DF_OPEN_PATH,
@@ -201,19 +217,24 @@ Struct tWorkspacePaths
                          // folder-paths configuration). Equal to psWorkspaceWSFile
                          // of phoWorkspace at startup.
     String sHome         // psHome         (workspace home, e.g. "C:\Proj\")
-    String sAppSrc       // psAppSrcPath   (first entry only)
-    String sAppHtml      // psAppHtmlPath
-    String sBitmaps      // psBitmapPath
-    String sData         // psDataPath
-    String sDDSrc        // psDdSrcPath    (first entry only)
+    String sAppSrc       // psAppSrcPath   (first entry where the .sws permits multiple)
+    String sAppHtml      // psAppHtmlPath  (first entry where the .sws permits multiple)
+    String sBitmaps      // psBitmapPath   (first entry where the .sws permits multiple)
+    String sData         // psDataPath     (first entry where the .sws permits multiple)
+    String sDDSrc        // psDdSrcPath    (first entry where the .sws permits multiple)
     String sFileList     // psFileList     (full path incl. filelist.cfg name)
     String sFilelistName // DF_FILELIST_NAME attribute value (usually == sFileList)
-    String sHelp         // psHelpPath
-    String sPrograms     // psProgramPath
-    String sOpenPath     // DF_OPEN_PATH value at capture time (composite for target)
+    String sHelp         // psHelpPath     (first entry where the .sws permits multiple)
+    String sPrograms     // psProgramPath  (first entry where the .sws permits multiple)
+    String sOpenPath     // DF_OPEN_PATH value at capture time (composite for target;
+                         // carries every AppSrc/DdSrc/AppHtml + library dep folder)
 End_Struct
 
 // Structs for reading a DataFlex 26+ JSON-format .sws workspace file.
+// Field shapes mirror the locked format documented at
+// https://docs.dataflex.dev/Tools/DfCli/Workspace/. Paths the spec shows as
+// string-or-array are stored as String arrays here; the parser promotes a
+// scalar JSON string into a single-element array transparently.
 
 // A dependency entry: either a simple path string or a git/cloud reference object.
 Struct tSwsDependency
@@ -221,24 +242,45 @@ Struct tSwsDependency
     String  sPath           // Simple path: cloud name, relative, or absolute
     String  sSource         // Git source URL (object only)
     String  sVersion        // Tag or branch name (object only)
-    String  sRef            // Optional commit hash; only when version is a branch
     String  sSws            // Optional sub-path to .sws within the repository
 End_Struct
 
-// Workspace source and data path configuration.
+// One override entry: pins or redirects a dependency. Per spec the value may
+// be a plain version string or an object with several override properties.
+Struct tSwsOverride
+    String  sKey            // Dependency identifier being overridden (the JSON map key)
+    Boolean bIsObject       // True = object value; False = simple version string
+    String  sVersion        // Version (object form) or full value (string form)
+    String  sSws            // Optional alternate sub-path to .sws
+    Boolean bHtmlIncludes   // Override htmlIncludes flag
+    Boolean bCacheCheck     // Override cacheCheck flag
+    Boolean bInstallFiles   // Override installFiles flag
+    String  sType           // e.g. "LOCAL"
+End_Struct
+
+// Workspace source and data path configuration. All multi-form paths are
+// arrays here regardless of whether the JSON used a string or an array.
 Struct tSwsPaths
     String   sConfigFile        // e.g. "Programs/Config.ws"
-    String   sAppHtml           // e.g. "AppHtml2"
+    String[] asAppHtml          // String or array: e.g. "AppHtml"
     String[] asIndexHtml        // String or array: index HTML / Flextron host
     String[] asAppSrc           // String or array: application source folder(s)
     String[] asData             // String or array: data folder(s)
     String[] asDdSrc            // String or array: data dictionary source folder(s)
     String   sFileList          // e.g. "Data/FileList.cfg"
     String   sConnectionIni     // e.g. "Data/connection.ini"
-    String   sBitmap            // e.g. "Bitmaps"
-    String   sProgram           // e.g. "Programs"
+    String[] asBitmap           // String or array: e.g. ["Bitmaps"]
+    String[] asPrograms         // String or array: e.g. ["Programs"]
     String   sIdeSrc            // e.g. "idesrc"
-    String   sHelp              // e.g. "help"
+    String[] asHelp             // String or array: e.g. ["Help"]
+End_Struct
+
+// One build target. May appear as a plain string filename or an object with
+// at minimum a name and an optional testProject flag.
+Struct tSwsProject
+    Boolean bIsObject           // True = object form; False = plain string
+    String  sName               // Project source file name (e.g. "MyApp.src")
+    Boolean bTestProject        // testProject flag (object only)
 End_Struct
 
 // A conditional compilation flag (name is case-insensitive).
@@ -247,50 +289,66 @@ Struct tSwsConditional
     Boolean bValue          // Conditional value
 End_Struct
 
-// A preferred-class mapping shown in the Studio class browser.
+// A preferred-class mapping shown in the Studio class browser. The JSON
+// representation is a map: the key (sName) is the slot/class being preferred
+// for; the object value carries the chosen class and its source file.
 Struct tSwsPreferredClass
-    String sName            // Display name
-    String sClass           // Class identifier
+    String sName            // Map key (slot / display name, e.g. "Button")
+    String sClass           // Class identifier (e.g. "cMyButton")
     String sFile            // Source file containing the class
 End_Struct
 
 // DataFlex Studio-specific workspace settings.
 Struct tSwsStudio
-    String               sTestWindowsProject      // Project used for Windows UI testing
+    String               sWindowsTestProject      // "windowsTestProject" — project used for Windows UI testing
     tSwsConditional[]    aConditionals            // Conditional compilation flags
     Boolean              bTableEditorReadOnly     // Lock the table editor
-    Integer              iDefaultFormHeight       // Default form height (pixels)
+    Integer              iDefaultFormSpacing      // "defaultFormSpacing" — default form spacing
     Boolean              bHideSystemClasses       // Hide system classes in the browser
-    tSwsPreferredClass[] aPreferredClasses        // Preferred class mappings
+    tSwsPreferredClass[] aPreferredClasses        // Preferred class mappings (parsed from a JSON map)
 End_Struct
 
 // An HTML include: either a plain module path string or an object with attributes.
 Struct tSwsHtmlInclude
     Boolean bIsObject       // True = object notation; False = plain string (module)
     String  sFile           // Path to the include file
-    Boolean bAsync          // Async attribute (object notation only)
-    Boolean bDefer          // Defer attribute (object notation only)
+    String  sType           // type attribute (object notation, e.g. "mjs")
+    Boolean bAsync          // async attribute (object notation only)
+    String  sIntegrity      // integrity attribute (object notation, e.g. "sha384-...")
+    String  sCrossorigin    // crossorigin attribute (object notation, e.g. "anonymous")
+End_Struct
+
+// One install entry: a glob/path string or an object with a "path" property.
+Struct tSwsInstallItem
+    Boolean bIsObject       // True = object form; False = plain string
+    String  sPath           // The glob/path (may use ${Variables})
 End_Struct
 
 // Package/library distribution metadata.
 Struct tSwsPackage
-    String            sIcon           // Icon file path
-    Number            nDfMin          // Minimum supported DataFlex version
-    Number            nDfMax          // Maximum supported DataFlex version
-    String            sVersion        // Package version string (semver)
-    String[]          asInstall       // Files to install (may use ${Variables})
-    tSwsHtmlInclude[] aHtmlIncludes   // HTML include entries
+    String              sIcon           // Icon file path
+    String              sLicense        // License identifier (e.g. "MIT")
+    String              sLicenseFile    // Path to a license file
+    String              sVersion        // Package version string ("1.2.3" or built from {major,minor,revision})
+    String[]            asIncludeFiles  // Glob patterns of files to include in the package
+    String[]            asExcludeFiles  // Glob patterns of files to exclude from the package
+    tSwsInstallItem[]   aInstall        // Files to install (string or object)
+    tSwsHtmlInclude[]   aHtmlIncludes   // HTML include entries
 End_Struct
 
 // Complete in-memory representation of a DataFlex 26+ JSON .sws workspace file.
 Struct tSwsFile
-    Number           nDfVersion      // DataFlex version (root workspace only)
-    String           sDescription    // Short description (required for packages)
-    tSwsPaths        Paths           // Source and data path configuration
-    tSwsDependency[] aDependencies   // Workspace dependencies (string or object)
-    String[]         asProjects      // Project source file names
-    tSwsStudio       Studio          // DataFlex Studio settings
-    tSwsPackage      Package         // Package/library distribution metadata
+    String           sWorkspaceName              // "workspaceName" (defaults to filename if absent)
+    Number           nDfVersion                  // "df" — target DataFlex version (also our successful-parse sentinel: > 0)
+    String           sDescription                // Short description (required for packages)
+    Boolean          bNoUpdateHtml               // "no-update-html"
+    Boolean          bNoHtmlIncludeVersioning    // "no-html-include-versioning"
+    tSwsPaths        Paths                       // Source and data path configuration
+    tSwsDependency[] aDependencies               // Workspace dependencies (string or object)
+    tSwsOverride[]   aOverrides                  // Overrides (only root-workspace overrides take effect)
+    tSwsProject[]    aProjects                   // Project entries (string or object)
+    tSwsStudio       Studio                      // DataFlex Studio settings
+    tSwsPackage      Package                     // Package/library distribution metadata
 End_Struct
 
 #IFNDEF cx_DbSelect_All    
