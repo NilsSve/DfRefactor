@@ -65,8 +65,12 @@ Object oTestCompile_dg is a cRDCModalPanel
     // StartCompile - which returns immediately after launching the compile -
     // and FinishCompile, which fires later from the poll timer.
 
-    Property String psCompilingProgram ""
+    Property String          psCompilingProgram ""
     Property tWorkspacePaths pCompilingWS
+    // Set True by KillCompile right before KillProcess; checked by
+    // FinishCompile so the post-mortem can show a "Cancelled" message
+    // instead of treating a missing .err file as a clean compile.
+    Property Boolean         pbCancelled        False
 
     // -----------------------------------------------------------------
     // Selection group: program picker
@@ -85,13 +89,13 @@ Object oTestCompile_dg is a cRDCModalPanel
             Set Label to "Programs are read from the current workspace's .sws [Projects] section. The last-picked program is remembered per workspace."
         End_Object
 
-        Object oProgram_cmb is a cRDCComboForm
+        Object oProgram_cf is a cRDCComboForm
             Set Location to 43 12
             Set Size to 13 316
             Set Label to ""
             Set peAnchors to anTopLeftRight
             Set psToolTip to "Pick a program from the current workspace's project list."
-            Set Entry_State to False     // combo-only (no free text)
+            Set Entry_State to False     // combo-selection-only (no free text)
 
             Procedure Fill_List
                 String sSWSFile sProgram
@@ -189,6 +193,10 @@ Object oTestCompile_dg is a cRDCModalPanel
         End_Object
     End_Object
 
+    // Doubles as the Stop button while a compile is in flight: StartCompile
+    // sets the label to "&Stop" right after launch, FinishCompile restores
+    // it to "&Compile". OnClick dispatches based on whether the process is
+    // active, so a single button covers both verbs.
     Object oCompile_btn is a cRDCButton
         Set Location to 209 220
         Set Size to 14 60
@@ -199,12 +207,26 @@ Object oTestCompile_dg is a cRDCModalPanel
         Set piImageSize to 16
 
         Procedure OnClick
-            Send StartCompile
+            Boolean bActive
+            Get pbActive of oCompileProcess to bActive
+            If (bActive = True) Begin
+                Send KillCompile
+            End
+            Else Begin
+                Send StartCompile
+            End
         End_Procedure
 
         Function IsEnabled Returns Boolean
             String sProgram
-            Get Value of oProgram_cmb to sProgram
+            Boolean bActive
+            // While a compile is in flight the button acts as Stop and
+            // must stay enabled regardless of the combo selection.
+            Get pbActive of oCompileProcess to bActive
+            If (bActive = True) Begin
+                Function_Return True
+            End
+            Get Value of oProgram_cf to sProgram
             Function_Return (sProgram <> "")
         End_Function
     End_Object
@@ -275,7 +297,7 @@ Object oTestCompile_dg is a cRDCModalPanel
         Boolean bOK
         tWorkspacePaths TargetWS
 
-        Get Value of oProgram_cmb to sProgram
+        Get Value of oProgram_cf to sProgram
         If (sProgram = "") Begin
             Set Value of oResult_fm to "Please select a program first. (See: Program Properties)"
             Set TextColor of oResult_fm to clRed
@@ -305,8 +327,11 @@ Object oTestCompile_dg is a cRDCModalPanel
             Procedure_Return
         End
 
-        // Lock UI, prime the result area, kick the marquee.
-        Set Enabled_State of oCompile_btn to False
+        // Prime the result area and kick the marquee. The Compile button
+        // stays ENABLED throughout the compile - its label flips to
+        // "&Stop" right after a successful launch (see below) so the same
+        // button can also kill the running compiler.
+        Set pbCancelled to False
         Set Value of oResult_fm to ("Compiling " * sProgram * "...")
         Set TextColor of oResult_fm to clBlack
         Set Value of oDetails_edit to ""
@@ -322,36 +347,62 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (bOK = False) Begin
             Get psLastError of oCompileProcess to sErrorText
             Send StopMarquee of oProgress_pb
-            Set Enabled_State of oCompile_btn to True
             Set Value of oResult_fm to ("Could not launch compiler: " + sErrorText)
             Set TextColor of oResult_fm to clRed
             Procedure_Return
         End
 
-        // Hand off to the poll timer. StartCompile returns now; the UI is
-        // free to repaint and the marquee animates as Windows pumps
-        // WM_TIMER messages through the progress bar control.
-        Send Cursor_Wait of Cursor_Control
+        // We now have a live child process. Flip the button into Stop mode
+        // and hand off to the poll timer. StartCompile returns immediately;
+        // the UI is free to repaint and the marquee animates as Windows
+        // pumps WM_TIMER messages through the progress bar control.
+        Set Label of oCompile_btn to "&Stop"
         Set pbEnabled of oCompilePoll_tm to True
     End_Procedure
 
-    // Fires from oCompilePoll_tm once the compiler process has exited.
-    // Check for an .err file, show success/failure
-    // in the result form, and surface the .err contents on failure.
+    // Stop button handler (the Compile button acts as Stop while a compile
+    // is in flight). Forcibly terminates the compiler child process. The
+    // poll timer will see IsProcessRunning go False on its next tick and
+    // FinishCompile takes over from there - so all the cleanup (handle
+    // close, marquee stop, button-label restore, UI message) happens in
+    // exactly one place.
+    Procedure KillCompile
+        Set pbCancelled to True
+        Set Value of oResult_fm to "Cancelling..."
+        Set TextColor of oResult_fm to clBlack
+        // Non-zero exit code by convention; we use pbCancelled rather
+        // than the OS exit code to detect cancellation in FinishCompile
+        // (compile failures also produce non-zero codes).
+        Send KillProcess of oCompileProcess 1
+    End_Procedure
+
+    // Fires from oCompilePoll_tm once the compiler process has exited
+    // (either normally OR because KillCompile killed it). Checks the
+    // .err file, shows success / failure / cancelled in the result form,
+    // and surfaces the .err contents on failure.
     Procedure FinishCompile
         String sProgram sErrorText sErrFile sErrPath sAppSrc
-        Boolean bOK bExists
+        Boolean bOK bExists bCancelled
         tWorkspacePaths TargetWS
 
         Get psCompilingProgram to sProgram
         Get pCompilingWS       to TargetWS
+        Get pbCancelled        to bCancelled
 
-        // Release process handles, reset cursor, stop the marquee, and
-        // re-enable the Compile button.
+        // Release process handles, stop the marquee, restore the Compile
+        // button's label (it was flipped to "&Stop" by StartCompile).
         Send CleanUp of oCompileProcess
-        Send Cursor_Ready of Cursor_Control
         Send StopMarquee of oProgress_pb
-        Set Enabled_State of oCompile_btn to True
+        Set Label of oCompile_btn to "&Compile"
+
+        // Cancelled path: don't bother reading the .err file. The compiler
+        // was killed mid-write and any .err on disk would be misleading.
+        If (bCancelled = True) Begin
+            Set Value of oResult_fm to ("Cancelled: " * sProgram * "compile was stopped.")
+            Set TextColor of oResult_fm to clBlack
+            Set Value of oDetails_edit to ""
+            Procedure_Return
+        End
 
         Get CheckCompileSucceeded of ghoApplication sProgram TargetWS (&sErrorText) to bOK
         If (bOK = True) Begin
@@ -380,13 +431,13 @@ Object oTestCompile_dg is a cRDCModalPanel
     Procedure Popup
         String sSWSFile sLastProgram
 
-        Send Fill_List of oProgram_cmb
+        Send Fill_List of oProgram_cf
 
         Get psSWSFile of ghoApplication to sSWSFile
         Get ReadString of ghoApplication CS_Settings ;
             (CS_LastCompileKeyPrefix + sSWSFile) "" to sLastProgram
         If (sLastProgram <> "") Begin
-            Set Value of oProgram_cmb to sLastProgram
+            Set Value of oProgram_cf to sLastProgram
         End
 
         // Clear the result/details area between invocations.
