@@ -17,6 +17,11 @@ Object oBackupFiles_dg is a cRDCModalPanel
     Set Icon to "UndoRefactoring.ico"
 
     Property tRFSearchResult[] pasSearchResultArray
+    // True only while MoveBackBackupFiles is iterating. Drives the oOK_Btn
+    // toggle (Move Files <-> Stop), keeps oOK_Btn enabled as the Stop button,
+    // and forces every other button's IsEnabled to return False so they grey
+    // out for the duration of the move.
+    Property Boolean pbOperationInProgress False
 
     Object oBackupFiles_grd is a cRDCCJSelectionGrid
         Set Size to 175 638
@@ -128,7 +133,16 @@ Object oBackupFiles_dg is a cRDCModalPanel
         Procedure OnClick
             Integer iCheckedItems iRetval
             String sText
+            Boolean bCancelled
             tRFSearchResult[] SearchResultArray
+
+            // Toggle: while a move is in progress this button is the Stop
+            // button (label + icon swap happen in MoveBackBackupFiles), so
+            // a click here cancels the loop and bails out.
+            If (pbOperationInProgress(oBackupFiles_dg(Self)) = True) Begin
+                Send ProgressTickCancel of ghoApplication
+                Procedure_Return
+            End
 
             Get CheckedItems of oBackupFiles_grd to iCheckedItems
             If (iCheckedItems = 0) Begin
@@ -147,22 +161,36 @@ Object oBackupFiles_dg is a cRDCModalPanel
             If (iRetval <> MBR_Yes) Begin
                 Procedure_Return
             End
-            Send Cursor_Wait of Cursor_Control 
-            
+
+            // No Cursor_Wait - it makes the Stop button look unclickable.
+            // MoveBackBackupFiles disables the other buttons so it's clear
+            // that Stop (this same button, relabelled) is the only
+            // interactive control during the move.
+
             // *** Move Files ***
             Send MoveBackBackupFiles
-            
+            Get ProgressTickCancelled of ghoApplication to bCancelled
+
             // Reset grid data
             Get AllBackupFolderFiles of ghoApplication to SearchResultArray
             Set pasSearchResultArray to SearchResultArray
-            Send LoadData of oBackupFiles_grd 
-            
-            Send Cursor_Ready of Cursor_Control
-            Send Info_Box "Ready!"
+            Send LoadData of oBackupFiles_grd
+
+            If (bCancelled = True) Begin
+                Send Info_Box "Move stopped by user. Any files moved so far remain in their original folders."
+            End
+            Else Begin
+                Send Info_Box "Ready!"
+            End
         End_Procedure
 
         Function IsEnabled Returns Boolean
             Integer iCheckedItems
+            // While a move is in progress this button is the Stop button -
+            // must stay enabled so the user can click it to cancel.
+            If (pbOperationInProgress(oBackupFiles_dg(Self)) = True) Begin
+                Function_Return True
+            End
             Get CheckedItems of oBackupFiles_grd to iCheckedItems
             Function_Return (iCheckedItems <> 0)
         End_Function
@@ -189,6 +217,9 @@ Object oBackupFiles_dg is a cRDCModalPanel
             String sCompareApp
             Boolean bOK
 
+            If (pbOperationInProgress(oBackupFiles_dg(Self)) = True) Begin
+                Function_Return False
+            End
             Move False to bOK
             Get psFileCompareApp of ghoApplication to sCompareApp
             Move (sCompareApp <> "") to bOK
@@ -208,6 +239,16 @@ Object oBackupFiles_dg is a cRDCModalPanel
             Send Close_Panel
         End_Procedure
 
+        // Disabled while MoveBackBackupFiles is running so the user can't
+        // close the panel mid-loop. The Stop button (oOK_Btn, relabelled)
+        // is the only abort path during a move.
+        Function IsEnabled Returns Boolean
+            If (pbOperationInProgress(oBackupFiles_dg(Self)) = True) Begin
+                Function_Return False
+            End
+            Function_Return True
+        End_Function
+
     End_Object
 
     Object oTextBox1 is a TextBox
@@ -220,7 +261,7 @@ Object oBackupFiles_dg is a cRDCModalPanel
         Integer iSize iCount iRetval
         String sBackupFileName sSourceFileName
         String[] saSelectedItems
-        tRFSearchResult[] SearchResultArray
+        Boolean bCancelled
         Handle hoStatusBar
 
         Get Statusbar_Id to hoStatusBar
@@ -228,15 +269,50 @@ Object oBackupFiles_dg is a cRDCModalPanel
         Move (SizeOfArray(saSelectedItems)) to iSize
         Decrement iSize
 
+        // Enter "moving" mode: oOK_Btn (the button the user just pressed)
+        // becomes the Stop button - label, icon, and tooltip all swap.
+        // Every other button is disabled so the Stop toggle is the only
+        // interactive control. PumpMsgQueue forces a repaint before the
+        // first vMoveFile so the transition is visible even for short move
+        // sets that would otherwise finish in milliseconds.
+        Set pbOperationInProgress to True
+        Set Label         of oOK_Btn           to "&Stop"
+        Set psImage       of oOK_Btn           to "Stop.ico"
+        Set psToolTip     of oOK_Btn           to "Stop moving files. Files already moved stay moved."
+        Set Enabled_State of oCompare_btn      to False
+        Set Enabled_State of oSelectAll_btn    to False
+        Set Enabled_State of oSelectNone_btn   to False
+        Set Enabled_State of oSelectInvert_btn to False
+        Set Enabled_State of oCancel_Btn       to False
+        Send PumpMsgQueue of Desktop
+        Send ProgressTickStart of ghoApplication
+
         For iCount from 0 to iSize
             Move saSelectedItems[iCount] to sBackupFileName
             Move (Replace((CS_DirSeparator + CS_BackupFolder), sBackupFileName, "")) to sSourceFileName
             Move (vMoveFile(sBackupFileName, sSourceFileName)) to iRetval
             If (hoStatusBar <> 0) Begin
-                Set StatusText to ("Moving file:" * String(sSourceFileName)) 
-                Send PumpMsgQueue of Desktop
+                Set StatusText to ("Moving file:" * String(sSourceFileName) - " (click Stop to cancel)")
+            End
+            Get ProgressTick of ghoApplication to bCancelled
+            If (bCancelled = True) Begin
+                Move iSize to iCount
             End
         Loop
+
+        // Restore the panel to its idle state. Flip pbOperationInProgress
+        // FIRST so the cRDCButton idle handler's next IsEnabled call returns
+        // the normal enabled state - otherwise the explicit re-enable below
+        // could briefly flicker back to disabled on the next idle tick.
+        Set pbOperationInProgress to False
+        Set Label         of oOK_Btn          to "Move Files"
+        Set psImage       of oOK_Btn          to "ActionMoveBack.ico"
+        Set psToolTip     of oOK_Btn          to "The selected backup file(s) will be moved to their original place, overwriting what is already there."
+        Set Enabled_State of oCompare_btn     to True
+        Set Enabled_State of oSelectAll_btn    to True
+        Set Enabled_State of oSelectNone_btn   to True
+        Set Enabled_State of oSelectInvert_btn to True
+        Set Enabled_State of oCancel_Btn      to True
     End_Procedure
 
     Object oSelectAll_btn is a Button
