@@ -31,7 +31,7 @@
 // in the help folder for more details.
 //****************************************************************************
 Use RefactorConstants.h.pkg
-Use WsGlobalFunctions.pkg
+Use RFRunProgram.pkg
 Use vWin32fh.pkg
 
 // Host-class properties used by the mixin. The mixin lives in its own
@@ -92,28 +92,101 @@ Class cCompileMixin is a Mixin
         Function_Return bOK
     End_Function
 
+    // Extracts the DataFlex version substring from a compiler executable's
+    // path, by scanning for "DataFlex N.M" (case-insensitive). Returns the
+    // raw digits/separator characters as a String (e.g. "25.0", "26.0") -
+    // NOT a Number - because DataFlex's String->Number conversion uses the
+    // OS locale's decimal separator, so on a Swedish/German/etc. machine
+    // "25.0" would mis-parse (the path always uses dot but the locale
+    // expects comma). Returns "" when no recognizable version substring is
+    // found; callers should treat "" as "version unknown, skip the version
+    // check" rather than as a hard mismatch. Typical inputs:
+    //   "C:\Program Files\DataFlex 25.0\bin\DFCompConsole.exe" -> "25.0"
+    //   "C:\Program Files\DataFlex 26.0\bin64\DFComp.exe"      -> "26.0"
+    //   "C:\Custom\bin\dfcomp.exe"                             -> ""
+    Function DFVersionFromPath String sPath Returns String
+        String  sLower sVer sChar
+        Integer iPos iEnd iLen
+
+        Move (Lowercase(sPath)) to sLower
+        Move (Pos("dataflex ", sLower)) to iPos
+        If (iPos = 0) ;
+            Function_Return ""
+
+        // Move past "dataflex " (9 chars) to where the version digits start.
+        Move (iPos + 9) to iEnd
+        Move (Length(sLower)) to iLen
+        Move "" to sVer
+
+        While (iEnd <= iLen)
+            Move (Mid(sLower, 1, iEnd)) to sChar
+            // Accept both "." and "," so an install whose folder name
+            // follows a locale convention still parses cleanly.
+            If ((sChar >= "0" and sChar <= "9") or sChar = "." or sChar = ",") Begin
+                Move (sVer + sChar) to sVer
+                Increment iEnd
+            End
+            Else Begin
+                // Hit a separator (backslash, space, etc.) - stop scanning.
+                Move (iLen + 1) to iEnd
+            End
+        Loop
+
+        Function_Return sVer
+    End_Function
+
+    // Locale-safe extraction of the major version number from a version
+    // string like "25.0", "26,0", or just "25". Splits at the first "."
+    // or "," and parses the left side as Integer - Integer parsing
+    // doesn't involve a decimal separator, so it's locale-neutral and
+    // safe to compare numerically. Returns 0 when the input is empty or
+    // has no leading digits.
+    { Visibility=Private }
+    Function MajorVersionFromVersionString String sVer Returns Integer
+        String  sMajor
+        Integer iPos iVal
+
+        Move (Pos(".", sVer)) to iPos
+        If (iPos = 0) ;
+            Move (Pos(",", sVer)) to iPos
+
+        If (iPos > 0) Begin
+            Move (Left(sVer, iPos - 1)) to sMajor
+        End
+        Else Begin
+            Move sVer to sMajor
+        End
+
+        Move sMajor to iVal
+        Function_Return iVal
+    End_Function
+
     // Builds the command-line invocation for compiling sProgram against WS.
     //   sProgram   - program name; ".src" optional, stripped if present.
     //   WS         - workspace to compile against (WS.sSWSFile is passed
-    //                to the compiler via -x).
+    //                to the compiler via -x; WS.nDfVersion drives the
+    //                compiler/workspace version-mismatch check below).
     //   sErrorText - ByRef; populated with a human-readable error if the
-    //                compiler executable cannot be located.
+    //                compiler executable cannot be located OR is too old
+    //                for the workspace's DF version.
     //   sCmdPath   - ByRef; receives the compiler executable's full path.
     //   sCmdArgs   - ByRef; receives the argument string for the compiler.
     // Returns True when both ByRef outputs are populated; False (with
-    // sErrorText set) when the compiler executable can't be located.
+    // sErrorText set) when the compiler executable can't be located, or
+    // when a known version mismatch would make the compile fail anyway.
     //
     // Split out of CompileProgram so callers that need to launch the
     // compiler *asynchronously* (e.g. TestCompile.dg, which polls for
     // completion from a cTimer to keep the UI / progress bar alive) can
     // reuse the path-resolution + option-stripping logic without dragging
-    // in the blocking Send RunProgramWait below.
+    // in the blocking Send RFRunProgramWait below.
     Function BuildCompileCommand String sProgram tWorkspacePaths WS ;
-            String ByRef sErrorText String ByRef sCmdPath String ByRef sCmdArgs ;
-            Returns Boolean
-        String sBinPath sCompPath sComOptions sSourceFile
+             String ByRef sErrorText String ByRef sCmdPath String ByRef sCmdArgs ;
+             Returns Boolean
+
+        String  sBinPath sCompPath sComOptions sSourceFile sCompilerVer
         Boolean bExists
-        Integer iPos
+        Integer iPos iCompilerMajor iWsMajor
 
         // ---- Locate the compiler executable ----
         Get psCompiler to sCompPath
@@ -128,8 +201,38 @@ Class cCompileMixin is a Mixin
 #ENDIF
         Get vFilePathExists sCompPath to bExists
         If (bExists = False) Begin
-            Move ("The compiler program and path, that is setup with the 'Program Properties' dialog, cannot be found:\n" + sCompPath) to sErrorText
+            Move ("The compiler program and path, that is setup with the 'Program Properties' dialog, cannot be found: " + sCompPath) to sErrorText
             Function_Return False
+        End
+
+        // ---- Pre-flight: compiler/workspace version compatibility ----
+        // CreateProcess will happily launch a DF25 compiler against a DF26
+        // JSON .sws — the compiler then pops a "File X.src not found" dialog
+        // because it couldn't parse the workspace to find AppSrc, exits
+        // non-zero, and we'd surface that post-facto. Catch the obvious
+        // mismatch here instead, before the user has to dismiss the dialog.
+        // Fail open when we can't infer the compiler's version from the
+        // path (custom installs, renamed folders) — better to let the user
+        // try than to wrongly block a working setup.
+        //
+        // Compare MAJOR versions only, parsed as Integer (locale-safe):
+        // DFVersionFromPath keeps the version as a String and the Number
+        // cast on WS.nDfVersion gets truncated to its integer part, so
+        // the comparison doesn't trip over the OS decimal separator.
+        //
+        // Single-line message: caller surfaces sErrorText in oResult_fm
+        // which is a single-line cRDCForm; CS_CRLF would render as a glyph.
+        Get DFVersionFromPath sCompPath to sCompilerVer
+        If (sCompilerVer <> "" and WS.nDfVersion > 0) Begin
+            Get MajorVersionFromVersionString sCompilerVer to iCompilerMajor
+            Move WS.nDfVersion to iWsMajor        // truncates Number -> Integer
+            If (iCompilerMajor > 0 and iCompilerMajor < iWsMajor) Begin
+                Move ("Compiler/workspace version mismatch: compiler is DataFlex " + String(iCompilerMajor) ;
+                      + " but workspace is DataFlex " + String(iWsMajor) ;
+                      + ". Update Program Properties to use a DataFlex " + String(iWsMajor) ;
+                      + " or later compiler.") to sErrorText
+                Function_Return False
+            End
         End
 
         // Strip ".src" (or any extension) from the program name.
@@ -156,7 +259,8 @@ Class cCompileMixin is a Mixin
     // asynchronously can run the same post-mortem once they observe the
     // child process exit.
     Function CheckCompileSucceeded String sProgram tWorkspacePaths WS ;
-            String ByRef sErrorText Returns Boolean
+             String ByRef sErrorText Returns Boolean
+        
         String sAppSrc sErrFile
         Boolean bExists
 
@@ -177,7 +281,7 @@ Class cCompileMixin is a Mixin
     End_Function
 
     // Compiles sProgram (e.g. "MyApp" or "MyApp.src") against the workspace
-    // described by WS. *Blocking call* - the Send RunProgramWait inside
+    // described by WS. *Blocking call* - the Send RFRunProgramWait inside
     // freezes the UI message pump for the duration of the compile, so this
     // is only appropriate for non-interactive contexts (e.g. TestBench's
     // own self-compile checks). UIs that need to stay responsive should
@@ -207,7 +311,7 @@ Class cCompileMixin is a Mixin
         End
 
         Send Cursor_Wait of Cursor_Control
-        Send RunProgramWait sCmdPath sCmdArgs
+        Send RFRunProgramWait sCmdPath sCmdArgs
         Send Cursor_Ready of Cursor_Control
 
         Get CheckCompileSucceeded sProgram WS (&sErrorText) to bOK
