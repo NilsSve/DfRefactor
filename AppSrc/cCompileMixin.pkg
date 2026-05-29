@@ -87,7 +87,7 @@ Class cCompileMixin is a Mixin
         Move (sPath + sErrFile) to sErrFile
         Get vFilePathExists sErrFile to bExists
         If (bExists = True) Begin
-            Move (RFDeleteFile(sErrFile)) to bOK
+            Move (rfDeleteFile(sErrFile)) to bOK
         End
         Function_Return bOK
     End_Function
@@ -179,14 +179,14 @@ Class cCompileMixin is a Mixin
     // compiler *asynchronously* (e.g. TestCompile.dg, which polls for
     // completion from a cTimer to keep the UI / progress bar alive) can
     // reuse the path-resolution + option-stripping logic without dragging
-    // in the blocking Send RFRunProgramWait below.
+    // in the blocking Send rfRunProgramWait below.
     Function BuildCompileCommand String sProgram tWorkspacePaths WS ;
              String ByRef sErrorText String ByRef sCmdPath String ByRef sCmdArgs ;
              Returns Boolean
 
-        String  sBinPath sCompPath sComOptions sSourceFile sCompilerVer
-        Boolean bExists
-        Integer iPos iCompilerMajor iWsMajor
+        String  sBinPath sCompPath sComOptions sCompilerVer
+        Boolean bExists bDfCli
+        Integer iCompilerMajor iWsMajor
 
         // ---- Locate the compiler executable ----
         Get psCompiler to sCompPath
@@ -199,6 +199,19 @@ Class cCompileMixin is a Mixin
 #IFDEF Is$Win64
         Move (Replace("\bin\", sCompPath, "\bin64\")) to sCompPath
 #ENDIF
+
+        // Classify the resolved compiler once: df-cli (DF26+) speaks the
+        // "build-file" command line; the older DFComp/DFCompConsole speak
+        // "-x". This single flag drives the dialect, the build-options
+        // handling, and the bin64 workaround below. It is a RUNTIME decision,
+        // not a build-time one: a DF26 build may be pointed at an older
+        // compiler (e.g. to test-compile a DF19.1 workspace with that Studio's
+        // own compiler), and a DF25 build may be pointed at df-cli. sCompPath
+        // is already lowercased above.
+        Move False to bDfCli
+        If (sCompPath contains "df-cli") ;
+            Move True to bDfCli
+
         Get vFilePathExists sCompPath to bExists
         If (bExists = False) Begin
             Move ("The compiler program and path, that is setup with the 'Program Properties' dialog, cannot be found: " + sCompPath) to sErrorText
@@ -206,8 +219,9 @@ Class cCompileMixin is a Mixin
         End
 
         // Resolve the workspace's MAJOR version up front (locale-safe Integer)
-        // so the pre-flight check, the bin64->bin substitution, and the
-        // args-format choice can all share the same value.
+        // for the compiler/workspace pre-flight check below. (The command-line
+        // dialect and the bin64->bin workaround key off bDfCli - the compiler
+        // actually being invoked - not this value.)
         // WS.sDfVersion is a String (e.g. "26.0") to dodge the OS decimal-
         // separator trap that would mis-parse "26.0" on a Swedish/German/etc.
         // machine — see feedback_dataflex_locale_decimal_separator. The helper
@@ -238,43 +252,40 @@ Class cCompileMixin is a Mixin
                 Function_Return False
             End
         End
-
-        // Strip ".src" (or any extension) from the program name.
-        If (Lowercase(sProgram) contains ".") Begin
-            Move (Pos(".", sProgram)) to iPos
-            Move (Left(sProgram, iPos - 1)) to sProgram
+        
+        // Build options (the "-x ..." flags) apply only to the legacy console
+        // compiler; df-cli's directives are hard-coded in the build-file
+        // command below, so only read/strip them when we are NOT using df-cli.
+        If (bDfCli = False) Begin
+            Get ReadString CS_Settings CS_Build_Options CS_CompOptions to sComOptions
+            Move (Replace("-x-", Lowercase(sComOptions), "")) to sComOptions
+            Move (Replace("-x",  Lowercase(sComOptions), "")) to sComOptions
         End
 
-        Get ReadString CS_Settings CS_Build_Options CS_CompOptions to sComOptions
-        Move (Replace("-x-", Lowercase(sComOptions), "")) to sComOptions
-        Move (Replace("-x",  Lowercase(sComOptions), "")) to sComOptions
-        Move (sProgram + ".src") to sSourceFile
-
-        // Workaround: when the target workspace is DF26+, force the compiler
-        // path back to \bin\ even if the Is$Win64 substitution above flipped
-        // it (or the user picked it) to \bin64\. The 64-bit df-cli.exe in
-        // the DF26.0 release returns exit code 23 on otherwise-valid
-        // invocations; the 32-bit binary in \bin\ works. Re-evaluate /
-        // remove this once DAW ships a fix (open issue: <link to ticket>).
-        If (iWsMajor > 25) Begin
+        // Workaround: when invoking df-cli, force the compiler path back to
+        // \bin\ even if the Is$Win64 substitution above flipped it (or the
+        // user picked it) to \bin64\. The 64-bit df-cli.exe in the DF26.0
+        // release returns exit code 23 on otherwise-valid invocations; the
+        // 32-bit binary in \bin\ works. Re-evaluate / remove this once DAW
+        // ships a fix (open issue: <link to ticket>). Keying off bDfCli (not
+        // the workspace version) also covers a DF26 build pointed at df-cli to
+        // compile an older workspace.
+        If (bDfCli = True) Begin
             Move (Replace("\bin64\", sCompPath, "\bin\")) to sCompPath
         End
         Move sCompPath to sCmdPath
-        #IF (!@ <= 250)
-            If (iWsMajor < 26) Begin
-                Move ("-x" + '"' + WS.sSWSFile + '"' * sComOptions * sSourceFile) to sCmdArgs
-            End
-            Else Begin
-                // New syntax from DF26 and up:
-                Move " --workspace" to sComOptions
-                Append sCmdArgs "build-file" " " ('"' + WS.sAppSrc + "\" + sSourceFile + '"') " " sComOptions " " ('"' + WS.sSWSFile + '"') " --rebuild"
-            End
-        #ELSE
-        // For our purposes, which is to test-compile, we want to hard-code the compiler directives, as we always wants to
-        // compile for a workspace and also a recompile.
-        Move " --workspace" to sComOptions
-        Append sCmdArgs "build-file" " " ('"' + WS.sAppSrc + "\" + sSourceFile + '"') " " sComOptions " " ('"' + WS.sSWSFile + '"') " --rebuild"
-        #ENDIF
+
+        // Emit the command line in the dialect the chosen compiler speaks:
+        // df-cli (DF26+) uses "build-file"; the legacy DFComp/DFCompConsole
+        // use "-x". For test-compiling we always build against the workspace
+        // and force a full rebuild, so the df-cli directives are hard-coded.
+        If (bDfCli = True) Begin
+            Move " --workspace" to sComOptions
+            Append sCmdArgs "build-file" " " ('"' + WS.sAppSrc + "\" + sProgram + '"') " " sComOptions " " ('"' + WS.sSWSFile + '"') " --rebuild --force --no-warnings"
+        End
+        Else Begin
+            Move ("-x" + '"' + WS.sSWSFile + '"' * sComOptions * sProgram) to sCmdArgs
+        End
         Function_Return True
     End_Function
 
@@ -308,7 +319,7 @@ Class cCompileMixin is a Mixin
     End_Function
 
     // Compiles sProgram (e.g. "MyApp" or "MyApp.src") against the workspace
-    // described by WS. *Blocking call* - the Send RFRunProgramWait inside
+    // described by WS. *Blocking call* - the Send rfRunProgramWait inside
     // freezes the UI message pump for the duration of the compile, so this
     // is only appropriate for non-interactive contexts (e.g. TestBench's
     // own self-compile checks). UIs that need to stay responsive should
@@ -338,7 +349,7 @@ Class cCompileMixin is a Mixin
         End
 
         Send Cursor_Wait of Cursor_Control
-        Send RFRunProgramWait sCmdPath sCmdArgs
+        Send rfRunProgramWait sCmdPath sCmdArgs
         Send Cursor_Ready of Cursor_Control
 
         Get CheckCompileSucceeded sProgram WS (&sErrorText) to bOK

@@ -15,7 +15,6 @@
 //               persistence of the last-picked program per workspace.
 //****************************************************************************
 Use Windows.pkg
-Use seq_chnl.pkg
 Use cProgressBar.pkg
 Use cTimer.pkg
 Use cTextEdit.pkg
@@ -27,6 +26,7 @@ Use cRDCHeaderGroup.pkg
 Use cRefactorApplication.pkg
 Use RefactorConstants.h.pkg
 Use cAsyncProcess.pkg
+Use cEncodingHelpers.pkg
 
 // Win32 progress-bar constants for marquee mode (not exposed by cProgressBar).
 //   PBS_MARQUEE     = 0x0008  - control style flag
@@ -73,6 +73,23 @@ Object oTestCompile_dg is a cRDCModalPanel
     // since "what the user thinks they passed" and "what the compiler
     // actually received" diverge often.
     Property String          psCompiledCmdLine  ""
+    // Absolute path to the temp file that captures the compiler's stdout +
+    // stderr. Written by the cmd.exe wrapper StartCompile launches, tailed
+    // by oCompilePoll_tm into oDetails_edit, and deleted by FinishCompile
+    // once consumed. Empty when no compile is in flight.
+    Property String          psCompileLogFile   ""
+    // Tick counter incremented every oCompilePoll_tm fire (every 100 ms).
+    // Used to sub-sample updates: elapsed-time display every 10 ticks
+    // (~1 s), log-file tail every 5 ticks (~500 ms). Reset to 0 at the
+    // start of each compile.
+    Property Integer         piCompileTicks     0
+    // Byte size of psCompileLogFile as of the last tick that refreshed the
+    // details pane. UpdateCompileProgress compares the live file size to
+    // this and only rereads + repaints when the log has actually grown -
+    // the cTextEdit rewrite (and the whole-file read) is the costly part,
+    // and most ticks during a single-file compile see no new output. Reset
+    // to 0 at the start of each compile.
+    Property Integer         piLastLogSize      0
     // Set True by KillCompile right before KillProcess; checked by
     // FinishCompile so the post-mortem can show a "Cancelled" message
     // instead of treating a missing .err file as a clean compile.
@@ -255,40 +272,34 @@ Object oTestCompile_dg is a cRDCModalPanel
         Set piTimeout to 100
         Set pbEnabled to False
 
+        // Fires every 100 ms while a compile is in flight. Detects process
+        // exit (-> FinishCompile) and otherwise hands off to the dialog's
+        // UpdateCompileProgress, which sub-samples expensive per-tick work
+        // (elapsed-time text every ~1 s, log-file tail every ~500 ms).
         Procedure OnTimer
             Boolean bRunning
             Get IsProcessRunning of oCompileProcess to bRunning
             If (bRunning = False) Begin
                 Set pbEnabled to False
                 Delegate Send FinishCompile
+                Procedure_Return
             End
+            Delegate Send UpdateCompileProgress
         End_Procedure
     End_Object
 
     // *** Functions/Procedures ***
 
-    // Load the compiler's .err output into a single string. 
-    // Returns "" on failure. Kept local because the .err files are short; 
-    // if we ever need a general helper this should move to cRefactorFileIO.
+    // Load the compiler's .err output into a single string.
+    // Returns "" on failure (missing / empty / locked file).
+    //
+    // Delegates to the byte-safe RFReadEncodedFileAsString helper - same
+    // rationale as LoadCompileLogTail: one Read_Block plus a single decode
+    // pass instead of a text-mode Readln loop, so OEM / extended bytes in
+    // compiler error text aren't mangled and there's no O(n^2) per-line
+    // string concatenation.
     Function LoadErrFileContents String sFilePath Returns String
-        String sLine sContent
-        Integer iCh
-        Boolean bExists
-
-        Get vFilePathExists sFilePath to bExists
-        If (bExists = False) ;
-            Function_Return ""
-
-        Get Seq_New_Channel to iCh
-        Direct_Input channel iCh sFilePath
-        While (not(SeqEof))
-            Readln channel iCh sLine
-            If (not(SeqEof)) ;
-                Move (sContent + sLine + Character(13) + Character(10)) to sContent
-        Loop
-        Close_Input channel iCh
-        Send Seq_Release_Channel iCh
-        Function_Return sContent
+        Function_Return (RFReadEncodedFileAsString(sFilePath))
     End_Function
 
     // Kick off a compile and return immediately. The actual compiler
@@ -299,9 +310,9 @@ Object oTestCompile_dg is a cRDCModalPanel
     // .err file load) runs from FinishCompile, fired by oCompilePoll_tm
     // once the child process has exited.
     Procedure StartCompile
-        String sProgram sErrorText sCmdPath sCmdArgs sWorkDir
+        String sProgram sErrorText sCmdPath sCmdArgs sWorkDir sLogFile sLaunchArgs
         Boolean bOK
-        tWorkspacePaths TargetWS
+        tWorkspacePaths TargetWS OrgWS
 
         Get Value of oProgram_cf to sProgram
         If (sProgram = "") Begin
@@ -358,10 +369,37 @@ Object oTestCompile_dg is a cRDCModalPanel
         // DFRefactor happens to have at the moment.
         Move TargetWS.sPrograms to sWorkDir
         If (sWorkDir = "") Move TargetWS.sHome to sWorkDir
+
         // Remember exactly what we're about to launch so FinishCompile can
-        // echo it into the details pane on failure.
+        // echo it into the details pane on failure. Keep this as the
+        // *original* df-cli command, not the cmd.exe wrapper below — the
+        // wrapper is transport for stdout capture, not what the user wants
+        // to debug.
         Set psCompiledCmdLine to (sCmdPath + " " + sCmdArgs)
-        Get StartProcess of oCompileProcess sCmdPath sCmdArgs sWorkDir False to bOK
+
+        // ---- Stdout capture for live progress feedback ----
+        // df-cli is mostly silent during a build, but anything it does
+        // emit (warnings, end-of-phase, errors that bypass the .err file)
+        // is interesting. Redirect stdout+stderr into a temp log file via
+        // a cmd.exe /c wrapper, then let oCompilePoll_tm tail it.
+        //
+        // The log lives in DFRefactor's OWN Programs folder (always
+        // writable, locale-independent) and is overwritten on each compile.
+        // FinishCompile deletes it after consuming.
+        Get pOrgWS of ghoApplication to OrgWS
+        Move (vFolderFormat(OrgWS.sPrograms) + "dfrefactor_compile.log") to sLogFile
+        If (vFilePathExists(sLogFile)) Move (rfDeleteFile(sLogFile)) to bOK
+        Set psCompileLogFile to sLogFile
+        Set piCompileTicks   to 0
+        Set piLastLogSize    to 0
+
+        // Wrap with cmd.exe /c for stdout+stderr redirection. The outer
+        // quotes around the /c argument let cmd parse the inner command
+        // (which contains > and quoted paths) correctly: cmd strips the
+        // first and last " on the /c argument, leaving the real command
+        // for parsing.
+        Move ('/c " "' + sCmdPath + '" ' + sCmdArgs + ' > "' + sLogFile + '" 2>&1 "') to sLaunchArgs
+        Get StartProcess of oCompileProcess "cmd.exe" sLaunchArgs sWorkDir False to bOK
         If (bOK = False) Begin
             Get psLastError of oCompileProcess to sErrorText
             Send StopMarquee of oProgress_pb
@@ -394,12 +432,74 @@ Object oTestCompile_dg is a cRDCModalPanel
         Send KillProcess of oCompileProcess 1
     End_Procedure
 
+    // Reads the entire compile log file into a String. Returns "" when the
+    // file is missing, locked, or empty. Called both per-tick (from
+    // UpdateCompileProgress, to refresh the live tail in oDetails_edit) and
+    // once after the process exits (from FinishCompile, to capture whatever
+    // df-cli wrote before exiting).
+    //
+    // Delegates to the byte-safe RFReadEncodedFileAsString helper instead of
+    // a local Readln loop: one Read_Block plus a single decode pass avoids
+    // both the lossy text-mode pipeline (DF 2025 Unicode mode mangles OEM /
+    // extended bytes - see cEncodingHelpers.pkg) and the O(n^2) per-line
+    // string concatenation the old loop incurred. The helper already returns
+    // "" on a missing / empty / locked file, so a polling caller can just
+    // retry on its next tick.
+    Function LoadCompileLogTail String sLogFile Returns String
+        Function_Return (RFReadEncodedFileAsString(sLogFile))
+    End_Function
+
+    // Per-tick progress refresh, dispatched by oCompilePoll_tm. Sub-samples
+    // the expensive bits so we're not formatting strings or hitting disk on
+    // every 100 ms tick.
+    Procedure UpdateCompileProgress
+        Integer iTicks iSec iMin iLogSize iLastLogSize
+        String  sProgram sText sLog sLogFile
+
+        Get piCompileTicks to iTicks
+        Increment iTicks
+        Set piCompileTicks to iTicks
+
+        // ---- Elapsed time (every 10 ticks ~= 1 second) ----
+        If (Mod(iTicks, 10) = 0) Begin
+            Get psCompilingProgram to sProgram
+            Move (iTicks / 10) to iSec        // total seconds
+            Move (iSec / 60) to iMin
+            Move (Mod(iSec, 60)) to iSec      // seconds within minute
+            Move ("Compiling " * sProgram * "... (" ;
+                  + String(iMin) + ":" + Right(("0" + String(iSec)), 2) + ")") to sText
+            Set Value of oResult_fm to sText
+        End
+
+        // ---- Log file tail (every 5 ticks ~= 500 ms) ----
+        // Use the log's byte size as a cheap change signal (RFFileSize reads
+        // metadata only, so it never fights the child's write handle): only
+        // reread the file and rewrite the details pane when it has actually
+        // grown since the last refresh. The whole-file read and the cTextEdit
+        // Set Value are the expensive bits, and most ticks during a single-
+        // file compile produce no new output - so this skips both on quiet
+        // ticks. piLastLogSize advances only after a successful read+display,
+        // so a transient empty read just retries on the next tick.
+        If (Mod(iTicks, 5) = 0) Begin
+            Get psCompileLogFile to sLogFile
+            Move (RFFileSize(sLogFile)) to iLogSize
+            Get piLastLogSize to iLastLogSize
+            If (iLogSize > iLastLogSize) Begin
+                Get LoadCompileLogTail sLogFile to sLog
+                If (sLog <> "") Begin
+                    Set piLastLogSize to iLogSize
+                    Set Value of oDetails_edit to sLog
+                End
+            End
+        End
+    End_Procedure
+
     // Fires from oCompilePoll_tm once the compiler process has exited
     // (either normally OR because KillCompile killed it). Checks the
     // .err file, shows success / failure / cancelled in the result form,
     // and surfaces the .err contents on failure.
     Procedure FinishCompile
-        String sProgram sErrorText sErrFile sErrPath sAppSrc sCmdLine
+        String sProgram sErrorText sErrFile sErrPath sAppSrc sCmdLine sCompilerLog sLogFile
         Boolean bOK bExists bCancelled
         Integer iExitCode
         tWorkspacePaths TargetWS
@@ -408,10 +508,18 @@ Object oTestCompile_dg is a cRDCModalPanel
         Get pCompilingWS       to TargetWS
         Get pbCancelled        to bCancelled
         Get psCompiledCmdLine  to sCmdLine
+        Get psCompileLogFile   to sLogFile
 
         // Capture the compiler's exit code BEFORE CleanUp releases the
         // process handle (ProcessExitCode returns -1 once phProcess = 0).
         Get ProcessExitCode of oCompileProcess to iExitCode
+
+        // Final read of the compiler stdout log (everything cmd.exe's
+        // redirection captured). df-cli is mostly silent during a build,
+        // so this is often empty — but on failure it can carry the one
+        // line that explains what went wrong without making it into
+        // the .err file. Read it once here and reuse across all branches.
+        Get LoadCompileLogTail sLogFile to sCompilerLog
 
         // Release process handles, stop the marquee, restore the Compile
         // button's label (it was flipped to "&Stop" by StartCompile).
@@ -424,7 +532,11 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (bCancelled = True) Begin
             Set Value of oResult_fm to ("Cancelled: " * sProgram * "compile was stopped.")
             Set TextColor of oResult_fm to clBlack
-            Set Value of oDetails_edit to ""
+            // Keep whatever the compiler emitted before it was killed instead
+            // of blanking the details pane. Prefer the final log read; if it
+            // came back empty, leave the live-tailed content in place.
+            If (sCompilerLog <> "") ;
+                Set Value of oDetails_edit to sCompilerLog
             Procedure_Return
         End
 
@@ -437,11 +549,16 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (iExitCode <> 0) Begin
             Set Value of oResult_fm to ("Failed: compiler exited with code " * String(iExitCode) + ". " * sProgram * "was not compiled.")
             Set TextColor of oResult_fm to clRed
+//            Move ("The compiler exited with code " * String(iExitCode) + " and did not produce a compiled program." + " " ;
             Move ("The compiler exited with code " * String(iExitCode) + " and did not produce a compiled program." + CS_CRLF + CS_CRLF ;
-                  + "A likely cause is a version mismatch — e.g. trying to compile a DataFlex 26 workspace with the DataFlex 25 compiler. " ;
-                  + "Check Program Properties to point at the matching compiler, or compile from the Studio that owns the workspace.") to sErrorText
+                  + "See bottom of output for the command line parameters passed to the compiler. " ;
+                  + "(Check also Program Properties to point at the matching compiler, or compile from the Studio that owns the workspace.)") to sErrorText
+//                  + "A likely cause is a version mismatch — e.g. trying to compile a DataFlex 26 workspace with the DataFlex 25 compiler. " ;
+            If (sCompilerLog <> "") ;
+                Move (sErrorText + CS_CRLF + CS_CRLF + "Compiler output:" + CS_CRLF + sCompilerLog) to sErrorText
             If (sCmdLine <> "") ;
-                Move (sErrorText + CS_CRLF + CS_CRLF + "Command line passed to the compiler:" + CS_CRLF + sCmdLine) to sErrorText
+                Move (sErrorText + CS_CRLF + "Command line passed to the compiler:" + CS_CRLF + sCmdLine) to sErrorText
+//                Move (sErrorText + CS_CRLF + CS_CRLF + "Command line passed to the compiler:" + CS_CRLF + sCmdLine) to sErrorText
             Set Value of oDetails_edit to sErrorText
             Procedure_Return
         End
@@ -465,6 +582,8 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (bExists = True) Begin
             Get LoadErrFileContents sErrPath to sErrorText
         End
+        If (sCompilerLog <> "") ;
+            Move (sErrorText + CS_CRLF + CS_CRLF + "Compiler output:" + CS_CRLF + sCompilerLog) to sErrorText
         If (sCmdLine <> "") ;
             Move (sErrorText + CS_CRLF + CS_CRLF + "Command line passed to the compiler:" + CS_CRLF + sCmdLine) to sErrorText
         Set Value of oDetails_edit to sErrorText
