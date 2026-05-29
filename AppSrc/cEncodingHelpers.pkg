@@ -337,7 +337,7 @@ End_Function
 
  Why this is needed:
  
- The obvious way -- `RFOpenInput ("binary:" + sPath)` + `Readln` + OemToUtf8
+ The obvious way -- `rfOpenInput ("binary:" + sPath)` + `Readln` + OemToUtf8
  -- is LOSSY under DataFlex 2025 Unicode mode. Readln on a "binary:" channel
  silently decodes the incoming byte stream as UTF-8 while dropping bytes
  into the String (Length(sLine) != SizeOfString(sLine) whenever multi-byte
@@ -433,6 +433,68 @@ Function RFReadEncodedFileAsStringArray Global String sFilePath Returns String[]
     End
 
     Function_Return asLines
+End_Function
+
+/* Global Function: RFReadEncodedFileAsString
+
+ Reads an entire file from disk as raw bytes and returns its full contents
+ as a single Unicode String - the whole-blob counterpart to
+ RFReadEncodedFileAsStringArray. Use this when you want the file's text in
+ one piece (e.g. dumping a compiler log into a cTextEdit) rather than split
+ into lines.
+
+ Same byte-safe pipeline: Read_Block the whole file into a UChar[] on a
+ binary channel, skip a leading UTF-8 BOM if present, then decode the bytes
+ ONCE - via RFUtf8BytesToString (BOM present => UTF-8) or RFOemBytesToUtf8
+ (no BOM => CP850/OEM, which is how redirected Windows console output is
+ encoded). The single decode pass avoids both the lossy Readln text-mode
+ pipeline (see RFReadEncodedFileAsStringArray's header) and the O(n^2)
+ per-line string concatenation a Readln-accumulate loop incurs.
+
+ Returns "" when the file is missing, empty, locked, or unreadable, so a
+ caller polling a file another process is still writing can simply retry on
+ its next tick.
+*/
+Function RFReadEncodedFileAsString Global String sFilePath Returns String
+    Integer  iChannel iRFFileSize iLen iJ
+    Boolean  bIsUtf8
+    UChar[]  ucaFile ucaBody
+
+    Move (RFFileSize(sFilePath)) to iRFFileSize
+    If (iRFFileSize <= 0) ;
+        Function_Return ""
+
+    // Detect a UTF-8 BOM before opening for the full read.
+    Move (RFFileHasBOM(sFilePath)) to bIsUtf8
+
+    // Read the entire file as raw bytes on a binary channel.
+    Move (Seq_New_Channel()) to iChannel
+    If (iChannel < 0) ;
+        Function_Return ""
+    Direct_Input channel iChannel ("binary:" + sFilePath)
+    If (SeqEof) Begin
+        Send Seq_Release_Channel iChannel
+        Function_Return ""
+    End
+    Read_Block channel iChannel ucaFile iRFFileSize
+    Close_Input channel iChannel
+    Send Seq_Release_Channel iChannel
+
+    // No BOM: treat the bytes as CP850/OEM (redirected console output) and
+    // decode the whole buffer in one pass - no copy needed.
+    If (bIsUtf8 = False) ;
+        Function_Return (RFOemBytesToUtf8(ucaFile))
+
+    // UTF-8 BOM present: copy the post-BOM bytes into their own buffer so
+    // the 3-byte marker never lands in the decoded text, then decode once.
+    Move (iRFFileSize - 3) to iLen
+    If (iLen <= 0) ;
+        Function_Return ""
+    Move (ResizeArray(ucaBody, iLen)) to ucaBody
+    For iJ from 0 to (iLen - 1)
+        Move ucaFile[3 + iJ] to ucaBody[iJ]
+    Loop
+    Function_Return (RFUtf8BytesToString(ucaBody))
 End_Function
 
 /* Global Function: RFWriteEncodedFileFromStringArray
