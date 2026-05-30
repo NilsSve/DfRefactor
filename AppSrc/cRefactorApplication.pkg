@@ -71,6 +71,15 @@ Class cRefactorApplication is a cRDCApplication
         {Visibility=Private}
         Property Boolean private.pbCancelRequested False
 
+        // Accumulators for the recursive workspace-library folder walk
+        // (GetWorkspaceLibrarySourceFolders). Reset at the start of each walk.
+        // pasLibVisited holds lowercased .sws paths already processed (cycle
+        // guard); pasLibFolders accumulates the resolved library source folders.
+        {Visibility=Private}
+        Property String[] pasLibVisited
+        {Visibility=Private}
+        Property String[] pasLibFolders
+
         {Visibility=Private}
         Property String private.psFileCompareApp
         {Visibility=Private}
@@ -1227,6 +1236,340 @@ Class cRefactorApplication is a cRDCApplication
         Function_Return sResult
     End_Function
 
+    // ----------------------------------------------------------------------
+    //  Workspace LIBRARY source-folder discovery.
+    //
+    //  The Folders tab is filled by recursively scanning the workspace home
+    //  (cFolderSelHeaDataDictionary.SaveNewHeaderAndChildRecords ->
+    //  AllSourceFolders). A workspace can also reference LIBRARY workspaces
+    //  whose source lives OUTSIDE the home and would therefore never be
+    //  scanned. These helpers follow those references so the library source
+    //  folders can be added as extra scan roots.
+    //
+    //  Library references come from the .sws:
+    //    - JSON .sws (DataFlex 26+): the "aDependencies" list (a local, non
+    //      git/cloud dependency sPath is a DIRECTORY holding the library .sws).
+    //    - INI  .sws (DataFlex 25-): the [Libraries] section, keys Lib1, Lib2,
+    //      ... (1-based; note [Projects] is 0-based) - each value is the path
+    //      to the library .sws, relative to the referencing .sws.
+    //  The chain is followed transitively (a library may reference libraries);
+    //  pasLibVisited guards against circular references.
+    //
+    //  Two bases matter and they DIFFER for a Studio Library: source paths
+    //  (AppSrcPath/DdSrcPath/...) resolve against the library's true HOME, which
+    //  its .ws may put ABOVE the .sws folder via [Workspace] Home=..\ (the .sws
+    //  sits in a StudioLibrary\ subfolder); but [Libraries] refs resolve against
+    //  the .sws folder. Resolved paths can carry embedded "..\" - canonicalize.
+    // ----------------------------------------------------------------------
+
+    // Collapses "." and ".." segments in a (drive-letter) absolute path, e.g.
+    // "E:\A\B\..\.\C" -> "E:\A\C" and "E:\A\StudioLibrary\..\" -> "E:\A". The
+    // leading drive segment is never popped. Returns no trailing backslash.
+    // (UNC \\server\share paths are not handled - DFRefactor uses drive paths.)
+    { Visibility=Private }
+    Function RFCanonicalizePath String sPath Returns String
+        String[] asSegs asOut
+        String sSeg sResult
+        Integer iMax iIdx iOutSize
+
+        Move (Trim(sPath)) to sPath
+        If (sPath = "") ;
+            Function_Return ""
+
+        Move (StrSplitToArray(sPath, "\")) to asSegs
+        Move (SizeOfArray(asSegs)) to iMax
+        Decrement iMax
+        For iIdx from 0 to iMax
+            Move (Trim(asSegs[iIdx])) to sSeg
+            If (sSeg = "..") Begin
+                Move (SizeOfArray(asOut)) to iOutSize
+                If (iOutSize > 1) ;
+                    Move (ResizeArray(asOut, iOutSize - 1)) to asOut
+            End
+            Else If (sSeg <> "" and sSeg <> ".") Begin
+                Move sSeg to asOut[SizeOfArray(asOut)]
+            End
+        Loop
+
+        Move "" to sResult
+        Move (SizeOfArray(asOut)) to iMax
+        Decrement iMax
+        For iIdx from 0 to iMax
+            If (iIdx = 0) Begin
+                Move asOut[iIdx] to sResult
+            End
+            Else Begin
+                Move (sResult + "\" + asOut[iIdx]) to sResult
+            End
+        Loop
+        Function_Return sResult
+    End_Function
+
+    // Returns the true HOME folder of library workspace sLibSWSFile - the base
+    // its .ws source paths resolve against. Studio Libraries keep the .sws in a
+    // StudioLibrary\ subfolder and set [Workspace] Home=..\ in the .ws, so the
+    // home is ABOVE the .sws folder. Falls back to the .sws folder when there is
+    // no .ws / no Home entry. Result is vFolderFormat'd (trailing separator).
+    { Visibility=Private }
+    Function LibraryWorkspaceHome String sLibSWSFile Returns String
+        String sSwsFolder sWsFile sWsFolder sHomeRaw sHome
+        Handle hoIni
+        Boolean bExists
+
+        Get ParseFolderName sLibSWSFile to sSwsFolder
+        Move (vFolderFormat(sSwsFolder)) to sSwsFolder
+
+        Get WsFileNameFromSWSFileName sLibSWSFile to sWsFile
+        Get vFilePathExists sWsFile to bExists
+        If (bExists = False) ;
+            Function_Return sSwsFolder
+
+        Get Create (RefClass(cIniFile)) to hoIni
+        Set psFilename of hoIni to sWsFile
+        Get ReadString of hoIni CS_Workspace CS_Home "" to sHomeRaw
+        Send Destroy of hoIni
+        Move (Trim(sHomeRaw)) to sHomeRaw
+
+        // No Home entry, or "." / ".\": the home IS the .ws folder.
+        If (sHomeRaw = "" or sHomeRaw = "." or sHomeRaw = ".\") ;
+            Function_Return sSwsFolder
+
+        // Absolute Home.
+        If (sHomeRaw contains ":") Begin
+            Get RFCanonicalizePath sHomeRaw to sHome
+            Function_Return (vFolderFormat(sHome))
+        End
+
+        // Relative Home: resolve against the .ws folder, then canonicalize.
+        Get ParseFolderName sWsFile to sWsFolder
+        Move (vFolderFormat(sWsFolder)) to sWsFolder
+        Get RFCanonicalizePath (sWsFolder + sHomeRaw) to sHome
+        Function_Return (vFolderFormat(sHome))
+    End_Function
+
+    // Resolves a JSON dependency reference (aDependencies[].sPath, a DIRECTORY)
+    // to the library .sws file path. Tries <dir>\<dirname>.sws first, then
+    // <dir>.sws. Returns "" when neither exists.
+    { Visibility=Private }
+    Function ResolveDependencySwsFile String sDepPathRaw String sHomePath Returns String
+        String sDepPath sDepHome sName sWsFile
+        Boolean bExists
+
+        Get ResolveWorkspacePath sDepPathRaw sHomePath to sDepPath
+        Move (vFolderFormat(sDepPath)) to sDepHome
+        Get ParseFileName sDepPath to sName
+        Move (sDepHome + sName + ".sws") to sWsFile
+        Get vFilePathExists sWsFile to bExists
+        If (bExists = False) Begin
+            Move (sDepPath + ".sws") to sWsFile
+            Get vFilePathExists sWsFile to bExists
+        End
+        If (bExists = False) ;
+            Function_Return ""
+        Function_Return sWsFile
+    End_Function
+
+    // Splits a semicolon-delimited path list and returns asFolders with each
+    // non-duplicate (case-insensitive) path appended.
+    { Visibility=Private }
+    Function AppendPathListToArray String sPathList String[] asFolders Returns String[]
+        String sPath sLower
+        Integer iCount iIdx iExist iExistMax
+        Boolean bFound
+
+        Get CountOfPaths of (phoWorkspace(Self)) sPathList to iCount
+        For iIdx from 1 to iCount
+            Get PathAtIndex of (phoWorkspace(Self)) sPathList iIdx to sPath
+            Move (Trim(sPath)) to sPath
+            If (sPath <> "") Begin
+                // Collapse any embedded "..\" / "." so stored folders are clean
+                // and de-dup compares canonical forms.
+                Get RFCanonicalizePath sPath to sPath
+                Move (Lowercase(sPath)) to sLower
+                Move False to bFound
+                Move (SizeOfArray(asFolders)) to iExistMax
+                Decrement iExistMax
+                For iExist from 0 to iExistMax
+                    If (Lowercase(asFolders[iExist]) = sLower) ;
+                        Move True to bFound
+                Loop
+                If (bFound = False) ;
+                    Move sPath to asFolders[SizeOfArray(asFolders)]
+            End
+        Loop
+        Function_Return asFolders
+    End_Function
+
+    // True when sSWSFile (case-insensitive) is already in pasLibVisited.
+    { Visibility=Private }
+    Function IsLibVisited String sSWSFile Returns Boolean
+        String[] asVisited
+        Get pasLibVisited to asVisited
+        Function_Return (SearchArray(Lowercase(Trim(sSWSFile)), asVisited) >= 0)
+    End_Function
+
+    // Records sSWSFile (lowercased) in pasLibVisited.
+    { Visibility=Private }
+    Procedure MarkLibVisited String sSWSFile
+        String[] asVisited
+        Get pasLibVisited to asVisited
+        Move (Lowercase(Trim(sSWSFile))) to asVisited[SizeOfArray(asVisited)]
+        Set pasLibVisited to asVisited
+    End_Procedure
+
+    // Returns the resolved .sws file paths of the DIRECT library references in
+    // sSWSFile. Handles both the JSON aDependencies list (DataFlex 26+) and the
+    // INI [Libraries] section (DataFlex 25-). sHomePath resolves relative refs.
+    { Visibility=Private }
+    Function DirectLibrarySwsFiles String sSWSFile String sHomePath Returns String[]
+        String[] asChildSws
+        String sChildRaw sChildSws sKey
+        Integer iIndex
+        Handle hoIni
+        #IF (!@ >= 250)
+            tSwsFile WsData
+            Integer iDep iDepMax
+        #ENDIF
+
+        #IF (!@ >= 250)
+            // JSON .sws: follow simple (non git/cloud) local dependencies.
+            Get ReadSwsJsonFile sSWSFile to WsData
+            If (WsData.sDfVersion <> "") Begin
+                Move (SizeOfArray(WsData.aDependencies)) to iDepMax
+                Decrement iDepMax
+                For iDep from 0 to iDepMax
+                    If (WsData.aDependencies[iDep].bIsObject = False) Begin
+                        Move (Trim(WsData.aDependencies[iDep].sPath)) to sChildRaw
+                        If (sChildRaw <> "" and not(sChildRaw contains "://")) Begin
+                            Get ResolveDependencySwsFile sChildRaw sHomePath to sChildSws
+                            If (sChildSws <> "") ;
+                                Move sChildSws to asChildSws[SizeOfArray(asChildSws)]
+                        End
+                    End
+                Loop
+                Function_Return asChildSws
+            End
+        #ENDIF
+
+        // INI .sws: [Libraries] Lib1, Lib2, ... (1-based; scan a fixed range
+        // and skip blanks, mirroring GetWorkspaceProjects).
+        Get Create (RefClass(cIniFile)) to hoIni
+        Set psFilename of hoIni to sSWSFile
+        For iIndex from 1 to 99
+            Move (CS_LibraryPrefix + String(iIndex)) to sKey
+            Get ReadString of hoIni CS_Libraries sKey "" to sChildRaw
+            Move (Trim(sChildRaw)) to sChildRaw
+            If (sChildRaw <> "") Begin
+                Get ResolveWorkspacePath sChildRaw sHomePath to sChildSws
+                Move sChildSws to asChildSws[SizeOfArray(asChildSws)]
+            End
+        Loop
+        Send Destroy of hoIni
+
+        Function_Return asChildSws
+    End_Function
+
+    // Recursively walks the library workspace sLibSWSFile: adds its own source
+    // folders to pasLibFolders, then recurses into its own library references.
+    // The library home is the folder that holds its .sws. pasLibVisited guards
+    // against cycles / repeated work.
+    { Visibility=Private }
+    Procedure CollectLibraryFolders String sLibSWSFile
+        String sSwsFolder sLibHome sLibPaths
+        String[] asChildSws asFolders
+        Integer iChild iChildMax
+        Boolean bExists bVisited
+        #IF (!@ >= 250)
+            tSwsFile WsLibData
+        #ENDIF
+
+        Move (Trim(sLibSWSFile)) to sLibSWSFile
+        If (sLibSWSFile = "") ;
+            Procedure_Return
+        // Canonicalize first: resolved refs carry embedded "..\", so the cycle
+        // guard, config reads and recursion all key off one clean form.
+        Get RFCanonicalizePath sLibSWSFile to sLibSWSFile
+        Get IsLibVisited sLibSWSFile to bVisited
+        If (bVisited = True) ;
+            Procedure_Return
+        // Mark visited up front so a missing/broken ref is not retried.
+        Send MarkLibVisited sLibSWSFile
+        Get vFilePathExists sLibSWSFile to bExists
+        If (bExists = False) ;
+            Procedure_Return
+
+        // The .sws folder ([Libraries] refs are relative to it).
+        Get ParseFolderName sLibSWSFile to sSwsFolder
+        Move (vFolderFormat(sSwsFolder)) to sSwsFolder
+
+        // This library's own source folders. INI source paths resolve against
+        // the TRUE home (its .ws may set Home=..\ above the .sws folder).
+        Move "" to sLibPaths
+        #IF (!@ >= 250)
+            Get ReadSwsJsonFile sLibSWSFile to WsLibData
+            If (WsLibData.sDfVersion <> "") Begin
+                Get CollectSwsSourcePaths WsLibData sSwsFolder to sLibPaths
+            End
+            Else Begin
+                Get LibraryWorkspaceHome sLibSWSFile to sLibHome
+                Get CollectIniSwsSourcePaths sLibSWSFile sLibHome to sLibPaths
+            End
+        #ELSE
+            Get LibraryWorkspaceHome sLibSWSFile to sLibHome
+            Get CollectIniSwsSourcePaths sLibSWSFile sLibHome to sLibPaths
+        #ENDIF
+
+        Get pasLibFolders to asFolders
+        Get AppendPathListToArray sLibPaths asFolders to asFolders
+        Set pasLibFolders to asFolders
+
+        // Recurse into this library's own library references (.sws-folder based).
+        Get DirectLibrarySwsFiles sLibSWSFile sSwsFolder to asChildSws
+        Move (SizeOfArray(asChildSws)) to iChildMax
+        Decrement iChildMax
+        For iChild from 0 to iChildMax
+            Send CollectLibraryFolders asChildSws[iChild]
+        Loop
+    End_Procedure
+
+    // Returns the source folders contributed by the workspace's libraries, by
+    // following the .sws library references (JSON aDependencies / INI
+    // [Libraries]) transitively. The workspace's OWN folders are NOT included
+    // (the caller already scans the home). Resolved absolute folder paths, de-
+    // duplicated; circular references are guarded against. Returns an empty
+    // array when sSWSFile is missing or references no (resolvable) libraries.
+    Function GetWorkspaceLibrarySourceFolders String sSWSFile Returns String[]
+        String[] asEmpty asChildSws asFolders
+        String sHomePath
+        Integer iChild iChildMax
+        Boolean bExists
+
+        Set pasLibVisited to asEmpty
+        Set pasLibFolders to asEmpty
+
+        Get vFilePathExists sSWSFile to bExists
+        If (bExists = False) ;
+            Function_Return asEmpty
+
+        Get psHomePath to sHomePath
+        Move (vFolderFormat(sHomePath)) to sHomePath
+
+        // Mark the root workspace visited: its own folders are the caller's
+        // home (already scanned), and this stops a library that points back at
+        // the root from being re-walked.
+        Send MarkLibVisited sSWSFile
+
+        Get DirectLibrarySwsFiles sSWSFile sHomePath to asChildSws
+        Move (SizeOfArray(asChildSws)) to iChildMax
+        Decrement iChildMax
+        For iChild from 0 to iChildMax
+            Send CollectLibraryFolders asChildSws[iChild]
+        Loop
+
+        Get pasLibFolders to asFolders
+        Function_Return asFolders
+    End_Function
+
     // Returns the list of project (.src) file names defined in the given
     // .sws workspace file. Handles both formats:
     //   JSON .sws (DataFlex 26+): aProjects from the parsed struct. Each
@@ -1863,8 +2206,17 @@ Class cRefactorApplication is a cRDCApplication
         Loop
         Move asFolders to FileData.asFolders
 
+        // Process files in a predictable, eyeball-able order: sort the full-path
+        // list CASE-INSENSITIVELY, so files group by folder alphabetically then
+        // by filename within each folder. Case-insensitive matters - a plain
+        // ASCII sort would place a capitalised library path (e.g. ...\WebAppSrc)
+        // BEFORE the lower-cased workspace home (...\meterconnector\AppSrc),
+        // defeating the goal of seeing AppSrc processed early. The folder list
+        // (FileData.asFolders) is intentionally left in selection order.
+        Move (SortArray(FileData.asFullFileNames, Desktop, RefFunc(DFSTRICMP))) to FileData.asFullFileNames
+
         Function_Return FileData
-    End_Function    
+    End_Function
     
     Function SingleSourceFile Returns tRefactorFiles
         String sFolder sFileName
