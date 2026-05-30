@@ -94,6 +94,15 @@ Object oTestCompile_dg is a cRDCModalPanel
     // FinishCompile so the post-mortem can show a "Cancelled" message
     // instead of treating a missing .err file as a clean compile.
     Property Boolean         pbCancelled        False
+    // Full path to the .err file shown on the dialog's bottom row after a
+    // failed compile (blank otherwise). The Open button shell-opens this;
+    // SetErrFile keeps it in sync with the filename form + the button state.
+    Property String          psErrFilePath      ""
+    // File that UpdateCompileProgress live-tails into the details pane during
+    // a compile: the cmd-redirect stdout log for df-cli, or the (incrementally
+    // written) .err file for the legacy DFComp/DFCompConsole, which emit
+    // nothing to stdout. Set per-compile in StartCompile.
+    Property String          psLiveTailFile     ""
 
     // -----------------------------------------------------------------
     // Selection group: program picker
@@ -216,6 +225,36 @@ Object oTestCompile_dg is a cRDCModalPanel
         End_Object
     End_Object
 
+    // -----------------------------------------------------------------
+    // .err file readout: bottom row, left of the Compile/Close buttons.
+    // Filled by SetErrFile after a failed compile; Open shell-opens the
+    // file in the user's default editor (OS file association).
+    // -----------------------------------------------------------------
+    Object oErrFile_fm is a cRDCForm
+        Set Location to 210 12
+        Set Size to 12 145
+        Set Form_Border to Border_None
+        Set Enabled_State to False
+        Set peAnchors to anBottomLeftRight
+        Set Value to ""
+    End_Object
+
+    Object oOpenErr_btn is a cRDCButton
+        Set Location to 209 160
+        Set Size to 14 50
+        Set Label to "&Open"
+        Set peAnchors to anBottomRight
+        Set Enabled_State to False
+        Set psToolTip to "Open the .err file in your default text editor."
+
+        Procedure OnClick
+            String sPath
+            Get psErrFilePath to sPath
+            If (sPath <> "") ;
+                Send vShellExecute "open" sPath "" ""
+        End_Procedure
+    End_Object
+
     // Doubles as the Stop button while a compile is in flight: StartCompile
     // sets the label to "&Stop" right after launch, FinishCompile restores
     // it to "&Compile". OnClick dispatches based on whether the process is
@@ -290,6 +329,16 @@ Object oTestCompile_dg is a cRDCModalPanel
 
     // *** Functions/Procedures ***
 
+    // Show (or clear, when sPath is "") the .err file readout on the dialog's
+    // bottom row: store the full path for the Open button, display that same
+    // full path (the field grows with the dialog, so widening reveals it all),
+    // and enable Open only when there is a file to open.
+    Procedure SetErrFile String sPath
+        Set psErrFilePath to sPath
+        Set Value of oErrFile_fm to sPath
+        Set Enabled_State of oOpenErr_btn to (sPath <> "")
+    End_Procedure
+
     // Load the compiler's .err output into a single string.
     // Returns "" on failure (missing / empty / locked file).
     //
@@ -310,7 +359,7 @@ Object oTestCompile_dg is a cRDCModalPanel
     // .err file load) runs from FinishCompile, fired by oCompilePoll_tm
     // once the child process has exited.
     Procedure StartCompile
-        String sProgram sErrorText sCmdPath sCmdArgs sWorkDir sLogFile sLaunchArgs
+        String sProgram sErrorText sCmdPath sCmdArgs sWorkDir sLogFile sLaunchArgs sErrFile sErrPath
         Boolean bOK
         tWorkspacePaths TargetWS OrgWS
 
@@ -351,7 +400,20 @@ Object oTestCompile_dg is a cRDCModalPanel
         Set pbCancelled to False
         Set Value of oResult_fm to ("Compiling " * sProgram * "...")
         Set TextColor of oResult_fm to clBlack
-        Set Value of oDetails_edit to ""
+        // Prime the details pane. df-cli streams progress as it runs (tailed
+        // live by UpdateCompileProgress); the legacy DFComp/DFCompConsole emit
+        // nothing to stdout until they exit, so show a "please wait" note
+        // instead of an empty pane that looks frozen. sCmdPath is lowercased,
+        // and "df-cli" matches the same test BuildCompileCommand keys off.
+        If (sCmdPath contains "df-cli") Begin
+            Set Value of oDetails_edit to ""
+        End
+        Else Begin
+            Set Value of oDetails_edit to ("This compiler does not report progress while it runs." + CS_CRLF + CS_CRLF ;
+                + "The result and any error details will appear here when it finishes.")
+        End
+        // New compile: no .err yet, so clear the bottom readout + disable Open.
+        Send SetErrFile ""
         Send StartMarquee of oProgress_pb
 
         // Remember the in-flight compile so FinishCompile can finish it.
@@ -368,7 +430,8 @@ Object oTestCompile_dg is a cRDCModalPanel
         // right folder explicitly is safer than relying on whatever CWD
         // DFRefactor happens to have at the moment.
         Move TargetWS.sPrograms to sWorkDir
-        If (sWorkDir = "") Move TargetWS.sHome to sWorkDir
+        If (sWorkDir = "") ;
+            Move TargetWS.sHome to sWorkDir
 
         // Remember exactly what we're about to launch so FinishCompile can
         // echo it into the details pane on failure. Keep this as the
@@ -388,10 +451,26 @@ Object oTestCompile_dg is a cRDCModalPanel
         // FinishCompile deletes it after consuming.
         Get pOrgWS of ghoApplication to OrgWS
         Move (vFolderFormat(OrgWS.sPrograms) + "dfrefactor_compile.log") to sLogFile
-        If (vFilePathExists(sLogFile)) Move (rfDeleteFile(sLogFile)) to bOK
+        If (vFilePathExists(sLogFile)) ;
+            Move (rfDeleteFile(sLogFile)) to bOK
         Set psCompileLogFile to sLogFile
         Set piCompileTicks   to 0
         Set piLastLogSize    to 0
+
+        // Choose the file UpdateCompileProgress live-tails. df-cli streams its
+        // progress to stdout (-> the cmd-redirect log); the legacy compilers
+        // write nothing to stdout but DO write their .err file incrementally,
+        // so tail that instead. (.err only exists once there are errors, so a
+        // clean legacy compile keeps the placeholder until FinishCompile.) The
+        // stale .err was already removed by DeleteCompileErrorsFile above.
+        If (sCmdPath contains "df-cli") Begin
+            Set psLiveTailFile to sLogFile
+        End
+        Else Begin
+            Get CompileErrorFileForProgram of ghoApplication sProgram to sErrFile
+            Move (vFolderFormat(TargetWS.sAppSrc) + sErrFile) to sErrPath
+            Set psLiveTailFile to sErrPath
+        End
 
         // Wrap with cmd.exe /c for stdout+stderr redirection. The outer
         // quotes around the /c argument let cmd parse the inner command
@@ -481,7 +560,7 @@ Object oTestCompile_dg is a cRDCModalPanel
         // ticks. piLastLogSize advances only after a successful read+display,
         // so a transient empty read just retries on the next tick.
         If (Mod(iTicks, 5) = 0) Begin
-            Get psCompileLogFile to sLogFile
+            Get psLiveTailFile to sLogFile
             Move (RFFileSize(sLogFile)) to iLogSize
             Get piLastLogSize to iLastLogSize
             If (iLogSize > iLastLogSize) Begin
@@ -527,6 +606,9 @@ Object oTestCompile_dg is a cRDCModalPanel
         Send StopMarquee of oProgress_pb
         Set Label of oCompile_btn to "&Compile"
 
+        // No .err to offer unless the failure path below finds one.
+        Send SetErrFile ""
+
         // Cancelled path: don't bother reading the .err file. The compiler
         // was killed mid-write and any .err on disk would be misleading.
         If (bCancelled = True) Begin
@@ -549,16 +631,13 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (iExitCode <> 0) Begin
             Set Value of oResult_fm to ("Failed: compiler exited with code " * String(iExitCode) + ". " * sProgram * "was not compiled.")
             Set TextColor of oResult_fm to clRed
-//            Move ("The compiler exited with code " * String(iExitCode) + " and did not produce a compiled program." + " " ;
             Move ("The compiler exited with code " * String(iExitCode) + " and did not produce a compiled program." + CS_CRLF + CS_CRLF ;
-                  + "See bottom of output for the command line parameters passed to the compiler. " ;
+                  + "See bottom of output for command line parameters used. " ;
                   + "(Check also Program Properties to point at the matching compiler, or compile from the Studio that owns the workspace.)") to sErrorText
-//                  + "A likely cause is a version mismatch — e.g. trying to compile a DataFlex 26 workspace with the DataFlex 25 compiler. " ;
             If (sCompilerLog <> "") ;
                 Move (sErrorText + CS_CRLF + CS_CRLF + "Compiler output:" + CS_CRLF + sCompilerLog) to sErrorText
             If (sCmdLine <> "") ;
-                Move (sErrorText + CS_CRLF + "Command line passed to the compiler:" + CS_CRLF + sCmdLine) to sErrorText
-//                Move (sErrorText + CS_CRLF + CS_CRLF + "Command line passed to the compiler:" + CS_CRLF + sCmdLine) to sErrorText
+                Move (sErrorText + CS_CRLF + "Command line:" + CS_CRLF + sCmdLine) to sErrorText
             Set Value of oDetails_edit to sErrorText
             Procedure_Return
         End
@@ -581,6 +660,8 @@ Object oTestCompile_dg is a cRDCModalPanel
         Get vFilePathExists sErrPath to bExists
         If (bExists = True) Begin
             Get LoadErrFileContents sErrPath to sErrorText
+            // Surface the .err on the bottom row with an Open button.
+            Send SetErrFile sErrPath
         End
         If (sCompilerLog <> "") ;
             Move (sErrorText + CS_CRLF + CS_CRLF + "Compiler output:" + CS_CRLF + sCompilerLog) to sErrorText
@@ -604,12 +685,14 @@ Object oTestCompile_dg is a cRDCModalPanel
         End
 
         // Clear the result/details area between invocations.
-        Set Value of oResult_fm to ""
-        Set Value of oDetails_edit to ""
+//        Set Value of oResult_fm to ""
+//        Set Value of oDetails_edit to ""
+//        Send SetErrFile ""
 
         Forward Send Popup
     End_Procedure
 
     On_Key Key_Alt+Key_C  Send KeyAction of oCompile_btn
     On_Key Key_Alt+Key_L  Send KeyAction of oClose_btn
+    On_Key Key_Alt+Key_O  Send KeyAction of oOpenErr_btn
 End_Object

@@ -1,0 +1,197 @@
+﻿//****************************************************************************
+// $Module type: Class
+// $Module name: cUnicodePointerToString
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : "Unicode" refactor family. Fixes the DataFlex Unicode-mode
+//               compile error 4539 ("Conversion from Pointer to String is not
+//               allowed, use PointerToString function") for the common bare
+//               assignment:
+//                   Move <ptrOrAddrVar> to <stringVar>
+//               by wrapping the source operand:
+//                   Move (PointerToString(<ptrOrAddrVar>)) to <stringVar>
+//
+//               It is deliberately NOT a blind text match. The rewrite only
+//               happens when the SOURCE is known to be pointer-like (declared
+//               Pointer or Address - an Address trips the very same 4539) and
+//               the DESTINATION is known to be a String. Those facts come from
+//               a per-method type map the class builds from the local variable
+//               declarations, using the shared lexer/funclib helpers
+//               (Tokenizer, _RetrieveFirstToken, _RemoveFirstToken,
+//               RemoveLocalKeyWord). Method boundaries are taken from the
+//               lexer's in-function / in-procedure state (a False->True
+//               transition), NOT from _IsFunctionDeclaration - that helper also
+//               matches "Function_Return", which would wipe the type map on an
+//               early return mid-method. Anything whose operand types it cannot
+//               resolve is left untouched - a missed line is harmless, a wrong
+//               wrap is not.
+//
+//               Deliberately OUT OF SCOPE (left for later / sibling functions):
+//                 - the String -> Pointer direction (needs MemCopy, a
+//                   structural rewrite, not a simple wrap)
+//                 - pointer-returning function calls used inside expressions
+//                 - method-parameter types (only body-local declarations map)
+//                 - a declaration that appears AFTER the Move that uses it
+//                   (single forward pass; such a Move is simply not rewritten)
+//
+//               The public wrapper is UnicodePointerToString in
+//               oRefactorFuncLib.pkg (MethodType eOtherFunction). This class
+//               holds the logic and mirrors cRemoveUnusedLocals.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS for a PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//****************************************************************************
+Use cApplication.pkg
+
+Class cUnicodePointerToString is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+    End_Procedure
+
+    // True when the datatype keyword is pointer-like for the 4539 conversion.
+    // DataFlex treats Address the same as Pointer for this assignment, so both
+    // qualify. sType is the raw first token of a declaration line.
+    Function IsPointerLikeType String sType Returns Boolean
+        Move (Lowercase(Trim(sType))) to sType
+        Function_Return (sType = "pointer" or sType = "address")
+    End_Function
+
+    // True when sName (compared case-insensitively) is one of the collected
+    // names. asNames is expected to already hold lowercased names.
+    Function NameInArray String[] asNames String sName Returns Boolean
+        Integer iCount iMax
+        Move (Lowercase(Trim(sName))) to sName
+        Move (SizeOfArray(asNames)) to iMax
+        Decrement iMax
+        For iCount from 0 to iMax
+            If (asNames[iCount] = sName) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    // Single forward pass over the source file. For each method it gathers the
+    // pointer-like and String local names from the declarations, then rewrites
+    // the bare "Move <ptr> to <str>" lines. Returns the number of rewrites.
+    Function ParseFile String[] ByRef asCode Returns Integer
+        Integer  iCount iMax iChanges iItems iIdx
+        String   sLine sOver sType sVars sName sId1 sId2
+        String[] asPointerVars asStringVars asVars asTokens
+        Boolean  bInMethod bInMethodPrev bPtr bStr bId1 bId2 bIgnore
+        tTokenizer Tok
+
+        Move 0 to iChanges
+        Move (SizeOfArray(asCode)) to iMax
+        If (iMax = 0) ;
+            Function_Return 0
+        Decrement iMax
+
+        For iCount from 0 to iMax
+            Move asCode[iCount] to sLine
+
+            // Progress: refresh the status panel every ~20 lines (keeps the UI
+            // responsive without repainting it on every single line). Guarded by
+            // Active_State so it is a no-op in batch mode / when no panel shows.
+            If (Mod(iCount, 20) = 0 and Active_State(ghoStatusPanel) = True) Begin
+                Send Update_StatusPanel of ghoStatusPanel ("Source line:" * String(iCount + 1) * "of:" * String(iMax + 1))
+                Set piPosition of ghoProgressBar to (iCount + 1)
+            End
+
+            Get Tokenizer of ghoFuncLib sLine to Tok
+            Move Tok.sOverstrikeLine to sOver
+
+            Move (Tok.bIsInProcedure = True or Tok.bIsInFunction = True) to bInMethod
+
+            // A new method opens a fresh local scope - drop the previous
+            // method's name sets. Detect the method START as the transition from
+            // not-in-method to in-method (driven by the lexer's in-function /
+            // in-procedure state).
+            //
+            // Do NOT key this off _IsFunctionDeclaration: that helper returns
+            // True for "Function_Return" as well as a real "Function <name>"
+            // declaration (both begin with "Function"), so an early
+            // Function_Return guard clause inside a method would wipe the type
+            // map mid-method. That is exactly why "Move aResult to sResult" in
+            // WinServCrypt.AESDecrypt (which has a Function_Return before it) was
+            // never being rewritten.
+            If (bInMethod = True and bInMethodPrev = False) Begin
+                Move (ResizeArray(asPointerVars, 0)) to asPointerVars
+                Move (ResizeArray(asStringVars, 0))  to asStringVars
+            End
+            Move bInMethod to bInMethodPrev
+
+            If (bInMethod = True) Begin
+                If (Tok.bIsVariableDeclaration = True) Begin
+                    // Classify the declaration and collect its names into the
+                    // matching set. All names on the line share one datatype,
+                    // so resolve that once.
+                    Get RemoveLocalKeyWord  of ghoFuncLib (&sOver) "" to bIgnore
+                    Get _RetrieveFirstToken of ghoFuncLib sOver to sType
+                    Get _RemoveFirstToken   of ghoFuncLib sOver to sVars
+                    Get IsPointerLikeType sType to bPtr
+                    Move (Lowercase(Trim(sType)) = "string") to bStr
+                    If (bPtr = True or bStr = True) Begin
+                        Move (StrSplitToArray(Trim(sVars), CS_S)) to asVars
+                        Move (SizeOfArray(asVars)) to iItems
+                        Decrement iItems
+                        For iIdx from 0 to iItems
+                            Move (Lowercase(Trim(asVars[iIdx]))) to sName
+                            If (sName <> "") Begin
+                                If (bPtr = True) ;
+                                    Move sName to asPointerVars[SizeOfArray(asPointerVars)]
+                                If (bStr = True) ;
+                                    Move sName to asStringVars[SizeOfArray(asStringVars)]
+                            End
+                        Loop
+                    End
+                End
+                Else Begin
+                    // Executable line: rewrite only the unambiguous bare form
+                    //   Move <id1> to <id2>
+                    // i.e. exactly 4 whitespace-separated tokens on the
+                    // overstruck line (strings/comments already masked).
+                    Move (StrSplitToArray(Trim(sOver), CS_S)) to asTokens
+                    If (SizeOfArray(asTokens) = 4) Begin
+                        If (Lowercase(asTokens[0]) = "move" and Lowercase(asTokens[2]) = "to") Begin
+                            Move asTokens[1] to sId1
+                            Move asTokens[3] to sId2
+                            Get NameInArray asPointerVars sId1 to bId1
+                            Get NameInArray asStringVars  sId2 to bId2
+                            If (bId1 = True and bId2 = True) Begin
+                                // Wrap the source operand. Operate on the
+                                // ORIGINAL line so indentation and any trailing
+                                // comment are preserved; the space-bounded
+                                // Replace hits the source operand (first match).
+                                Move (Replace((CS_S + sId1 + CS_S), sLine, (CS_S + "(PointerToString(" + sId1 + "))" + CS_S))) to sLine
+                                Move (RTrim(sLine)) to sLine
+                                Move sLine to asCode[iCount]
+                                Increment iChanges
+                            End
+                        End
+                    End
+                End
+            End
+        Loop
+
+        // The in-loop bar update is sub-sampled, and a short file may never hit
+        // a sample point, so drive the file's progress bar to the end here.
+        If (Active_State(ghoStatusPanel) = True) ;
+            Set piPosition of ghoProgressBar to (iMax + 1)
+
+        Function_Return iChanges
+    End_Function
+
+    // Public entry. Pass one source file as a String ByRef array.
+    // Returns the number of Move lines rewritten.
+    Function UnicodePointerToString String[] ByRef asCode Returns Integer
+        Integer iChanges
+        Get ParseFile (&asCode) to iChanges
+        Function_Return iChanges
+    End_Function
+
+End_Class

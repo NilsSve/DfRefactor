@@ -89,12 +89,12 @@ Class cFolderSelHeaDataDictionary is a DataDictionary
         Function_Return FolderSelHeaA.TotalSelected
     End_Function
 
-    // Returns False if save went all right.
-    Function SaveNewHeaderAndChildRecords String sHomeFolder Returns Boolean
-        Boolean bFound bErr bResult
-        Integer iSize iCount iID
+    // Returns False if save went all right. bLibInclude=False scans only the
+    // workspace home; True also follows the .sws library references.
+    Function SaveNewHeaderAndChildRecords String sHomeFolder Boolean bLibInclude Returns Boolean
+        Boolean bErr bResult
+        Integer iID
         String sUserName
-        String[] asStartFolder asFolderArray
 
         // Preserve the status of the Err system flag:
         Send SaveErrorState
@@ -119,26 +119,223 @@ Class cFolderSelHeaDataDictionary is a DataDictionary
         Unlock
 
         If (Err = False) Begin
-            Move sHomeFolder to asStartFolder[0]
-            Get AllSourceFolders of ghoApplication asStartFolder to asFolderArray
-            Move (SizeOfArray(asFolderArray)) to iSize
-            If (iSize = 0) Begin
-                Function_Return False
-            End
-            Decrement iSize
-            // Start on 1 because the first one is the "Home" folder.
-            For iCount from 1 to iSize
-                Get SaveDetailRecord FolderSelHea.ID asFolderArray[iCount] sUserName False to bErr
-                If (bErr = True) Begin
-                    Function_Return False
-                End
-            Loop
+            Get PopulateFolderRecords FolderSelHea.ID sHomeFolder sUserName bLibInclude to bErr
         End
 
         Move Err to bResult
         Send RestoreErrorState
         Function_Return bResult
     End_Function
+
+    // Discovers the workspace's source folders - the home folder PLUS every
+    // folder contributed by the workspace's libraries (followed via the .sws
+    // [Libraries]/aDependencies references) - and saves a FolderSelDtl record
+    // for each one not already present. Existing rows (and their bSelected
+    // state) are left untouched by SaveDetailRecord, so this is safe to re-run
+    // as a "refresh". An active FolderSelHea record for iHeaderID is assumed.
+    // Returns True if a detail record failed to save.
+    { Visibility=Private }
+    Function PopulateFolderRecords Integer iHeaderID String sHomeFolder String sUserName Boolean bLibInclude Returns Boolean
+        Boolean bErr
+        Integer iSize iCount iLibSize iLibIdx
+        String sSWSFile sFolder
+        String[] asStartFolder asFolderArray asLibFolders
+
+        Move sHomeFolder to asStartFolder[0]
+
+        // When bLibInclude, add each library's source folders as extra scan
+        // roots so library source files (outside the home) are discovered too.
+        Get psSWSFile of ghoApplication to sSWSFile
+        If (bLibInclude = True and sSWSFile <> "") Begin
+            Get GetWorkspaceLibrarySourceFolders of ghoApplication sSWSFile to asLibFolders
+            Move (SizeOfArray(asLibFolders)) to iLibSize
+            Decrement iLibSize
+            For iLibIdx from 0 to iLibSize
+                Move asLibFolders[iLibIdx] to asStartFolder[SizeOfArray(asStartFolder)]
+            Loop
+        End
+
+        Get AllSourceFolders of ghoApplication asStartFolder to asFolderArray
+        Move (SizeOfArray(asFolderArray)) to iSize
+        If (iSize = 0) ;
+            Function_Return False
+        Decrement iSize
+        // Start on 1 because the first one is the "Home" folder.
+        For iCount from 1 to iSize
+            Move asFolderArray[iCount] to sFolder
+            // RecursiveSearchFolders returns each START folder WITH a trailing
+            // separator but its subfolders WITHOUT one, so a library root the
+            // home scan also finds would be stored twice ("...\cDictionary" and
+            // "...\cDictionary\"). Strip the trailing separator so the header-
+            // scoped de-dup in SaveDetailRecord collapses the two forms (a
+            // library OUTSIDE the home is kept, just normalized - not dropped).
+            If (Right(sFolder, 1) = CS_DirSeparator) ;
+                Move (Left(sFolder, (Length(sFolder) - 1))) to sFolder
+            Get SaveDetailRecord iHeaderID sFolder sUserName False to bErr
+            If (bErr = True) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    // Re-runs folder discovery for the CURRENT workspace. bLibInclude True
+    // merges newly found folders (home + libraries) WITHOUT disturbing folders
+    // already listed or their selected state. bLibInclude False ALSO removes any
+    // folder under a library root (so the list matches the unticked "Include
+    // library folders" checkbox); the workspace's own folders and any manually
+    // added folders are left alone. Returns the NET change in folder count
+    // (positive = added, negative = removed, 0 = no change).
+    Function RefreshFolderRecords Boolean bLibInclude Returns Integer
+        Boolean bErr
+        Integer iBefore iAfter
+        String sUserName sHomeFolder
+
+        Get psUsername of ghoApplication to sUserName
+        Get psHomePath  of ghoApplication to sHomeFolder
+
+        Clear FolderSelHea
+        Move sUserName   to FolderSelHea.UserName
+        Move sHomeFolder to FolderSelHea.WorkspaceHomeFolder
+        Find eq FolderSelHea.WorkspaceHomeFolder
+        If (Found = False) Begin
+            // No header yet: do a normal first-time discovery, then report.
+            Get SaveNewHeaderAndChildRecords sHomeFolder bLibInclude to bErr
+            Clear FolderSelHea
+            Move sUserName   to FolderSelHea.UserName
+            Move sHomeFolder to FolderSelHea.WorkspaceHomeFolder
+            Find eq FolderSelHea.WorkspaceHomeFolder
+            Move 0 to iAfter
+            If (Found = True) ;
+                Move FolderSelHea.TotalFolders to iAfter
+            Function_Return iAfter
+        End
+
+        Move FolderSelHea.TotalFolders to iBefore
+
+        // Libraries excluded: remove any folder under a library root so the list
+        // matches the unticked checkbox (the workspace's own folders and any
+        // manually added folders are kept). Re-find afterwards so the home
+        // re-scan below sees the corrected counters.
+        If (bLibInclude = False) Begin
+            Send RemoveLibraryFolders FolderSelHea.ID
+            Clear FolderSelHea
+            Move sUserName   to FolderSelHea.UserName
+            Move sHomeFolder to FolderSelHea.WorkspaceHomeFolder
+            Find eq FolderSelHea.WorkspaceHomeFolder
+        End
+
+        Get PopulateFolderRecords FolderSelHea.ID sHomeFolder sUserName bLibInclude to bErr
+
+        // Re-find for the authoritative updated total.
+        Clear FolderSelHea
+        Move sUserName   to FolderSelHea.UserName
+        Move sHomeFolder to FolderSelHea.WorkspaceHomeFolder
+        Find eq FolderSelHea.WorkspaceHomeFolder
+        Move iBefore to iAfter
+        If (Found = True) ;
+            Move FolderSelHea.TotalFolders to iAfter
+        Function_Return (iAfter - iBefore)
+    End_Function
+
+    // True when sFolder equals sRoot or is nested under it (case-insensitive,
+    // separator-aware). A trailing separator on either side is ignored.
+    { Visibility=Private }
+    Function IsFolderUnderRoot String sFolder String sRoot Returns Boolean
+        String sLowFolder sLowRoot
+        Move (Lowercase(Trim(sFolder))) to sLowFolder
+        Move (Lowercase(Trim(sRoot)))   to sLowRoot
+        If (Right(sLowFolder, 1) = CS_DirSeparator) ;
+            Move (Left(sLowFolder, (Length(sLowFolder) - 1))) to sLowFolder
+        If (Right(sLowRoot, 1) = CS_DirSeparator) ;
+            Move (Left(sLowRoot, (Length(sLowRoot) - 1))) to sLowRoot
+        If (sLowRoot = "") ;
+            Function_Return False
+        If (sLowFolder = sLowRoot) ;
+            Function_Return True
+        If (Left(sLowFolder, (Length(sLowRoot) + 1)) = (sLowRoot + CS_DirSeparator)) ;
+            Function_Return True
+        Function_Return False
+    End_Function
+
+    // True when sFolder is under (or equal to) any root in asRoots.
+    { Visibility=Private }
+    Function IsFolderUnderAnyRoot String sFolder String[] asRoots Returns Boolean
+        Integer iRoots iRoot
+        Boolean bUnder
+        Move (SizeOfArray(asRoots)) to iRoots
+        Decrement iRoots
+        For iRoot from 0 to iRoots
+            Get IsFolderUnderRoot sFolder asRoots[iRoot] to bUnder
+            If (bUnder = True) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    // Deletes the FolderSelDtl rows for iHeaderID whose folder is under a
+    // library source root (from the .sws walk), so unticking "Include library
+    // folders" + Re-scan drops the library folders. The workspace's own folders
+    // (under the home) and any manually added folders are KEPT. Header counters
+    // are recomputed from the surviving rows (the alias Delete bypasses the DD's
+    // Deleting handler, so the counts must be fixed up explicitly).
+    { Visibility=Private }
+    Procedure RemoveLibraryFolders Integer iHeaderID
+        Integer iTotal iSelected
+        String sSWSFile sFolder sHome
+        String[] asLibRoots
+        Boolean bUnderLib bUnderHome
+
+        Get psSWSFile of ghoApplication to sSWSFile
+        If (sSWSFile = "") ;
+            Procedure_Return
+        Get GetWorkspaceLibrarySourceFolders of ghoApplication sSWSFile to asLibRoots
+        If (SizeOfArray(asLibRoots) = 0) ;
+            Procedure_Return
+        Get psHomePath of ghoApplication to sHome
+
+        Send SaveErrorState
+
+        Constraint_Set Self Clear
+        Constrained_Clear eq FolderSelDtlA by Index.2
+        Constrain FolderSelDtlA.FolderSelHeaID eq iHeaderID
+        Constrained_Find First FolderSelDtlA by Index.2
+        While (Found)
+            Move (Trim(FolderSelDtlA.FolderName)) to sFolder
+            Get IsFolderUnderAnyRoot sFolder asLibRoots to bUnderLib
+            Get IsFolderUnderRoot    sFolder sHome     to bUnderHome
+            // Remove only true library folders - never the workspace's own.
+            If (bUnderLib = True and bUnderHome = False) Begin
+                Lock
+                    Delete FolderSelDtlA
+                Unlock
+            End
+            Constrained_Find Next
+        Loop
+
+        // Recompute the header counters from the surviving rows.
+        Move 0 to iTotal
+        Move 0 to iSelected
+        Constrained_Find First FolderSelDtlA by Index.2
+        While (Found)
+            Increment iTotal
+            If (FolderSelDtlA.bSelected = True) ;
+                Increment iSelected
+            Constrained_Find Next
+        Loop
+
+        Clear FolderSelHeaA
+        Move iHeaderID to FolderSelHeaA.ID
+        Find eq FolderSelHeaA.ID
+        If (Found = True) Begin
+            Reread FolderSelHeaA
+                Move iTotal    to FolderSelHeaA.TotalFolders
+                Move iSelected to FolderSelHeaA.TotalSelected
+                SaveRecord FolderSelHeaA
+            Unlock
+        End
+
+        Send RestoreErrorState
+    End_Procedure
 
     // Note: An active header record (FolderSelHea) must be present
     //       in the global record buffer prior calling this:

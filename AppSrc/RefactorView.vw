@@ -558,6 +558,36 @@ Object oRefactorView is a cRDCDbView
                     On_Key Key_Ctrl+Key_F5  Send ActivateProcess
                 End_Object
 
+                // Controls whether folder scanning (on workspace open and via
+                // Re-scan) follows the workspace's library (.sws) references and
+                // includes their source folders. Persisted across sessions; both
+                // the on-open scan and the Re-scan button honor it.
+                Object oIncludeLibFolders_cb is a CheckBox
+                    Set Size to 12 170
+                    Set Location to 12 508
+                    Set Label to "Include library folders"
+                    Set Status_Help to "When ticked, scanning for folders also follows the workspace's library (.sws) references and includes their source folders. Untick to scan only the selected workspace."
+                    Set peAnchors to anTopRight
+                    Set Checked_State to True
+
+                    Procedure End_Construct_Object
+                        String sVal
+                        Forward Send End_Construct_Object
+                        Get ReadString of ghoApplication CS_Settings CS_IncludeLibFoldersKey "1" to sVal
+                        Set Checked_State to (sVal <> "0")
+                    End_Procedure
+
+                    Procedure OnChange
+                        Boolean bChecked
+                        String sVal
+                        Get Checked_State to bChecked
+                        Move "0" to sVal
+                        If (bChecked = True) ;
+                            Move "1" to sVal
+                        Send WriteString of ghoApplication CS_Settings CS_IncludeLibFoldersKey sVal
+                    End_Procedure
+                End_Object
+
                 Object oSelectAll_btn is a Button
                     Set Size to 14 62
                     Set Location to 10 238
@@ -591,6 +621,45 @@ Object oRefactorView is a cRDCDbView
                     Set peAnchors to anTopRight
                     Procedure OnClick
                         Send SelectInvert of oDbFolders_grd
+                    End_Procedure
+                End_Object
+
+                // Re-scans the workspace for source folders. With "Include
+                // library folders" ticked it merges in the library folders (.sws
+                // [Libraries] / aDependencies); unticked it removes them. The
+                // workspace's own + manually added folders are kept either way.
+                Object oRescanFolders_btn is a Button
+                    Set Size to 14 52
+                    Set Location to 10 452
+                    Set Label to "Re-scan"
+                    Set psToolTip to "Re-scan the workspace for source folders, following library (.sws) references, and add any newly found folders. Existing folders and their selections are kept."
+                    Set psImage to "Refresh.ico"
+                    Set peAnchors to anTopRight 
+                    
+                    Procedure OnClick
+                        Integer iNew
+                        Handle hoFolderSelHeaDD
+                        String sMsg
+                        Boolean bLibInclude
+                        Get phoFolderSelHeaDD of ghoApplication to hoFolderSelHeaDD
+                        Get Checked_State of oIncludeLibFolders_cb to bLibInclude
+                        Get RefreshFolderRecords of hoFolderSelHeaDD bLibInclude to iNew
+                        // Reload the folders grid (mirror OnWorkspaceLoaded).
+                        Send Request_Assign of hoFolderSelHeaDD
+                        Move FolderSelHea.ID to FolderSelDtl.FolderSelHeaID
+                        Move FolderSelHea.WorkspaceHomeFolder to FolderSelDtl.FolderName
+                        Send Find of oFolderSelDtl_DD GE Index.1
+                        Send RefreshDataFromDD of oDbFolders_grd 0
+                        If (iNew > 0) Begin
+                            Move (String(iNew) * "folder(s) added to the list.") to sMsg
+                        End
+                        Else If (iNew < 0) Begin
+                            Move (String(0 - iNew) * "library folder(s) removed from the list.") to sMsg
+                        End
+                        Else Begin
+                            Move "No changes to the folder list." to sMsg
+                        End
+                        Send Info_Box sMsg "Re-scan Folders"
                     End_Procedure
                 End_Object
 
@@ -1118,7 +1187,7 @@ Object oRefactorView is a cRDCDbView
     Procedure OnWorkspaceLoaded
         Integer iSelectedFolders  
         Handle hoFolderSelHeaDD hoDD
-        Boolean bExists bOK
+        Boolean bExists bOK bLibInclude
         String sHomePath sUserName sWorkspaceHome sValue
         tFolderData[] asSavedFolders
         
@@ -1128,7 +1197,8 @@ Object oRefactorView is a cRDCDbView
         End
 
         Get phoFolderSelHeaDD of ghoApplication to hoFolderSelHeaDD        
-        Get SaveNewHeaderAndChildRecords of hoFolderSelHeaDD sWorkspaceHome to bOK 
+        Get Checked_State of oIncludeLibFolders_cb to bLibInclude
+        Get SaveNewHeaderAndChildRecords of hoFolderSelHeaDD sWorkspaceHome bLibInclude to bOK 
         Send Request_Assign of hoFolderSelHeaDD 
         Move FolderSelHea.ID to FolderSelDtl.FolderSelHeaID
         Move FolderSelHea.WorkspaceHomeFolder to FolderSelDtl.FolderName
