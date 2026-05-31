@@ -27,6 +27,13 @@ Use cRefactorApplication.pkg
 Use RefactorConstants.h.pkg
 Use cAsyncProcess.pkg
 Use cEncodingHelpers.pkg
+// For matching the error pane to the user's editor look: ghoEditorProperties
+// (font) + the global colorer gtColorer[EC_WINDOW] (colors) - the same source
+// the Scintilla settings dialog/preview use. Both packages are already pulled in
+// elsewhere in the app and are include-guarded, so re-Use'ing them here is a
+// no-op there. See ApplyEditorAppearance.
+Use oEditorProperties.pkg
+Use THColorer.pkg
 
 // Win32 progress-bar constants for marquee mode (not exposed by cProgressBar).
 //   PBS_MARQUEE     = 0x0008  - control style flag
@@ -222,6 +229,50 @@ Object oTestCompile_dg is a cRDCModalPanel
             Set Read_Only_State to True
             Set Value to ""
             Set Label to "Error details (.err file contents):"
+
+            // Bold every occurrence of a fixed marker in the current text: find it,
+            // select it, bold the selection. (Read-only does not block programmatic
+            // character formatting.) cRichEdit's pbBold applies to the current
+            // selection - same property its Ctrl+B / ToggleBold uses.
+            Procedure BoldEveryOccurrence String sNeedle
+                Integer iPos iLen
+                Move (Length(sNeedle)) to iLen
+                If (iLen = 0) ;
+                    Procedure_Return
+                // FindText's 2nd argument is a FLAG, not a start position - it
+                // searches forward from the current selection. So start at the top
+                // and, after bolding each hit, collapse the caret PAST it so the next
+                // FindText advances. (The old code passed the position as that flag,
+                // which is why only the first hit ever got bolded.)
+                Send SetSel 0 0
+                Repeat
+                    Get FindText sNeedle 0 to iPos
+                    If (iPos <> -1) Begin
+                        Send SetSel iPos (iPos + iLen)
+                        Set pbBold to True
+                        Send SetSel (iPos + iLen) (iPos + iLen)
+                    End
+                Until (iPos = -1)
+            End_Procedure
+
+            // Make a wall of compiler errors easy to skim by bolding the severity
+            // markers. Called after the .err text is loaded (FinishCompile). A fresh
+            // Set Value resets formatting, so this re-applies each run. Leaves the
+            // caret at the top with nothing selected.
+            Procedure BoldErrorMarkers
+                // Severity markers, covering BOTH the df-cli output (") ERROR" /
+                // ") WARNING") AND DFComp.exe / the .err file ("ERROR:" / "WARNING:").
+                // Each is bolded wherever it appears; a form that isn't present is
+                // simply a no-op, so this is safe regardless of which compiler ran.
+                Send BoldEveryOccurrence ") ERROR"
+                Send BoldEveryOccurrence "ERROR:"
+                Send BoldEveryOccurrence ") WARNING"
+                Send BoldEveryOccurrence "WARNING:"
+                // Location markers (the .err file format) so the file + line stand out.
+                Send BoldEveryOccurrence "ON LINE:"
+                Send BoldEveryOccurrence "OF FILE:"
+                Send SetSel 0 0
+            End_Procedure
         End_Object
 
         Object oClear_btn is a cRDCButton
@@ -383,6 +434,23 @@ Object oTestCompile_dg is a cRDCModalPanel
     // string concatenation.
     Function LoadErrFileContents String sFilePath Returns String
         Function_Return (RFReadEncodedFileAsString(sFilePath))
+    End_Function
+
+    // Count non-overlapping occurrences of sNeedle in sText. Pure string scan (no
+    // control state) - used for the error/warning summary header.
+    Function CountInString String sText String sNeedle Returns Integer
+        Integer iCount iPos iLen
+        Move (Length(sNeedle)) to iLen
+        If (iLen = 0) ;
+            Function_Return 0
+        Move 0 to iCount
+        Move (Pos(sNeedle, sText)) to iPos
+        While (iPos > 0)
+            Increment iCount
+            Move (Mid(sText, (Length(sText)), (iPos + iLen))) to sText
+            Move (Pos(sNeedle, sText)) to iPos
+        Loop
+        Function_Return iCount
     End_Function
 
     // Kick off a compile and return immediately. The actual compiler
@@ -612,9 +680,9 @@ Object oTestCompile_dg is a cRDCModalPanel
     // .err file, shows success / failure / cancelled in the result form,
     // and surfaces the .err contents on failure.
     Procedure FinishCompile
-        String sProgram sErrorText sErrFile sErrPath sAppSrc sCmdLine sCompilerLog sLogFile
+        String sProgram sErrorText sErrFile sErrPath sAppSrc sCmdLine sCompilerLog sLogFile sHeader
         Boolean bOK bExists bCancelled
-        Integer iExitCode
+        Integer iExitCode iErrors iWarnings iC1 iC2
         tWorkspacePaths TargetWS
 
         Get psCompilingProgram to sProgram
@@ -681,6 +749,8 @@ Object oTestCompile_dg is a cRDCModalPanel
             If (bExists = True) Begin
                 Send SetErrFile sErrPath
             End
+            // Highlight the error/warning markers so the readout is easy to skim.
+            Send BoldErrorMarkers of oDetails_edit
             Procedure_Return
         End
 
@@ -702,6 +772,16 @@ Object oTestCompile_dg is a cRDCModalPanel
         Get vFilePathExists sErrPath to bExists
         If (bExists = True) Begin
             Get LoadErrFileContents sErrPath to sErrorText
+            // Count errors/warnings for the summary header from the .err contents
+            // ONLY (before the stdout log is appended below), so errors echoed to
+            // both aren't double-counted. Max of the two marker forms gives the right
+            // count whichever compiler wrote the .err.
+            Get CountInString sErrorText ") ERROR"   to iC1
+            Get CountInString sErrorText "ERROR:"    to iC2
+            Move (If(iC1 > iC2, iC1, iC2)) to iErrors
+            Get CountInString sErrorText ") WARNING" to iC1
+            Get CountInString sErrorText "WARNING:"  to iC2
+            Move (If(iC1 > iC2, iC1, iC2)) to iWarnings
             // Surface the .err on the bottom row with an Open button.
             Send SetErrFile sErrPath
         End
@@ -709,7 +789,16 @@ Object oTestCompile_dg is a cRDCModalPanel
             Move (sErrorText + CS_CRLF + CS_CRLF + "Compiler output:" + CS_CRLF + sCompilerLog) to sErrorText
         If (sCmdLine <> "") ;
             Move (sErrorText + CS_CRLF + CS_CRLF + "Command line passed to the compiler:" + CS_CRLF + sCmdLine) to sErrorText
+        // Prepend a summary header (errors/warnings counted from the .err above).
+        If (iErrors > 0 or iWarnings > 0) Begin
+            Move ("*** " + String(iErrors) + " error(s)") to sHeader
+            If (iWarnings > 0) ;
+                Append sHeader ", " (String(iWarnings)) " warning(s)"
+            Move (sHeader + " ***" + CS_CRLF + CS_CRLF + sErrorText) to sErrorText
+        End
         Set Value of oDetails_edit to sErrorText
+        // Highlight the error/warning markers so the readout is easy to skim.
+        Send BoldErrorMarkers of oDetails_edit
     End_Procedure  
     
     // Clear the result/details area between invocations.
@@ -717,6 +806,57 @@ Object oTestCompile_dg is a cRDCModalPanel
         Set Value of oResult_fm to ""
         Set Value of oDetails_edit to ""
         Send SetErrFile ""
+    End_Procedure
+
+    // Make the error-details pane match the user's Scintilla editor look - the
+    // font and colors they picked in the Scintilla settings - instead of a
+    // hard-coded font / white background, so a wall of compiler errors reads the
+    // same as their editor. Pulls from the same place the settings preview does
+    // (ScintillaParameters.dg mGeneratePreview / oNumbersPreview):
+    //   - font face: ghoEditorProperties.psFontFace ("11pt; 0; Courier New" form)
+    //   - colors:    two separate colorer elements (see THColorer). Background =
+    //                the "Window" element gtColorer[EC_WINDOW].iForeC (EC_WINDOW
+    //                carries ONLY a fore color, iBackOff=0, which the colorer uses
+    //                as the editor's paper - so its .iBackC is an unused slot = black).
+    //                Text = the "Text" element gtColorer[EC_TEXT].iForeC, which is
+    //                exactly what the editor itself applies (THColorer.pkg:
+    //                "Set TextColor to gtColorer[EC_TEXT].iForeC"). A value < 0 means
+    //                "not set", so we leave the control default.
+    // Called from Popup so each open reflects the current settings. Font SIZE is
+    // intentionally left at the control default for now (the face - i.e. a fixed-
+    // width font - is what aligns the error columns).
+    Procedure ApplyEditorAppearance
+        String  sFontData sFontTemp sFontFace
+        Integer iPaper iInk iSize iPos
+        Handle  hoProps
+
+        // Font face (parse mirrors cRefactorScintillaEditor.SetAdjustments).
+        Move ghoEditorProperties to hoProps
+        If (hoProps <> 0) Begin
+            Get psFontFace of hoProps to sFontData
+            If (sFontData = "") ;
+                Move "11pt; 0; Courier New" to sFontData 
+
+            Move (Pos(";", sFontData)) to iPos
+            Move (Left(sFontData, iPos -3))                to iSize
+            If (iSize < 6) ;
+                Move 11 to iSize
+            Set piFontSize  of oDetails_edit to (iSize * 20) // Twips
+            Move (Left(sFontData, Pos(";", sFontData)))    to sFontTemp   // "11pt;"
+            Move (Trim(Replace(sFontTemp, sFontData, ""))) to sFontData   // "0; Courier New"
+            Move (Left(sFontData, Pos(";", sFontData)))    to sFontTemp   // "0;"
+            Move (Trim(Replace(sFontTemp, sFontData, ""))) to sFontFace   // "Courier New"
+            If (sFontFace <> "") ;
+                Set TypeFace of oDetails_edit to sFontFace
+        End
+
+        // Colors - see the note above for the two-element mapping.
+        Move gtColorer[EC_WINDOW].iForeC to iPaper   // "Window" element -> editor paper
+        Move gtColorer[EC_TEXT].iForeC   to iInk     // "Text" element   -> editor ink
+        If (iPaper >= 0) ;
+            Set Color of oDetails_edit to iPaper
+        If (iInk >= 0) ;
+            Set TextColor of oDetails_edit to iInk
     End_Procedure
 
     // Reset to a clean state and pre-select the last-used program for the
@@ -732,6 +872,9 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (sLastProgram <> "") Begin
             Set Value of oProgram_cf to sLastProgram
         End
+
+        // Match the details pane to the user's current editor font + colors.
+        Send ApplyEditorAppearance
 
         Forward Send Popup
     End_Procedure
