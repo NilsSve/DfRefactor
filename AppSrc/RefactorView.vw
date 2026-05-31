@@ -550,6 +550,16 @@ Object oRefactorView is a cRDCDbView
                         End
                         Function_Return bSave
                     End_Procedure
+
+                    // Select the focused folder and all its sub-folders in one go
+                    // (the "Select Subtree" button). Bulk-selects via the DD, then
+                    // reloads the grid so the new checkbox states show.
+                    Procedure SelectFocusedSubtree
+                        Integer iNewly
+                        Get SelectFolderSubtree of (Server(Self)) to iNewly
+                        If (iNewly > 0) ;
+                            Send RefreshDataFromDD of Self 0
+                    End_Procedure
                     
                     On_Key Key_F2           Send Request_Save 
                     On_Key Key_Ctrl+Key_S   Send Request_Save
@@ -564,7 +574,7 @@ Object oRefactorView is a cRDCDbView
                 // the on-open scan and the Re-scan button honor it.
                 Object oIncludeLibFolders_cb is a CheckBox
                     Set Size to 12 170
-                    Set Location to 12 508
+                    Set Location to 12 449
                     Set Label to "Include library folders"
                     Set Status_Help to "When ticked, scanning for folders also follows the workspace's library (.sws) references and includes their source folders. Untick to scan only the selected workspace."
                     Set peAnchors to anTopRight
@@ -585,6 +595,18 @@ Object oRefactorView is a cRDCDbView
                         If (bChecked = True) ;
                             Move "1" to sVal
                         Send WriteString of ghoApplication CS_Settings CS_IncludeLibFoldersKey sVal
+                    End_Procedure
+                End_Object
+
+                Object oSelectSubtree_btn is a Button
+                    Set Size to 14 80
+                    Set Location to 10 150
+                    Set Label to "Select Subtree"
+                    Set psImage to "SelectAll.ico"
+                    Set psToolTip to "Select the currently-focused folder and ALL of its sub-folders. Handy for deep library trees - enable a whole subtree in one click instead of ticking each folder."
+                    Set peAnchors to anTopRight
+                    Procedure OnClick
+                        Send SelectFocusedSubtree of oDbFolders_grd
                     End_Procedure
                 End_Object
 
@@ -630,7 +652,7 @@ Object oRefactorView is a cRDCDbView
                 // workspace's own + manually added folders are kept either way.
                 Object oRescanFolders_btn is a Button
                     Set Size to 14 52
-                    Set Location to 10 452
+                    Set Location to 10 539
                     Set Label to "Re-scan"
                     Set psToolTip to "Re-scan the workspace for source folders, following library (.sws) references, and add any newly found folders. Existing folders and their selections are kept."
                     Set psImage to "Refresh.ico"
@@ -1134,9 +1156,6 @@ Object oRefactorView is a cRDCDbView
                 String sSWSFile
                 Get psSWSFile of ghoApplication to sSWSFile
                 Function_Return (sSWSFile <> "")
-//                Boolean bIsEnabled
-//                Get IsEnabled of (oCompare_MenuItem(ghoCommandBars)) to bIsEnabled
-//                Function_Return bIsEnabled
             End_Function
 
         End_Object
