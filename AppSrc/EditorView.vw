@@ -32,55 +32,67 @@ Object oEditorView_vw is a cRefactorDbView
         Set Visible_State to False
     End_Object
 
-    Object oEditor_edt is a cRefactorScintillaEditor
-        Set Size to 244 473
+    Object oEditorDockHost is a Container3d
+        // nhPublic puts this editor region into the public docking neighborhood so the bottom
+        // CompilerOutput dock resizes against the editor (drag its top edge) instead of
+        // overlapping it. Plain containers default to nhNo (no docking participation); this
+        // mirrors the nhPublic editor panes in RefactorTestBench.vw.
+        Set peNeighborhood to nhPublic
+        Set Border_Style to Border_None
         Set Location to 16 10
+        Set Size to 244 473
         Set peAnchors to anAll
-        Set Enabled_State to False
 
-        // View property.
-        Delegate Set phoEditor to Self
-        Set phoEditor of ghoApplication to Self
-         
-        Property Boolean piInSetFocus False
+        Object oEditor_edt is a cRefactorScintillaEditor
+            Set Size to 244 473
+            Set Location to 0 0
+            Set peAnchors to anAll
+            Set Enabled_State to False
 
-        // We con't care about potential data loss here.
-        Function pbShouldSave Returns Boolean
-            Function_Return False
-        End_Function
+            // View property.
+            Delegate Set phoEditor to Self
+            Set phoEditor of ghoApplication to Self
 
-        // Note: We need this "intermediate" procedure because the phoMainPanel property
-        //       is zero when the program starts - which generates a runtime error.
-        Procedure SwitchNextView
-            Send Switch_Next_View of (Client_Id(phoMainPanel(ghoApplication)))
-        End_Procedure
+            Property Boolean piInSetFocus False
 
-        Object oIdleHandler is a cIdleHandler 
-            Procedure OnIdle
-                String sSWSFile
-                Get psSWSFile of ghoApplication to sSWSFile
-                Set Enabled_State to (sSWSFile <> "")   
-                // Make the editor not visible, because else it is possible to click inside it
-                // even when no workspace has been selected.
-                // The oDbInvisible_fm object above takes care of the focusable necessity.
-                Set Visible_State to (sSWSFile <> "")
+            // We con't care about potential data loss here.
+            Function pbShouldSave Returns Boolean
+                Function_Return False
+            End_Function
+
+            // Note: We need this "intermediate" procedure because the phoMainPanel property
+            //       is zero when the program starts - which generates a runtime error.
+            Procedure SwitchNextView
+                Send Switch_Next_View of (Client_Id(phoMainPanel(ghoApplication)))
             End_Procedure
+
+            Object oIdleHandler is a cIdleHandler 
+                Procedure OnIdle
+                    String sSWSFile
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Set Enabled_State to (sSWSFile <> "")   
+                    // Make the editor not visible, because else it is possible to click inside it
+                    // even when no workspace has been selected.
+                    // The oDbInvisible_fm object above takes care of the focusable necessity.
+                    Set Visible_State to (sSWSFile <> "")
+                End_Procedure
+            End_Object
+
+            Procedure Activating
+                Forward Send Activating
+                Set pbEnabled of oIdleHandler to True
+            End_Procedure
+
+            Procedure Deactivating
+                Set pbEnabled of oIdleHandler to False
+                Forward Send DeActivating 
+            End_Procedure
+
+            // This short-cut key will keep the UI consistent, as the editor was "grabbing" this
+            // key combination and did nothing, but everywhere else it flips through the views/tab-pages.
+            On_Key Key_Ctrl+Key_Tab Send SwitchNextView
+            On_Key Key_Ctrl+Key_S   Send Request_Save
         End_Object
-
-        Procedure Activating
-            Forward Send Activating
-            Set pbEnabled of oIdleHandler to True
-        End_Procedure
-    
-        Procedure Deactivating
-            Set pbEnabled of oIdleHandler to False
-            Forward Send DeActivating 
-        End_Procedure
-
-        // This short-cut key will keep the UI consistent, as the editor was "grabbing" this
-        // key combination and did nothing, but everywhere else it flips through the views/tab-pages.
-        On_Key Key_Ctrl+Key_Tab Send SwitchNextView
-        On_Key Key_Ctrl+Key_S   Send Request_Save
     End_Object
 
     Procedure OnSetFocus

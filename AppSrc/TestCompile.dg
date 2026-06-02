@@ -18,7 +18,9 @@ Use Windows.pkg
 Use cProgressBar.pkg
 Use cTimer.pkg
 Use cTextEdit.pkg
-Use cRDCModalPanel.pkg
+Use cCJToolPanel.pkg
+Use cCJGrid.pkg
+Use cCJGridColumn.pkg
 Use cRDCButton.pkg
 Use cRDCForm.pkg
 Use cRDCComboForm.pkg
@@ -27,13 +29,6 @@ Use cRefactorApplication.pkg
 Use RefactorConstants.h.pkg
 Use cAsyncProcess.pkg
 Use cEncodingHelpers.pkg
-// For matching the error pane to the user's editor look: ghoEditorProperties
-// (font) + the global colorer gtColorer[EC_WINDOW] (colors) - the same source
-// the Scintilla settings dialog/preview use. Both packages are already pulled in
-// elsewhere in the app and are include-guarded, so re-Use'ing them here is a
-// no-op there. See ApplyEditorAppearance.
-Use oEditorProperties.pkg
-Use THColorer.pkg
 
 // Win32 progress-bar constants for marquee mode (not exposed by cProgressBar).
 //   PBS_MARQUEE     = 0x0008  - control style flag
@@ -52,14 +47,19 @@ Use THColorer.pkg
     Define CS_LastCompileKeyPrefix for "LastCompileProgram_"
 #ENDIF
 
-Object oTestCompile_dg is a cRDCModalPanel
-    Set Label to "Test Compile"
-    Set Size to 227 360
-    Set piMinSize to 200 360
-    Set Location to 6 6
-    Set Border_Style to Border_Thick
-    Set Locate_Mode to CENTER_ON_PARENT
-    Set Icon to "CompileProject.ico"
+// Non-modal, dockable tool panel (was a cRDCModalPanel). Modality was the only thing
+// blocking the main editor while errors were shown; as a dock it coexists with the
+// Scintilla editor so an error row can jump straight to the source line. Shown via the
+// ShowTestCompilePanel entry point at the bottom of this file (not Popup). Docking
+// attributes mirror CompilerOutput.dg, the app's other cCJToolPanel.
+Object oTestCompile_dg is a cCJToolPanel
+    Set Size to 78 483
+    Set piMinSize to 78 360
+    Set Location to 10 5
+    Set Border_Style to Border_None
+    Set peNeighborhood to nhPublic
+    Set peBarPosition to xtpBarBottom 
+    Set Color to clBtnFace
 
     // -----------------------------------------------------------------
     // Async-compile state
@@ -72,252 +72,189 @@ Object oTestCompile_dg is a cRDCModalPanel
     // StartCompile - which returns immediately after launching the compile -
     // and FinishCompile, which fires later from the poll timer.
 
-    Property String          psCompilingProgram ""
+    Property String psCompilingProgram ""
     Property tWorkspacePaths pCompilingWS
     // Full command line (sCmdPath + sCmdArgs) that StartCompile handed to
-    // cAsyncProcess. Captured so FinishCompile can echo it into the details
-    // pane on failure — invaluable when iterating on compiler directives,
-    // since "what the user thinks they passed" and "what the compiler
-    // actually received" diverge often.
-    Property String          psCompiledCmdLine  ""
+    // cAsyncProcess. Captured for debugging compiler directives - "what the
+    // user thinks they passed" and "what the compiler actually received"
+    // diverge often. Not currently displayed; it is the data source for a
+    // command-line info-row if the shared dock grows one.
+    Property String psCompiledCmdLine ""
     // Absolute path to the temp file that captures the compiler's stdout +
-    // stderr. Written by the cmd.exe wrapper StartCompile launches, tailed
-    // by oCompilePoll_tm into oDetails_edit, and deleted by FinishCompile
-    // once consumed. Empty when no compile is in flight.
-    Property String          psCompileLogFile   ""
+    // stderr, written by the cmd.exe wrapper StartCompile launches. While a
+    // df-cli compile runs, UpdateCompileProgress watches it grow and refreshes
+    // the live error dock from it. It PERSISTS after the compile (the dock can
+    // be reopened to review). Empty when no compile is in flight.
+    Property String psCompileLogFile ""
     // Tick counter incremented every oCompilePoll_tm fire (every 100 ms).
     // Used to sub-sample updates: elapsed-time display every 10 ticks
-    // (~1 s), log-file tail every 5 ticks (~500 ms). Reset to 0 at the
-    // start of each compile.
-    Property Integer         piCompileTicks     0
+    // (~1 s), live error-dock refresh every 5 ticks (~500 ms). Reset to 0
+    // at the start of each compile.
+    Property Integer piCompileTicks 0
     // Byte size of psCompileLogFile as of the last tick that refreshed the
-    // details pane. UpdateCompileProgress compares the live file size to
-    // this and only rereads + repaints when the log has actually grown -
-    // the cTextEdit rewrite (and the whole-file read) is the costly part,
+    // live error dock. UpdateCompileProgress compares the live file size to
+    // this and only refreshes the dock when the log has actually grown -
+    // the grid rebuild (and the whole-file read) is the costly part,
     // and most ticks during a single-file compile see no new output. Reset
     // to 0 at the start of each compile.
-    Property Integer         piLastLogSize      0
+    Property Integer piLastLogSize 0
     // Set True by KillCompile right before KillProcess; checked by
     // FinishCompile so the post-mortem can show a "Cancelled" message
     // instead of treating a missing .err file as a clean compile.
-    Property Boolean         pbCancelled        False
+    Property Boolean pbCancelled False
     // Full path to the .err file shown on the dialog's bottom row after a
     // failed compile (blank otherwise). The Open button shell-opens this;
     // SetErrFile keeps it in sync with the filename form + the button state.
-    Property String          psErrFilePath      ""
-    // File that UpdateCompileProgress live-tails into the details pane during
-    // a compile: the cmd-redirect stdout log for df-cli, or the (incrementally
-    // written) .err file for the legacy DFComp/DFCompConsole, which emit
-    // nothing to stdout. Set per-compile in StartCompile.
-    Property String          psLiveTailFile     ""
+    Property String psErrFilePath      ""
+    // True for a df-cli compile (which streams to stdout): StartCompile then shows the error
+    // dock live, UpdateCompileProgress refreshes it as the log grows, and FinishCompile swaps
+    // to the parsed .err. Legacy compilers (no streaming) leave it False. Set per-compile.
+    Property Boolean pbStreamOutput False
+    // Retry budget for the intermittent df-cli "pre-compile needed" bail (external/transient,
+    // NOT a code error). FinishCompile retries ONCE immediately when a df-cli compile exits
+    // non-zero with NO .err (a genuine compile error would have produced an .err). Reset to 0
+    // by the Compile button on a fresh user compile; NOT reset by the retry, so it caps at 1.
+    Property Integer piCompileRetries 0
 
     // -----------------------------------------------------------------
-    // Selection group: program picker
+    // Top strip (direct panel children, anchored to the top). The two
+    // cRDCHeaderGroup wrappers were removed - their header/border chrome ate
+    // the vertical space the error grid needs. Only the grid (bottom, anAll)
+    // grows when the dock is resized; everything here stays anchored top.
     // -----------------------------------------------------------------
-    Object oSelect_grp is a cRDCHeaderGroup
-        Set Location to 5 10
-        Set Size to 63 340
-        Set Label to "Program to compile"
-        Set psImage to "CompileProject.ico"
-
-        Object oInfo_tb is a TextBox
-            Set Location to 21 12
-            Set Size to 20 316
-            Set Auto_Size_State to False
-            Set Justification_Mode to JMode_Left
-            Set Label to "Programs are read from the current workspace's .sws [Projects] section. The last-picked program is remembered per workspace."
-        End_Object
-
-        Object oProgram_cf is a cRDCComboForm
-            Set Location to 43 12
-            Set Size to 13 316
-            Set Label to ""
-            Set peAnchors to anTopLeftRight
-            Set psToolTip to "Pick a program from the current workspace's project list."
-            Set Entry_State to False     // combo-selection-only (no free text)
-
-            Procedure Fill_List
-                String sSWSFile sProgram
-                String[] asProjects
-                Integer iCount iMax
-
-                Send Combo_Delete_Data
-                Get psSWSFile of ghoApplication to sSWSFile
-                If (sSWSFile = "") ;
-                    Procedure_Return
-
-                Get GetWorkspaceProjects of ghoApplication sSWSFile to asProjects
-                Move (SizeOfArray(asProjects)) to iMax
-                Decrement iMax
-                For iCount from 0 to iMax
-                    Move asProjects[iCount] to sProgram
-                    Send Combo_Add_Item sProgram
-                Loop
-            End_Procedure
-
-            Procedure OnChange
-                String sSWSFile sProgram
-                Forward Send OnChange
-                Get Value to sProgram
-                Get psSWSFile of ghoApplication to sSWSFile
-                If (sProgram <> "" and sSWSFile <> "") Begin
-                    Send WriteString of ghoApplication CS_Settings ;
-                        (CS_LastCompileKeyPrefix + sSWSFile) sProgram
-                End
-            End_Procedure
-        End_Object
+    Object oInfo_tb is a TextBox
+        Set Location to 4 22
+        Set Size to 11 472
+        Set peAnchors to anTopLeftRight
+        Set Auto_Size_State to False
+        Set Justification_Mode to JMode_Left
+        Set Label to "Test Compile. Programs are read from the current workspace's .sws [Projects] section. The last-picked program is remembered per workspace."
     End_Object
 
-    // -----------------------------------------------------------------
-    // Progress + result group
-    // -----------------------------------------------------------------
-    Object oResult_grp is a cRDCHeaderGroup
-        Set Location to 76 10
-        Set Size to 124 340
-        Set Label to "Result"
-        Set psImage to "ActionAbout.ico"
-        Set peAnchors to anAll
+    Object oProgram_cf is a cRDCComboForm
+        Set Location to 24 22
+        Set Size to 13 237
+        Set Label to "Select Program:"
+        Set peAnchors to anNone
+        Set psToolTip to "Pick a program from the current workspace's project list."
+        Set Entry_State to False     // combo-selection-only (no free text)
+        Set Label_Justification_Mode to JMode_Top
+        Set Label_Col_Offset to 0
 
-        Object oResult_fm is a cRDCForm
-            Set Location to 22 12
-            Set Size to 13 296
-            Set Form_Border to Border_None
-            Set Enabled_State to False
-            Set FontWeight to FW_BOLD
-            Set peAnchors to anTopLeftRight
-            Set Value to ""
-        End_Object
+        Procedure Fill_List
+            String sSWSFile sProgram
+            String[] asProjects
+            Integer iCount iMax
 
-        Object oProgress_pb is a cProgressBar
-            Set Location to 38 12
-            Set Size to 10 314
-            Set pbSmooth to True
-            Set piAdvanceBy to 1
-            Set peAnchors to anNone
+            Send Combo_Delete_Data
+            Get psSWSFile of ghoApplication to sSWSFile
+            If (sSWSFile = "") ;
+                Procedure_Return
 
-            // Apply the Win32 marquee style. Windows animates the moving
-            // block itself by posting WM_TIMER messages to the control,
-            // so the animation runs only while the UI thread is pumping
-            // messages - i.e. as long as the compile was launched async
-            // (see StartCompile). End_Construct_Object is the safe spot to
-            // call Set Window_Style from inside an inline Object body
-            // (Construct_Object would compile-error here: classes only).
-            Procedure End_Construct_Object
-                Forward Send End_Construct_Object
-                Set Window_Style to PBS_MARQUEE True
-            End_Procedure
+            Get GetWorkspaceProjects of ghoApplication sSWSFile to asProjects
+            Move (SizeOfArray(asProjects)) to iMax
+            Decrement iMax
+            For iCount from 0 to iMax
+                Move asProjects[iCount] to sProgram
+                Send Combo_Add_Item sProgram
+            Loop
+        End_Procedure
 
-            // Turn the OS-driven marquee animation on. lParam 30 is the
-            // animation step interval in ms - lower = smoother but more
-            // WM_TIMER traffic.
-            Procedure StartMarquee
-                Set piPosition to 0
-                Send Windows_Message PBM_SETMARQUEE 1 30
-            End_Procedure
+        Procedure OnChange
+            String sSWSFile sProgram
+            Forward Send OnChange
+            Get Value to sProgram
+            Get psSWSFile of ghoApplication to sSWSFile
+            If (sProgram <> "" and sSWSFile <> "") Begin
+                Send WriteString of ghoApplication CS_Settings ;
+                    (CS_LastCompileKeyPrefix + sSWSFile) sProgram
+            End
+        End_Procedure
+    End_Object
 
-            Procedure StopMarquee
-                Send Windows_Message PBM_SETMARQUEE 0 0
-                Set piPosition to 0
-            End_Procedure
-        End_Object
+    Object oResult_fm is a Form
+        Set Location to 43 262
+        Set Size to 13 211
+        Set Form_Border to Border_None
+        Set Enabled_State to False
+        Set FontWeight to FW_BOLD
+        Set peAnchors to anNone
+        Set Value to ""
+    End_Object
 
-        Object oDetails_edit is a cRichEdit //cTextEdit
-            Set Location to 68 12
-            Set Size to 45 316
-            Set peAnchors to anAll
-            Set Border_Style to Border_StaticEdge
-            Set Read_Only_State to True
-            Set Value to ""
-            Set Label to "Error details (.err file contents):"
+    Object oProgress_pb is a cProgressBar
+        Set Location to 43 22
+        Set Size to 10 237
+        Set pbSmooth to True
+        Set piAdvanceBy to 1
+        Set peAnchors to anNone
 
-            // Bold every occurrence of a fixed marker in the current text: find it,
-            // select it, bold the selection. (Read-only does not block programmatic
-            // character formatting.) cRichEdit's pbBold applies to the current
-            // selection - same property its Ctrl+B / ToggleBold uses.
-            Procedure BoldEveryOccurrence String sNeedle
-                Integer iPos iLen
-                Move (Length(sNeedle)) to iLen
-                If (iLen = 0) ;
-                    Procedure_Return
-                // FindText's 2nd argument is a FLAG, not a start position - it
-                // searches forward from the current selection. So start at the top
-                // and, after bolding each hit, collapse the caret PAST it so the next
-                // FindText advances. (The old code passed the position as that flag,
-                // which is why only the first hit ever got bolded.)
-                Send SetSel 0 0
-                Repeat
-                    Get FindText sNeedle 0 to iPos
-                    If (iPos <> -1) Begin
-                        Send SetSel iPos (iPos + iLen)
-                        Set pbBold to True
-                        Send SetSel (iPos + iLen) (iPos + iLen)
-                    End
-                Until (iPos = -1)
-            End_Procedure
+        // Apply the Win32 marquee style. Windows animates the moving
+        // block itself by posting WM_TIMER messages to the control,
+        // so the animation runs only while the UI thread is pumping
+        // messages - i.e. as long as the compile was launched async
+        // (see StartCompile). End_Construct_Object is the safe spot to
+        // call Set Window_Style from inside an inline Object body
+        // (Construct_Object would compile-error here: classes only).
+        Procedure End_Construct_Object
+            Forward Send End_Construct_Object
+            Set Window_Style to PBS_MARQUEE True
+        End_Procedure
 
-            // Make a wall of compiler errors easy to skim by bolding the severity
-            // markers. Called after the .err text is loaded (FinishCompile). A fresh
-            // Set Value resets formatting, so this re-applies each run. Leaves the
-            // caret at the top with nothing selected.
-            Procedure BoldErrorMarkers
-                // Severity markers, covering BOTH the df-cli output (") ERROR" /
-                // ") WARNING") AND DFComp.exe / the .err file ("ERROR:" / "WARNING:").
-                // Each is bolded wherever it appears; a form that isn't present is
-                // simply a no-op, so this is safe regardless of which compiler ran.
-                Send BoldEveryOccurrence ") ERROR"
-                Send BoldEveryOccurrence "ERROR:"
-                Send BoldEveryOccurrence ") WARNING"
-                Send BoldEveryOccurrence "WARNING:"
-                // Location markers (the .err file format) so the file + line stand out.
-                Send BoldEveryOccurrence "ON LINE:"
-                Send BoldEveryOccurrence "OF FILE:"
-                Send SetSel 0 0
-            End_Procedure
-        End_Object
+        // Turn the OS-driven marquee animation on. lParam 30 is the
+        // animation step interval in ms - lower = smoother but more
+        // WM_TIMER traffic.
+        Procedure StartMarquee
+            Set piPosition to 0
+            Send Windows_Message PBM_SETMARQUEE 1 30
+        End_Procedure
 
-        Object oClear_btn is a cRDCButton
-            Set Location to 5 151
-            Set Label to "Clear"
-            Set peAnchors to anTopRight
-            Set pbAutoEnable to True
-    
-            Procedure OnClick
-                Send Clear
-            End_Procedure
+        Procedure StopMarquee
+            Send Windows_Message PBM_SETMARQUEE 0 0
+            Set piPosition to 0
+        End_Procedure
+    End_Object
 
-            Function IsEnabled Returns Boolean
-                Boolean bRetVal 
-                String sVal
-                
-                Forward Get IsEnabled to bRetVal
-                Get Value of oErrFile_fm to sVal
-                Move (sVal <> "") to bRetVal
-                Function_Return bRetVal
-            End_Function
+    Object oClear_btn is a cRDCButton
+        Set Location to 23 316
+        Set Label to "Clear"
+        Set peAnchors to anNone
+        Set pbAutoEnable to True
+
+        Procedure OnClick
+            Send Clear
+        End_Procedure
+
+        Function IsEnabled Returns Boolean
+            Boolean bRetVal 
+            String sVal
             
-        End_Object
+            Forward Get IsEnabled to bRetVal
+            Get Value of oErrFile_fm to sVal
+            Move (sVal <> "") to bRetVal
+            Function_Return bRetVal
+        End_Function
         
     End_Object
 
     // -----------------------------------------------------------------
-    // .err file readout: bottom row, left of the Compile/Close buttons.
-    // Filled by SetErrFile after a failed compile; Open shell-opens the
-    // file in the user's default editor (OS file association).
+    // .err file readout (top strip, right of the program combo). Filled by
+    // SetErrFile after a failed compile; Open shell-opens it in the user's
+    // default editor (OS file association).
     // -----------------------------------------------------------------
     Object oErrFile_fm is a cRDCForm
-        Set Location to 210 12
-        Set Size to 12 145
+        Set Location to 60 22
+        Set Size to 12 237
         Set Form_Border to Border_None
         Set Enabled_State to False
-        Set peAnchors to anBottomLeftRight
+        Set peAnchors to anNone
         Set Value to ""
     End_Object
 
     Object oOpenErr_btn is a cRDCButton
-        Set Location to 209 160
-        Set Size to 14 50
+        Set Location to 59 262
         Set Label to "&Open"
-        Set peAnchors to anBottomRight
+        Set peAnchors to anNone
         Set Enabled_State to False
         Set psToolTip to "Open the .err file in your default text editor."
         Set pbAutoEnable to True
@@ -337,6 +274,15 @@ Object oTestCompile_dg is a cRDCModalPanel
             Move (sVal <> "") to bRetVal
             Function_Return bRetVal
         End_Function
+
+        Procedure CreateGridControl
+            String sErrFile        
+        
+            Get psErrFilePath to sErrFile
+            If (sErrFile <> "") Begin
+                Forward Send CreateGridControl
+            End
+        End_Procedure
         
     End_Object
 
@@ -345,11 +291,10 @@ Object oTestCompile_dg is a cRDCModalPanel
     // it to "&Compile". OnClick dispatches based on whether the process is
     // active, so a single button covers both verbs.
     Object oCompile_btn is a cRDCButton
-        Set Location to 209 220
-        Set Size to 14 60
+        Set Location to 23 262
         Set Label to "&Compile"
         Set Default_State to True
-        Set peAnchors to anBottomRight
+        Set peAnchors to anNone
         Set psImage to "CompileProject.ico"
         Set piImageSize to 16
 
@@ -360,6 +305,9 @@ Object oTestCompile_dg is a cRDCModalPanel
                 Send KillCompile
             End
             Else Begin
+                // Fresh user-initiated compile: reset the df-cli auto-retry budget (the retry
+                // in FinishCompile does NOT reset it, so an auto-retry caps at one extra attempt).
+                Set piCompileRetries to 0
                 Send StartCompile
             End
         End_Procedure
@@ -379,8 +327,7 @@ Object oTestCompile_dg is a cRDCModalPanel
     End_Object
 
     Object oClose_btn is a cRDCButton
-        Set Location to 209 290
-        Set Size to 14 60
+        Set Location to 59 415
         Set Label to "C&lose"
         Set peAnchors to anBottomRight
 
@@ -410,6 +357,7 @@ Object oTestCompile_dg is a cRDCModalPanel
             End
             Delegate Send UpdateCompileProgress
         End_Procedure
+
     End_Object
 
     // *** Functions/Procedures ***
@@ -422,6 +370,9 @@ Object oTestCompile_dg is a cRDCModalPanel
         Set psErrFilePath to sPath
         Set Value of oErrFile_fm to sPath
         Set Enabled_State of oOpenErr_btn to (sPath <> "")
+        // SetErrFile now only maintains the .err-path readout + Open button. The error grid
+        // moved to CompilerOutput.dg's shared dock (shown via ActivateCompileErrorDialog from
+        // FinishCompile).
     End_Procedure
 
     // Load the compiler's .err output into a single string.
@@ -500,22 +451,18 @@ Object oTestCompile_dg is a cRDCModalPanel
         // "&Stop" right after a successful launch (see below) so the same
         // button can also kill the running compiler.
         Set pbCancelled to False
-        Set Value of oResult_fm to ("Compiling " * sProgram * "...")
-        Set TextColor of oResult_fm to clBlack
-        // Prime the details pane. df-cli streams progress as it runs (tailed
-        // live by UpdateCompileProgress); the legacy DFComp/DFCompConsole emit
-        // nothing to stdout until they exit, so show a "please wait" note
-        // instead of an empty pane that looks frozen. sCmdPath is lowercased,
-        // and "df-cli" matches the same test BuildCompileCommand keys off.
-        If (sCmdPath contains "df-cli") Begin
-            Set Value of oDetails_edit to ""
+        If (piCompileRetries(Self) > 0) Begin
+            Set Value of oResult_fm to ("Re-compiling " * sProgram * " (retry)...")
         End
         Else Begin
-            Set Value of oDetails_edit to ("This compiler does not report progress while it runs." + CS_CRLF + CS_CRLF ;
-                + "The result and any error details will appear here when it finishes.")
+            Set Value of oResult_fm to ("Compiling " * sProgram * "...")
         End
-        // New compile: no .err yet, so clear the bottom readout + disable Open.
+        Set TextColor of oResult_fm to clBlack
+        // New compile: clear the bottom .err readout + disable Open, and hide any error dock
+        // left from a previous compile. The live "still working" signal is the elapsed-time
+        // counter in oResult_fm (UpdateCompileProgress).
         Send SetErrFile ""
+        Send CloseCompileErrorDialog of (Client_Id(ghoCommandBars))
         Send StartMarquee of oProgress_pb
 
         // Remember the in-flight compile so FinishCompile can finish it.
@@ -535,22 +482,22 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (sWorkDir = "") ;
             Move TargetWS.sHome to sWorkDir
 
-        // Remember exactly what we're about to launch so FinishCompile can
-        // echo it into the details pane on failure. Keep this as the
-        // *original* df-cli command, not the cmd.exe wrapper below — the
+        // Remember exactly what we're about to launch. Keep this as the
+        // *original* df-cli command, not the cmd.exe wrapper below - the
         // wrapper is transport for stdout capture, not what the user wants
-        // to debug.
+        // to debug. (Captured into psCompiledCmdLine; see its declaration.)
         Set psCompiledCmdLine to (sCmdPath + " " + sCmdArgs)
 
         // ---- Stdout capture for live progress feedback ----
         // df-cli is mostly silent during a build, but anything it does
         // emit (warnings, end-of-phase, errors that bypass the .err file)
         // is interesting. Redirect stdout+stderr into a temp log file via
-        // a cmd.exe /c wrapper, then let oCompilePoll_tm tail it.
+        // a cmd.exe /c wrapper; UpdateCompileProgress then refreshes the
+        // live error dock from it as it grows.
         //
         // The log lives in DFRefactor's OWN Programs folder (always
         // writable, locale-independent) and is overwritten on each compile.
-        // FinishCompile deletes it after consuming.
+        // It is NOT deleted afterwards - kept so the dock can be reopened.
         Get pOrgWS of ghoApplication to OrgWS
         Move (vFolderFormat(OrgWS.sPrograms) + "dfrefactor_compile.log") to sLogFile
         If (vFilePathExists(sLogFile)) ;
@@ -559,19 +506,15 @@ Object oTestCompile_dg is a cRDCModalPanel
         Set piCompileTicks   to 0
         Set piLastLogSize    to 0
 
-        // Choose the file UpdateCompileProgress live-tails. df-cli streams its
-        // progress to stdout (-> the cmd-redirect log); the legacy compilers
-        // write nothing to stdout but DO write their .err file incrementally,
-        // so tail that instead. (.err only exists once there are errors, so a
-        // clean legacy compile keeps the placeholder until FinishCompile.) The
-        // stale .err was already removed by DeleteCompileErrorsFile above.
+        // Only df-cli streams progress to stdout (-> the cmd-redirect log), so
+        // only it drives the live error-dock refresh in UpdateCompileProgress.
+        // The legacy DFComp/DFCompConsole write nothing to stdout, so they show
+        // no live output - just the parsed .err at the end (via FinishCompile).
         If (sCmdPath contains "df-cli") Begin
-            Set psLiveTailFile to sLogFile
+            Set pbStreamOutput to True
         End
         Else Begin
-            Get CompileErrorFileForProgram of ghoApplication sProgram to sErrFile
-            Move (vFolderFormat(TargetWS.sAppSrc) + sErrFile) to sErrPath
-            Set psLiveTailFile to sErrPath
+            Set pbStreamOutput to False
         End
 
         // Wrap with cmd.exe /c for stdout+stderr redirection. The outer
@@ -595,6 +538,12 @@ Object oTestCompile_dg is a cRDCModalPanel
         // pumps WM_TIMER messages through the progress bar control.
         Set Label of oCompile_btn to "&Stop"
         Set pbEnabled of oCompilePoll_tm to True
+
+        // df-cli streams to stdout: open the error dock now and show that log live (the poll
+        // timer refreshes it; FinishCompile swaps to the parsed .err). Legacy compilers don't
+        // stream, so they stay hidden until the .err is ready.
+        If (pbStreamOutput(Self) = True) ;
+            Send ShowCompileOutputLive of (Client_Id(ghoCommandBars)) sLogFile
     End_Procedure
 
     // Stop button handler (the Compile button acts as Stop while a compile
@@ -614,10 +563,9 @@ Object oTestCompile_dg is a cRDCModalPanel
     End_Procedure
 
     // Reads the entire compile log file into a String. Returns "" when the
-    // file is missing, locked, or empty. Called both per-tick (from
-    // UpdateCompileProgress, to refresh the live tail in oDetails_edit) and
-    // once after the process exits (from FinishCompile, to capture whatever
-    // df-cli wrote before exiting).
+    // file is missing, locked, or empty. Called by FinishCompile after the
+    // process exits, to capture whatever df-cli wrote before exiting. (The
+    // live, mid-compile refresh reads the log via the shared dock, not here.)
     //
     // Delegates to the byte-safe RFReadEncodedFileAsString helper instead of
     // a local Readln loop: one Read_Block plus a single decode pass avoids
@@ -635,13 +583,13 @@ Object oTestCompile_dg is a cRDCModalPanel
     // every 100 ms tick.
     Procedure UpdateCompileProgress
         Integer iTicks iSec iMin iLogSize iLastLogSize
-        String  sProgram sText sLog sLogFile
+        String  sProgram sText sLogFile
 
         Get piCompileTicks to iTicks
         Increment iTicks
         Set piCompileTicks to iTicks
 
-        // ---- Elapsed time (every 10 ticks ~= 1 second) ----
+        // Elapsed time (every 10 ticks ~= 1 second)
         If (Mod(iTicks, 10) = 0) Begin
             Get psCompilingProgram to sProgram
             Move (iTicks / 10) to iSec        // total seconds
@@ -652,25 +600,16 @@ Object oTestCompile_dg is a cRDCModalPanel
             Set Value of oResult_fm to sText
         End
 
-        // ---- Log file tail (every 5 ticks ~= 500 ms) ----
-        // Use the log's byte size as a cheap change signal (RFFileSize reads
-        // metadata only, so it never fights the child's write handle): only
-        // reread the file and rewrite the details pane when it has actually
-        // grown since the last refresh. The whole-file read and the cTextEdit
-        // Set Value are the expensive bits, and most ticks during a single-
-        // file compile produce no new output - so this skips both on quiet
-        // ticks. piLastLogSize advances only after a successful read+display,
-        // so a transient empty read just retries on the next tick.
-        If (Mod(iTicks, 5) = 0) Begin
-            Get psLiveTailFile to sLogFile
+        // Live compiler output (df-cli): every 5 ticks (~500 ms), refresh the error dock
+        // if the stdout log grew. RFFileSize is a cheap metadata read; the grid rebuild
+        // only runs when there's actually new output.
+        If (pbStreamOutput(Self) = True and Mod(iTicks, 5) = 0) Begin
+            Get psCompileLogFile to sLogFile
             Move (RFFileSize(sLogFile)) to iLogSize
             Get piLastLogSize to iLastLogSize
             If (iLogSize > iLastLogSize) Begin
-                Get LoadCompileLogTail sLogFile to sLog
-                If (sLog <> "") Begin
-                    Set piLastLogSize to iLogSize
-                    Set Value of oDetails_edit to sLog
-                End
+                Set piLastLogSize to iLogSize
+                Send RefreshCompileOutputLive of (Client_Id(ghoCommandBars))
             End
         End
     End_Procedure
@@ -680,9 +619,9 @@ Object oTestCompile_dg is a cRDCModalPanel
     // .err file, shows success / failure / cancelled in the result form,
     // and surfaces the .err contents on failure.
     Procedure FinishCompile
-        String sProgram sErrorText sErrFile sErrPath sAppSrc sCmdLine sCompilerLog sLogFile sHeader
+        String sProgram sErrorText sErrFile sErrPath sAppSrc sCmdLine sCompilerLog sLogFile
         Boolean bOK bExists bCancelled
-        Integer iExitCode iErrors iWarnings iC1 iC2
+        Integer iExitCode iRetries
         tWorkspacePaths TargetWS
 
         Get psCompilingProgram to sProgram
@@ -716,11 +655,14 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (bCancelled = True) Begin
             Set Value of oResult_fm to ("Cancelled: " * sProgram * "compile was stopped.")
             Set TextColor of oResult_fm to clBlack
-            // Keep whatever the compiler emitted before it was killed instead
-            // of blanking the details pane. Prefer the final log read; if it
-            // came back empty, leave the live-tailed content in place.
-            If (sCompilerLog <> "") ;
-                Set Value of oDetails_edit to sCompilerLog
+            // Don't yank the dock away on Stop. For df-cli, keep it showing the output reached
+            // so far (refresh once for the final captured lines); legacy had nothing streaming.
+            If (pbStreamOutput(Self) = True) Begin
+                Send RefreshCompileOutputLive of (Client_Id(ghoCommandBars))
+            End
+            Else Begin
+                Send CloseCompileErrorDialog of (Client_Id(ghoCommandBars))
+            End
             Procedure_Return
         End
 
@@ -733,24 +675,39 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (iExitCode <> 0) Begin
             Set Value of oResult_fm to ("Failed: compiler exited with code " * String(iExitCode) + ". " * sProgram * "was not compiled.")
             Set TextColor of oResult_fm to clRed
-            Move ("The compiler exited with code " * String(iExitCode) + " and did not produce a compiled program." + CS_CRLF + CS_CRLF ;
-                  + "(See bottom of output for command line parameters used. " ;
-                  + "Check also Program Properties to point at the matching compiler, or compile from the Studio that owns the workspace.)") to sErrorText
-            If (sCompilerLog <> "") ;
-                Move (sErrorText + CS_CRLF + CS_CRLF + "Compiler output:" + CS_CRLF + sCompilerLog) to sErrorText
-            If (sCmdLine <> "") ;
-                Move (sErrorText + CS_CRLF + "Command line:" + CS_CRLF + sCmdLine) to sErrorText
-            Set Value of oDetails_edit to sErrorText
-            Get CompileErrorFileForProgram of ghoApplication sProgram to sErrFile 
+            // An exit-code failure usually produces NO .err, so the error dock simply won't
+            // appear (the headline on oResult_fm carries the failure).
+            Get CompileErrorFileForProgram of ghoApplication sProgram to sErrFile
             Move (Replace(".x64", sErrFile, "")) to sErrFile
             Move (vFolderFormat(TargetWS.sAppSrc)) to sAppSrc
             Move (sAppSrc + sErrFile) to sErrPath
             Get vFilePathExists sErrPath to bExists
             If (bExists = True) Begin
-                Send SetErrFile sErrPath
+                Send SetErrFile sErrPath                                                  // Open button + .err readout
+                If (pbStreamOutput(Self) = True) Begin
+                    // df-cli: keep the streamed output, capped with the parsed errors (Studio-style).
+                    Send ActivateCombinedCompileOutput of (Client_Id(ghoCommandBars)) sLogFile sErrPath
+                End
+                Else Begin
+                    Send ActivateCompileErrorDialog of (Client_Id(ghoCommandBars)) sErrPath
+                End
             End
-            // Highlight the error/warning markers so the readout is easy to skim.
-            Send BoldErrorMarkers of oDetails_edit
+            Else Begin
+                // No .err produced. For df-cli this is also the profile of the intermittent
+                // "pre-compile needed" bail (external/transient; a genuine compile error would
+                // have produced an .err, so a real error never reaches here). EXPERIMENT
+                // (step 1-2): retry ONCE immediately to learn whether the retry alone clears it
+                // (vs needing a settle delay). Capped at 1 so a hard failure can't loop.
+                Get piCompileRetries to iRetries
+                If (pbStreamOutput(Self) = True and iRetries < 1) Begin
+                    Set piCompileRetries to (iRetries + 1)
+                    Send StartCompile
+                    Procedure_Return
+                End
+                // Already retried (or a legacy compiler): leave the streamed output showing.
+                If (pbStreamOutput(Self) = True) ;
+                    Send RefreshCompileOutputLive of (Client_Id(ghoCommandBars))
+            End
             Procedure_Return
         End
 
@@ -758,11 +715,11 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (bOK = True) Begin
             Set Value of oResult_fm to ("Success: " * sProgram * "compiled cleanly.")
             Set TextColor of oResult_fm to clGreen
-            Set Value of oDetails_edit to ""
+            Send CloseCompileErrorDialog of (Client_Id(ghoCommandBars))
             Procedure_Return
         End
 
-        // Failure path: short message + .err file contents.
+        // Failure path: show CompilerOutput.dg's error dock for the .err (if one exists).
         Set Value of oResult_fm to ("Failed: " * sProgram * "did not compile.")
         Set TextColor of oResult_fm to clRed
 
@@ -771,97 +728,33 @@ Object oTestCompile_dg is a cRDCModalPanel
         Move (sAppSrc + sErrFile) to sErrPath
         Get vFilePathExists sErrPath to bExists
         If (bExists = True) Begin
-            Get LoadErrFileContents sErrPath to sErrorText
-            // Count errors/warnings for the summary header from the .err contents
-            // ONLY (before the stdout log is appended below), so errors echoed to
-            // both aren't double-counted. Max of the two marker forms gives the right
-            // count whichever compiler wrote the .err.
-            Get CountInString sErrorText ") ERROR"   to iC1
-            Get CountInString sErrorText "ERROR:"    to iC2
-            Move (If(iC1 > iC2, iC1, iC2)) to iErrors
-            Get CountInString sErrorText ") WARNING" to iC1
-            Get CountInString sErrorText "WARNING:"  to iC2
-            Move (If(iC1 > iC2, iC1, iC2)) to iWarnings
-            // Surface the .err on the bottom row with an Open button.
-            Send SetErrFile sErrPath
+            Send SetErrFile sErrPath                                                  // Open button + .err readout
+            If (pbStreamOutput(Self) = True) Begin
+                // df-cli: keep the streamed output, capped with the parsed errors (Studio-style).
+                Send ActivateCombinedCompileOutput of (Client_Id(ghoCommandBars)) sLogFile sErrPath
+            End
+            Else Begin
+                Send ActivateCompileErrorDialog of (Client_Id(ghoCommandBars)) sErrPath
+            End
         End
-        If (sCompilerLog <> "") ;
-            Move (sErrorText + CS_CRLF + CS_CRLF + "Compiler output:" + CS_CRLF + sCompilerLog) to sErrorText
-        If (sCmdLine <> "") ;
-            Move (sErrorText + CS_CRLF + CS_CRLF + "Command line passed to the compiler:" + CS_CRLF + sCmdLine) to sErrorText
-        // Prepend a summary header (errors/warnings counted from the .err above).
-        If (iErrors > 0 or iWarnings > 0) Begin
-            Move ("*** " + String(iErrors) + " error(s)") to sHeader
-            If (iWarnings > 0) ;
-                Append sHeader ", " (String(iWarnings)) " warning(s)"
-            Move (sHeader + " ***" + CS_CRLF + CS_CRLF + sErrorText) to sErrorText
+        Else Begin
+            If (pbStreamOutput(Self) = True) ;
+                Send RefreshCompileOutputLive of (Client_Id(ghoCommandBars))
         End
-        Set Value of oDetails_edit to sErrorText
-        // Highlight the error/warning markers so the readout is easy to skim.
-        Send BoldErrorMarkers of oDetails_edit
-    End_Procedure  
+    End_Procedure
     
     // Clear the result/details area between invocations.
     Procedure Clear
         Set Value of oResult_fm to ""
-        Set Value of oDetails_edit to ""
         Send SetErrFile ""
+        Send CloseCompileErrorDialog of (Client_Id(ghoCommandBars))
     End_Procedure
 
-    // Make the error-details pane match the user's Scintilla editor look - the
-    // font and colors they picked in the Scintilla settings - instead of a
-    // hard-coded font / white background, so a wall of compiler errors reads the
-    // same as their editor. Pulls from the same place the settings preview does
-    // (ScintillaParameters.dg mGeneratePreview / oNumbersPreview):
-    //   - font face: ghoEditorProperties.psFontFace ("11pt; 0; Courier New" form)
-    //   - colors:    two separate colorer elements (see THColorer). Background =
-    //                the "Window" element gtColorer[EC_WINDOW].iForeC (EC_WINDOW
-    //                carries ONLY a fore color, iBackOff=0, which the colorer uses
-    //                as the editor's paper - so its .iBackC is an unused slot = black).
-    //                Text = the "Text" element gtColorer[EC_TEXT].iForeC, which is
-    //                exactly what the editor itself applies (THColorer.pkg:
-    //                "Set TextColor to gtColorer[EC_TEXT].iForeC"). A value < 0 means
-    //                "not set", so we leave the control default.
-    // Called from Popup so each open reflects the current settings. Font SIZE is
-    // intentionally left at the control default for now (the face - i.e. a fixed-
-    // width font - is what aligns the error columns).
-    Procedure ApplyEditorAppearance
-        String  sFontData sFontTemp sFontFace
-        Integer iPaper iInk iSize iPos
-        Handle  hoProps
-
-        // Font face (parse mirrors cRefactorScintillaEditor.SetAdjustments).
-        Move ghoEditorProperties to hoProps
-        If (hoProps <> 0) Begin
-            Get psFontFace of hoProps to sFontData
-            If (sFontData = "") ;
-                Move "11pt; 0; Courier New" to sFontData 
-
-            Move (Pos(";", sFontData)) to iPos
-            Move (Left(sFontData, iPos -3))                to iSize
-            If (iSize < 6) ;
-                Move 11 to iSize
-            Set piFontSize  of oDetails_edit to (iSize * 20) // Twips
-            Move (Left(sFontData, Pos(";", sFontData)))    to sFontTemp   // "11pt;"
-            Move (Trim(Replace(sFontTemp, sFontData, ""))) to sFontData   // "0; Courier New"
-            Move (Left(sFontData, Pos(";", sFontData)))    to sFontTemp   // "0;"
-            Move (Trim(Replace(sFontTemp, sFontData, ""))) to sFontFace   // "Courier New"
-            If (sFontFace <> "") ;
-                Set TypeFace of oDetails_edit to sFontFace
-        End
-
-        // Colors - see the note above for the two-element mapping.
-        Move gtColorer[EC_WINDOW].iForeC to iPaper   // "Window" element -> editor paper
-        Move gtColorer[EC_TEXT].iForeC   to iInk     // "Text" element   -> editor ink
-        If (iPaper >= 0) ;
-            Set Color of oDetails_edit to iPaper
-        If (iInk >= 0) ;
-            Set TextColor of oDetails_edit to iInk
-    End_Procedure
-
-    // Reset to a clean state and pre-select the last-used program for the
-    // current workspace (if any).
-    Procedure Popup
+    // Prime the panel before it is shown: refill the program list and pre-select the
+    // last-used program for the current workspace. Called from ShowTestCompilePanel each
+    // time the dock is brought up (this replaces the old modal Popup body now that this
+    // is a non-modal cCJToolPanel).
+    Procedure PrepareForShow
         String sSWSFile sLastProgram
 
         Send Fill_List of oProgram_cf
@@ -872,14 +765,56 @@ Object oTestCompile_dg is a cRDCModalPanel
         If (sLastProgram <> "") Begin
             Set Value of oProgram_cf to sLastProgram
         End
+    End_Procedure
 
-        // Match the details pane to the user's current editor font + colors.
-        Send ApplyEditorAppearance
+    // The cCJToolPanel base sends OnUpdate during its show/activate cycle, AFTER the panel
+    // and its OCX children are realized - the right moment to prime it (CompilerOutput loads
+    // its grid here). A cCJToolPanel subclass MUST define OnUpdate; without it the base's
+    // "Send OnUpdate" has no handler and faults (that was the runtime error).
+    Procedure OnUpdate
+        Send PrepareForShow
+    End_Procedure
 
-        Forward Send Popup
+    // Hide the dock (the Close button + Esc). Forward to the cCJToolPanel base, and take the
+    // piggybacked CompilerOutput error dock down with it - closing Test Compile hides its errors.
+    Procedure Close_Panel
+        Forward Send Close_Panel
+        Send CloseCompileErrorDialog of (Client_Id(ghoCommandBars))
     End_Procedure
 
     On_Key Key_Alt+Key_C  Send KeyAction of oCompile_btn
     On_Key Key_Alt+Key_L  Send KeyAction of oClose_btn
     On_Key Key_Alt+Key_O  Send KeyAction of oOpenErr_btn
+    On_Key Key_Escape     Send Close_Panel
 End_Object
+
+// *** Public entry message - replaces the old modal "Send Popup of (oTestCompile_dg(...))" ***
+// Bring the non-modal, dockable Test Compile panel up: prime it, make it visible, and
+// dock/activate it. Send to the command-bar client area:
+//     Send ShowTestCompilePanel of (Client_Id(ghoCommandBars))
+Procedure ShowTestCompilePanel
+    Handle ho
+    String sErr
+    Boolean bExists
+    // 1) Bring up the Scintilla editor view FIRST. The dock coexists with it, and an
+    //    error->source jump must land in a paged-in (visible) editor OCX. Doing this here
+    //    (not at the call site) keeps the trigger view-independent. Same Activate the
+    //    SelectSourceFile flow uses (DFRefactor.src).
+    Send Activate_oEditorView_vw of (Client_Id(phoMainPanel(ghoApplication)))
+    // 2) Show + dock the (non-modal) panel. The base then fires OnUpdate (after the OCX
+    //    children are realized), which primes the panel via PrepareForShow - so we do NOT
+    //    prime here (priming before the panel was realized was the runtime error).
+    Move (oTestCompile_dg(Self)) to ho
+    Set pbVisible of ho to True
+    Send Activate of ho
+    // 3) Reopen: if the last compile's .err is still on disk, re-show the error dock too.
+    //    The panel remembers it in psErrFilePath (the bottom readout + Open button persist
+    //    across close/reopen), so closing the panel to check something then reopening brings
+    //    the same errors back. Guard on existence so a stale path can't pop an Info_Box.
+    Get psErrFilePath of ho to sErr
+    If (sErr <> "") Begin
+        Get vFilePathExists sErr to bExists
+        If (bExists = True) ;
+            Send ActivateCompileErrorDialog of (Client_Id(ghoCommandBars)) sErr
+    End
+End_Procedure
