@@ -190,6 +190,182 @@ Class cRefactorUtilities is a cObject
         Function_Return sOut
     End_Function
 
+    // Renames a leading TYPE keyword in a declaration: if the first token of the (masked,
+    // position-aligned) line is sFromType - or the token right after a Property /
+    // Global_Variable / Class_Global keyword is sFromType - it is replaced with sToType in
+    // sLine. Whole-word (so AddressOf / sAddress / a longer identifier are never touched),
+    // and because it inspects only the type SLOT it never touches a field (Customer.Address)
+    // or a variable that merely happens to be named like the type. sOver must be the
+    // indentation + overstrike so positions line up with sLine. Params / "Returns" types
+    // sit mid-signature and are intentionally NOT handled. Returns the (possibly) new line.
+    Function _RenameLeadingType String sLine String sOver String sFromType String sToType Returns String
+        String  sTrim sWord1 sCandidate
+        Integer iLeadWs iStart iFromLen iSp iAfter
+        Boolean bIdent
+
+        Move (Length(sFromType)) to iFromLen
+        Move (Ltrim(sOver)) to sTrim
+        If (sTrim = "") ;
+            Function_Return sLine
+        Move (Length(sOver) - Length(sTrim)) to iLeadWs
+
+        // First word (up to the first space). A single-token line has no <type> <name> pair.
+        Move (Pos(" ", sTrim)) to iSp
+        If (iSp = 0) ;
+            Function_Return sLine
+        Move (Left(sTrim, iSp - 1)) to sWord1
+
+        // The type slot is the first word, unless the line opens with a declaration keyword,
+        // in which case it is the second word.
+        Move (iLeadWs + 1) to iStart
+        If (Lowercase(sWord1) = "property" or Lowercase(sWord1) = "global_variable" or Lowercase(sWord1) = "class_global") Begin
+            Move (iLeadWs + iSp) to iStart
+            While (iStart <= Length(sOver) and Mid(sOver, 1, iStart) = " ")
+                Increment iStart
+            Loop
+        End
+
+        // Is the type-slot token exactly sFromType?
+        Move (Mid(sOver, iFromLen, iStart)) to sCandidate
+        If (Lowercase(sCandidate) <> Lowercase(sFromType)) ;
+            Function_Return sLine
+
+        // Whole-word right boundary: the next char must be a non-identifier (space, "[", end).
+        Move (iStart + iFromLen) to iAfter
+        If (iAfter <= Length(sOver)) Begin
+            Get _IsIdentifierChar (Mid(sOver, 1, iAfter)) to bIdent
+            If (bIdent = True) ;
+                Function_Return sLine
+        End
+
+        // Rewrite the type token in the real line (sOver is position-aligned with sLine).
+        Move (Left(sLine, iStart - 1) + sToType + Mid(sLine, CI_EOL, iStart + iFromLen)) to sLine
+        Function_Return sLine
+    End_Function
+
+    // Maps an External_Function PARAMETER NAME to the pointer-sized DataFlex type it most
+    // likely should be (Handle/Pointer/Longptr/ULongptr) per the official Windows->DataFlex
+    // table, or "" when the name carries no pointer-sized signal. Heuristic + case-aware:
+    // the Hungarian "h"/"p" prefixes require an uppercase second char so "height"/"pos"
+    // don't false-match. Report-only, so a stray false positive is harmless.
+    Function _SuggestPointerType String sName Returns String
+        String  sLC sSecond
+        Boolean bSecondUpper
+
+        Move (Lowercase(Trim(sName))) to sLC
+        If (sLC = "") ;
+            Function_Return ""
+
+        // Is the 2nd character an uppercase LETTER? (No string-range compare - those
+        // misbehave; see _IsIdentifierChar.)
+        Move False to bSecondUpper
+        If (Length(sName) >= 2) Begin
+            Move (Mid(sName, 1, 2)) to sSecond
+            If (sSecond = Uppercase(sSecond) and sSecond <> Lowercase(sSecond)) ;
+                Move True to bSecondUpper
+        End
+
+        // Most specific patterns first.
+        If (sLC = "lparam" or sLC = "wparam" or sLC = "lresult") ;
+            Function_Return "Longptr"
+        If (sLC contains "uint_ptr" or sLC contains "dword_ptr" or sLC contains "size_t") ;
+            Function_Return "ULongptr"
+        If (sLC contains "int_ptr" or sLC contains "long_ptr") ;
+            Function_Return "Longptr"
+        If (sLC contains "size") ;
+            Function_Return "ULongptr"
+        If (Left(sLC, 2) = "lp" or sLC contains "buffer" or sLC contains "lpsz") ;
+            Function_Return "Pointer"
+        If (Left(sLC, 1) = "p" and bSecondUpper = True) ;
+            Function_Return "Pointer"
+        If (sLC contains "hwnd" or sLC contains "hinstance" or sLC contains "handle" or sLC contains "hdc" or sLC contains "hmenu") ;
+            Function_Return "Handle"
+        If (Left(sLC, 1) = "h" and bSecondUpper = True) ;
+            Function_Return "Handle"
+        Function_Return ""
+    End_Function
+
+    // Audits ONE logical External_Function/External_Procedure declaration (continuation
+    // lines already joined; RAW text, not overstruck - we need the quoted entry-point
+    // name). Appends one finding line per parameter/return that should change type and
+    // returns the count. Checks: (1) 64-bit - an Integer/DWord param whose NAME signals a
+    // pointer-sized type (via _SuggestPointerType) -> Handle/Pointer/Longptr/ULongptr, plus
+    // a Create*/Open* Integer/DWord RETURN -> Handle. (2) Unicode - a String param in an
+    // ANSI wrapper (entry-point ends in "A") -> WString. Already-correct types are never
+    // flagged, so a re-run finds nothing new. A clean declaration returns 0.
+    Function _AuditApiDeclaration String sDecl String[] ByRef asFindings Returns Integer
+        String[] asRaw asTok
+        String  sFirst sEntry sEntryLC sType sTypeLC sName sSuggest
+        Integer iRaw iR iNum iIdx iCount
+        Boolean bAnsiEntry
+
+        // Normalize whitespace (tabs -> space), split, drop empty tokens - so aligned
+        // declarations with runs of spaces still tokenize 1:1.
+        Move (Replaces((Character(9)), sDecl, " ")) to sDecl
+        Move (StrSplitToArray(Trim(sDecl), CS_S)) to asRaw
+        Move (SizeOfArray(asRaw)) to iRaw
+        Move 0 to iNum
+        Decrement iRaw
+        For iR from 0 to iRaw
+            If (Trim(asRaw[iR]) <> "") Begin
+                Move (Trim(asRaw[iR])) to asTok[iNum]
+                Increment iNum
+            End
+        Loop
+        If (iNum < 5) ;
+            Function_Return 0
+        Move (Lowercase(asTok[0])) to sFirst
+        If (sFirst <> "external_function" and sFirst <> "external_procedure") ;
+            Function_Return 0
+
+        // token[1]=DF name, token[2]="entry" (quoted), token[3]=dll. Params from token[4].
+        Move (Replaces('"', asTok[2], "")) to sEntry
+        Move (Lowercase(sEntry)) to sEntryLC
+        Move (Right(sEntry, 1) = "A") to bAnsiEntry
+
+        Move 0 to iCount
+        Move 4 to iIdx
+        While (iIdx < iNum)
+            Move (Trim(asTok[iIdx])) to sType
+            Move (Lowercase(sType)) to sTypeLC
+            If (sTypeLC = "returns") Begin
+                Move (iIdx + 1) to iIdx
+                If (iIdx < iNum) Begin
+                    Move (Trim(asTok[iIdx])) to sType
+                    Move (Lowercase(sType)) to sTypeLC
+                    If ((sTypeLC = "integer" or sTypeLC = "dword") and (Left(sEntryLC, 6) = "create" or Left(sEntryLC, 4) = "open")) Begin
+                        Move ("Returns " + sType + " -> Handle") to asFindings[SizeOfArray(asFindings)]
+                        Increment iCount
+                    End
+                End
+                Move iNum to iIdx
+            End
+            Else Begin
+                Move (iIdx + 1) to iIdx
+                If (iIdx < iNum) Begin
+                    If (Lowercase(asTok[iIdx]) = "byref" or Lowercase(asTok[iIdx]) = "byval") ;
+                        Move (iIdx + 1) to iIdx
+                End
+                If (iIdx < iNum) Begin
+                    Move (Trim(asTok[iIdx])) to sName
+                    Move (iIdx + 1) to iIdx
+                    If (sTypeLC = "integer" or sTypeLC = "dword") Begin
+                        Get _SuggestPointerType sName to sSuggest
+                        If (sSuggest <> "") Begin
+                            Move (sType + " " + sName + " -> " + sSuggest) to asFindings[SizeOfArray(asFindings)]
+                            Increment iCount
+                        End
+                    End
+                    If (sTypeLC = "string" and bAnsiEntry = True) Begin
+                        Move (sType + " " + sName + " -> WString") to asFindings[SizeOfArray(asFindings)]
+                        Increment iCount
+                    End
+                End
+            End
+        Loop
+        Function_Return iCount
+    End_Function
+
     // Helper message for _ClearFirstCompoundBeforeMethod
     // Overwrites the string content with blanks up to the iPos position.
     Procedure _WipeUntilPosition String ByRef sLine Integer iPos
