@@ -1,0 +1,215 @@
+﻿//****************************************************************************
+// $Module type: Class
+// $Module name: cWin64PointerTruncation
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : "Win64" refactor family. REPORT-ONLY audit (makes NO changes)
+//               for the classic 64-bit pointer-truncation bug: a pointer-sized
+//               value moved into a 32-bit Integer/DWord silently loses its high
+//               32 bits on x64.
+//
+//               Flags two high-signal forms, per-method scope:
+//                 1. Move <Pointer/Address var or param> to <Integer/DWord var>
+//                 2. Move (AddressOf(...))               to <Integer/DWord var>
+//
+//               Modeled on cUnicodeStringToPointer: a per-method type map is
+//               built from BOTH the body-local declarations AND the signature
+//               PARAMETERS (the Integer destination is very often a parameter).
+//               Method STARTS are detected from the declaration line itself via
+//               _IsProcedureDeclaration / _IsFunctionDeclaration (robust to a
+//               preceding method that mismatched its End_ keyword, which leaves
+//               the lexer stuck in-method).
+//
+//               Report-only, so a stray false positive is harmless. Deliberately
+//               OUT OF SCOPE (v1): a pointer RETURNED by a function call (no
+//               return-type knowledge), an Integer merely NAMED like a handle
+//               (hWnd/lp*/...), a parenthesized single-variable source, and
+//               expression contexts. The public wrapper is Win64PointerTruncation
+//               in oRefactorFuncLib.pkg (MethodType eReportFunctionAll).
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS for a PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//****************************************************************************
+Use cApplication.pkg
+Use cRefactorFuncLib.pkg
+
+Class cWin64PointerTruncation is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+    End_Procedure
+
+    // Pointer-sized native type - the SOURCE that gets truncated.
+    Function IsPointerLikeType String sType Returns Boolean
+        Move (Lowercase(Trim(sType))) to sType
+        Function_Return (sType = "pointer" or sType = "address")
+    End_Function
+
+    // 32-bit integer types that TRUNCATE a pointer on x64. Integer is always
+    // 32-bit; DWord is an alias for the 32-bit UInteger.
+    Function IsTruncatingIntType String sType Returns Boolean
+        Move (Lowercase(Trim(sType))) to sType
+        Function_Return (sType = "integer" or sType = "dword" or sType = "uinteger")
+    End_Function
+
+    // Case-insensitive membership test. asNames already holds lowercased names.
+    Function NameInArray String[] asNames String sName Returns Boolean
+        Integer iCount iMax
+        Move (Lowercase(Trim(sName))) to sName
+        Move (SizeOfArray(asNames)) to iMax
+        Decrement iMax
+        For iCount from 0 to iMax
+            If (asNames[iCount] = sName) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    // Append a name (lowercased, non-blank) to a name set.
+    Procedure AddName String[] ByRef asNames String sName
+        Move (Lowercase(Trim(sName))) to sName
+        If (sName <> "") ;
+            Move sName to asNames[SizeOfArray(asNames)]
+    End_Procedure
+
+    // Parse a Procedure/Function signature (overstruck) and collect its
+    // Pointer/Address parameter names into asPointerVars and its
+    // Integer/DWord/UInteger parameter names into asIntVars. Form is
+    // <Type> [ByRef|ByVal] <name> repeated; a Function's list ends at "Returns".
+    Procedure CollectParameters String sOverSignature String[] ByRef asPointerVars String[] ByRef asIntVars
+        String[] asTokens
+        Integer  iIdx iNum
+        String   sTok sName
+
+        Move (StrSplitToArray(Trim(sOverSignature), CS_S)) to asTokens
+        Move (SizeOfArray(asTokens)) to iNum
+        Move 2 to iIdx                              // skip Procedure|Function + the method name
+        While (iIdx < iNum)
+            Move (Lowercase(asTokens[iIdx])) to sTok
+            If (sTok = "returns") ;
+                Procedure_Return                    // a Function's return type follows - done
+            If (sTok = "pointer" or sTok = "address" or sTok = "integer" or sTok = "dword" or sTok = "uinteger") Begin
+                Increment iIdx
+                If (iIdx < iNum) Begin
+                    If (Lowercase(asTokens[iIdx]) = "byref" or Lowercase(asTokens[iIdx]) = "byval") ;
+                        Increment iIdx
+                End
+                If (iIdx < iNum) Begin
+                    Move asTokens[iIdx] to sName
+                    Increment iIdx
+                    If (sTok = "pointer" or sTok = "address") Begin
+                        Send AddName (&asPointerVars) sName
+                    End
+                    Else Begin
+                        Send AddName (&asIntVars) sName
+                    End
+                End
+            End
+            Else Begin
+                Increment iIdx
+            End
+        Loop
+    End_Procedure
+
+    // Single forward pass. For each method it gathers the Pointer/Address and
+    // Integer/DWord names (parameters first, then body declarations), then flags
+    // every bare "Move <ptr> to <int>" and "Move (AddressOf(...)) to <int>".
+    // Appends a two-line finding (the offending line + the reason) per hit and
+    // returns the hit count. Makes NO changes to asCode. The caller must reset
+    // the lexer first (Send ClearFuncLibProperties of ghoFuncLib), as the wrapper
+    // and the unit-test fixture do per file.
+    Function AuditFile String[] asCode String[] ByRef asFindings Returns Integer
+        Integer  iCount iMax iFound iItems iIdx
+        String   sLine sOver sType sVars sName sId1 sId2 sId1LC sReason
+        String[] asPointerVars asIntVars asVars asTokens
+        Boolean  bInMethod bIsProcDecl bIsFuncDecl bPtr bInt bIgnore bId2Int bId1Ptr
+        tTokenizer TokenizerData
+
+        Move 0 to iFound
+        Move (SizeOfArray(asCode)) to iMax
+        If (iMax = 0) ;
+            Function_Return 0
+        Decrement iMax
+
+        For iCount from 0 to iMax
+            Move asCode[iCount] to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Move TokenizerData.sOverstrikeLine to sOver
+            Move (TokenizerData.bIsInProcedure = True or TokenizerData.bIsInFunction = True) to bInMethod
+
+            // New method opens a fresh scope: reset the name sets, then seed them
+            // with this signature's Pointer/Address + Integer/DWord parameters.
+            Get _IsProcedureDeclaration of ghoFuncLib sOver to bIsProcDecl
+            Get _IsFunctionDeclaration  of ghoFuncLib sOver to bIsFuncDecl
+            If (bIsProcDecl = True or bIsFuncDecl = True) Begin
+                Move (ResizeArray(asPointerVars, 0)) to asPointerVars
+                Move (ResizeArray(asIntVars, 0))     to asIntVars
+                Send CollectParameters sOver (&asPointerVars) (&asIntVars)
+            End
+
+            If (bInMethod = True) Begin
+                If (TokenizerData.bIsVariableDeclaration = True) Begin
+                    // Classify the declaration and collect its names (all names on
+                    // one line share the datatype, so resolve it once).
+                    Get RemoveLocalKeyWord  of ghoFuncLib (&sOver) "" to bIgnore
+                    Get _RetrieveFirstToken of ghoFuncLib sOver to sType
+                    Get _RemoveFirstToken   of ghoFuncLib sOver to sVars
+                    Get IsPointerLikeType   sType to bPtr
+                    Get IsTruncatingIntType sType to bInt
+                    If (bPtr = True or bInt = True) Begin
+                        Move (StrSplitToArray(Trim(sVars), CS_S)) to asVars
+                        Move (SizeOfArray(asVars)) to iItems
+                        Decrement iItems
+                        For iIdx from 0 to iItems
+                            Move (Trim(asVars[iIdx])) to sName
+                            If (sName <> "") Begin
+                                If (bPtr = True) ;
+                                    Send AddName (&asPointerVars) sName
+                                If (bInt = True) ;
+                                    Send AddName (&asIntVars) sName
+                            End
+                        Loop
+                    End
+                End
+                Else Begin
+                    // Executable line: flag the unambiguous bare form
+                    //   Move <id1> to <id2>
+                    // (exactly 4 whitespace-separated tokens on the overstruck line)
+                    // when id2 is a 32-bit Integer/DWord and id1 is either a known
+                    // Pointer/Address or an AddressOf(...) result.
+                    Move (StrSplitToArray(Trim(sOver), CS_S)) to asTokens
+                    If (SizeOfArray(asTokens) = 4) Begin
+                        If (Lowercase(asTokens[0]) = "move" and Lowercase(asTokens[2]) = "to") Begin
+                            Move asTokens[1] to sId1
+                            Move asTokens[3] to sId2
+                            Get NameInArray asIntVars sId2 to bId2Int     // destination is 32-bit
+                            If (bId2Int = True) Begin
+                                Get NameInArray asPointerVars sId1 to bId1Ptr
+                                Move (Lowercase(sId1)) to sId1LC
+                                Move "" to sReason
+                                If (bId1Ptr = True) Begin
+                                    Move "Pointer/Address moved into a 32-bit Integer/DWord - truncates on x64." to sReason
+                                End
+                                Else If (sId1LC contains "addressof") Begin
+                                    Move "AddressOf() result moved into a 32-bit Integer/DWord - pointer truncated on x64." to sReason
+                                End
+                                If (sReason <> "") Begin
+                                    Move ("  Line " + String(iCount + 1) + ":  " + Trim(sLine)) to asFindings[SizeOfArray(asFindings)]
+                                    Move ("        -> " + sReason) to asFindings[SizeOfArray(asFindings)]
+                                    Increment iFound
+                                End
+                            End
+                        End
+                    End
+                End
+            End
+        Loop
+
+        Function_Return iFound
+    End_Function
+
+End_Class
