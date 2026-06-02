@@ -57,8 +57,8 @@ Object oSelectFunctions_vw is a cRDCDbView
             Set Location to 27 10  
             Set Ordering to 2
             Set pbDbShowInvertSelectionsMenuItem to True
-            Set pbDbShowEditMenuItem to False 
             Set pbHeaderPrompts to False
+            Set pbDbShowEditMenuItem to False 
             Set piHScrollStep to 1
             // Need this to load all records in the grid,
             // else the select buttons won't work properly.
@@ -66,7 +66,7 @@ Object oSelectFunctions_vw is a cRDCDbView
             Set pbEditOnClick to True
             Set pbEditOnKeyNavigation to False
             Set pbShowNonActiveInPlaceButton to False
-            Set piLayoutBuild to 6 
+            Set piLayoutBuild to 9
 
             Object oFunctions_ID is a cRDCDbCJGridColumn
                 Entry_Item Functions.ID
@@ -78,13 +78,41 @@ Object oSelectFunctions_vw is a cRDCDbView
 
             Object oFunctions_Function_Name is a cDbCJGridColumnSuggestionNew //cDbCJGridColumnSuggestion
                 Entry_Item Functions.Function_Name
-                Set piWidth to 185
+                Set piWidth to 180
                 Set psCaption to "Function Name (Suggestion list)"    
                 Set psToolTip to "This is a full text suggestion list. You can start typing to search for any keyword and a suggestion list will appear for you to select from."
                 Set Status_Help to (psToolTip(Self))
                 Set pbFullText to True    
                 Set pbAllowRemove to False
                 Set phoData_Col to Self 
+
+                Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                    Get RowValue of oFunctions_Function_Help iRow to sText
+                    If (sText <> "") Begin
+                        Move (Replaces("\r\n", sText, CS_CRLF)) to sText
+                        Move (Replaces("\n", sText, CS_CRLF)) to sText
+                    End
+                    Function_Return sText
+                End_Function
+            
+            End_Object
+
+            Object oFunctions_SummaryText is a cRDCDbCJGridColumn
+                Entry_Item Functions.SummaryText
+                Set piWidth to 200
+                Set psCaption to "Summary Text"
+                Set pbEditable to False
+                Set pbMultiLine to True
+
+                Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                    Get RowValue of oFunctions_Function_Help iRow to sText
+                    If (sText <> "") Begin
+                        Move (Replaces("\r\n", sText, CS_CRLF)) to sText
+                        Move (Replaces("\n", sText, CS_CRLF)) to sText
+                    End
+                    Function_Return sText
+                End_Function
+            
             End_Object
 
             Object oFunctions_Function_Help is a cRDCDbCJGridColumn
@@ -94,25 +122,32 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Set psCaption to "Help Text"
                 Set pbEditable to False
                 Set pbMultiLine to True
+                Set pbVisible to False
             End_Object
     
             Object oFunctions_Type is a cRDCDbCJGridColumn
                 Entry_Item Functions.Type
                 Set piWidth to 130
                 Set psCaption to "Type"
-                Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing."
+                Set psToolTip to "The function type rules how data is feed to the function. For 'Standard' and 'Remove' functions one source line at a time are send. To others either a full source file as a string array is passed, or the last option is to pass all selected files as a string array with full pathing. See: Help for further info."
                 Set Status_Help to (psToolTip(Self))
                 Set peHeaderAlignment to xtpAlignmentCenter  
                 Set peTextAlignment to xtpAlignmentCenter
                 Set pbComboButton to True
                 // pbEditable *must* be set after the pbComboButton setting.
-                Set pbEditable to True
+                Set pbEditable to False
                 Set pbComboEntryState to False
+
+                Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                    Get psToolTip to sText
+                    Function_Return sText
+                End_Function
+            
             End_Object                    
 
             Object oFunctions_Parameter is a cRDCDbCJGridColumn
                 Entry_Item Functions.Parameter
-                Set piWidth to 100
+                Set piWidth to 122
                 Set psCaption to "Parameter"
                 Set psToolTip to "Click for dropdown choices when there is a value. For some functions an extra parameter is passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
                 Set Status_Help to (psToolTip(Self))
@@ -170,23 +205,21 @@ Object oSelectFunctions_vw is a cRDCDbView
 
             Object oFunctions_Selected is a cRDCDbCJGridColumn
                 Entry_Item Functions.Selected
-                Set piWidth to 39
-                Set psCaption to "Select"
+                Set piWidth to 25
+                Set psCaption to "Select" 
+                Set psToolTip to "Select functions that should be part of the next refactoring, when the 'Start Refactoring' button is clicked."
                 Set pbAllowRemove to False
                 Set pbCheckbox to True
                 Set peHeaderAlignment to xtpAlignmentCenter  
                 Set peFooterAlignment to xtpAlignmentCenter
                 Set Status_Help to (psToolTip(Self))
                 Set phoCheckbox_Col to Self
-            End_Object
 
-            Object oFunctions_SummaryText is a cRDCDbCJGridColumn
-                Entry_Item Functions.SummaryText
-                Set piWidth to 200
-                Set psCaption to "Summary Text"
-                Set pbEditable to False
-                Set pbMultiLine to True
-                Set pbVisible to False
+                Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                    Get psToolTip to sText
+                    Function_Return sText
+                End_Function
+            
             End_Object
 
             Object oFunctions_ParameterHelp is a cRDCDbCJGridColumn
@@ -226,33 +259,10 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Set psFooterText of oFunctions_ID  to ("#" * String(iItems))
             End_Procedure
 
-            Procedure LoadData 
-                Handle hoDataSource hoServer
-                Integer iRows iFile
-                tDataSourceRow[] TheData 
-                Boolean bFound
-                
-                Get Server to hoServer
-                Get Main_File of hoServer to iFile
-                Send Request_Read of hoServer FIRST_RECORD 2
-                Move (Found) to bFound
-                Get phoDataSource to hoDataSource
-                While (bFound)
-                    Get CreateDataSourceRow of hoDataSource to TheData[iRows]
-                    Increment iRows
-                    Send Request_Read of hoServer GT iFile 2
-                    Move (Found) to bFound
-                Loop
-                Send InitializeData TheData 
-                Send Reset of hoDataSource
-                Send MoveToFirstRow
-            End_Procedure
-
             // For unknown reason the first row in the list is *not* highlighted
             // when the grid is filled. This fixes it.
             Procedure Activating
                 Forward Send Activating
-                Send LoadData 
             End_Procedure 
             
         End_Object
