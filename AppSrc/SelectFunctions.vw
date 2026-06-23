@@ -3,7 +3,7 @@ Use cCJGridColumnRowIndicator.pkg
 Use cRDCSuggestionsBaseClasses.pkg
 Use cRDCDbView.pkg
 Use cRDCDbHeaderGroup.pkg
-Use cRDCDbCJGrid.pkg
+Use cRefactorDbCJGrid.pkg
 Use cRDCDbCJGridColumn.pkg
 Use cRDCDbForm.pkg
 Use cRDCComboForm.pkg
@@ -51,7 +51,7 @@ Object oSelectFunctions_vw is a cRDCDbView
         Set Border_Style to Border_None
         Set peAnchors to anAll
 
-        Object oFunctionSelection_grd is a cRDCDbCJGrid
+        Object oFunctionSelection_grd is a cRefactorDbCJGrid
             Set Size to 159 620
             Set Location to 27 10  
             Set Ordering to 2
@@ -249,6 +249,11 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Set pbShowInFieldChooser to False
             End_Object
 
+            // Save the Parameter combo edit immediately (see cRefactorDbCJGrid.OnComValueChanged) so a
+            // change followed by an immediate "Start refactoring" is not lost. The Select checkbox is
+            // auto-saved via the grid's phoCheckbox_Col (oFunctions_Selected).
+            Set phoSaveOnChangeColumn to oFunctions_Parameter
+
             // The Functions.Function_Name column is a cDbCJGridColumnSuggestion
             // That class has a bug were it is possible to enter something in
             // the suggestion form that is not in the list, click outside the
@@ -265,6 +270,10 @@ Object oSelectFunctions_vw is a cRDCDbView
                 End
                 Function_Return bSave
             End_Procedure
+            
+            Procedure Request_Clear
+            End_Procedure
+    
             
             // The function edit view has been removed.
             Procedure Request_Edit

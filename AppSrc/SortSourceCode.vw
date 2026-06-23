@@ -1,4 +1,4 @@
-Use Windows.pkg
+﻿Use Windows.pkg
 Use DFClient.pkg
 Use File_dlg.pkg
 Use vWin32fh.pkg
@@ -8,7 +8,7 @@ Use cCJGridColumnRowIndicator.pkg
 Use cRDCDbHeaderGroup.pkg
 Use cSortSourceCode.pkg 
 Use cRDCHeaderGroup.pkg
-Use cRDCCJGrid.pkg 
+Use cRefactorCJGrid.pkg 
 Use cRDCButton.pkg
 
 Activate_View Activate_oSortSourceCode_vw for oSortSourceCode_vw
@@ -153,7 +153,7 @@ Object oSortSourceCode_vw is a dbView
         Set psToolTip to "Sorted result for Classes, Procedures and Functions. Note: Construct_Object/End_Construct_Object are always at top"
         Set peAnchors to anNone 
 
-        Object oSourceFileData_grd is a cRDCCJGrid
+        Object oSourceFileData_grd is a cRefactorCJGrid
             Set Size to 115 461
             Set Location to 30 38
             Set pbAllowEdit to False

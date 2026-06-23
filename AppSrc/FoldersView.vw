@@ -8,7 +8,7 @@ Use dfTabDlg.pkg
 
 //Use cRefactorDbView.pkg
 Use cRDCDbView.pkg
-Use cRDCDbCJGrid.pkg  
+Use cRefactorDbCJGrid.pkg  
 Use cRDCDbCJGridColumn.pkg
 Use cRDCDbComboForm.pkg
 Use RefactorConstants.h.pkg
@@ -17,7 +17,6 @@ Use cRDCDbForm.pkg
 Use cRDCDbSpinForm.pkg
 Use cRDCButton.pkg
 Use cRDCForm.pkg
-Use TestCompile.dg
 
 Use cSysFileDataDictionary.dd
 Use cFunctionsDataDictionary.dd
@@ -127,7 +126,7 @@ Object oFoldersView is a cRDCDbView
                 Set Border_Style to Border_None
                 Set piMinSize to 126 490
 
-                Object oDbFolders_grd is a cRDCDbCJGrid
+                Object oDbFolders_grd is a cRefactorDbCJGrid
                     Set Server to oFolderSelDtl_DD
                     Set Size to 157 620
                     Set Location to 27 10
@@ -797,27 +796,6 @@ Object oFoldersView is a cRDCDbView
 
         End_Object
 
-        Object oTestCompile_btn is a cRDCButton
-            Set Size to 30 54
-            Set Location to 29 360
-            Set Label to "&Test Compile"
-            Set peAnchors to anBottomLeft
-            Set psImage to "CompileProject.ico"
-            Set piImageSize to 24
-            Set psToolTip to "Compile a program from the current workspace to verify the refactor did not break the build. Programs are read from the .sws [Projects] section; the last-picked program is remembered per workspace. (F5)"
-            Set MultiLineState to True
-
-            Procedure OnClick
-                Send ShowTestCompilePanel of (Client_Id(ghoCommandBars))
-            End_Procedure
-
-            Function IsEnabled Returns Boolean
-                String sSWSFile
-                Get psSWSFile of ghoApplication to sSWSFile
-                Function_Return (sSWSFile <> "")
-            End_Function
-
-        End_Object
 
     End_Object
 

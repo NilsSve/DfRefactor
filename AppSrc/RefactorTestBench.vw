@@ -374,8 +374,9 @@ Object oRefactorTestBench is a cRefactorDbView
                     Procedure OnClick
                         String sCompareApp
                         Send Execute of (oSave_ToolItem(ghoCommandBars))
-                        Get psFileCompareApp of ghoApplication to sCompareApp
-                        Send CompareFiles of ghoApplication sCompareApp
+                        Move (Trim(SysFile.PathSourceCompareTool)) to sCompareApp 
+                        Set psFileCompareApp of ghoApplication to sCompareApp
+                        Send CompareFiles of ghoApplication
                     End_Procedure
             
                     Function IsEnabled Returns Boolean

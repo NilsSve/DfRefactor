@@ -8,7 +8,7 @@ Use dfTabDlg.pkg
 
 //Use cRefactorDbView.pkg
 Use cRDCDbView.pkg
-Use cRDCDbCJGrid.pkg  
+Use cRefactorDbCJGrid.pkg  
 Use cRDCDbCJGridColumn.pkg
 Use cRDCDbComboForm.pkg
 Use RefactorConstants.h.pkg
@@ -17,7 +17,6 @@ Use cRDCDbForm.pkg
 Use cRDCDbSpinForm.pkg
 Use cRDCButton.pkg
 Use cRDCForm.pkg
-Use TestCompile.dg
 
 Use cSysFileDataDictionary.dd
 //Use cFunctionsDataDictionary.dd
@@ -82,7 +81,7 @@ Object oSelectFoldersView is a cRDCDbView
         Set Border_Style to Border_None
         Set piMinSize to 126 490
 
-        Object oDbFolders_grd is a cRDCDbCJGrid
+        Object oDbFolders_grd is a cRefactorDbCJGrid
             Set Server to oFolderSelDtl_DD
             Set Size to 157 620
             Set Location to 27 10
@@ -176,6 +175,10 @@ Object oSelectFoldersView is a cRDCDbView
                 If (iNewly > 0) ;
                     Send RefreshDataFromDD of Self 0
             End_Procedure
+
+            Procedure Request_Clear
+            End_Procedure
+    
             
             On_Key Key_F2           Send Request_Save 
             On_Key Key_Ctrl+Key_S   Send Request_Save
@@ -341,7 +344,7 @@ Register_Object oFunctionSelection_grd
         Set Size to 37 260
         Set Location to 199 6
         Set psLabel to "File Filter"
-        Set psNote to "File Extensions Filter"
+//        Set psNote to "File Extensions Filter"
         Set psToolTip to "Select file extensions filter. Each extension must start with a wildcard character and a dot (*.) and file extensions must be separated with a semicolon (;)"
         Set psImage to "FileExtensions.ico"
         Set peAnchors to anBottomLeft
@@ -544,8 +547,7 @@ Register_Object oFunctionSelection_grd
 
                 Function_Return bEnabled
             End_Function
-            
-            
+                        
             On_Key Key_Ctrl+Key_S Send OnExitObject
             On_Key Key_F2         Send OnExitObject
         End_Object
