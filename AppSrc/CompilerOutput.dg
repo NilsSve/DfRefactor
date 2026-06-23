@@ -8,15 +8,7 @@ Use vwin32fh.pkg
 Use cCJGrid.pkg
 Use cCJGridColumn.pkg
 Use cCJToolPanel.pkg
-
-Struct tCompileError
-    Boolean bError    // If false, it is a warning.
-    Integer iErrorNo
-    Integer iLine    
-    String sFileName
-    String sErrorTxt
-    String sText
-End_Struct
+Use cCompileErrorParser.pkg   // shared .err parser (lifted from here)
 
 Object oCompilerOutput_dg is a cCJToolPanel
     Set Size to 60 400  
@@ -26,6 +18,7 @@ Object oCompilerOutput_dg is a cCJToolPanel
     Set Border_Style to Border_None
     Set peNeighborhood to nhPublic
     Set peBarPosition to xtpBarBottom
+    Move Self to ghoCompilerOutputDock
     
     Property String psErrorFile ""
     // When non-blank, the dock shows this log file's lines verbatim (live df-cli compiler
@@ -33,12 +26,23 @@ Object oCompilerOutput_dg is a cCJToolPanel
     // ActivateCompileErrorDialog / CloseCompileErrorDialog. See LoadRawOutput / Initialize.
     Property String psRawLogFile ""
 
+    // One-at-a-time docks: whenever this dock is shown (Activate), hide the Modernization
+    // Analyzer dock so the two don't stack and crowd the editor. We go via ghoModAnalyzerDock
+    // because oModAnalyzer_dg is Used after this file. Covers all show paths (live output,
+    // .err, combined) since they all Send Activate.
+    Procedure Activate Returns Integer
+        Integer iErr
+        Forward Get msg_Activate to iErr
+        If ((iErr = 0) and (ghoModAnalyzerDock <> 0)) Begin
+            Set pbVisible of ghoModAnalyzerDock to False
+        End
+        Procedure_Return iErr
+    End_Procedure
+
     Object oCompileErrors_grd is a cCJGrid
         Set Size to 60 396
         Set piMinSize to 54 100
         Set Location to 2 4
-        Set peAnchors to anAll
-        
         Set peVisualTheme to xtpGridThemeVisualStudio2012Dark
         Set peHorizontalGridStyle to xtpGridNoLines
         Set peVerticalGridStyle to xtpGridNoLines
@@ -59,12 +63,14 @@ Object oCompilerOutput_dg is a cCJToolPanel
         Set pbAutoAppend to False
         Set pbRestoreLayout to True
         Set pbSelectionEnable to True
+        Set pbMultipleSelection to True
         Set pbSelectTextOnEdit to False
         Set psLayoutSection to "oCompileErrors_grd"
         Set piHighlightBackColor to clLtGray
         Set piHighlightForeColor to clBlack
         Set piHScrollStep to 1  
         Set phoContextMenu to (phoToolPanelContextMenu(Self))
+        Set peAnchors to anAll
 
         Property Integer piIconOff
         Property Integer piWarningIcon
@@ -362,7 +368,8 @@ Object oCompilerOutput_dg is a cCJToolPanel
             // Sit at the start of the error section (the last output line) so the errors
             // read from the top, like Studio. Errors-only -> top; output-only -> newest line.
             If (iErrStart > 0 and iItem > iErrStart) Begin
-                Send MoveToRow iErrStart
+                Send MoveToRow iErrStart 
+                Send MoveDownRow // This will place us on the first error line.
             End
             Else If (iErrStart = 0) Begin
                 Send MoveToFirstRow
@@ -372,142 +379,83 @@ Object oCompilerOutput_dg is a cCJToolPanel
             End
         End_Procedure
 
-        Function ExtractData String sValue Returns tCompileError
-            String sTmp
-            Integer iPos
-            Boolean bLinkError
-            tCompileError CompileError
-            
-            // Link Error?
-            Move (Pos("LINK ERROR:", sValue)) to bLinkError
-            If (bLinkError) Begin
-                Move True to CompileError.bError
-                Move (Length("LINK ERROR: ")) to iPos
+        // Parses a df-cli stdout diagnostic line - "file(900,1) Warning 4532: ..." (or
+        // "Error NNNN:") - into its file name + line number. Returns False for any other
+        // line shape ("Compiling X", "Building Y (26.0.0+windows-32)...", plain text).
+        // The line number is digit-guarded BEFORE the Move into the Integer - a Move from
+        // a non-numeric string FAULTS in DF26.
+        Function _ParseRawDiagnostic String sData String ByRef sFile Integer ByRef iLine Returns Boolean
+            Integer iParen iComma iClose i
+            String  sTrim sRest sNum sAfter
 
-                // Remove read part
-                Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
-                
-                // File name:
-                Move (Pos(",", sValue)) to iPos
-                If (iPos <> 0) Begin
-                    Move (Trim(Left(sValue, iPos - 1))) to sTmp
-                    Move sTmp to CompileError.sFileName
-                    // Remove read part
-                    Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
-                End
-            End
-
-            // Error or Warning?
-            Else Begin
-                Move (Pos(" ", sValue)) to iPos
-                If (Left(sValue, iPos) contains "ERROR") Begin
-                    Move True to CompileError.bError
-                End
-                // Remove read part
-                Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
-                
-                If (bLinkError = False) Begin
-                    Move (Pos(" ", sValue)) to iPos
-                    // Error number:
-                    Move (Trim(Left(sValue, iPos))) to sTmp
-                    Move sTmp to CompileError.iErrorNo
-                End
-                // Remove read part
-                Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
-    
-                // File name:
-                Move (Pos("OF FILE:", sValue)) to iPos
-                Move (Trim(Mid(sValue, Length(sValue), iPos + 8))) to sTmp
-                Move sTmp to CompileError.sFileName
-                // Remove read part
-                Move (Trim(Left(sValue, iPos-1))) to sValue
-    
-                // Line number - ONLY when the line actually carries "ON LINE:". Without the
-                // guard, a line lacking it makes the Mid/Left below extract a non-numeric token
-                // (e.g. "US" out of a path like ...\Users\...), and Move-ing that to an Integer
-                // FAULTS in DF26 ("Invalid symbol in expression 'US'") - Move is NOT lenient.
-                // With "ON LINE:" present the token is the numeric line. See
-                // feedback_dataflex_integer_cast_faults.md.
-                Move (Pos("ON LINE:", sValue)) to iPos
-                If (iPos > 0) Begin
-                    Move (Trim(Mid(sValue, Length(sValue), iPos + 8))) to sTmp
-                    Move (Pos(" ", sTmp)) to iPos
-                    Move (Trim(Left(sTmp, iPos))) to sTmp
-                    Move sTmp to CompileError.iLine
-                    Move (Pos("ON LINE:", sValue)) to iPos
-                    Move (Trim(Left(sValue, iPos -1))) to sValue
-                End
-            End
-            
-            // Error Text:
-            Move sValue to CompileError.sErrorTxt
-            
-            // Finally, construct the text to display:
-            If (bLinkError) Begin
-                Move "Link Error:" to sValue
-            End
-            Else Begin
-                Move "Error" to sValue
-            End
-            If (bLinkError = False) Begin
-                Append sValue " " CompileError.iErrorNo ":"
-            End
-            Append sValue "   " CompileError.sFileName
-            If (bLinkError = False) Begin
-                Append sValue "   " "(ln " CompileError.iLine ")"
-            End    
-            Append sValue " " CompileError.sErrorTxt
-            Move sValue to CompileError.sText
-            
-            Function_Return CompileError
+            Move (Trim(sData)) to sTrim
+            Move (Pos("(", sTrim)) to iParen
+            If (iParen <= 1) ;
+                Function_Return False
+            Move (Mid(sTrim, Length(sTrim), (iParen + 1))) to sRest
+            Move (Pos(",", sRest)) to iComma
+            Move (Pos(")", sRest)) to iClose
+            If (iComma = 0 or iClose = 0 or iComma > iClose) ;
+                Function_Return False
+            // ") Warning " / ") Error " must follow the parens, else not a diagnostic.
+            Move (Lowercase(Mid(sRest, Length(sRest), (iClose + 1)))) to sAfter
+            If ((Left(sAfter, 9) <> " warning ") and (Left(sAfter, 7) <> " error ")) ;
+                Function_Return False
+            Move (Left(sRest, (iComma - 1))) to sNum
+            If (sNum = "") ;
+                Function_Return False
+            For i from 1 to (Length(sNum))
+                If (Pos(Mid(sNum, 1, i), "0123456789") = 0) ;
+                    Function_Return False
+            Loop
+            Move sNum to iLine
+            If (iLine <= 0) ;
+                Function_Return False
+            Move (Left(sTrim, (iParen - 1))) to sFile
+            Function_Return (sFile <> "")
         End_Function
 
-        Function ReadErrorFile String sFileName Returns String[]
-            Integer iCh iRFFileSize iCount
-            String[] asFile  
-            String sLine
-    
-            Move 0 to iCount
-            Move (RFFileSize(sFilename)) to iRFFileSize
-            Move (ResizeArray(asFile, iRFFileSize)) to asFile
-    
-            Get RFOpenInput ("binary:" + sFilename) to iCh
-            If (iCh < 0) Begin 
-                Function_Return asFile
+        // Resolve the (usually relative) file name from a df-cli stdout diagnostic to a
+        // full path: an absolute path stays as-is; otherwise try the target workspace's
+        // AppSrc, its library source folders, and finally the TARGET DataFlex install's
+        // Pkg folder - system packages (cMapiHandler.pkg, cCrystal.pkg, ...) live there.
+        // The editor opens those fine for a closer look; the OS write-protection on
+        // Program Files guards against accidental saves. Returns "" when nothing matches.
+        Function _ResolveRawDiagnosticFile String sFile Returns String
+            String sPath sSWS sPkg
+            String[] asLibs
+            Integer i iMax
+            tWorkspacePaths WS
+
+            If (sFile contains ":") ;
+                Function_Return sFile
+            Get pTargetWS of ghoApplication to WS
+            If (WS.sAppSrc <> "") Begin
+                Move (vFolderFormat(WS.sAppSrc) + sFile) to sPath
+                If (vFilePathExists(sPath)) ;
+                    Function_Return sPath
             End
-    
-            While (SeqEof = False)
-                Readln channel iCh sLine
-                If (Trim(sLine) <> "") Begin
-                    Move sLine to asFile[iCount]
-                    Increment iCount
-                End
+            Get psSWSFile of ghoApplication to sSWS
+            Get GetWorkspaceLibrarySourceFolders of ghoApplication sSWS to asLibs
+            Move (SizeOfArray(asLibs) - 1) to iMax
+            For i from 0 to iMax
+                Move (vFolderFormat(asLibs[i]) + sFile) to sPath
+                If (vFilePathExists(sPath)) ;
+                    Function_Return sPath
             Loop
-            Send RFCloseInput iCh
-            Move (ResizeArray(asFile, iCount)) to asFile
-    
-            Function_Return asFile
-        End_Function  
-        
-        // Changes the original output by calling ExtractData for each line.
-        Function MassageErrorFile String[] asFile Returns tCompileError[]
-            String sValue
-            Integer iSize iCount
-            tCompileError[] asCompileError
-            
-            Move (SizeOfArray(asFile)) to iSize
-            Decrement iSize
-            For iCount from 0 to iSize
-                Move asFile[iCount] to sValue 
-                Get ExtractData asFile[iCount] to asCompileError[iCount]
-            Loop
-            
-            Function_Return asCompileError
+            Get psTargetPkgFolder of ghoApplication to sPkg
+            If (sPkg <> "") Begin
+                Move (vFolderFormat(sPkg) + sFile) to sPath
+                If (vFilePathExists(sPath)) ;
+                    Function_Return sPath
+            End
+            Function_Return ""
         End_Function
-        
+
         Procedure DisplayCurrentSourceLine
             Integer iLine_Col iText_Col iFileName_Col iLine iItem
             String sData sFileName sProduct
+            Boolean bParsed
             Handle hoDataSource hoEditor
             tDataSourceRow[] TheData
 
@@ -524,6 +472,21 @@ Object oCompilerOutput_dg is a cCJToolPanel
 
             Move TheData[iItem].sValue[iLine_Col]     to iLine
             Move TheData[iItem].sValue[iFileName_Col] to sFileName
+            // Raw compiler-output rows (the live / combined view) carry no File/Line -
+            // historically non-jumping. But a df-cli diagnostic line has both right in
+            // its text ("cMapiHandler.Pkg(900,1) Warning 4532: ..."), so parse it and
+            // resolve the relative name against the workspace + the target install's
+            // Pkg, and the double-click works there too (Nils 2026-06-10 - "nothing
+            // happens" on a system-package warning row).
+            If (sFileName = "" or iLine <= 0) Begin
+                Get _ParseRawDiagnostic sData (&sFileName) (&iLine) to bParsed
+                If (bParsed = True) Begin
+                    Get _ResolveRawDiagnosticFile sFileName to sFileName
+                End
+                Else Begin
+                    Move "" to sFileName
+                End
+            End
             // This dock is shared by TestBench and DFRefactor. Both expose the source editor as
             // phoEditor (in TestBench phoEditor == phoEditorRefactored == its refactored editor;
             // in DFRefactor it is the main Scintilla editor). Only the jump differs - TestBench's
@@ -608,24 +571,73 @@ Object oCompilerOutput_dg is a cCJToolPanel
             Function_Return sValue
         End_Function
 
-        Procedure Copy 
-            Integer iCh
-            String sData
-            
-            Get CurrentSourceLine to sData
-            If (sData contains "----Compiler Error Summary----(") Begin
-                Procedure_Return    
+        // "Copy content to Clipboard": every SELECTED row (multi-select via pbMultipleSelection),
+        // each as tab-separated columns, one row per line. Falls back to the focused row when
+        // nothing is multi-selected. Reuses the RFOpenOutput("Clipboard:") pattern from CompilerOutput.dg.
+        Procedure Copy
+            Integer iText_Col ibError_Col iErrorNum_Col iLine_Col iFileName_Col iErrorTxt_Col
+            Integer iItem iCh i iSel
+            Integer[] aiRows
+            Handle hoDataSource
+            tDataSourceRow[] TheData
+            String sOut sLine sCRLF
+
+            Get piColumnId of oText_Col     to iText_Col
+            Get piColumnId of obError_Col   to ibError_Col
+            Get piColumnId of oErrorNum_Col to iErrorNum_Col
+            Get piColumnId of oLine_Col     to iLine_Col
+            Get piColumnId of oFileName_Col to iFileName_Col
+            Get piColumnId of oErrorTxt_Col to iErrorTxt_Col
+
+            Get phoDataSource to hoDataSource
+            Get DataSource of hoDataSource to TheData
+            Get GetIndexesForSelectedRows to aiRows
+            If (SizeOfArray(aiRows) = 0) Begin
+                Get SelectedRow of hoDataSource to iItem
+                If (iItem >= 0) ;
+                    Move iItem to aiRows[0]
             End
-            
-            Get RFOpenOutput ("Clipboard:") to iCh
-            If (iCh < 0) Begin
+            Move (SizeOfArray(aiRows)) to iSel
+            Move (Character(13) + Character(10)) to sCRLF
+            Move "" to sOut
+            For i from 0 to (iSel - 1)
+                Move aiRows[i] to iItem
+                Move (TheData[iItem].sValue[iText_Col]) to sLine   
+                Append sLine (TheData[iItem].sValue[ibError_Col])
+                Append sLine (TheData[iItem].sValue[iErrorNum_Col])
+                Append sLine (TheData[iItem].sValue[iLine_Col])
+                Append sLine (TheData[iItem].sValue[iFileName_Col])
+                Append sLine (TheData[iItem].sValue[iErrorTxt_Col])
+                Move (sOut + sLine + sCRLF) to sOut
+            Loop
+            If (sOut = "") ;
                 Procedure_Return
-            End
-            Write channel iCh sData
+            Get RFOpenOutput ("Clipboard:") to iCh
+            If (iCh < 0) ;
+                Procedure_Return
+            Write channel iCh sOut
             Send RFCloseOutput iCh
-            Set StatusText of (Statusbar_Id(Self)) to "Line copied to Windows clipboard."
+            Set StatusText of (Statusbar_Id(Self)) to (String(iSel) * "row(s) copied to Windows clipboard.")
         End_Procedure
         
+        // Ctrl+A selects every row, so the whole list can be copied in one go.
+        // Toogles between marking all and if all rows are selected,
+        // all rows are deselected.
+        Procedure SelectAllRows
+            Integer iCount iSelected
+            Handle hoDataSource
+    
+            Get phoDataSource to hoDataSource
+            Get RowCount of hoDataSource to iCount
+            Get GetSelectedRowsCount to iSelected
+            If (iCount <> iSelected) Begin
+                Send SetSelectedRowsAll True
+            End
+            Else Begin
+                Send SetSelectedRowsAll False
+            End
+        End_Procedure
+
         Procedure CopyErrorLineNo
             Integer iCh
             String sData
@@ -659,6 +671,7 @@ Object oCompilerOutput_dg is a cCJToolPanel
 
         On_Key kEnter Send DisplayCurrentSourceLine
         On_Key Key_Ctrl+Key_C Send Copy
+        On_Key Key_Ctrl+Key_A Send SelectAllRows
     End_Object
 
     Procedure OnCreateToolPanel Handle hoToolPane
@@ -678,6 +691,13 @@ Object oCompilerOutput_dg is a cCJToolPanel
     Procedure RefreshLiveOutput
         Send LoadRawOutput to oCompileErrors_grd
     End_Procedure
+
+    // Reload the parsed .err error grid without re-activating, then scroll to the newest error so
+    // the live view tails the compile - the legacy-compiler counterpart of RefreshLiveOutput.
+    Procedure RefreshErrorOutput
+        Send LoadData      to oCompileErrors_grd
+        Send MoveToLastRow to oCompileErrors_grd
+    End_Procedure
        
     On_Key Key_Alt+Key_C  Send Close_Panel
     On_Key Key_Escape     Send Close_Panel 
@@ -687,7 +707,6 @@ End_Object
 //
 // Pass a file name including path to display.
 Procedure ActivateCompileErrorDialog String sErrorFile
-    Handle ho
     Boolean bExists bVisible
     String sCurrErrorFile
     
@@ -697,11 +716,28 @@ Procedure ActivateCompileErrorDialog String sErrorFile
         Procedure_Return
     End
     
-    Move (oCompilerOutput_dg(Self)) to ho
-    Set psRawLogFile of ho to ""
-    Set psErrorFile of ho to sErrorFile
-    Set pbVisible of ho to True
-    Send Activate of ho    
+    Set psRawLogFile of ghoCompilerOutputDock to ""
+    Set psErrorFile  of ghoCompilerOutputDock to sErrorFile
+    Set pbVisible    of ghoCompilerOutputDock to True
+    Send Activate    of ghoCompilerOutputDock
+End_Procedure
+
+// Live legacy-compiler errors: refresh the parsed .err grid as the compiler writes it. Called each
+// poll tick by the host (size-gated) once errors start appearing. Activates the dock ONLY on the
+// first error (when it isn't already shown), then refreshes silently - so a clean compile never
+// pops the dock, and a failing one shows errors live without stealing focus on every tick.
+Procedure RefreshCompileErrorsLive String sErrorFile
+    Boolean bExists bVisible
+
+    Get vFilePathExists sErrorFile to bExists
+    If (bExists = False) ;
+        Procedure_Return
+    Get ComVisible   of ghoCompilerOutputDock to bVisible
+    Set psRawLogFile of ghoCompilerOutputDock to ""
+    Set psErrorFile  of ghoCompilerOutputDock to sErrorFile
+    If (bVisible = False) ;
+        Send Activate of ghoCompilerOutputDock            // first error: show the dock (once - never before an error)
+    Send RefreshErrorOutput of ghoCompilerOutputDock      // (re)load the parsed errors + scroll to the newest row
 End_Procedure
 
 // Show the dock with the live compiler output (sLogFile) FOLLOWED by the parsed, jumpable
@@ -709,7 +745,6 @@ End_Procedure
 // for a df-cli failure so the output you watched is capped with the error list, not replaced.
 // Falls back to errors-only when the log is empty.
 Procedure ActivateCombinedCompileOutput String sLogFile String sErrFile
-    Handle ho
     Boolean bExists
 
     Get vFilePathExists sErrFile to bExists
@@ -718,38 +753,34 @@ Procedure ActivateCombinedCompileOutput String sLogFile String sErrFile
         Procedure_Return
     End
 
-    Move (oCompilerOutput_dg(Self)) to ho
-    Set psRawLogFile of ho to sLogFile
-    Set psErrorFile  of ho to sErrFile
-    Set pbVisible    of ho to True
-    Send Activate of ho
+    Set psRawLogFile of ghoCompilerOutputDock to sLogFile
+    Set psErrorFile  of ghoCompilerOutputDock to sErrFile
+    Set pbVisible    of ghoCompilerOutputDock to True
+    Send Activate    of ghoCompilerOutputDock
 End_Procedure
 
 // Public access method close the toolpanel.
 Procedure CloseCompileErrorDialog
-    Set psRawLogFile of (oCompilerOutput_dg(Self)) to ""
-    Send Close_Panel of (oCompilerOutput_dg(Self))
+    Set psRawLogFile of ghoCompilerOutputDock to "" 
+    Set pbVisible    of ghoCompilerOutputDock to False
+    Send Close_Panel of ghoCompilerOutputDock
 End_Procedure
 
 // Show the dock streaming a compile's live stdout (sLogFile), refreshed by
 // RefreshCompileOutputLive while the compile runs. FinishCompile then swaps to the parsed
 // .err via ActivateCompileErrorDialog (which clears raw mode).
 Procedure ShowCompileOutputLive String sLogFile
-    Handle ho
-    Move (oCompilerOutput_dg(Self)) to ho
-    Set psRawLogFile of ho to sLogFile
-    Set psErrorFile  of ho to ""
-    Set pbVisible    of ho to True
-    Send Activate of ho
+    Set psRawLogFile of ghoCompilerOutputDock to sLogFile
+    Set psErrorFile  of ghoCompilerOutputDock to ""
+    Set pbVisible    of ghoCompilerOutputDock to True
+    Send Activate    of ghoCompilerOutputDock
 End_Procedure
 
 // Reload the live compiler output (called each poll tick while the stdout log grows).
 Procedure RefreshCompileOutputLive
-    Send RefreshLiveOutput of (oCompilerOutput_dg(Self))
+    Send RefreshLiveOutput of ghoCompilerOutputDock
 End_Procedure
 
 Function IsCompileErrorDialogActive Returns Boolean
-    Handle ho
-    Move (oCompilerOutput_dg(Self)) to ho
-    Function_Return (ComVisible(ho))    
+    Function_Return (ComVisible(ghoCompilerOutputDock))    
 End_Function

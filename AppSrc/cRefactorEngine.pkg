@@ -41,6 +41,27 @@ Register_Function phoRefactorView Returns Handle
 Register_Function A_InsertSpaceAfterParenthesis String ByRef sLine String sParameter Returns Boolean
 Register_Function pbIgnoreErrorState Returns Boolean
 
+// FT dashboard hook: the engine Broadcasts this when a run completes (RunRefactoringEngine) so the
+// dashboard re-reads its live action-row gates (Revert lights once a backup exists, the run buttons
+// re-check). Declared HERE in the shared engine so the Broadcast compiles in BOTH builds; the handler
+// lives in DashboardFT.vw (FT only), so it is a harmless no-op in the non-FT build (no view handles it).
+Register_Procedure RefreshAfterRun
+
+// Human-readable label for a run's origin (the engine's peRunOrigin), shown as "Run source:" in
+// the summary log so a saved summary says WHAT triggered the run. Global + pure so it is
+// unit-testable without an engine instance. A batch (/bm) run reaches the engine through the
+// normal path with pbBatchMode set, so StartEngine stamps peRunOrigin = eRunBatch before the
+// summary is built (Nils 2026-06-13).
+Function RunOriginText Global Integer eOrigin Returns String
+    If (eOrigin = eRunPlan) ;
+        Function_Return "Refactor Plan (from Analyze)"
+    If (eOrigin = eRunBatch) ;
+        Function_Return "Batch mode (command-line)"
+    If (eOrigin = eRunTestBench) ;
+        Function_Return "Test Bench"
+    Function_Return "Manual selection (Start Refactoring)"
+End_Function
+
 {ClassLibrary = Windows}
 Class cRefactorEngine is a BusinessProcess
     
@@ -63,7 +84,10 @@ Class cRefactorEngine is a BusinessProcess
         Property String psCurrentSourceFileName   
         Property String psTotalTime
         Property tRefactorSettings pRefactorSettings
-        
+        // Which UI action triggered this run - shown as "Run source:" in the summary log. Each
+        // entry point Sets it before StartEngine; StartEngine stamps eRunBatch for a /bm run.
+        Property Integer peRunOrigin eRunManual
+
         Property String psLineBreak CS_CRLF
         Property Boolean pbLastLineBreak
 
@@ -131,7 +155,7 @@ Class cRefactorEngine is a BusinessProcess
             Move False to RefactorSettings.bShowSummary
         End
 
-        Set pRefactorSettings                       to RefactorSettings
+        Set pRefactorSettings               to RefactorSettings
         Set pRefactorSettings of ghoFuncLib to RefactorSettings
         Function_Return RefactorSettings
     End_Function
@@ -201,7 +225,11 @@ Class cRefactorEngine is a BusinessProcess
         Get StatusBar_Id of (phoMainPanel(ghoApplication)) to hoStatusBarID
         Set StatusBar_Id  to hoStatusBarID
         Set phoEditor  to hoEditor
-        
+        // A headless /bm run reaches StartEngine through the normal path with pbBatchMode set;
+        // stamp the true origin so the summary says "Batch mode", not whatever the caller set.
+        If (pbBatchMode(Self) = True) ;
+            Set peRunOrigin to eRunBatch
+
         // Initializes the engine and makes validations.
         Get InitializeEngine RefactorFiles to bOK
         If (bOK = False) Begin
@@ -259,6 +287,11 @@ Class cRefactorEngine is a BusinessProcess
         Get SummaryText eResponse RefactorSettings dtExecStart hoEditor to sText
         Send Stop_StatusPanel of ghoStatusPanel
         Send Destroy of (phoDD(Self))
+
+        // FT dashboard: announce run completion so the dashboard re-reads its live gates (the Revert chip
+        // lights once a backup exists). Fired on ALL outcomes (a partial/cancelled run can still create a
+        // backup) and before the batch-exit. No-op in non-FT builds (no view handles RefreshAfterRun).
+        Broadcast Send RefreshAfterRun of (Client_Id(phoMainPanel(ghoApplication)))
         
         If (pbBatchMode(Self) = True) Begin
             Send Exit_Application
@@ -498,7 +531,7 @@ Class cRefactorEngine is a BusinessProcess
     End_Function
 
     Function LineByLineFunctions String[] ByRef asCode tRefactorSettings RefactorSettings Returns Boolean
-        Integer iLine iSize iItem
+        Integer iLine iSize iItem iCRLFPos
         Boolean bOK bChange bWriteLine
         String sLine
         String[] asCodeNew asCodeOrg
@@ -550,6 +583,18 @@ Class cRefactorEngine is a BusinessProcess
             End
 
             If (bWriteLine = True) Begin
+                // A line-function may expand one source line into a multi-line block (embedded CRLF) - e.g.
+                // ChangeLegacyIndicators turning "[Found] If x Indicate ..." into an If/Begin/End block.
+                // Split it back into separate array elements so the file (and the whole-file pass) see proper
+                // lines. No current single-line function emits CRLF, so this is a plain one-element store in
+                // every other case (the While loop simply does not run).
+                Move (Pos(CS_CRLF, sLine)) to iCRLFPos
+                While (iCRLFPos > 0)
+                    Move (Left(sLine, (iCRLFPos - 1))) to asCodeNew[iItem]
+                    Increment iItem
+                    Move (Mid(sLine, (Length(sLine) - iCRLFPos - 1), (iCRLFPos + 2))) to sLine
+                    Move (Pos(CS_CRLF, sLine)) to iCRLFPos
+                Loop
                 Move sLine to asCodeNew[iItem]
                 Increment iItem
             End
@@ -573,7 +618,7 @@ Class cRefactorEngine is a BusinessProcess
     //           Line-by-line functions
     Function eRemoveFunctions String ByRef sLine tRefactorSettings RefactorSettings Boolean ByRef bWriteLine Returns Boolean
         Boolean bChanged bChangesMade
-        String sFunctionName sParameter
+        String sFunctionName sParameter sLineBefore
         Integer iFunctionID
         
         Move False to bChangesMade
@@ -589,9 +634,16 @@ Class cRefactorEngine is a BusinessProcess
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName
             Set psExecutionContext of ghoFuncLib to sFunctionName
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
+            Move sLine to sLineBefore
             Get iFunctionID of ghoFuncLib (&sLine) sParameter to bChanged
             If (bChanged = True) Begin
-                Move False to bWriteLine     
+                Move False to bWriteLine
+                // Same re-tokenize as eStandardFunctions, so a following remove-function sees the masked
+                // line aligned with sLine. Guarded on the ACTUAL text change because a remove-function can
+                // flag a line for deletion WITHOUT rewriting it - and re-tokenizing an unchanged line can
+                // corrupt lexer state on an image /* marker (see the LineByLineFunctions note).
+                If (sLine <> sLineBefore) ;
+                    Send InitializeTokenizer of ghoFuncLib sLine
                 Reread FunctionsA
                     Add 1 to FunctionsA.Counter
                     SaveRecord FunctionsA
@@ -608,7 +660,7 @@ Class cRefactorEngine is a BusinessProcess
     //           Line-by-line functions
     Function eStandardFunctions String ByRef sLine tRefactorSettings RefactorSettings Returns Boolean
         Boolean bChanged bChangesMade
-        String sFunctionName sParameter
+        String sFunctionName sParameter sLineBefore
         Integer iFunctionID
         
         Move False to bChangesMade
@@ -624,15 +676,25 @@ Class cRefactorEngine is a BusinessProcess
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName
             Set psExecutionContext of ghoFuncLib to sFunctionName
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
+            Move sLine to sLineBefore
             Get iFunctionID of ghoFuncLib (&sLine) sParameter to bChanged
             If (bChanged = True) Begin
+                // The function rewrote sLine, so the shared tokenizer's masked line (sOverstrikeLine)
+                // now holds stale positions. Re-tokenize so the NEXT line-by-line function sees offsets
+                // aligned with the rewritten line: e.g. UnicodeOemAnsiFunctions' _RenameMaskedCalls
+                // locates matches in the masked line but splices out of sLine BY POSITION, so a skew
+                // there mangles the result (e.g. ChangeTrim's "Move (Trim(ToOEM(x)))" then mis-renamed
+                // to "Move (Utf8ToOem(ToOEM(x))))"). Guarded on the ACTUAL text change: skips a needless
+                // re-tokenize, and never re-tokenizes an unchanged line (which would corrupt an image /* marker).
+                If (sLine <> sLineBefore) ;
+                    Send InitializeTokenizer of ghoFuncLib sLine
                 Reread FunctionsA
                     Add 1 to FunctionsA.Counter
                     SaveRecord FunctionsA
                     Move True to bChangesMade
                 Unlock
             End
-            Constrained_Find Next            
+            Constrained_Find Next
         Loop
         
         Function_Return bChangesMade
@@ -722,6 +784,7 @@ Class cRefactorEngine is a BusinessProcess
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName
             Set psExecutionContext of ghoFuncLib to sFunctionName
+            Set Message_Text of ghoStatusPanel to ("Function:" * sFunctionName)
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
             Get iFunctionID of ghoFuncLib (&asCode) sParameter to iRetval
             If (iRetval <> 0) Begin
@@ -762,6 +825,7 @@ Class cRefactorEngine is a BusinessProcess
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName
             Set psExecutionContext of ghoFuncLib to sFunctionName
+            Set Message_Text of ghoStatusPanel to ("Function:" * sFunctionName)
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
             // Data send as ByRef to have a consistent calling convention for all refactoring functions:
             Get iFunctionID of ghoFuncLib (&asCode) sParameter to iRetval
@@ -800,6 +864,7 @@ Class cRefactorEngine is a BusinessProcess
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName
             Set psExecutionContext of ghoFuncLib to sFunctionName
+            Set Message_Text of ghoStatusPanel to ("Function:" * sFunctionName)
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
             Get iFunctionID of ghoFuncLib (&RefactorSettings.FileData.asFullFileNames) sParameter to iRetval
             If (iRetval <> 0) Begin
@@ -847,6 +912,7 @@ Class cRefactorEngine is a BusinessProcess
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName
             Set psExecutionContext of ghoFuncLib to sFunctionName
+            Set Message_Text of ghoStatusPanel to ("Function:" * sFunctionName)
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
             Get iFunctionID of ghoFuncLib (&RefactorSettings.FileData.asFullFileNames) sParameter to iRetval
             If (iRetval <> 0) Begin
@@ -1075,6 +1141,7 @@ Class cRefactorEngine is a BusinessProcess
         Move SysFile.iCountNumberOfChangedFiles to iChangedFiles
         Move SysFile.iCountNumberOfFiles        to iFileCount
         Append sText "\n  Statistics:\n  ===========\n"
+        Append sText sTab ("Run source:" * RunOriginText(peRunOrigin(Self)) + "\n")
         Move "Note: bReadOnly = True. *No* changes were actually made to the source code." to sReadOnlyTxt
         Get psSWSFile of ghoApplication to sSWSFile
         If (sSWSFile <> "") Begin
@@ -1126,7 +1193,7 @@ Class cRefactorEngine is a BusinessProcess
                 Constrain FunctionsA.bPublished eq True
                 Constrained_Find First FunctionsA by Index.4
                 While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * Trim(FunctionsA.Function_Name))
+                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
                     Constrained_Find Next            
                 Loop
             End
@@ -1142,7 +1209,7 @@ Class cRefactorEngine is a BusinessProcess
                 Constrain FunctionsA.bPublished eq True
                 Constrained_Find First FunctionsA by Index.4
                 While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * Trim(FunctionsA.Function_Name))
+                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
                     Constrained_Find Next            
                 Loop
             End
@@ -1158,7 +1225,7 @@ Class cRefactorEngine is a BusinessProcess
                 Constrain FunctionsA.bPublished eq True
                 Constrained_Find First FunctionsA by Index.4
                 While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "file(s)" * Trim(FunctionsA.SummaryText) * Trim(FunctionsA.Function_Name))
+                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
                     Constrained_Find Next            
                 Loop
             End
@@ -1174,7 +1241,7 @@ Class cRefactorEngine is a BusinessProcess
                 Constrain FunctionsA.bPublished eq True
                 Constrained_Find First FunctionsA by Index.4
                 While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * Trim(FunctionsA.Function_Name))
+                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
                     Constrained_Find Next            
                 Loop
             End
@@ -1190,7 +1257,7 @@ Class cRefactorEngine is a BusinessProcess
                 Constrain FunctionsA.bPublished eq True
                 Constrained_Find First FunctionsA by Index.4
                 While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "file(s)" * Trim(FunctionsA.SummaryText) * Trim(FunctionsA.Function_Name))
+                    Append sText ("\n-" * String(FunctionsA.Counter) * "file(s)" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
                     Constrained_Find Next            
                 Loop
             End
@@ -1206,8 +1273,8 @@ Class cRefactorEngine is a BusinessProcess
                 Constrain FunctionsA.bPublished eq True
                 Constrained_Find First FunctionsA by Index.4
                 While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "file(s)" * Trim(FunctionsA.SummaryText) * Trim(FunctionsA.Function_Name))
-                    Constrained_Find Next            
+                    Append sText ("\n-" * String(FunctionsA.Counter) * "item(s)" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
+                    Constrained_Find Next
                 Loop
             End
 
@@ -1222,8 +1289,10 @@ Class cRefactorEngine is a BusinessProcess
                 Constrain FunctionsA.bPublished eq True
                 Constrained_Find First FunctionsA by Index.4
                 While (Found)
-                    Append sText ("\n-" * Trim(FunctionsA.SummaryText) * Trim(FunctionsA.Function_Name) * String(FunctionsA.Counter) * "file(s)" )
-                    Constrained_Find Next            
+                    // "item(s)" not "file(s)": an eReportFunctionAll counter is the return value (e.g.
+                    // TypeToStructReport returns Types + accessor sites), NOT a file count.
+                    Append sText ("\n-" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")" * String(FunctionsA.Counter) * "item(s)" )
+                    Constrained_Find Next
                 Loop
             End
         End
@@ -1588,29 +1657,29 @@ Class cRefactorEngine is a BusinessProcess
     End_Procedure
 
     { MethodType=Event Visibility=Private }
-    Procedure Error_Report Integer ErrNum Integer iErrLine String ErrMsg
-        Integer id
-        If (pbIgnoreErrorState(ghoFuncLib) = True) Begin
-            Procedure_Return
-        End
-        If (Error_Processing_State(Self) = False) Begin
-            Set Error_Processing_State to True // prevents recursion
-            Set Error_Check_State to True
-            Set Error_Count to (Error_Count(Self)+1)
-            If (Status_Log_State(Self)) ;
-                Send Error_Log_Status ErrNum iErrLine ErrMsg
-            If (Display_Error_State(Self)) Begin
-                Get Old_Error_Object_Id to ID
-                Send End_Status // YOU MUST DO THIS!!!!
-                If ID ;
-                    Send Error_Report to Id ErrNum iErrLine ErrMsg
-                Else ;
-                    Send Error_Report of desktop ErrNum iErrLine ErrMsg
-            End
-            Send OnError ErrNum iErrLine ErrMsg
-            Set Error_Processing_State to False
-        End
-    End_Procedure
+//    Procedure Error_Report Integer ErrNum Integer iErrLine String ErrMsg
+//        Integer id
+//        If (pbIgnoreErrorState(ghoFuncLib) = True) Begin
+//            Procedure_Return
+//        End
+//        If (Error_Processing_State(Self) = False) Begin
+//            Set Error_Processing_State to True // prevents recursion
+//            Set Error_Check_State to True
+//            Set Error_Count to (Error_Count(Self)+1)
+//            If (Status_Log_State(Self)) ;
+//                Send Error_Log_Status ErrNum iErrLine ErrMsg
+//            If (Display_Error_State(Self)) Begin
+//                Get Old_Error_Object_Id to ID
+//                Send End_Status // YOU MUST DO THIS!!!!
+//                If ID ;
+//                    Send Error_Report to Id ErrNum iErrLine ErrMsg
+//                Else ;
+//                    Send Error_Report of desktop ErrNum iErrLine ErrMsg
+//            End
+//            Send OnError ErrNum iErrLine ErrMsg
+//            Set Error_Processing_State to False
+//        End
+//    End_Procedure
     
 // This happens after the Log_Status procedure has saved the error to the database (cRefactorStatusLog.pkg)    
 //    Procedure OnError Integer iErrNum Integer iErrLine String sErrMsg

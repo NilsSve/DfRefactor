@@ -418,7 +418,7 @@ Object oRefactorTestBench is a cRefactorDbView
     End_Procedure
     
     Procedure RefactorCode
-        String sLegacyFileName sRefactoredFileName sErrFile
+        String sLegacyFileName sRefactoredFileName
         Handle hoLegacyEditor hoRefactoredEditor
         Integer iRetval
         Boolean bOK
@@ -428,9 +428,8 @@ Object oRefactorTestBench is a cRefactorDbView
         Move False to Err
         // RefactorTestBench compiles the test program in DFRefactor's
         // own workspace, so pass pOrgWS regardless of any user-selected
-        // target.
+        // target. (DeleteCompileErrorsFile removes BOTH suffix candidates.)
         Get pOrgWS of ghoApplication to OrgWS
-        Get CompileErrorFileForProgram of ghoApplication CS_TestProgram to sErrFile
         Get DeleteCompileErrorsFile of ghoApplication CS_TestProgram OrgWS to bOK
         If (bOK = False) Begin
             Get YesNo_Box "Could not delete the compiler's error file. Continue?" to iRetval
@@ -445,10 +444,6 @@ Object oRefactorTestBench is a cRefactorDbView
         Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
         Get psCodeFile          of hoLegacyEditor     to sLegacyFileName 
 
-// File format test:
-//    Boolean bIsFileUTF8
-//    Move (RFFileHasBOM(sLegacyFileName)) to bIsFileUTF8
-
         Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
         // We need to copy the legacy file to the refactor file before we start our work,
         // because else the ghoEngine would overwrite the sLegacyFileName with
@@ -462,6 +457,7 @@ Object oRefactorTestBench is a cRefactorDbView
         End
 
         // Start the Engine!
+        Set peRunOrigin of ghoEngine to eRunTestBench
         Send StartEngine of ghoEngine RefactorFiles hoRefactoredEditor
         // Reload the refactored file into the editor. This is necessary for
         // eOtherFunctionAll functions (e.g. cDbGridTocDbCJGrid) which write

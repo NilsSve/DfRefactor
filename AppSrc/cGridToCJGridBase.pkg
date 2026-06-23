@@ -1,4 +1,4 @@
-/* cGridToCJGridBase.pkg
+﻿/* cGridToCJGridBase.pkg
 
  Abstract base class for CJ grid conversion worker classes.
  Shared by:
@@ -108,6 +108,12 @@ Class cGridToCJGridBase is a cObject
         Property String[]  pasEntryDisplayExtracted
         Property Boolean   pbEntryDisplayFlushed  False
         Property Boolean   pbLastFileWasUtf8      False
+        // Procedure-nesting depth captured at the CURRENT grid's declaration. > 0 means the
+        // grid object is physically inside an open Procedure/Function body (e.g. a class's
+        // Construct_Object). The subclasses read this to SUPPRESS any generated procedure
+        // (LoadData/Activating/OnSetCalculatedValue) that would otherwise be nested inside
+        // that procedure - illegal in DataFlex - and emit a //TODO instead (Nils 2026-06-11).
+        Property Integer   piProcDepthAtGrid       0
     End_Procedure
 
     // *** File I/O ***
@@ -716,6 +722,29 @@ Class cGridToCJGridBase is a cObject
         Function_Return (sLeading + sTargetClass)
     End_Function
 
+    // Parse the item index N from a per-column Set line, handling both:
+    //   "set <propname> item N to value"  (with  Item keyword)
+    //   "set <propname> N to value"       (without Item keyword)
+    // sPropName is the lowercase property name to locate in the line.
+    // Returns -1 when the index cannot be parsed.
+    // A source token -> a non-negative integer (used for BOTH a column index AND a form-width), but ONLY
+    // when the token is all digits; otherwise -1 - the "skip" sentinel the grid callers already test
+    // (index: If iItemIdx >= 0; width: If iWidth >= 0). Essential: a NON-numeric token - a variable or
+    // constant index/width ("... item iCol to ..." or "... to C_Width") instead of a literal - would
+    // otherwise FAULT Integer() (string -> numeric) in DF26 and abort the whole grid -> cDbCJGrid run.
+    Function _DigitsToIntOrMinus1 String sToken Returns Integer
+        Integer i iLen
+        Move (Trim(sToken)) to sToken
+        Move (Length(sToken)) to iLen
+        If (iLen = 0) ;
+            Function_Return -1
+        For i from 1 to iLen
+            If (Pos(Mid(sToken, 1, i), "0123456789") = 0) ;
+                Function_Return -1
+        Loop
+        Function_Return (Integer(sToken))
+    End_Function
+
     // Parse the item index N from a line like "set form_width   item N to ..."
     Function ParseItemIndex String sTrimLower Returns Integer
         Integer iItem iSpace
@@ -733,7 +762,7 @@ Class cGridToCJGridBase is a cObject
         Else Begin
             Move sRest to sToken
         End
-        Function_Return (Integer(Trim(sToken)))
+        Function_Return (_DigitsToIntOrMinus1(Self,sToken))
     End_Function
 
     // Extract a quoted label string from "Set Header_Label [Item] N to "Label"".
@@ -766,14 +795,9 @@ Class cGridToCJGridBase is a cObject
     Function ParseFormWidth String sTrimLower Returns Integer
         String sVal
         Get ParseValueAfterTo sTrimLower to sVal
-        Function_Return (Integer(Trim(sVal)))
+        Function_Return (_DigitsToIntOrMinus1(Self,sVal))
     End_Function
 
-    // Parse the item index N from a per-column Set line, handling both:
-    //   "set <propname> item N to value"  (with  Item keyword)
-    //   "set <propname> N to value"       (without Item keyword)
-    // sPropName is the lowercase property name to locate in the line.
-    // Returns -1 when the index cannot be parsed.
     Function ParseColumnItemIndex String sTrimLower String sPropName Returns Integer
         Integer iProp iAfter iSpace
         String  sRest
@@ -784,9 +808,9 @@ Class cGridToCJGridBase is a cObject
             Move (Trim(Mid(sTrimLower, CI_EOL, (iProp + 6)))) to sRest
             Move (Pos(CS_S, sRest)) to iSpace
             If (iSpace > 0) Begin
-                Function_Return (Integer(Left(sRest, iSpace - 1)))
+                Function_Return (_DigitsToIntOrMinus1(Self,Left(sRest, iSpace - 1)))
             End
-            Function_Return (Integer(Trim(sRest)))
+            Function_Return (_DigitsToIntOrMinus1(Self,Trim(sRest)))
         End
 
         // No "item" keyword: N sits directly after the property name.
@@ -800,9 +824,9 @@ Class cGridToCJGridBase is a cObject
         // sRest = "N to value"
         Move (Pos(CS_S, sRest)) to iSpace
         If (iSpace > 0) Begin
-            Function_Return (Integer(Left(sRest, iSpace - 1)))
+            Function_Return (_DigitsToIntOrMinus1(Self,Left(sRest, iSpace - 1)))
         End
-        Function_Return (Integer(Trim(sRest)))
+        Function_Return (_DigitsToIntOrMinus1(Self,Trim(sRest)))
     End_Function
 
     // Extract the raw value after " to " from a line (uses original casing).
@@ -905,7 +929,7 @@ Class cGridToCJGridBase is a cObject
         String  sScanLine sScanLower
         String  sMouseClickOldP1 sMouseClickOldP2
         Integer iCount iSize iGridsChanged iGridInnerNest iTr iTrSize
-        Integer iScan iScanSize iScanNest
+        Integer iScan iScanSize iScanNest iProcDepth
         Boolean bInEntryDisplay bSkip bFound bOK bScanFound
         Boolean bInRenameProcedure bInLegacyOnlyMethod
         Boolean bScanInEntryDisplay bScanDone
@@ -913,6 +937,7 @@ Class cGridToCJGridBase is a cObject
         Get pasSource to asSource
         Move 0 to iGridsChanged
         Move 0 to iGridInnerNest
+        Move 0 to iProcDepth
         Move False to bInEntryDisplay
         Move False to bInRenameProcedure
         Move False to bInLegacyOnlyMethod
@@ -928,6 +953,17 @@ Class cGridToCJGridBase is a cObject
 
             // NOT inside any grid
             If (iGridInnerNest = 0) Begin
+                // Track procedure/function nesting at this TOP scope, so a grid declared
+                // inside a Procedure body (e.g. Construct_Object) is detected. Procedure
+                // lines INSIDE a grid body never reach here (they run at iGridInnerNest >= 1),
+                // so this counter reflects only the scope the grid itself sits in.
+                If (Left(sLower, 10) = "procedure " or Left(sLower, 9) = "function ") Begin
+                    Increment iProcDepth
+                End
+                Else If (Left(sLower, 13) = "end_procedure" or Left(sLower, 12) = "end_function") Begin
+                    If (iProcDepth > 0) ;
+                        Decrement iProcDepth
+                End
                 Get IsGridDeclaration sLower to bFound
                 If (bFound = True) Begin
                     Move (Replace(sTrimLine, sLine, "")) to sGridIndent
@@ -938,6 +974,9 @@ Class cGridToCJGridBase is a cObject
                     Move False to bInRenameProcedure
                     Move False to bInLegacyOnlyMethod
                     Send OnGridStarted sGridIndent iCount
+                    // Snapshot the proc-depth for THIS grid (read at End_Object by the
+                    // subclass to decide whether a generated procedure is safe to emit).
+                    Set piProcDepthAtGrid to iProcDepth
                     // Pre-scan: search ahead through this grid's body for a Procedure
                     // Entry_Display block and collect any translatable grid-level Set
                     // properties (e.g. Set CurrentRowColor) within it.  Results are
@@ -1259,6 +1298,7 @@ Class cGridToCJGridBase is a cObject
             Decrement iSize
             For iCount from 0 to iSize
                 Move asFiles[iCount] to sFilePath
+                Set Caption_Text of ghoStatusPanel to ("Grid conversion - File No:" * String(iCount + 1) * "of:" * String(iSize + 1))
                 Set Title_Text   of ghoStatusPanel to ("Converting Grid objects in:" * sFilePath)
                 Set Message_Text of ghoStatusPanel to (ParseFileName(sFilePath))
 

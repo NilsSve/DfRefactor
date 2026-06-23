@@ -10,9 +10,13 @@ Declare_Datafile FunctionsA
     Define C_CtrlShiftTab for 7170
 #ENDIF
 Register_Object oOpenFolderMenuItem
+// Defined on cRefactorScintillaEditor BELOW this menu - register so the menu items
+// can reference them at compile time.
+Register_Procedure CloseFile
+Register_Function psCodeFile Returns String
 
 Object oSciContextMenu is a cCJContextMenu
-    Property Handle phoServedObject    0
+    Property Handle phoServedObject 0
 
     Object oSourceFileText_MenuItem is a cCJMenuItem
         Set psCaption to "Select Source File"
@@ -22,7 +26,7 @@ Object oSciContextMenu is a cCJContextMenu
 
         Procedure OnExecute Variant vCommandBarControl
             Forward Send OnExecute vCommandBarControl
-            Send Execute of (oOpenFolderMenuItem(ghoCommandBars))
+            Send SelectSourceFile of ghoApplication
         End_Procedure
 
         Function IsEnabled Returns Boolean
@@ -36,6 +40,23 @@ Object oSciContextMenu is a cCJContextMenu
             Function_Return bState
         End_Function
 
+    End_Object
+
+    Object oCloseFileMenuItem is a cCJMenuItem
+        Set psCaption to "Close File"
+        Set psToolTip to "Close File"
+        Set psDescription to "Closes the file currently loaded in the editor (asks to save pending changes first)"
+        Set psImage to "ActionClose.ico"
+
+        Procedure OnExecute Variant vCommandBarControl
+            Send CloseFile of (phoServedObject(Self))
+        End_Procedure
+
+        Function IsEnabled Returns Boolean
+            String sFile
+            Get psCodeFile of (phoServedObject(Self)) to sFile
+            Function_Return (sFile <> "")
+        End_Function
     End_Object
 
     Object oCutMenuItem is a cCJCutMenuItem
@@ -181,10 +202,15 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         Set pbFindDocumentStart to True
         
         Property Boolean piInSetFocus False
-        // Should we check for the file being changed externally?  
+        // Should we check for the file being changed externally?
         Property Boolean pbExternalModifyCheck True
         Property DateTime pdtCurrentFileDateTime
         Property String psCodeFile
+        // The main panel's caption as it was BEFORE a file name was appended to it -
+        // captured on the first UpdateMainPanelCaption call (the label is set once at
+        // program start and never changes otherwise), so the file display can always
+        // rebuild "<base> - <full path>" or restore the bare base on Close File.
+        Property String psBaseMainCaption ""
 
         Property Handle phoCodeMaxEditor   (Self)
         Property Handle phoEditorEditView  0 // This is only needed in The Hammer where an editor view has also components such as a treeview on the left
@@ -206,6 +232,15 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         On_Key Key_Ctrl+Key_Alt+Key_F3 Send CME_FindReplace  
     End_Procedure
     
+    // DFRefactor is a refactoring tool, not a debugger, so the leftmost status/breakpoint margin is wasted
+    // space. The base (cSciLexer.ApplyEditorOptions) gives MARGIN_STATUS (margin 0) width 16; hide it here
+    // after the base runs. Line numbers (MARGIN_LINE_NUMBERS = margin 2) are untouched, and ApplyEditorOptions
+    // is the ONLY place MARGIN_STATUS width is set, so a width of 0 here is final. (Submodule left unchanged.)
+    Procedure ApplyEditorOptions
+        Forward Send ApplyEditorOptions
+        Send EditorMessage SCI_SETMARGINWIDTHN MARGIN_STATUS 0
+    End_Procedure
+
     Function ReadImageDataToStringArray Integer iImg Returns String[]
         Integer iCh iCount
         String sTextValue sLine
@@ -370,14 +405,70 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         If (sFileName <> "") Begin
             Set psCodeFile to sFileName
             Send Delete_Data
-            Get CM_OpenFile sFileName to eStatus  
-            Get TextEncoding to iEncoding 
+            Get CM_OpenFile sFileName to eStatus
+            Get TextEncoding to iEncoding
             Send ShowTextEncoding iEncoding
-            Send FillFileTimeStamp sFileName // Update the filetime.  
+            Send FillFileTimeStamp sFileName // Update the filetime.
             // Activate the Editor object(!) and view.
             Send Activate
+            // Show the loaded file (full path) in the program's title bar.
+            Send UpdateMainPanelCaption sFileName
         End
-    End_Procedure   
+    End_Procedure
+
+    // Reflect the loaded file in the MAIN panel's caption (the title bar):
+    // "<base caption> - <full path>", back to the bare base caption when no file is
+    // loaded. The title bar is the one spot with room for the FULL path - the editor
+    // view itself is cramped, and its Label only feeds the CodeJock tab text (hard to
+    // see, no path; the first attempt). Guarded to the program's MAIN editor
+    // (phoEditor), so a host with several editor instances doesn't fight over the title.
+    Procedure UpdateMainPanelCaption String sFileName
+        Handle hoMain
+        String sBase
+
+        If (phoEditor(ghoApplication) <> Self) ;
+            Procedure_Return
+        Get phoMainPanel of ghoApplication to hoMain
+        If (hoMain = 0) ;
+            Procedure_Return
+        // The base caption is set once at program start (DFRefactor.src) and never
+        // changes - capture it on first use so it can always be rebuilt/restored.
+        Get psBaseMainCaption to sBase
+        If (sBase = "") Begin
+            Get Label of hoMain to sBase
+            Set psBaseMainCaption to sBase
+        End
+        If (sFileName <> "") Begin
+            Move (sBase * "-" * sFileName) to sBase
+        End
+        Set Label of hoMain to sBase
+    End_Procedure
+
+    // Close the file currently loaded in the editor: ONE question about pending
+    // changes (Yes = save first), then empty the editor and clear the per-file
+    // state (psCodeFile, the view caption, the encoding pane). Wired to the
+    // editor's context menu (oCloseFileMenuItem).
+    Procedure CloseFile
+        String sFileName
+        Integer iRetval
+        Boolean bChanged
+
+        Get psCodeFile to sFileName
+        If (sFileName = "") ;
+            Procedure_Return
+        Get Changed_State to bChanged
+        If (bChanged = True) Begin
+            Get YesNo_Box ("Save the changes to" * sFileName * "before closing it?") to iRetval
+            If (iRetval = MBR_Yes) Begin
+                Send Request_Save
+            End
+        End
+        Send Delete_Data
+        Set psCodeFile to ""
+        Set Changed_State to False
+        Send UpdateMainPanelCaption ""
+        Set UTF8Text of (StatusBar_Id(ghoCommandBars)) to ""
+    End_Procedure
     
     Procedure ShowTextEncoding Integer iEncoding
         Case Begin

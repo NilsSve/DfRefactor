@@ -1,0 +1,912 @@
+﻿//****************************************************************************
+// $Module type: Class
+// $Module name: cModAnalyzer
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : Modernization Analyzer - the "brain" that maps a DataFlex compiler
+//               MESSAGE (a warning OR an error: number + text) to a fix RECIPE: a
+//               category (Auto-fix / Suggest / Explain / Unknown), a one-line hint,
+//               and the refactor function that addresses it (if any).
+//
+//               The recipe set is DATA-DRIVEN - it lives in the "ModAnalyzer" table
+//               (created by DUF_MultipleTables, filelist #12). BuildDefaultRecipes
+//               holds the built-in defaults; RefreshRecipeTable writes them to the table on
+//               first use (idempotent: a non-empty table keeps the user's edits), and
+//               LoadRecipes caches the table in memory. ClassifyMessage then matches a
+//               message against the cache - ClassifyFromRecipes is the pure matcher: a
+//               row whose MatchText appears in the message text beats a generic (blank
+//               MatchText) row for the same number.
+//
+//               Grounded in real DF19->DF21+ migration output, where the WARNING family
+//               (4531 string commands, 4532 ZeroString, 4533 dbList/dbGrid, 4534
+//               ToOEM/ToANSI, 4538 indicators, ...) dwarfs the error family and mostly
+//               maps straight onto refactor functions we already ship.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS for a PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//****************************************************************************
+Use cApplication.pkg
+Use cRefactorFuncLib.pkg
+Use cRDCAutoCreateNewID.pkg
+Use cCompileErrorParser.pkg   // tCompileError + ReadCompilerMessages (parse the .prn)
+Use cRefactorFileIO.pkg       // RFOpenInput / RFOpenOutput / Read_Block (recipe JSON cache I/O)
+Use cEncodingHelpers.pkg      // RFReadEncodedFileAsStringArray - the plan source-guards the warned line
+Use cJsonObject.pkg           // recipe JSON import/export (DataTypeToJson / JsonToDataType)
+Use RefactorConstants.h.pkg
+
+Open ModAnalyzer
+
+// Version of the built-in recipe set. BUMP THIS whenever BuildDefaultRecipes changes, so
+// RefreshRecipeTable refreshes already-seeded tables on the next run.
+// v23: dbList 4537 recipe match-text corrected DBGRID -> DBLIST (the compiler emits the actual
+//      class name - "Obsolete class: DBLIST" for a dbList - so the old "class: DBGRID" never matched
+//      and every dbList object fell through to the generic 4537 Explain).
+// v24: 4538 "Obsolete command: Indicator" ownership moved to the new ChangeIndicatorToBoolean (the
+//      DECLARATION refactor); removed the mis-applied 4538 tag from ChangeLegacyIndicators /
+//      ChangeSquareBracketsIndicators (they fix [Found]/Indicate USAGE, which emits no 4538).
+// v25: new ChangeUppercaseCommandToFunction / ChangeLowercaseCommandToFunction (4531 | command:
+//      Uppercase / Lowercase) - "Uppercase sX to sY" -> "Move (Uppercase(sX)) to sY".
+// v26: 4538 is a SHARED message with THREE text variants - "Indicate. Use Move command", "Indicator.
+//      Use Boolean", and "Obsolete technique...without parentheses" ([Found] square-bracket usage). v24
+//      wrongly assumed usage emits no 4538 and stripped the tags, so [Found]/Indicate lines fell to the
+//      generic ChangeIndicatorToBoolean and failed its source guard ("Explain - not fixable on this line").
+//      Now match-text routes each: "Use Boolean" -> ChangeIndicatorToBoolean; "Use Move command" +
+//      "without parentheses" -> ChangeLegacyIndicators; "without parentheses" -> ChangeSquareBracketsIndicators.
+// v27: new CommentOutArgumentSizeCommands - comments out the obsolete Get_Argument_Size /
+//      Set_Argument_Size legacy string-buffer-sizing commands (no-ops under modern dynamic strings).
+//      4533 | Get_Argument_Size / Set_Argument_Size | Suggest (Review - the rare inline-If form drops
+//      the guarding If when the whole line is commented, so it's worth an eyeball).
+// v28: corrected that match-text. The compiler emits "SET_ARGUMENT_SIZE. It can be removed." /
+//      "GET_ARGUMENT_SIZE. It can be removed." (NOT the "Obsolete command: X" phrasing the other 4533
+//      recipes use), so the recipe keys on the bare command name (4533 | Set_Argument_Size /
+//      Get_Argument_Size), not "command: ...", which never matched -> the rows fell to generic Explain.
+// v29: 4345 is now a VARIANT-routed error (like 4538). The compiler emits "Type check error SELECT, MUST
+//      BE DEFINED" when the predefined SELECT macro indicator is used bare without OldFMACCommands.pkg
+//      (e.g. after ChangeLegacyIndicators / ChangeSquareBracketsIndicators bare-ify [SELECT], or in legacy
+//      source that lost the Use line). A function-backed meta-tag recipe on AddUseOldFMACCommands
+//      (4345 | SELECT, MUST BE DEFINED) routes that variant to the fix; the FMAC reserved-name variant
+//      (iEntry/iExit/iValidate) still falls to the function-less generic 4345 (Explain - manual rename).
+// v30: AddUseOldFMACCommands now DEFINES the SELECT macro (an IFNDEF-guarded #Replace SELECT shim) instead
+//      of adding 'Use OldFMACCommands.pkg' - the Use line only made the REPORT macro available and did NOT
+//      define bare SELECT on its own (Nils 2026-06-20). The recipe's hint (its {Description} first line)
+//      changed, so the cached recipe table + ModAnalyzerRecipes.json must reseed. Recipe wiring unchanged.
+Define CI_ModAnalyzerRecipeVersion for 30
+
+Class cModAnalyzer is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // In-memory recipe cache, lazily loaded from the ModAnalyzer table.
+        Property tModAnalyzer[] paRecipes
+        Property Boolean pbRecipesLoaded False
+        // The target DataFlex version this cache was last loaded for. Compared against the app's
+        // current psTargetDfVersion to detect a target switch and force a re-scan / re-seed.
+        Property String psLoadedDfVersion ""
+    End_Procedure
+
+    // Human-readable label for a category value (shown in the analysis grid).
+    Function CategoryText Integer eCategory Returns String
+        If (eCategory = eModAutoFix) ;
+            Function_Return "Auto-fix"
+        If (eCategory = eModSuggest) ;
+            Function_Return "Review"
+        If (eCategory = eModExplain) ;
+            Function_Return "Explain"
+        Function_Return "Unknown"
+    End_Function
+
+    // Append one recipe to a recipe array and return the grown array.
+    Function AddRecipe tModAnalyzer[] aRecipes Integer iMsgNo Boolean bWarn String sMatch String sFn Integer eCat String sHint Returns tModAnalyzer[]
+        Integer i
+        Move (SizeOfArray(aRecipes)) to i
+        Move iMsgNo to aRecipes[i].iMsgNumber
+        Move bWarn  to aRecipes[i].bIsWarning
+        Move sMatch to aRecipes[i].sMatchText
+        Move eCat   to aRecipes[i].eCategory
+        Move sHint  to aRecipes[i].sHint
+        Move sFn    to aRecipes[i].sRefactorFn
+        Get CategoryText eCat to aRecipes[i].sCategoryText
+        Function_Return aRecipes
+    End_Function
+
+    // NOTE: the per-file obsolete-warning parser (_ObsoleteRecipesFromLines) and the install-Pkg scan
+    // it drove (ScanInstallPackages) were RELOCATED to cRefactorFuncLib (ghoFuncLib). ONE shared
+    // install-package walk there (WalkInstallPackages / InstallScanRecipes) now feeds BOTH this recipe
+    // scan and the TypeToStructReport Type catalogue, reading each package once. RefreshRecipeTable
+    // (below) calls InstallScanRecipes of ghoFuncLib; AddRecipe / CategoryText (above) stay here.
+
+    // The built-in DEFAULT recipe set. This is both the SEED written to the ModAnalyzer
+    // table on first run, and the data the unit tests classify against (no DB needed).
+    // Tune the live mapping by editing the ModAnalyzer TABLE - this only bootstraps it.
+    Function BuildDefaultRecipes Returns tModAnalyzer[]
+        tModAnalyzer[] aR
+        // --- ERRORS (bIsWarning = False) ---
+        Get AddRecipe aR 4539 False "" "" eModSuggest "Pointer/String conversion (Unicode compiler) - check the direction; see the Unicode refactor family." to aR
+        Get AddRecipe aR 4544 False "" "" eModSuggest "Ambiguous return value (a Get_ / function call) used in an expression - assign it to a typed local first, then use the local. If no such call is on this line, it's inside a macro/command (fix at the definition)." to aR
+        Get AddRecipe aR 4390 False "" "" eModSuggest "Duplicate global definition - remove or rename the later one." to aR
+        // 4345 is variant-routed by message text: the "SELECT, MUST BE DEFINED" variant (bare predefined
+        // SELECT macro with no OldFMACCommands.pkg) is owned by AddUseOldFMACCommands via a { ModRecipe }
+        // meta-tag (auto-fix). This generic catches the OTHER 4345 - a reserved FMAC macro name used as a
+        // local - which has no auto-fix (function-less -> shown as Explain; manual rename).
+        Get AddRecipe aR 4345 False "" "" eModSuggest "Reserved name (FMAC macro iEntry/iExit/iValidate) used as a local - rename it (e.g. iExitCode)." to aR
+        Get AddRecipe aR 4379 False "" "" eModExplain "Wrong number of arguments - check the function/procedure signature." to aR
+        Get AddRecipe aR 4546 False "" "" eModExplain "Function not legal at runtime / has moved - check the owning package." to aR
+        Get AddRecipe aR 4328 False "" "" eModExplain "Undefined symbol - a missing DB field/table, or a source typo (check the table/field spelling). A source/schema fix, not an automated refactor." to aR
+        // --- WARNINGS (bIsWarning = True) ---
+        Get AddRecipe aR 4533 True "" "" eModExplain "Obsolete command - see the message for the specific command and its modern replacement." to aR
+        Get AddRecipe aR 4536 True "" "" eModExplain "Obsolete package - replace with the suggested modern class (e.g. dftable.pkg -> cCJGrid/cCJDbGrid)." to aR
+        Get AddRecipe aR 4537 True "" "" eModExplain "Obsolete class - replace with the modern equivalent." to aR
+        // 4537 class LIST: deliberately Explain-ONLY (Nils, 2026-06-10) - the declaration swap is
+        // trivial but the call sites (the Add_Item fill, Current_Item/Value reads, selection events)
+        // need a manual datasource redesign; an auto-rewrite would leave the code WORSE. Rare too
+        // (2x in the whole WinServ corpus), so no refactor function is planned.
+        Get AddRecipe aR 4537 True "class: LIST" "" eModExplain "Obsolete class: List - it still compiles and runs. Replace by hand when reworking the view (usually a one-column cCJGrid): the Add_Item fill and Current_Item/Value reads need a datasource redesign. No auto-fix (rare + semantic migration)." to aR
+        Get AddRecipe aR 4534 True "" "" eModExplain "Not Unicode-safe (OEM/ANSI) - see the message. ToOEM/ToANSI auto-rewrite; other _Oem/_Ansi calls are manual." to aR
+        // Function-backed recipes are co-located on the functions as { ModRecipe } meta-tags.
+        Get _AddMetaTagRecipes aR to aR
+        Function_Return aR
+    End_Function
+
+    // Build the function-backed recipes from each refactor function's { ModRecipe } meta-tag(s),
+    // read off ghoFuncLib's parsed metadata (the tag is co-located with the function in
+    // oRefactorFuncLib / UserDefinedRefactorFunctions). Tag format: "msg# | match-text | [category]"
+    // - category defaults from bFuncEnumList (an { EnumList } -> Review, none -> Auto-fix), overridable by
+    //   an explicit category in the tag; the hint is the function's { Description } first line; and
+    // bIsWarning is display-only here (ClassifyFromRecipes matches on number + text, not W/E).
+    Function _AddMetaTagRecipes tModAnalyzer[] aRecipes Returns tModAnalyzer[]
+        tFuncLib[] FuncLibArray
+        Integer iFunc jTag iFuncCount iTagCount iMsgNo eCat iPos k iParts
+        String sPart sMatch sHint
+        String[] asParts
+
+        Get pFuncLibArray of ghoFuncLib to FuncLibArray
+        Move (SizeOfArray(FuncLibArray)) to iFuncCount
+        For iFunc from 0 to (iFuncCount - 1)
+            Move (SizeOfArray(FuncLibArray[iFunc].asModRecipe)) to iTagCount
+            For jTag from 0 to (iTagCount - 1)
+                Move (StrSplitToArray(FuncLibArray[iFunc].asModRecipe[jTag], "|")) to asParts
+                Move (SizeOfArray(asParts)) to iParts
+                If (iParts > 0) Begin
+                    Move 0 to iMsgNo
+                    Move (Trim(asParts[0])) to iMsgNo
+                    Move "" to sMatch
+                    // Default the category from whether the function exposes a user-choosable parameter
+                    // (an { EnumList }, flagged by bFuncEnumList): a choice to make -> Review; none -> a
+                    // deterministic transform -> Auto-fix. An explicit category in the tag (handled in
+                    // the loop below) still overrides this default.
+                    If (FuncLibArray[iFunc].bFuncEnumList) ;
+                        Move eModSuggest to eCat
+                    Else ;
+                        Move eModAutoFix to eCat
+                    For k from 1 to (iParts - 1)
+                        Move (Trim(asParts[k])) to sPart
+                        Case Begin
+                            Case (Lowercase(sPart) = "autofix")
+                                Move eModAutoFix to eCat
+                                Case Break
+                            Case (Lowercase(sPart) = "suggest")
+                                Move eModSuggest to eCat
+                                Case Break
+                            Case (Lowercase(sPart) = "explain")
+                                Move eModExplain to eCat
+                                Case Break
+                            Case Else
+                                Move sPart to sMatch
+                        Case End
+                    Loop
+                    // Hint = first line of the function's { Description } overview (sHelp).
+                    Move FuncLibArray[iFunc].sHelp to sHint
+                    Move (Pos(Character(10), sHint)) to iPos
+                    If (iPos > 0) ;
+                        Move (Left(sHint, (iPos - 1))) to sHint
+                    Move (Trim(sHint)) to sHint
+                    If (iMsgNo > 0) ;
+                        Get AddRecipe aRecipes iMsgNo True sMatch FuncLibArray[iFunc].sName eCat sHint to aRecipes
+                End
+            Loop
+        Loop
+        Function_Return aRecipes
+    End_Function
+
+    // Pure matching: find the best recipe in aRecipes for (message number, message text).
+    // A row whose MatchText appears in the text (specific) beats a blank-MatchText row
+    // (generic) for the same number. Returns an eModUnknown recipe if nothing matches.
+    Function ClassifyFromRecipes Integer iMsgNo String sMsgTxt tModAnalyzer[] aRecipes Returns tModAnalyzer
+        tModAnalyzer Recipe rSpecific rGeneric
+        Integer i iSize
+        Boolean bSpecific bGeneric
+        String sTxt sMatch
+
+        Move (Lowercase(sMsgTxt)) to sTxt
+        Move False to bSpecific
+        Move False to bGeneric
+        Move (SizeOfArray(aRecipes) -1) to iSize
+        For i from 0 to iSize
+            If (aRecipes[i].iMsgNumber = iMsgNo) Begin
+                If (aRecipes[i].sMatchText = "") Begin
+                    If (bGeneric = False) Begin
+                        Move aRecipes[i] to rGeneric
+                        Move True to bGeneric
+                    End
+                End
+                Else Begin
+                    Move (Lowercase(aRecipes[i].sMatchText)) to sMatch
+                    If ((bSpecific = False) and (sTxt contains sMatch)) Begin
+                        Move aRecipes[i] to rSpecific
+                        Move True to bSpecific
+                    End
+                End
+            End
+        Loop
+
+        // A function-less SPECIFIC must not SHADOW a function-bearing GENERIC - mirror
+        // MatchingRecipesFromList, so the triage GRID classifies a message the SAME way
+        // Auto Select will act on it. The install-catalog scan seeds a function-less
+        // Explain specific for every obsolete command (e.g. "...: Type. Use Struct/
+        // End_Struct"), which would otherwise show the Type-family 4532 as Explain/no-fix
+        // in the grid while Auto Select runs TypeToStructReport (generic 4532 | Suggest) -
+        // a confusing split (Nils 2026-06-11). Prefer the function-bearing generic.
+        If (bSpecific = True) Begin
+            If ((Trim(rSpecific.sRefactorFn) = "") and bGeneric and (Trim(rGeneric.sRefactorFn) <> "")) ;
+                Function_Return rGeneric
+            // A matched recipe with NO refactor function can't be "applied" - it is
+            // informational, so present it as Explain, never Review/Auto-fix (keeps
+            // function-less compiler errors out of the actionable "review" list).
+            If (Trim(rSpecific.sRefactorFn) = "") Begin
+                Move eModExplain to rSpecific.eCategory
+                Get CategoryText eModExplain to rSpecific.sCategoryText
+            End
+            Function_Return rSpecific
+        End
+        If (bGeneric = True) Begin
+            If (Trim(rGeneric.sRefactorFn) = "") Begin
+                Move eModExplain to rGeneric.eCategory
+                Get CategoryText eModExplain to rGeneric.sCategoryText
+            End
+            Function_Return rGeneric
+        End
+
+        // Nothing matched this number - Unknown.
+        Move iMsgNo to Recipe.iMsgNumber
+        Move eModUnknown to Recipe.eCategory
+        Move "No Refactoring Function yet - review manually." to Recipe.sHint
+        Move "" to Recipe.sRefactorFn
+        Get CategoryText eModUnknown to Recipe.sCategoryText
+        Function_Return Recipe
+    End_Function
+
+    // Source-guard a recipe against the actual source line: a line-based refactor only applies if its
+    // obsolete construct is really ON that line. Two guards:
+    //   A) obsolete-function auto-fix ("use of X" - the MARK$AS$OBSOLETEUNICODE phrasing): the line
+    //      must contain X (e.g. ToOEM for UnicodeOemAnsiFunctions).
+    //   B) legacy-indicator review (ChangeLegacyIndicators): the line must carry a bracket indicator
+    //      or an Indicate command - mirrors the function's own gate (HasBracket / bHasIndicateCommand).
+    // If the construct isn't on the line, it sits inside a macro/command expansion - the warning fires
+    // at the call site (File_Exist_OEM's body calls ToOEM; Deferred_View's body has [Found ~Found]),
+    // where the line-based fix would no-op. Demote those to Explain (fix at the definition). Pure (no
+    // file I/O): the caller passes the source line, keeping this unit-testable.
+    Function VerifyAutoFix tModAnalyzer Recipe String sSourceLine Returns tModAnalyzer
+        String sMatch sGuard sFn sLC
+        Boolean bGuarded bOnLine
+        Move (Trim(Recipe.sMatchText)) to sMatch
+        Move (Lowercase(Trim(Recipe.sRefactorFn))) to sFn
+        Move (Lowercase(sSourceLine)) to sLC
+        Move False to bGuarded
+        Move False to bOnLine
+        // Guard A - obsolete-function auto-fix.
+        If (Recipe.eCategory = eModAutoFix and Lowercase(Left(sMatch, 7)) = "use of ") Begin
+            Move (Trim(Right(sMatch, Length(sMatch) - 7))) to sGuard
+            If (sGuard <> "") Begin
+                Move True to bGuarded
+                Move (Pos(Lowercase(sGuard), sLC) > 0) to bOnLine
+            End
+        End
+        // Guard B - legacy-indicator USAGE review. BOTH usage functions fix the same [bracket] /
+        // Indicate constructs, so both guard the SAME way: the warned line must carry a "[" or "Indicate".
+        If (sFn = "changelegacyindicators" or sFn = "changesquarebracketsindicators") Begin
+            Move True to bGuarded
+            Move ((Pos("[", sLC) > 0) or (Pos("indicate", sLC) > 0)) to bOnLine
+        End
+        // Guard C - legacy Indicator DECLARATION (ChangeIndicatorToBoolean owns 4538). The warned line
+        // must carry the "Indicator" keyword; a 4538 that fires inside a macro expansion (its call-site
+        // line has no literal "Indicator") demotes to Explain. ("indicate" is NOT a substring of
+        // "indicator", so Guard B and Guard C never cross-match.)
+        If (sFn = "changeindicatortoboolean") Begin
+            Move True to bGuarded
+            Move (Pos("indicator", sLC) > 0) to bOnLine
+        End
+        // Guard D - obsolete-COMMAND auto-fix (the "command: X" recipe family: ChangeMidCommandToFunction,
+        // ChangeCalcToMoveStatement, ChangeLeft/Insert/ReplaceCommandToFunction, and the rest). The warned
+        // line must contain the command keyword X. When a 4531/4533 fires inside a macro / #COMMAND expansion
+        // the compiler attributes EVERY expanded warning to the INVOCATION line (e.g.
+        // "SETT_UDDA_AAR trans_datum to udda_aar", usually with an (xN) count) - which has no literal X - so
+        // the line-based refactor would no-op there. Demote to Explain (fix it at the macro definition).
+        // Mirrors Guard A's "use of X".
+        If (Recipe.eCategory = eModAutoFix and Lowercase(Left(sMatch, 9)) = "command: ") Begin
+            Move (Trim(Right(sMatch, Length(sMatch) - 9))) to sGuard
+            If (sGuard <> "") Begin
+                Move True to bGuarded
+                Move (Pos(Lowercase(sGuard), sLC) > 0) to bOnLine
+            End
+        End
+        If (bGuarded = False) ;
+            Function_Return Recipe
+        If (bOnLine = True) ;
+            Function_Return Recipe
+        // The construct isn't on this line -> it's inside a macro/command -> demote to Explain.
+        Move eModExplain to Recipe.eCategory
+        Get CategoryText eModExplain to Recipe.sCategoryText
+        Move "Not fixable on this line - the obsolete construct is inside a macro/command. Fix it at the definition." to Recipe.sHint
+        Move "" to Recipe.sRefactorFn
+        Function_Return Recipe
+    End_Function
+
+    // True if a recipe must be SOURCE-GUARDED (VerifyAutoFix, against the actual warned line)
+    // before it can be trusted as an applicable fix: the "use of X" obsolete-function auto-fixes
+    // and the legacy-indicator review. Shared by the triage GRID (ModAnalyzer.dg) and the refactor
+    // PLAN (PlanFromMessages) so both gate IDENTICALLY - the two must never disagree on whether a
+    // message yields a refactor (the divergence Nils spotted: grid showed no UnicodeOemAnsiFunctions
+    // row while the plan offered it). (Nils 2026-06-12.)
+    Function RecipeNeedsSourceGuard tModAnalyzer Recipe Returns Boolean
+        If (Recipe.eCategory = eModAutoFix and Lowercase(Left(Trim(Recipe.sMatchText), 7)) = "use of ") ;
+            Function_Return True
+        // The "command: X" auto-fix family (Mid/Calc/Left/Insert/Replace/... command-to-function/Move) -
+        // guard so a 4531/4533 fired from a macro/#COMMAND expansion (no literal X on the invocation line)
+        // demotes to Explain instead of promising a no-op auto-fix. See VerifyAutoFix Guard D.
+        If (Recipe.eCategory = eModAutoFix and Lowercase(Left(Trim(Recipe.sMatchText), 9)) = "command: ") ;
+            Function_Return True
+        If (Lowercase(Trim(Recipe.sRefactorFn)) = "changelegacyindicators" or ;
+            Lowercase(Trim(Recipe.sRefactorFn)) = "changesquarebracketsindicators" or ;
+            Lowercase(Trim(Recipe.sRefactorFn)) = "changeindicatortoboolean") ;
+            Function_Return True
+        Function_Return False
+    End_Function
+
+    // Like ClassifyFromRecipes, but returns ALL recipes matching (number + text) at the winning
+    // precedence level: every specific (MatchText-in-text) row if any exist, else every generic
+    // (blank-MatchText) row. Lets ONE message map to more than one refactor function when several
+    // genuinely apply (each only touches its own construct, so running all is safe). NOTE: the 4537
+    // grid family is NOT such a case - the compiler names the ACTUAL class ("Obsolete class: DBGRID"
+    // for a dbGrid, "Obsolete class: DBLIST" for a dbList), so each maps 1:1 to its own refactor; do
+    // NOT key the dbList recipe on "DBGRID" (it never matches a dbList message - the 2026-06-19 bug).
+    Function MatchingRecipesFromList Integer iMsgNo String sMsgTxt tModAnalyzer[] aRecipes Returns tModAnalyzer[]
+        tModAnalyzer[] aSpecific aGeneric
+        Integer i iSize
+        String sTxt sMatch
+        Boolean bAnyFn
+
+        Move (Lowercase(sMsgTxt)) to sTxt
+        Move (SizeOfArray(aRecipes) -1) to iSize
+        For i from 0 to iSize
+            If (aRecipes[i].iMsgNumber = iMsgNo) Begin
+                If (aRecipes[i].sMatchText = "") Begin
+                    Move aRecipes[i] to aGeneric[SizeOfArray(aGeneric)]
+                End
+                Else Begin
+                    Move (Lowercase(aRecipes[i].sMatchText)) to sMatch
+                    If (sTxt contains sMatch) ;
+                        Move aRecipes[i] to aSpecific[SizeOfArray(aSpecific)]
+                End
+            End
+        Loop
+
+        If (SizeOfArray(aSpecific) > 0) Begin
+            // A function-less SPECIFIC hint must not SHADOW a function-bearing GENERIC
+            // recipe out of the refactor plan: the install-catalog scan seeds a specific
+            // Explain row for every obsolete command, which starved TypeToStructReport
+            // (generic 4532 | Suggest) of every Type-family message - the function never
+            // appeared in Auto Select (Nils 2026-06-11). When NO winning specific carries
+            // a refactor function, append the generics that do; when one does, behavior
+            // is unchanged (the dbGrid/dbList multi-match case).
+            Move False to bAnyFn
+            Move (SizeOfArray(aSpecific) - 1) to iSize
+            For i from 0 to iSize
+                If (Trim(aSpecific[i].sRefactorFn) <> "") ;
+                    Move True to bAnyFn
+            Loop
+            If (bAnyFn = False) Begin
+                Move (SizeOfArray(aGeneric) - 1) to iSize
+                For i from 0 to iSize
+                    If (Trim(aGeneric[i].sRefactorFn) <> "") ;
+                        Move aGeneric[i] to aSpecific[SizeOfArray(aSpecific)]
+                Loop
+            End
+            Function_Return aSpecific
+        End
+        Function_Return aGeneric
+    End_Function
+
+    // Map a compiler message (number + text) to a fix recipe, using the ModAnalyzer table
+    // (seeded from the built-in defaults on first use). sMsgTxt lets a recipe sub-classify
+    // - e.g. a 4539 "Pointer to String" vs "String to Pointer" picks the matching function.
+    Function ClassifyMessage Integer iMsgNo String sMsgTxt Returns tModAnalyzer
+        tModAnalyzer[] aR
+        tModAnalyzer Recipe
+        Send EnsureRecipesLoaded
+        Get paRecipes to aR
+        Get ClassifyFromRecipes iMsgNo sMsgTxt aR to Recipe
+        Function_Return Recipe
+    End_Function
+
+    // Aggregate parsed compiler messages into the actionable plan: the distinct refactor
+    // functions to apply + the distinct workspace-source files to process. Files are
+    // scoped to sScopeRoot (the workspace home), so system/library files - e.g. the
+    // DataFlex install packages flagged by 4536 - are never included. Only messages that
+    // map to a refactor function (Auto-fix / Suggest) contribute; Explain/Unknown skipped.
+    Function PlanFromMessages tCompileError[] aMessages String sScopeRoot Returns tModRefactorPlan
+        tModRefactorPlan Plan
+        tModAnalyzer[] aR aMatched
+        tModAnalyzer rVerified
+        Integer i j iSize iLen iMatch iGuardLn
+        String sFn sFile sGuardFile sSrcLine
+        String[] asGuardLines
+        Boolean bAnyFn bNeedsGuard
+
+        Send EnsureRecipesLoaded
+        Get paRecipes to aR
+        Move (SizeOfArray(aMessages) - 1) to iSize
+        Move (Length(sScopeRoot)) to iLen
+        Move "" to sGuardFile
+        For i from 0 to iSize
+            Move aMessages[i].sFileName to sFile
+            // Scope filter: keep only files under the workspace root (iLen = 0 => no filter).
+            If ((iLen = 0) or (Left(sFile, iLen) = sScopeRoot)) Begin
+                // One message can map to MORE THAN ONE function (e.g. a 4533 "command: Begin_Row"
+                // is emitted by both a dbGrid and a dbList) - pull in every matching refactor.
+                Get MatchingRecipesFromList aMessages[i].iErrorNo aMessages[i].sErrorTxt aR to aMatched
+                Move (SizeOfArray(aMatched)) to iMatch
+                Move False to bAnyFn
+                For j from 0 to (iMatch - 1)
+                    Move aMatched[j] to rVerified
+                    // SOURCE-GUARD each matched recipe against the real warned line - the SAME guard
+                    // the triage grid applies (ModAnalyzer.dg) - so a fix the grid demotes to Explain
+                    // because its obsolete construct is NOT on that line (a macro/command expansion,
+                    // e.g. ToOEM inside File_Exist_OEM, or [Found] inside Deferred_View) is not offered
+                    // in the plan either. Read lazily + cache the last file; never demote on a failed
+                    // or short read (Nils 2026-06-12 - grid/plan must agree).
+                    Get RecipeNeedsSourceGuard rVerified to bNeedsGuard
+                    If (bNeedsGuard = True) Begin
+                        If (sFile <> sGuardFile) Begin
+                            Move (RFReadEncodedFileAsStringArray(sFile)) to asGuardLines
+                            Move sFile to sGuardFile
+                        End
+                        Move aMessages[i].iLine to iGuardLn
+                        If (iGuardLn >= 1 and iGuardLn <= SizeOfArray(asGuardLines)) Begin
+                            Move asGuardLines[iGuardLn - 1] to sSrcLine
+                            Get VerifyAutoFix rVerified sSrcLine to rVerified
+                        End
+                    End
+                    Move (Trim(rVerified.sRefactorFn)) to sFn
+                    If (sFn <> "") Begin
+                        Move True to bAnyFn
+                        If (SearchArray(sFn, Plan.asFunctions) = -1) Begin
+                            Move sFn to Plan.asFunctions[SizeOfArray(Plan.asFunctions)]
+                            // Carry the function's hint (its {Description} first line) alongside,
+                            // so the preview dialog can show it as a per-row tooltip. Parallel index.
+                            Move (Trim(rVerified.sHint)) to Plan.asFunctionHints[SizeOfArray(Plan.asFunctionHints)]
+                        End
+                    End
+                Loop
+                If (bAnyFn and (SearchArray(sFile, Plan.asFiles) = -1)) ;
+                    Move sFile to Plan.asFiles[SizeOfArray(Plan.asFiles)]
+            End
+        Loop
+        Get _AddIndicatorUseCompanion Plan to Plan
+        Get _PruneUnneededOldFMAC Plan to Plan
+        Function_Return Plan
+    End_Function
+
+    // Pull AddUseOldFMACCommands into a plan whenever ChangeLegacyIndicators / ChangeSquareBracketsIndicators
+    // is present. Those bare-ify a [Select] indicator under eModernizeSelect, and bare SELECT only compiles
+    // where the SELECT macro is defined - but being line-by-line (eStandardFunction) they cannot add that
+    // file-level definition themselves. AddUseOldFMACCommands (eOtherFunction) does, by scanning the rewritten
+    // file for the bare Select they leave behind and splicing a guarded SELECT-macro shim near the top. This
+    // is the PROACTIVE path: the bare Select is produced by THIS run's modernisation, so there is no 4345
+    // compiler error yet to drive it via the recipe table. (AddUseOldFMACCommands DOES also carry a
+    // { ModRecipe = 4345 | SELECT, MUST BE DEFINED } that pulls it in REACTIVELY when the compiler already
+    // flagged a bare SELECT - the two paths are complementary and de-dupe below.) It runs on the same files
+    // and is a no-op when no bare Select is found, so pulling it in whenever either indicator function is
+    // present is always safe. Pure (no I/O) -> unit-testable.
+    Function _AddIndicatorUseCompanion tModRefactorPlan Plan Returns tModRefactorPlan
+        If ((SearchArray("ChangeLegacyIndicators", Plan.asFunctions) <> -1) or ;
+            (SearchArray("ChangeSquareBracketsIndicators", Plan.asFunctions) <> -1)) Begin
+            If (SearchArray("AddUseOldFMACCommands", Plan.asFunctions) = -1) Begin
+                Move "AddUseOldFMACCommands" to Plan.asFunctions[SizeOfArray(Plan.asFunctions)]
+                Move "Defines the SELECT macro when a [Select] indicator is modernised" to Plan.asFunctionHints[SizeOfArray(Plan.asFunctionHints)]
+            End
+        End
+        Function_Return Plan
+    End_Function
+
+    // Accuracy gate run AFTER the companion / 4345 recipe may have added AddUseOldFMACCommands: keep it only
+    // if running it would STILL change at least one plan file. The companion is deliberately blunt - it pulls
+    // AddUseOldFMACCommands in whenever ANY indicator function is in the plan, even residual non-Select ones -
+    // so once the SELECT macro has been defined and the workspace recompiled it would otherwise keep offering
+    // an already-applied fix (the post-run false positive Nils hit). AddUseOldFMACCommands is idempotent and
+    // returns 1 ONLY when it would add the definition (a Select indicator/usage present AND the SELECT macro
+    // not already defined in-source), so a dry-run on a THROWAWAY copy of each plan file is the exact
+    // "still needed?" probe - reusing the one canonical detector rather than duplicating its string/comment-
+    // safe scan here. Short-circuits on the first file that still needs it; reads files (RFRead...), so it is
+    // verified against on-disk state, not stale .prn rows. When no file needs it, drop the function (+ its
+    // parallel hint). The dry-run's tokenizer churn is harmless: the engine resets lexer state per file before
+    // the real run. ClearFuncLibProperties precedes each probe so the stateful tokeniser starts clean.
+    Function _PruneUnneededOldFMAC tModRefactorPlan Plan Returns tModRefactorPlan
+        Integer iIdx i iSize iRet
+        Boolean bNeeded
+        String[] asLines
+        tModRefactorPlan NewPlan
+
+        Move (SearchArray("AddUseOldFMACCommands", Plan.asFunctions)) to iIdx
+        If (iIdx = -1) ;
+            Function_Return Plan
+
+        Move False to bNeeded
+        Move 0 to i
+        Move (SizeOfArray(Plan.asFiles)) to iSize
+        While (i < iSize and bNeeded = False)
+            Move (RFReadEncodedFileAsStringArray(Plan.asFiles[i])) to asLines
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get AddUseOldFMACCommands of ghoFuncLib (&asLines) "" to iRet
+            If (iRet = 1) ;
+                Move True to bNeeded
+            Increment i
+        Loop
+        If (bNeeded = True) ;
+            Function_Return Plan
+
+        // No plan file needs it -> rebuild the parallel function / hint arrays without AddUseOldFMACCommands.
+        Move (SizeOfArray(Plan.asFunctions) - 1) to iSize
+        For i from 0 to iSize
+            If (i <> iIdx) Begin
+                Move Plan.asFunctions[i] to NewPlan.asFunctions[SizeOfArray(NewPlan.asFunctions)]
+                // Defensive: keep the parallel hint when present, else append "" so NewPlan's two arrays stay
+                // parallel - never index a short asFunctionHints out of bounds (err 4509) if a builder forgot it.
+                If (i < SizeOfArray(Plan.asFunctionHints)) ;
+                    Move Plan.asFunctionHints[i] to NewPlan.asFunctionHints[SizeOfArray(NewPlan.asFunctionHints)]
+                Else ;
+                    Move "" to NewPlan.asFunctionHints[SizeOfArray(NewPlan.asFunctionHints)]
+            End
+        Loop
+        Move NewPlan.asFunctions     to Plan.asFunctions
+        Move NewPlan.asFunctionHints to Plan.asFunctionHints
+        Function_Return Plan
+    End_Function
+
+    // Load the recipe cache once per target, seeding the table from the defaults if it is empty.
+    // Reloads when the app's TARGET DataFlex version changes (a different compiler selected), so the
+    // per-version cache + catalog follow the target the user is migrating to.
+    Procedure EnsureRecipesLoaded
+        Boolean bLoaded
+        String sVer sLoaded
+        // The app pre-resolves the current target version; compare it to what THIS cache last loaded
+        // for, so a target switch (new compiler) forces a re-scan + re-seed.
+        Get psTargetDfVersion of ghoApplication to sVer
+        Get psLoadedDfVersion to sLoaded
+        Get pbRecipesLoaded to bLoaded
+        If ((bLoaded = False) or (sVer <> sLoaded)) Begin
+            Send RefreshRecipeTable
+            Send LoadRecipes
+            Set psLoadedDfVersion to sVer
+            Set pbRecipesLoaded to True
+        End
+    End_Procedure
+
+    // Read every ModAnalyzer row into the in-memory cache (paRecipes).
+    Procedure LoadRecipes
+        tModAnalyzer[] TheData
+        Integer i 
+        
+        Move 0 to i
+        Clear ModAnalyzer
+        Find Gt ModAnalyzer by 1
+        While (Found)
+            Move ModAnalyzer.MsgNumber            to TheData[i].iMsgNumber
+            Move (ModAnalyzer.IsWarning <> 0)     to TheData[i].bIsWarning
+            Move (Trim(ModAnalyzer.MatchText))    to TheData[i].sMatchText
+            Move ModAnalyzer.Category             to TheData[i].eCategory
+            Move (Trim(ModAnalyzer.Hint))         to TheData[i].sHint
+            Move (Trim(ModAnalyzer.RefactorFn))   to TheData[i].sRefactorFn
+            Get CategoryText TheData[i].eCategory to TheData[i].sCategoryText
+            Increment i
+            Find Gt ModAnalyzer by 1
+        Loop
+        Set paRecipes to TheData
+    End_Procedure
+
+    // Full path to the editable recipe JSON: the workspace Data folder + the filename. Uses the
+    // phoWorkspace built-in (NOT pOrgWS) so this class still compiles in the cApplication-based
+    // DFUnit test runner; during Analyze the active workspace is DFRefactor's own. Pass
+    // ghoApplication (NOT Self): phoWorkspace resolves off the object handed to it, and the
+    // workspace hangs off the APP - Self here is this class, giving a bad handle (psDataPath faults).
+    Function RecipeJsonPath Returns String
+        String sData sVer sFile
+        Get psDataPath of (phoWorkspace(ghoApplication)) to sData
+        // Key the cache file by the TARGET DataFlex version (resolved by the app) so each target keeps
+        // its own scanned catalog (e.g. ModAnalyzerRecipes-26.0.json). Unversioned name when blank.
+        // Only ever called via RefreshRecipeTable (never from the test fixtures), so reading the app here is
+        // safe in the cApplication-based test runner.
+        Get psTargetDfVersion of ghoApplication to sVer
+        Move CS_ModAnalyzerRecipesJson to sFile
+        If (Trim(sVer) <> "") ;
+            Move (Replace(".json", sFile, ("-" + sVer + ".json"))) to sFile
+        Function_Return (vFolderFormat(sData) + sFile)
+    End_Function
+
+    // Serialize recipes + version to the JSON file (pretty, NO BOM - a BOM breaks ParseUtf8).
+    // Mirrors cExportImportFunctions.GenerateJsonExportFile / WriteJsonToFile.
+    Procedure WriteRecipesToJson tModAnalyzer[] aRecipes Integer iVersion
+        Handle hoJson
+        tModRecipeFile RecipeFile
+        UChar[] ucJson
+        Integer iCh
+        String sFile
+        
+        Move iVersion to RecipeFile.iVersion
+        Move aRecipes to RecipeFile.aRecipes
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson RecipeFile
+        Set peWhiteSpace  of hoJson to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoJson to ucJson
+        Send Destroy of hoJson
+        Get RecipeJsonPath to sFile
+        Get RFOpenOutput sFile to iCh
+        If (iCh < 0) ;
+            Procedure_Return
+        Write channel iCh ucJson
+        Send RFCloseOutput iCh
+    End_Procedure
+
+    // Read recipes + version from the JSON file. Returns False if the file is absent or does
+    // not parse; on True, aRecipes / iVersion are filled. Mirrors ReadJsonFile / ParseJsonData.
+    Function ReadRecipesFromJson tModAnalyzer[] ByRef aRecipes Integer ByRef iVersion Returns Boolean
+        Handle hoJson
+        Boolean bOK bExists
+        Integer iCh
+        UChar[] ucData
+        tModRecipeFile RecipeFile
+        String sFile
+        Get RecipeJsonPath to sFile
+        Get vFilePathExists sFile to bExists
+        If (bExists = False) ;
+            Function_Return False
+        Get RFOpenInput sFile to iCh
+        If (iCh < 0) ;
+            Function_Return False
+        Read_Block channel iCh ucData -1
+        Send RFCloseInput iCh
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Set pbRequireAllMembers of hoJson to False
+        Get ParseUtf8 of hoJson ucData to bOK
+        If (bOK = False) Begin
+            Send Destroy of hoJson
+            Function_Return False
+        End
+        Get JsonToDataType of hoJson to RecipeFile
+        Send Destroy of hoJson
+        Move RecipeFile.aRecipes to aRecipes
+        Move RecipeFile.iVersion to iVersion
+        Function_Return True
+    End_Function
+
+    // ---- Saved "last refactoring plan" JSON (per-WORKSPACE, latest-only) ---------------------------
+    // Full path to the saved-plan file: DFRefactor's Data folder + LastPlan-<wskey>.json, where
+    // <wskey> is the SAME AnalyzeSnapshotKey fold the registry snapshot uses, so the plan and the
+    // snapshot are co-located + identically keyed per workspace. Like RecipeJsonPath, reads off
+    // ghoApplication (phoWorkspace + the app's AnalyzeSnapshotKey / psSWSFile) - only ever called from
+    // the FT analyzer grid / saved-plan viewer, never the cApplication-based test fixtures.
+    Function SavedPlanJsonPath Returns String
+        String sData sSWS sKey sFile
+        Get psDataPath of (phoWorkspace(ghoApplication)) to sData
+        Get psSWSFile of ghoApplication to sSWS
+        Get AnalyzeSnapshotKey of ghoApplication sSWS to sKey
+        Move CS_SavedPlanJson to sFile
+        If (Trim(sKey) <> "") ;
+            Move (Replace(".json", sFile, ("-" + sKey + ".json"))) to sFile
+        Function_Return (vFolderFormat(sData) + sFile)
+    End_Function
+
+    // Serialize the saved plan to its per-workspace JSON (pretty, NO BOM - a BOM breaks ParseUtf8).
+    // Mirrors WriteRecipesToJson. iVersion is stamped here so ReadSavedPlan can reject a stale layout.
+    Procedure WriteSavedPlan tSavedPlan ThePlan
+        Handle hoJson
+        UChar[] ucJson
+        Integer iCh
+        String sFile
+        Move CI_SavedPlanVersion to ThePlan.iVersion
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson ThePlan
+        Set peWhiteSpace of hoJson to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoJson to ucJson
+        Send Destroy of hoJson
+        Get SavedPlanJsonPath to sFile
+        Get RFOpenOutput sFile to iCh
+        If (iCh < 0) ;
+            Procedure_Return
+        Write channel iCh ucJson
+        Send RFCloseOutput iCh
+    End_Procedure
+
+    // Read the saved plan for the current workspace. Returns False if absent, unparseable, or a stale
+    // layout (iVersion <> CI_SavedPlanVersion); on True, ThePlan is filled. Mirrors ReadRecipesFromJson.
+    Function ReadSavedPlan tSavedPlan ByRef ThePlan Returns Boolean
+        Handle hoJson
+        Boolean bOK bExists
+        Integer iCh
+        UChar[] ucData
+        tSavedPlan ThePlanEmpty
+        String sFile
+        Get SavedPlanJsonPath to sFile
+        Get vFilePathExists sFile to bExists
+        If (bExists = False) ;
+            Function_Return False
+        Get RFOpenInput sFile to iCh
+        If (iCh < 0) ;
+            Function_Return False
+        Read_Block channel iCh ucData -1
+        Send RFCloseInput iCh
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Set pbRequireAllMembers of hoJson to False
+        Get ParseUtf8 of hoJson ucData to bOK
+        If (bOK = False) Begin
+            Send Destroy of hoJson
+            Function_Return False
+        End
+        Get JsonToDataType of hoJson to ThePlan
+        Send Destroy of hoJson
+        If (ThePlan.iVersion <> CI_SavedPlanVersion) Begin
+            Move ThePlanEmpty to ThePlan
+            Function_Return False
+        End
+        Function_Return True
+    End_Function
+
+    // Build the actionable plan (distinct refactor function names + distinct workspace files) straight from
+    // a SAVED plan's frozen rows - the path "Refactor Plan" takes when the analyzer grid is in saved-view
+    // mode (View last plan), where no live messages exist. Only Auto-fix / Review rows that carry a refactor
+    // function contribute; a row's Fn cell can be a ", "-joined list (the grid merges several functions per
+    // file row), so each is split out and de-duped. Produces the same tModRefactorPlan as PlanFromMessages.
+    Function PlanFromSavedRows tSavedPlanRow[] aRows Returns tModRefactorPlan
+        tModRefactorPlan Plan
+        Integer i iSize iPos
+        String sFns sFn sFile
+        Move (SizeOfArray(aRows) - 1) to iSize
+        For i from 0 to iSize
+            Move (Trim(aRows[i].sFn)) to sFns
+            If (((aRows[i].eCategory = eModAutoFix) or (aRows[i].eCategory = eModSuggest)) and (sFns <> "")) Begin
+                // Functions - the Fn cell may hold a ", "-joined list of names.
+                While (sFns <> "")
+                    Move (Pos(", ", sFns)) to iPos
+                    If (iPos > 0) Begin
+                        Move (Trim(Left(sFns, iPos - 1)))                  to sFn
+                        Move (Trim(Mid(sFns, (Length(sFns)), (iPos + 2)))) to sFns
+                    End
+                    Else Begin
+                        Move sFns to sFn
+                        Move ""   to sFns
+                    End
+                    If ((sFn <> "") and (SearchArray(sFn, Plan.asFunctions) = -1)) Begin
+                        Move sFn to Plan.asFunctions[SizeOfArray(Plan.asFunctions)]
+                        // Keep asFunctionHints PARALLEL to asFunctions (carry the row's suggested-fix hint) -
+                        // PlanFromMessages does, and _PruneUnneededOldFMAC's rebuild indexes both by the same i,
+                        // so a short hints array here would index out of bounds (err 4509) on Run Modernization Plan.
+                        Move (Trim(aRows[i].sHint)) to Plan.asFunctionHints[SizeOfArray(Plan.asFunctionHints)]
+                    End
+                Loop
+                // File - de-duped.
+                Move (Trim(aRows[i].sFile)) to sFile
+                If ((sFile <> "") and (SearchArray(sFile, Plan.asFiles) = -1)) ;
+                    Move sFile to Plan.asFiles[SizeOfArray(Plan.asFiles)]
+            End
+        Loop
+        // SAME companion pull PlanFromMessages does (it must, to "produce the same tModRefactorPlan"):
+        // when a legacy-indicator function is in the plan, AddUseOldFMACCommands has to ride along to add
+        // the Use line for any bare Select the modernisation leaves behind. On a FIRST compile of untouched
+        // legacy code there is no 4345 "SELECT, MUST BE DEFINED" error yet (the [Select] still compiles), so
+        // the companion is the ONLY way AddUseOldFMACCommands enters - and the saved-plan path (dashboard
+        // "Run Modernization Plan" / "View last plan") was missing it, so it only appeared on the SECOND
+        // compile via the 4345 recipe row. Mirrors PlanFromMessages; de-dupes inside the companion.
+        Get _AddIndicatorUseCompanion Plan to Plan
+        Get _PruneUnneededOldFMAC Plan to Plan
+        Function_Return Plan
+    End_Function
+
+    // (Re)seed the ModAnalyzer table from the canonical recipe set for the CURRENT target version -
+    // on EVERY call, NOT only when empty: the table is a per-target CACHE, so it must always mirror
+    // the active target (a previous target's rows carry the same recipe-version and can't be told
+    // apart). STEP 1 picks the canonical set - the per-version JSON when present + new enough
+    // (iVersion >= CI_ModAnalyzerRecipeVersion), else the built-ins + a fresh install-package scan,
+    // then writes that JSON. STEP 2 wipes the table + re-seeds from that set. The table is a cache,
+    // not a hand-edit surface - edit the JSON instead. Uses GlobalAutoCreateNewID.
+    Procedure RefreshRecipeTable
+        tModAnalyzer[] aR aJson aScan
+        Integer i iSize iID iJsonVer iCanonicalVer iScan
+        Boolean bHaveJson bScanStale
+        // STEP 1 - decide the canonical recipe set + version. The editable JSON in the Data
+        // folder wins when its version is >= the built-in CI_ModAnalyzerRecipeVersion (so a user
+        // can hand-edit recipes) AND the install packages haven't changed under it; otherwise the
+        // built-in defaults win and we re-walk + (re)write the JSON so it always exists and tracks
+        // both a code bump AND an install change.
+        Get BuildDefaultRecipes to aR
+        Move CI_ModAnalyzerRecipeVersion to iCanonicalVer
+        Get ReadRecipesFromJson (&aJson) (&iJsonVer) to bHaveJson
+        // Is the raw install scan stale (ObsoleteScan-<ver>.json missing, or a package newer than its
+        // watermark - an in-place DataFlex update)? If so we must re-walk + re-merge even when the
+        // merged JSON looks current - else the install's NEW obsolete-warning defs would never reach
+        // the recipe table, and a deleted ObsoleteScan-<ver>.json would never be rebuilt. The merged
+        // JSON carries no watermark (it's tracked, shared seed data - no machine-specific stamps); the
+        // gitignored raw scan owns the watermark, so we ask it. Cheap: one probe per RefreshRecipeTable.
+        Get InstallScanIsStale of ghoFuncLib to bScanStale
+        If (bHaveJson and (iJsonVer >= CI_ModAnalyzerRecipeVersion) and (bScanStale = False)) Begin
+            Move aJson    to aR
+            Move iJsonVer to iCanonicalVer
+            // The recipe set is current and the recipe scan is fresh, so the shared package walk did
+            // NOT run here - a missing/stale TypeDefs-<ver>.json would otherwise wait for the next
+            // Type->Struct report. Ensure it now too (walks only if IT is stale, piggybacking the recipe
+            // scan if that is somehow also stale), so deleting EITHER install cache is healed at Analyze
+            // time. Recipes untouched here (bForRecipes = False); silent (no progress bar) like the scan.
+            Send EnsureInstallCaches of ghoFuncLib False True False
+        End
+        Else Begin
+            // Built-in is canonical (no JSON, a code version bump, or the install changed): append the
+            // live install's obsolete-warning catalog (Explain) AFTER the built-ins so function-backed
+            // recipes keep first-match precedence, then persist the merged set to the JSON. The catalog
+            // comes from the SHARED install-Pkg walk (ghoFuncLib.InstallScanRecipes), itself cached in
+            // ObsoleteScan-<ver>.json - so a recipe-version bump re-merges here WITHOUT re-walking the
+            // packages (the walk runs only when that raw-scan cache is stale, which InstallScanIsStale
+            // detected above; InstallScanRecipes then rebuilds it with a fresh watermark).
+            Get InstallScanRecipes of ghoFuncLib to aScan
+            Move (SizeOfArray(aScan)) to iScan
+            If (iScan = 0 and bHaveJson and (iJsonVer >= CI_ModAnalyzerRecipeVersion)) Begin
+                // The re-walk came back empty (only the raw cache was stale and the install Pkg folder
+                // is momentarily unreachable) but the merged JSON is otherwise current: KEEP it rather
+                // than drop its install recipes down to built-ins only. The raw cache stays stale, so
+                // this self-heals on the next run once the install reappears. (Scoped to a CURRENT-version
+                // JSON, so a real recipe-version bump - iJsonVer < CI - still rebuilds from the built-ins.)
+                Move aJson    to aR
+                Move iJsonVer to iCanonicalVer
+            End
+            Else Begin
+                Move (iScan - 1) to iScan
+                For i from 0 to iScan
+                    Move aScan[i] to aR[SizeOfArray(aR)]
+                Loop
+                Send WriteRecipesToJson aR iCanonicalVer
+            End
+        End
+
+        // STEP 2 - (re)seed the table from the canonical set on EVERY load. The table is a per-target
+        // CACHE of the canonical set, which is now version-keyed by the selected compiler, so it must
+        // always mirror the CURRENT target. A skip-if-already-seeded check can't tell whether the
+        // existing rows belong to a PREVIOUS target (they carry the same recipe-version), so it would
+        // serve a stale catalog after a target switch. Re-seeding is cheap (~150 rows) and the
+        // expensive scan already ran (or was cached) in STEP 1, so this just rewrites the table.
+        // Wipe any junk/stale/previous-target rows first, then (re)seed from the canonical set (aR).
+        Clear ModAnalyzer
+        Repeat
+            Find Gt ModAnalyzer by 1
+            If (Found) Begin
+                Delete ModAnalyzer
+                Clear ModAnalyzer
+            End
+        Until (not(Found))
+        Move (SizeOfArray(aR) -1) to iSize
+        For i from 0 to iSize
+            // GlobalAutoCreateNewID clears the buffer + sets ONLY the ID field, so call it
+            // FIRST, then fill the data fields, then save - else the row saves blank.
+            Get GlobalAutoCreateNewID File_Field ModAnalyzer.ID False to iID
+            Move aR[i].iMsgNumber to ModAnalyzer.MsgNumber
+            Move (If(aR[i].bIsWarning, 1, 0)) to ModAnalyzer.IsWarning
+            Move aR[i].sMatchText to ModAnalyzer.MatchText
+            Move aR[i].sRefactorFn to ModAnalyzer.RefactorFn
+            Move aR[i].eCategory to ModAnalyzer.Category
+            Move aR[i].sHint to ModAnalyzer.Hint
+            Move iCanonicalVer to ModAnalyzer.Version
+            SaveRecord ModAnalyzer
+        Loop
+    End_Procedure
+
+End_Class

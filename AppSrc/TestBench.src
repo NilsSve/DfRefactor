@@ -24,12 +24,14 @@ Use cRDCCJCommandBarSystem.pkg
 Use File_dlg.pkg
 Use gFormatNumbers.pkg
 Use vwin32fh.pkg
-Use RefactorConstants.h.pkg
+Use RefactorConstants.h.pkg 
 //Use cEncodingHelpers.pkg
 
 // Uncomment thie define statement to show a "Theme selector" combobutton and
 // a "Snap Shot" camera iton in the toolbar.
 //Define Is$BlingStuff
+
+Define Is$TestBench
 
 Function Can_UndoAction Desktop Returns Boolean
     Function_Return False
@@ -170,10 +172,11 @@ Object oApplication is a cRefactorApplication
         End
     End_Procedure
 
-    // NOTE: DeleteCompileErrorsFile / CompileProgram / TestErrorFile
-    //       moved to cCompileMixin.pkg (imported by cRefactorApplication)
-    //       so DFRefactor can share them. TestErrorFile was renamed to
-    //       CompileErrorFileForProgram and now takes the program name.
+    // NOTE: DeleteCompileErrorsFile / CompileProgram moved to cCompileMixin.pkg
+    //       (imported by cRefactorApplication) so DFRefactor can share them.
+    //       The old TestErrorFile/CompileErrorFileForProgram name PREDICTION was
+    //       removed 2026-06-11 - the .err is resolved by EXISTENCE instead
+    //       (ResolveCompiledFile), whichever bitness suffix the compiler wrote.
 
     Procedure CompileRefactoredCode
         String sAppSrc sErrorText sTestErrFile
@@ -199,23 +202,29 @@ Object oApplication is a cRefactorApplication
         // own workspace, so use pOrgWS (target may be selected for a
         // different purpose; we want this compile to land here).
         Get pOrgWS to OrgWS
-        Move (vFolderFormat(OrgWS.sAppSrc)) to sAppSrc
-        Get CompileErrorFileForProgram CS_TestProgram to sTestErrFile
         Get DeleteCompileErrorsFile CS_TestProgram OrgWS to bOK
         If (bOK = False) Begin
-            Move ("The" * String(sTestErrFile) + "file, could not be deleted! Cannot continue compiling.") to sErrorText
+            Send Info_Box "The old compiler error file could not be deleted! Cannot continue compiling."
             Procedure_Return
         End
 
         // Compile program:
         Get CompileProgram CS_TestProgram OrgWS (&sErrorText) to bOK
-        
-        // Show result:
-        Move (RFFileSize(sAppSrc + sTestErrFile)) to iLines
-        If (iLines > 0 and bOK = False) Begin
-            Send ActivateCompileErrorDialog of (Client_Id(ghoCommandBars)) (sAppSrc + sTestErrFile)
+
+        // Show result. Resolve the .err the compiler ACTUALLY wrote (cfg-driven
+        // suffix, either bitness) - the old predicted name (always ".x64.err" in
+        // this x64 build) stopped matching once the shared compiler setting pointed
+        // TestBench at df-cli, which builds windows-32 here and writes the plain
+        // ".err": a FAILED compile was then reported as a success (2026-06-11).
+        Get ResolveCompiledFile CS_TestProgram OrgWS "err" to sTestErrFile
+        If (sTestErrFile <> "") Begin
+            Send ActivateCompileErrorDialog of (Client_Id(ghoCommandBars)) sTestErrFile
         End
-        Else Begin                   
+        Else If (bOK = False) Begin
+            // No .err on disk, but the compiler could not run at all.
+            Send Info_Box sErrorText
+        End
+        Else Begin
             Send CloseCompileErrorDialog of (Client_Id(ghoCommandBars))
             Send Info_Box "The refactored code compiled successfully!"
         End
@@ -223,28 +232,21 @@ Object oApplication is a cRefactorApplication
     
     // The sProgram param should be the name of the DF program to be run with NO extenstion.
     Procedure RunDFProgram String sProgram
-        String sProgramPath
-        Boolean bExists
-        Integer iPos
+        String sExePath
         tWorkspacePaths OrgWS
 
         Get pOrgWS of ghoApplication to OrgWS
-        Move (vFolderFormat(OrgWS.sPrograms)) to sProgramPath
-        If (Lowercase(sProgram) contains ".") Begin 
-            Move (Pos(".", sProgram)) to iPos
-            Move (Left(sProgram, iPos -1)) to sProgram
-        End
-        #IFDEF Is$Win64
-            Append sProgram "64.exe"
-        #ELSE
-            Append sProgram ".exe"
-        #ENDIF
-        Get vFilePathExists (sProgramPath + sProgram) to bExists
-        If (bExists = False) Begin
-            Send Info_Box ("The program file was not found:\n" + ('"' + sProgramPath + sProgram + '"'))
+        // Resolve the actual compiled .exe by existence + the target program's own
+        // <program>.cfg suffix (DFRefactor=x64, TestBench/DFUnit=64). NEVER decide the
+        // bitness from #IFDEF Is$Win64 - that is THIS program's build bitness, not the
+        // launched program's, and the 64-bit suffix is not always "64" (DFRefactor uses
+        // "x64", so the old code looked for a non-existent DFRefactor64.exe).
+        Get ResolveProgramExe of ghoApplication sProgram OrgWS to sExePath
+        If (sExePath = "") Begin
+            Send Info_Box ("Could not find the compiled program in:\n" + ('"' + vFolderFormat(OrgWS.sPrograms) + '"') + "\nMake sure it compiled for the expected 32-/64-bit platform.")
             Procedure_Return
         End
-        Runprogram Background (sProgramPath + sProgram)
+        Runprogram Background sExePath
     End_Procedure
     
     Procedure OpenContainingContainer
@@ -310,7 +312,9 @@ Object oDbUpdateHandler is a cDbUpdateHandler
 //    Use DUF_MultipleTables1_1.pkg
 //    Use DUF_MultipleTables1_2.pkg
 //    Use DUF_MultipleTables1_3.pkg
-    Use DUF_MultipleTables1_4.pkg
+//    Use DUF_MultipleTables1_4.pkg
+    Use DUF_MultipleTables1_5.pkg
+    Use DUF_MultipleTables1_6.pkg
 End_Object
 
 Use cRDCTooltipController.pkg
@@ -1048,18 +1052,18 @@ Object oMain is a Panel
             Set psShortcut to "Alt+E"
 
             Procedure OnExecute Variant vCommandBarControl
-                String sAppSrcPath sTestErrFile
-                Boolean bExists bActive
+                String sTestErrFile
+                Boolean bActive
                 tWorkspacePaths OrgWS
 
                 Get pOrgWS of ghoApplication to OrgWS
-                Move (vFolderFormat(OrgWS.sAppSrc)) to sAppSrcPath
-                Get CompileErrorFileForProgram of ghoApplication CS_TestProgram to sTestErrFile
-                Get vFilePathExists (sAppSrcPath + sTestErrFile) to bExists
-                If (bExists = True) Begin
+                // Resolve the .err the compiler ACTUALLY wrote (cfg-driven suffix,
+                // either bitness) - never predict the name (see CompileRefactoredCode).
+                Get ResolveCompiledFile of ghoApplication CS_TestProgram OrgWS "err" to sTestErrFile
+                If (sTestErrFile <> "") Begin
                     Get IsCompileErrorDialogActive of (Client_Id(phoMainPanel(ghoApplication))) to bActive
                     If (bActive = False) Begin
-                        Send ActivateCompileErrorDialog of (Client_Id(phoMainPanel(ghoApplication))) (sAppSrcPath + sTestErrFile)
+                        Send ActivateCompileErrorDialog of (Client_Id(phoMainPanel(ghoApplication))) sTestErrFile
                     End
                     Else Begin
                         Send CloseCompileErrorDialog of (Client_Id(phoMainPanel(ghoApplication)))
@@ -1068,17 +1072,14 @@ Object oMain is a Panel
             End_Procedure
 
             Function IsEnabled Returns Boolean
-                Boolean bExists
-                String sAppSrcPath sTestErrFile
+                String sTestErrFile
                 Integer iLines
                 tWorkspacePaths OrgWS
 
                 Get pOrgWS of ghoApplication to OrgWS
-                Move (vFolderFormat(OrgWS.sAppSrc)) to sAppSrcPath
-                Get CompileErrorFileForProgram of ghoApplication CS_TestProgram to sTestErrFile
-                Get vFilePathExists (sAppSrcPath + sTestErrFile) to bExists
+                Get ResolveCompiledFile of ghoApplication CS_TestProgram OrgWS "err" to sTestErrFile
                 Get SC_LineCount of (phoEditorRefactored(ghoApplication)) to iLines
-                Function_Return (bExists = True and iLines > 1)
+                Function_Return (sTestErrFile <> "" and iLines > 1)
             End_Function
 
         End_Object
@@ -1240,12 +1241,18 @@ Object oMain is a Panel
         End_Object 
         
         // Common method for oExternalProgramsToolbar and oDFRefactor_MenuItem OnExectute.
-        Procedure CompileRunProgram String sProgram
+        Procedure CompileRunProgram String sProgram 
             Boolean bOK
             String sErrorText
+            tWorkspacePaths WS
             
+            Move (Lowercase(sProgram) contains ".src") to bOK
+            If (bOK = False) Begin
+                Append sProgram ".src"
+            End
             // Compile program:
-            Get CompileProgram of ghoApplication sProgram (&sErrorText) to bOK
+            Get pOrgWS of ghoApplication to WS
+            Get CompileProgram of ghoApplication sProgram WS (&sErrorText) to bOK
             If (bOK = False) Begin
                 Send Info_Box sErrorText
                 Procedure_Return
@@ -1492,6 +1499,7 @@ Object oMain is a Panel
 //        Use Dd_debug.dg
         Use ScintillaParameters.dg
         Use CompilerOutput.dg
+//        Use ModAnalyzer.dg          // .err-triage panel + ActivateModAnalyzer/CloseModAnalyzer globals
         Use EngineErrorLog.dg
         Use EngineLogFile.dg
         Use ProgramSetup.dg
@@ -1549,6 +1557,8 @@ Object oMain is a Panel
     Procedure End_Construct_Object
         Forward Send End_Construct_Object
         Set Icon to "DFRefactorTest.ico"
+        Send Activate_oSelectFunctions_vw of (Client_Id(ghoCommandBars)) 0 
+        Send Switch_Next_View of (ClientAreaObject (ghoCommandBars))
     End_Procedure
 
     On_Key C_CtrlShiftTab   Send Switch_Prior_View

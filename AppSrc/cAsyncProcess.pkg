@@ -49,6 +49,14 @@ Use StartProg.pkg   // brings in tStartInfo, tProcessInfo,
     Define CREATE_NO_WINDOW for |CI$08000000
 #ENDIF
 
+// GetProcessId(handle) -> the OS process id. KillProcess needs it to hand the whole process
+// TREE to taskkill: the launched process is often a shell wrapper (e.g. cmd.exe for stdout
+// redirection), and a bare TerminateProcess on that handle kills only the wrapper, orphaning
+// the real child it spawned. Declared here - StartProg.pkg doesn't expose it.
+#IFNDEF get_GetProcessIdEf
+    External_Function GetProcessIdEf "GetProcessId" kernel32.dll Handle hProcess Returns Integer
+#ENDIF
+
 Class cAsyncProcess is a cObject
 
     Procedure Construct_Object
@@ -203,16 +211,31 @@ Class cAsyncProcess is a cObject
     //              non-zero value (e.g. 1) by convention so any exit-code
     //              consumer sees the abnormal termination.
     Procedure KillProcess Integer iExitCode
-        Boolean bActive
+        Boolean bActive bKilled
         Handle  hProcess
-        Integer iRet
+        Integer iRet iPid
 
         Get pbActive  to bActive
         Get phProcess to hProcess
         If (bActive = False or hProcess = 0) Begin
             Procedure_Return
         End
-        Move (TerminateProcessEf(hProcess, iExitCode)) to iRet
+
+        // The launched process is often a shell WRAPPER (e.g. a cmd.exe used to redirect a
+        // child's stdout to a file). TerminateProcess on this handle kills ONLY the wrapper
+        // and ORPHANS the real child it spawned - which keeps running and can hold resources
+        // (open files, a workspace) even after the caller restarts. So kill the whole TREE
+        // with taskkill /T (it walks the wrapper's children), while the wrapper is still
+        // alive so the tree is intact. IsProcessRunning still goes False on the next poll.
+        Move False to bKilled
+        Move (GetProcessIdEf(hProcess)) to iPid
+        If (iPid > 0) ;
+            Get _RunHidden "taskkill.exe" ("/F /T /PID " + String(iPid)) to bKilled
+
+        // Fallback (taskkill missing / failed to launch): at least terminate the wrapper,
+        // the original behavior - better than leaving the whole compile running.
+        If (bKilled = False) ;
+            Move (TerminateProcessEf(hProcess, iExitCode)) to iRet
     End_Procedure
 
     // Closes process + thread handles and clears state. Idempotent.
@@ -232,5 +255,43 @@ Class cAsyncProcess is a cObject
         Set phThread  to 0
         Set pbActive  to False
     End_Procedure
+
+    // Fire-and-forget launch of a short-lived helper (e.g. taskkill), fully hidden:
+    // CREATE_NO_WINDOW so no console flashes (SW_HIDE alone doesn't suppress a console-
+    // subsystem child's window - the same reason StartProcess uses it). Returns True if the
+    // process was created; its handles are closed at once since we never poll it.
+    Function _RunHidden String sCommand String sParams Returns Boolean
+        String  sCmd
+        Pointer pCmd pStartup pProcessInfo
+        Integer iRet iFlags
+        tProcessInfo ProcessInfo
+        tStartInfo   StartInfo
+
+        If (Left(sCommand, 1) <> '"' and (Left(sCommand, 1) <> "'")) ;
+            Move ('"' + sCommand + '"') to sCommand
+        Move (sCommand + " " + sParams + (Character(0))) to sCmd
+        Move (AddressOf(sCmd))       to pCmd
+        Move (OemToAnsi(pCmd, pCmd)) to iRet
+
+        Move (SizeOfType(tStartInfo)) to StartInfo.cb
+        Move STARTF_USESHOWWINDOW     to StartInfo.dwFlags
+        Move SW_HIDE                  to StartInfo.wShowWindow
+        Move CREATE_NO_WINDOW         to iFlags
+
+        Move 0                        to ProcessInfo.hProcess
+        Move (AddressOf(StartInfo))   to pStartup
+        Move (AddressOf(ProcessInfo)) to pProcessInfo
+
+        Move (CreateProcessEf(0, pCmd, 0, 0, False, iFlags, 0, 0, pStartup, pProcessInfo)) to iRet
+        If (iRet = 0) ;
+            Function_Return False
+
+        // We never poll this helper, so release its handles immediately.
+        If (ProcessInfo.hProcess <> 0) ;
+            Move (CloseHandleEf(ProcessInfo.hProcess)) to iRet
+        If (ProcessInfo.hThread <> 0) ;
+            Move (CloseHandleEf(ProcessInfo.hThread)) to iRet
+        Function_Return True
+    End_Function
 
 End_Class

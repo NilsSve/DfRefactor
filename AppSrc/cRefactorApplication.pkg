@@ -43,6 +43,7 @@ Use cCompileMixin.pkg
 Register_Procedure ActivateEngineLogFile
 Register_Procedure ShowOtherLogFilesDialog
 Register_Function SelectedFolders Returns String[]
+Register_Function SelectedFolderPathsByHome Returns String[]
 Register_Function psHomePath Returns String
 Register_Function ApplyTargetFilelist String sSWSFile Returns Boolean
 Register_Procedure RestoreActiveFilelist
@@ -103,8 +104,14 @@ Class cRefactorApplication is a cRDCApplication
         
         {Visibility=Public}
         Property Handle phoFolderSelHeaDD
+        {Visibility=Private}
+        Property String private_psCompiler ""
+        // Resolved target of the refactoring session (set by ResolveTargetDataFlex from psCompiler,
+        // fallback DFRefactor's own runtime). Never blank. Read by the analyzer scan + the UI label.
         {Visibility=Public}
-        Property String psCompiler 
+        Property String psTargetDfVersion ""
+        {Visibility=Public}
+        Property String psTargetPkgFolder ""
         {Visibility=Public}
         Property String psCompOpt CS_CompOptions
         {Visibility=Public}
@@ -113,6 +120,10 @@ Class cRefactorApplication is a cRDCApplication
         Property Handle phoEditorView 0
         {Visibility=Public}
         Property Handle phoRefactorView 0
+        {Visibility=Public}
+        Property Handle phoFunctionView 0
+        {Visibility=Public}
+        Property Handle phoFoldersView 0
         {Visibility=Public}
         Property Handle phoEditor 0
         {Visibility=Public}
@@ -169,6 +180,48 @@ Class cRefactorApplication is a cRDCApplication
     Function psHomePath Returns String
         Function_Return (Private_psHomePath(Self))
     End_Function
+
+    // psCompiler is the target compiler. Setting it auto-resolves the target DataFlex version + Pkg
+    // folder, so the version label, the scan, and the recipe cache always track the chosen compiler.
+    Procedure Set psCompiler String sCompiler
+        Set private_psCompiler to sCompiler
+        Send ResolveTargetDataFlex
+    End_Procedure
+
+    Function psCompiler Returns String
+        Function_Return (private_psCompiler(Self))
+    End_Function
+
+    // Resolve the TARGET of the refactoring session from psCompiler (the compiler that compiles the
+    // source against the version being migrated TO), falling back to DFRefactor's OWN runtime bin so
+    // psTargetDfVersion + psTargetPkgFolder are NEVER blank. Called from Set psCompiler (every change)
+    // and once from End_Construct_Object (startup safety net, before ProgramSetup's form sets it).
+    // Does NOT set psCompiler - that would recurse through the setter above.
+    Procedure ResolveTargetDataFlex
+        String sComp sBin sRoot sPkg sVer
+        Integer iPos
+        Get psCompiler to sComp
+        If (sComp <> "") Begin
+            Move (RightPos("\", sComp)) to iPos          // strip the compiler exe -> bin folder
+            If (iPos > 0) ;
+                Move (Left(sComp, (iPos - 1))) to sBin
+        End
+        If (sBin = "") ;
+            Get DFBinPath to sBin                         // fallback: DFRefactor's own runtime bin
+        If (sBin = "") ;
+            Procedure_Return
+        // bin -> install root -> Pkg.
+        If (Right(sBin, 1) = "\") ;
+            Move (Left(sBin, (Length(sBin) - 1))) to sBin
+        Move (RightPos("\", sBin)) to iPos
+        If (iPos > 0) Begin
+            Move (Left(sBin, (iPos - 1))) to sRoot
+            Move (vFolderFormat(sRoot) + "Pkg") to sPkg
+        End
+        Get DFVersionFromPath sBin to sVer
+        Set psTargetPkgFolder to sPkg
+        Set psTargetDfVersion  to sVer
+    End_Procedure
         
     // The psUserName has already have been set, if the /c flag and the name of an ini-file
     // was specified on the command line.
@@ -186,12 +239,23 @@ Class cRefactorApplication is a cRDCApplication
         tWorkspacePaths OrgWS
         Forward Send End_Construct_Object
 
+        // Resolve the target DataFlex version + Pkg up front (psCompiler may still be blank here -
+        // ProgramSetup's form sets it slightly later and re-resolves via Set psCompiler), so the two
+        // are never blank from the very start.
+        Send ResolveTargetDataFlex
+
         Send InitUserName
         Open SysFile
         Open Functions
         Open FunctionsA
         Set private.psStarZenSourceExplorer to (Trim(SysFile.PathStarZen))
         Set piBackupDaysOverwriteCycle      to SysFile.iBackupDaysOverwriteCycle
+
+        // Load the SHARED compiler + options from SysFile (written by ProgramSetup; shared between
+        // DFRefactor + TestBench via the one workspace DB). Setting psCompiler re-resolves the target
+        // version + Pkg; a blank value (fresh DB) falls back to DFRefactor's own runtime.
+        Set psCompiler to (Trim(SysFile.CompilerPath))
+        Set psCompOpt  to (Trim(SysFile.CompilerOptions))
 
         // Snapshot the program's own workspace state at startup. Used by:
         //   UpdateDFOpenPath      - restores DF_OPEN_PATH when target closes
@@ -435,7 +499,8 @@ Class cRefactorApplication is a cRDCApplication
         // It is probably safest to clear all views when switching workspace.
         If (phoMainPanel(Self) <> 0) Begin
             Broadcast Send Request_Clear_All of (Client_Id(phoMainPanel(ghoApplication)))
-            Set psCaption of (phoWorkspaceSelector_Menuitem(Self)) to sWorkspaceText
+            If (phoWorkspaceSelector_Menuitem(Self) <> 0) ;   // 0 in builds with no workspace combo (e.g. the FlexTron dashboard build)
+                Set psCaption of (phoWorkspaceSelector_Menuitem(Self)) to sWorkspaceText
         End
         Set psSWSFile to sFileName
         If (phoMainPanel(Self) <> 0) Begin
@@ -488,6 +553,154 @@ Class cRefactorApplication is a cRDCApplication
         Loop
         Function_Return asWorkspaces
     End_Function
+
+    // ---- Per-workspace "last analyze" snapshot ----------------------------------------------------
+    // The FT dashboard's Last-analyze tile is normally fed by process-memory globals that die on exit.
+    // To show the last counts when a workspace is RE-opened in a later run, cache them in the per-EXE
+    // registry, keyed by the .sws path - mirroring the recent-workspaces store above. (SysFile is one
+    // global record so it would share counts across every workspace; the Data\*.json caches key by DF
+    // version - neither fits a per-workspace value.)
+
+    // Today's date as ISO yyyy-mm-dd (locale-safe: no separator ambiguity, sorts naturally).
+    Function TodayIsoDate Returns String
+        DateTime dtNow
+        Integer  iY iM iD
+        Move (CurrentDateTime()) to dtNow
+        Move (DateGetYear(dtNow))  to iY
+        Move (DateGetMonth(dtNow)) to iM
+        Move (DateGetDay(dtNow))   to iD
+        Function_Return (String(iY) + "-" + Right(("0" + String(iM)), 2) + "-" + Right(("0" + String(iD)), 2))
+    End_Function
+
+    // Today's date + time as "yyyy-mm-dd HH:MM" (24-hour, locale-safe, sorts naturally). Used for the
+    // analyze-snapshot "last run" stamp so the Modernize tile can show the time alongside the date.
+    Function TodayIsoDateTime Returns String
+        DateTime dtNow
+        Integer  iY iM iD iH iMin
+        Move (CurrentDateTime()) to dtNow
+        Move (DateGetYear(dtNow))   to iY
+        Move (DateGetMonth(dtNow))  to iM
+        Move (DateGetDay(dtNow))    to iD
+        Move (DateGetHour(dtNow))   to iH
+        Move (DateGetMinute(dtNow)) to iMin
+        Function_Return (String(iY) + "-" + Right(("0" + String(iM)), 2) + "-" + Right(("0" + String(iD)), 2) + " " + Right(("0" + String(iH)), 2) + ":" + Right(("0" + String(iMin)), 2))
+    End_Function
+
+    // Folds a full .sws path into a registry-safe value-name stem: lowercased (Windows paths are
+    // case-insensitive, matching the recent-list identity) with \ / : and spaces turned into "_".
+    Function AnalyzeSnapshotKey String sSWSFile Returns String
+        String  sIn sOut sChar
+        Integer i iLen
+        Move (Lowercase(Trim(sSWSFile))) to sIn
+        Move (Length(sIn)) to iLen
+        Move "" to sOut
+        For i from 1 to iLen
+            Move (Mid(sIn, 1, i)) to sChar
+            If (sChar = "\" or sChar = "/" or sChar = ":" or sChar = " ") ;
+                Move "_" to sChar
+            Move (sOut + sChar) to sOut
+        Loop
+        Function_Return sOut
+    End_Function
+
+    // Stamps the four analyze counts + today's date for the CURRENTLY-loaded workspace (psSWSFile).
+    Procedure WriteAnalyzeSnapshot Integer iWarn Integer iErr Integer iAuto Integer iSuggest
+        String sSWSFile sKey sIso sProgram sProgKey
+        Get psSWSFile to sSWSFile
+        If (sSWSFile = "") ;
+            Procedure_Return
+        Get AnalyzeSnapshotKey sSWSFile to sKey
+        Get TodayIsoDateTime to sIso   // date + time, so the tile's "last run" shows both
+        // Single-slot = the LAST analyzed program's counts (the tile's primary readout).
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Warn")    (String(iWarn))
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Err")     (String(iErr))
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Auto")    (String(iAuto))
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Suggest") (String(iSuggest))
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Date")    sIso
+        // Tag the snapshot with WHICH program it is for + stamp a per-program snapshot so AnalyzeRollup can
+        // total "N of M analyzed" across a many-program workspace. The analyzed program == the last-compiled
+        // one (CS_LastCompileKeyPrefix), whose name is verbatim a GetWorkspaceProjects entry - so the per-
+        // program key here matches the one AnalyzeRollup derives when it enumerates the workspace's programs.
+        Get ReadString CS_Settings (CS_LastCompileKeyPrefix + sSWSFile) "" to sProgram
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Program") sProgram
+        If (sProgram <> "") Begin
+            Get AnalyzeSnapshotKey sProgram to sProgKey
+            Send WriteString CS_AnalyzeSnapshotKey (sKey + ".P_" + sProgKey + ".Warn") (String(iWarn))
+            Send WriteString CS_AnalyzeSnapshotKey (sKey + ".P_" + sProgKey + ".Date") sIso
+        End
+    End_Procedure
+
+    // Reads the snapshot for the CURRENTLY-loaded workspace. TheData.bFound is True only when a stored
+    // date was found; counts come back via a lenient string->Integer Move (never Integer(), which faults
+    // on a blank/garbage value).
+    Function ReadAnalyzeSnapshot Returns tAnalyzeSnapshot
+        tAnalyzeSnapshot TheData
+        String sSWSFile sKey sDate sWarn sErr sAuto sSuggest sProgram
+        Get psSWSFile to sSWSFile
+        If (sSWSFile = "") ;
+            Function_Return TheData
+        Get AnalyzeSnapshotKey sSWSFile to sKey
+        Get ReadString CS_AnalyzeSnapshotKey (sKey + ".Date") "" to sDate
+        If (sDate = "") ;
+            Function_Return TheData
+        Get ReadString CS_AnalyzeSnapshotKey (sKey + ".Warn")    "0" to sWarn
+        Get ReadString CS_AnalyzeSnapshotKey (sKey + ".Err")     "0" to sErr
+        Get ReadString CS_AnalyzeSnapshotKey (sKey + ".Auto")    "0" to sAuto
+        Get ReadString CS_AnalyzeSnapshotKey (sKey + ".Suggest") "0" to sSuggest
+        Get ReadString CS_AnalyzeSnapshotKey (sKey + ".Program") ""  to sProgram
+        Move sWarn    to TheData.iWarn
+        Move sErr     to TheData.iErr
+        Move sAuto    to TheData.iAuto
+        Move sSuggest to TheData.iSuggest
+        Move sDate    to TheData.sDate
+        Move sProgram to TheData.sProgram
+        Move True     to TheData.bFound
+        Function_Return TheData
+    End_Function
+
+    // Workspace-wide roll-up across the per-program snapshots WriteAnalyzeSnapshot stamps (.P_<prog>.Warn /
+    // .Date). iTotal = every program in the .sws [Projects]; iAnalyzed = those with a stored snapshot;
+    // iWarnTotal = the sum of their warning counts. Enumerates GetWorkspaceProjects so the per-program keys
+    // match what WriteAnalyzeSnapshot wrote (both fold the SAME program-name strings via AnalyzeSnapshotKey).
+    // Counts use the lenient string->Integer Move (never Integer(), which faults on a blank value).
+    Function AnalyzeRollup Returns tAnalyzeRollup
+        tAnalyzeRollup TheData
+        String[] asProjects
+        String sSWSFile sKey sProgKey sDate sWarn
+        Integer i iSize iWarnVal
+        Get psSWSFile to sSWSFile
+        If (sSWSFile = "") ;
+            Function_Return TheData
+        Get AnalyzeSnapshotKey sSWSFile to sKey
+        Get GetWorkspaceProjects sSWSFile to asProjects
+        Move (SizeOfArray(asProjects)) to TheData.iTotal
+        Move (SizeOfArray(asProjects) - 1) to iSize
+        For i from 0 to iSize
+            Get AnalyzeSnapshotKey asProjects[i] to sProgKey
+            Get ReadString CS_AnalyzeSnapshotKey (sKey + ".P_" + sProgKey + ".Date") "" to sDate
+            If (sDate <> "") Begin
+                Increment TheData.iAnalyzed
+                Get ReadString CS_AnalyzeSnapshotKey (sKey + ".P_" + sProgKey + ".Warn") "0" to sWarn
+                Move sWarn to iWarnVal
+                Move (TheData.iWarnTotal + iWarnVal) to TheData.iWarnTotal
+            End
+        Loop
+        Function_Return TheData
+    End_Function
+
+    // Drops the snapshot for an explicit .sws path - called when a workspace is removed from the recent
+    // list, so its cached counts don't linger as orphaned registry values.
+    Procedure ClearAnalyzeSnapshot String sSWSFile
+        String sKey
+        If (sSWSFile = "") ;
+            Procedure_Return
+        Get AnalyzeSnapshotKey sSWSFile to sKey
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Warn")    ""
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Err")     ""
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Auto")    ""
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Suggest") ""
+        Send WriteString CS_AnalyzeSnapshotKey (sKey + ".Date")    ""
+    End_Procedure
 
     // Pass an SWS file with full path.
     // Returns the .ws file name of the Programs folder.
@@ -970,7 +1183,7 @@ Class cRefactorApplication is a cRDCApplication
     { MethodType=Property }
     Procedure Set psSWSFile String sSWSFile
         String sPath sExt sOldSWSFile
-        String[] asEmpty
+        String[] asFolders
 
         Get psSWSFile to sOldSWSFile
 
@@ -995,16 +1208,18 @@ Class cRefactorApplication is a cRDCApplication
         // original path and empties pTargetWS.
         Send UpdateDFOpenPath sSWSFile
 
-        // The selected-folders list is per workspace (the FolderSel tables are
-        // keyed by WorkspaceHomeFolder, and OnWorkspaceLoaded re-keys the
-        // folder view to the new workspace). Drop the cached selection when
-        // the workspace actually changes so CollectFileData re-reads it from
-        // the re-keyed folder view; otherwise a run after switching workspace
-        // would scan the previous (e.g. DFRefactor's own) workspace's folders.
-        // Guarded on an actual change so redundant same-workspace setter calls
-        // (e.g. combo re-display) don't wipe the user's folder selection.
+        // The selected-folders list is per workspace (the FolderSel tables are keyed by WorkspaceHomeFolder,
+        // and OnWorkspaceLoaded re-keys the folder view to the new workspace). When the workspace actually
+        // changes, RE-SYNC the cache from the DB (keyed by the now-current psHomePath, via the header DD's
+        // alias-based SelectedFolderPathsByHome) rather than just emptying it - so SizeOfArray(pasSelectedFolders)
+        // stays in step with TotalSelectedFolders even on load paths (e.g. the dashboard) that never open a
+        // folder view. phoFolderSelHeaDD is 0 only very early at startup (before the DDs exist); then asFolders
+        // stays empty (the lazy CollectFileData re-read still covers a later run). Guarded on an actual change
+        // so redundant same-workspace setter calls (e.g. combo re-display) don't disturb the selection.
         If (Lowercase(Trim(sSWSFile)) <> Lowercase(Trim(sOldSWSFile))) Begin
-            Set pasSelectedFolders to asEmpty
+            If (phoFolderSelHeaDD(Self) <> 0) ;
+                Get SelectedFolderPathsByHome of (phoFolderSelHeaDD(Self)) to asFolders
+            Set pasSelectedFolders to asFolders
         End
     End_Procedure
 
@@ -2359,11 +2574,22 @@ Class cRefactorApplication is a cRDCApplication
     End_Function
 
     Procedure ComparePaths String sCompareApp
-        String sPath sPathBackup
+        String sPath sPathBackup sBackupRoot sDriveEncoded sCheck
 
         Get psHomePath to sPath
-        Get HomeBackupFilePath to sPathBackup
-        If (sPath <> "" and sPathBackup <> "") Begin
+        Get HomeBackupFilePath to sBackupRoot
+        If (sPath <> "" and sBackupRoot <> "") Begin
+            // Backups mirror each file's FULL path with the drive colon turned into a folder
+            // (BackupSubfolderForFile): E:\<home>\ -> <Backup>\E\<home>\. So to line the two trees up in the
+            // compare tool, point the backup side at that drive-encoded home subfolder, NOT the bare <Backup>
+            // root - whose first level is now just the lone drive letter, which is why the folders stopped
+            // matching after the drive-encoded backup change. Fall back to the root if the home-rooted backup
+            // subtree doesn't exist yet (e.g. only library files on other roots have been backed up).
+            Move (Replace(":", sPath, "")) to sDriveEncoded
+            Move (vFolderFormat(sBackupRoot) + vFolderFormat(sDriveEncoded)) to sPathBackup
+            Get RemoveFolderSeperator sPathBackup to sCheck
+            If (vFolderExists(sCheck) = False) ;
+                Move sBackupRoot to sPathBackup
             Runprogram Background ('"' + sCompareApp + '"') ('"' + sPath + '" "' + sPathBackup + '"')
         End
     End_Procedure

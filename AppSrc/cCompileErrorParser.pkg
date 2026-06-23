@@ -1,0 +1,198 @@
+﻿//****************************************************************************
+// $Module type: Package (global functions + the tCompileError struct)
+// $Module name: cCompileErrorParser
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : The canonical DataFlex compiler ".err" parser. Lifted out of
+//               CompilerOutput.dg so BOTH the compiler-output dock AND the .err
+//               analysis panel (cModAnalyzer / ModAnalyzer.dg) share ONE parser.
+//
+//               The .err format is regular:
+//                 ERROR: <num> <desc> ON LINE: <ln> (<off>) OF FILE: <path>
+//               (plus LINK ERROR lines). ReadErrorFile reads the file into a line
+//               array; ExtractData parses one line into a tCompileError; and
+//               MassageErrorFile runs the whole array through ExtractData.
+//
+//               These are GLOBAL functions (Get-callable from anywhere, like the
+//               RF* file functions), so the dock's existing "Get ReadErrorFile" /
+//               "Get MassageErrorFile" call sites keep working unchanged after the
+//               lift - we only remove the old inline copies + the struct there and
+//               add "Use cCompileErrorParser.pkg".
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS for a PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//****************************************************************************
+Use cRefactorFileIO.pkg   // RFOpenInput / RFCloseInput (+ seq_chnl: Readln channel, SeqEof)
+
+Struct tCompileError
+    Boolean bError    // If false, it is a warning.
+    Integer iErrorNo
+    Integer iLine
+    String sFileName
+    String sErrorTxt
+    String sText
+End_Struct
+
+// Read a .err (or any text/log) file into a line array, skipping blank lines.
+// (Lifted from CompilerOutput.dg; the original RFFileSize pre-size was a perf
+// micro-opt only - the array auto-grows, so the result is identical.)
+Function ReadErrorFile Global String sFileName Returns String[]
+    Integer iCh iCount
+    String[] asFile
+    String sLine
+
+    Move 0 to iCount
+    Get RFOpenInput ("binary:" + sFileName) to iCh
+    If (iCh < 0) Begin
+        Function_Return asFile
+    End
+
+    While (SeqEof = False)
+        Readln channel iCh sLine
+        If (Trim(sLine) <> "") Begin
+            Move sLine to asFile[iCount]
+            Increment iCount
+        End
+    Loop
+    Send RFCloseInput iCh
+
+    Function_Return asFile
+End_Function
+
+// Parse one .err line into a tCompileError (error/warning, number, file, line, text).
+Function ExtractData Global String sValue Returns tCompileError
+    String sTmp
+    Integer iPos
+    Boolean bLinkError
+    tCompileError CompileError
+
+    // Link Error?
+    Move (Pos("LINK ERROR:", sValue)) to bLinkError
+    If (bLinkError) Begin
+        Move True to CompileError.bError
+        Move (Length("LINK ERROR: ")) to iPos
+
+        // Remove read part
+        Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
+
+        // File name:
+        Move (Pos(",", sValue)) to iPos
+        If (iPos <> 0) Begin
+            Move (Trim(Left(sValue, iPos - 1))) to sTmp
+            Move sTmp to CompileError.sFileName
+            // Remove read part
+            Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
+        End
+    End
+
+    // Error or Warning?
+    Else Begin
+        Move (Pos(" ", sValue)) to iPos
+        If (Left(sValue, iPos) contains "ERROR") Begin
+            Move True to CompileError.bError
+        End
+        // Remove read part
+        Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
+
+        If (bLinkError = False) Begin
+            Move (Pos(" ", sValue)) to iPos
+            // Error number:
+            Move (Trim(Left(sValue, iPos))) to sTmp
+            Move sTmp to CompileError.iErrorNo
+        End
+        // Remove read part
+        Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
+
+        // File name:
+        Move (Pos("OF FILE:", sValue)) to iPos
+        Move (Trim(Mid(sValue, Length(sValue), iPos + 8))) to sTmp
+        Move sTmp to CompileError.sFileName
+        // Remove read part
+        Move (Trim(Left(sValue, iPos-1))) to sValue
+
+        // Line number - ONLY when the line actually carries "ON LINE:". Without the
+        // guard, a line lacking it makes the Mid/Left below extract a non-numeric token
+        // (e.g. "US" out of a path like ...\Users\...), and Move-ing that to an Integer
+        // FAULTS in DF26 ("Invalid symbol in expression 'US'") - Move is NOT lenient.
+        // With "ON LINE:" present the token is the numeric line. See
+        // feedback_dataflex_integer_cast_faults.md.
+        Move (Pos("ON LINE:", sValue)) to iPos
+        If (iPos > 0) Begin
+            Move (Trim(Mid(sValue, Length(sValue), iPos + 8))) to sTmp
+            Move (Pos(" ", sTmp)) to iPos
+            Move (Trim(Left(sTmp, iPos))) to sTmp
+            Move sTmp to CompileError.iLine
+            Move (Pos("ON LINE:", sValue)) to iPos
+            Move (Trim(Left(sValue, iPos -1))) to sValue
+        End
+    End
+
+    // Error Text:
+    Move sValue to CompileError.sErrorTxt
+
+    // Finally, construct the text to display:
+    If (bLinkError) Begin
+        Move "Link Error:" to sValue
+    End
+    Else Begin
+        Move "Error" to sValue
+    End
+    If (bLinkError = False) Begin
+        Append sValue " " CompileError.iErrorNo ":"
+    End
+    Append sValue "   " CompileError.sFileName
+    If (bLinkError = False) Begin
+        Append sValue "   " "(ln " CompileError.iLine ")"
+    End
+    Append sValue " " CompileError.sErrorTxt
+    Move sValue to CompileError.sText
+
+    Function_Return CompileError
+End_Function
+
+// Parse a whole .err line array into tCompileError[] (calls ExtractData per line).
+Function MassageErrorFile Global String[] asFile Returns tCompileError[]
+    String sValue
+    Integer iSize iCount
+    tCompileError[] asCompileError
+
+    Move (SizeOfArray(asFile)) to iSize
+    Decrement iSize
+    For iCount from 0 to iSize
+        Move asFile[iCount] to sValue
+        Get ExtractData asFile[iCount] to asCompileError[iCount]
+    Loop
+
+    Function_Return asCompileError
+End_Function
+
+// Read a .prn listing (or a .err) and return ONLY the parsed compiler messages - the
+// WARNING: / ERROR: / LINK ERROR: lines. A .prn interleaves the FULL source listing
+// with the diagnostics, so we must filter to the diagnostic lines before parsing
+// (ExtractData would mis-parse a random listing line). For a .err every line already
+// is a diagnostic, so the filter is a harmless pass-through there. This is how the
+// modernization analyzer gets WARNINGS - the .err carries errors only.
+Function ReadCompilerMessages Global String sFileName Returns tCompileError[]
+    String[] asAll asMsg
+    Integer iSize iCount iMsg
+    String sTrim
+    tCompileError[] asResult
+
+    Get ReadErrorFile sFileName to asAll
+    Move (SizeOfArray(asAll)) to iSize
+    Move 0 to iMsg
+    Decrement iSize
+    For iCount from 0 to iSize
+        Move (Trim(asAll[iCount])) to sTrim
+        If ((Left(sTrim, 8) = "WARNING:") or (Left(sTrim, 6) = "ERROR:") or (Left(sTrim, 11) = "LINK ERROR:")) Begin
+            Move sTrim to asMsg[iMsg]
+            Increment iMsg
+        End
+    Loop
+    Get MassageErrorFile asMsg to asResult
+    Function_Return asResult
+End_Function

@@ -1,4 +1,4 @@
-    Object oChangeTrimCommandToFunction is a cTestFixture
+﻿    Object oChangeTrimCommandToFunction is a cTestFixture
         Set psFunctionName to "ChangeTrimCommandToFunction"
 
         {Published = True}
@@ -52,6 +52,166 @@
             Get Tokenizer of ghoFuncLib sLine to TokenizerData
             Get ChangeTrimCommandToFunction of ghoFuncLib (&sLine) to bChanged
             Send AssertSAreEqual sExpected sLine
+        End_Procedure
+
+        // Regression (2026-06-10 audit): ANY whitespace run between the keyword and
+        // the variable is still the same command. The old keyword+ONE-space+varname
+        // pattern silently skipped aligned code like "Trim  sTmp to sValue".
+        {Published = True}
+        Procedure ChangeTrimCommandToFunction_MultiSpace
+            String sLine sExpected
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Move " Trim  sTmp to sValue" to sLine
+            Move " Move (Trim(sTmp)) to sValue" to sExpected
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeTrimCommandToFunction of ghoFuncLib (&sLine) to bChanged
+            Send Assert bChanged
+            Send AssertSAreEqual sExpected sLine
+        End_Procedure
+
+        // Regression (Nils 2026-06-11): the argument is a PARENTHESISED EXPRESSION. The old
+        // asLineTokens[next] grab got the masked pipe-token, not "(Val(...))", and skipped the
+        // line. Now the whole argument between "Trim" and "to" is extracted by position.
+        {Published = True}
+        Procedure ChangeTrimCommandToFunction_ParenExprArg
+            String sLine sExpected
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Move 'Trim (Val(hDD,"ARTIKLAR.ARTNR")) to sItemId' to sLine
+            Move 'Move (Trim((Val(hDD,"ARTIKLAR.ARTNR")))) to sItemId' to sExpected
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeTrimCommandToFunction of ghoFuncLib (&sLine) to bChanged
+            Send Assert bChanged
+            Send AssertSAreEqual sExpected sLine
+        End_Procedure
+
+        // Regression (Nils 2026-06-11): the argument is a table.field (dotted). The tokenizer
+        // splits "USER.SPRAK" on the dot, so the old single-token grab took only "USER" and
+        // produced the corrupt "Move (Trim(USER)).SPRAK". Indentation is preserved too.
+        {Published = True}
+        Procedure ChangeTrimCommandToFunction_TableFieldArg
+            String sLine sExpected
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Move "                Trim USER.SPRAK to sCurrent" to sLine
+            Move "                Move (Trim(USER.SPRAK)) to sCurrent" to sExpected
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeTrimCommandToFunction of ghoFuncLib (&sLine) to bChanged
+            Send Assert bChanged
+            Send AssertSAreEqual sExpected sLine
+        End_Procedure
+
+        // Regression (Nils 2026-06-11): a "Trim table.field to var" inside a real FUNCTION
+        // body (the scope tokenized first, so bIsInFunction etc. are genuinely set) - the
+        // scenario where these were reported NOT refactoring. Confirms no entry-gate
+        // (bLineIsReady/bIsInCommand/bIsVariableDeclaration) trips in that context. A
+        // single-line fixture can't prove this - build the scope (sticky-scope lesson).
+        {Published = True}
+        Procedure ChangeTrimCommandToFunction_TableFieldInFunctionScope
+            String sLine sExpected
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get Tokenizer of ghoFuncLib "Function CurrentLanguageIs Global String sLang Returns Boolean" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    String sCurrent" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    Open USER" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    If (Found and not(StringIsEmpty(USER.SPRAK))) Begin" to TokenizerData
+            Move "        Trim USER.SPRAK to sCurrent" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeTrimCommandToFunction of ghoFuncLib (&sLine) to bChanged
+            Send Assert bChanged
+            Send AssertSAreEqual "        Move (Trim(USER.SPRAK)) to sCurrent" sLine
+            Send ClearFuncLibProperties of ghoFuncLib
+        End_Procedure
+
+        // Same, after a #IFDEF/#ELSE/#ENDIF block (the construct Nils suspected). The
+        // preprocessor lines set no sticky lexer state, so a later Trim still converts.
+        {Published = True}
+        Procedure ChangeTrimCommandToFunction_TableFieldAfterIfdef
+            String sLine sExpected
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get Tokenizer of ghoFuncLib "Function CurrentLanguageIs Global String sLang Returns Boolean" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    String sCurrent" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    #IFDEF get_CurrentLanguage" to TokenizerData
+            Get Tokenizer of ghoFuncLib "        Move (CurrentLanguage()) to sCurrent" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    #ELSE" to TokenizerData
+            Get Tokenizer of ghoFuncLib '        Move \"SV\" to sCurrent' to TokenizerData
+            Get Tokenizer of ghoFuncLib "    #ENDIF" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    If (not(StringIsEmpty(LANGSYS.BASED_ON))) Begin" to TokenizerData
+            Move "        Trim LANGSYS.BASED_ON to sCurrent" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeTrimCommandToFunction of ghoFuncLib (&sLine) to bChanged
+            Send Assert bChanged
+            Send AssertSAreEqual "        Move (Trim(LANGSYS.BASED_ON)) to sCurrent" sLine
+            Send ClearFuncLibProperties of ghoFuncLib
+        End_Procedure
+
+        // Regression (Nils 2026-06-11): THE real-file culprit. A custom "#Command ... #EndCommand"
+        // block whose #EndCommand is INDENTED. The lexer detected the (indented) #Command via the
+        // left-trimmed sOverstrikeLine but tested #EndCommand against the RAW line at column 1, so
+        // the indented end was missed and pbInCommand stuck ON - every later line (the whole
+        // following function) then reported bIsInCommand=True and ChangeTrim's entry gate skipped
+        // it ("untouched"). With _IsCommandEnd now trimming, the command closes and the Trim
+        // converts. (A single-line fixture can't catch this - the stuck flag comes from above.)
+        {Published = True}
+        Procedure ChangeTrimCommandToFunction_AfterIndentedEndCommand
+            String sLine
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get Tokenizer of ghoFuncLib "    #Command Show_Message String sMsg" to TokenizerData
+            Get Tokenizer of ghoFuncLib "        Send Info_Box sMsg" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    #EndCommand" to TokenizerData
+            Get Tokenizer of ghoFuncLib "Function CurrentLanguageIs Global String sLang Returns Boolean" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    String sCurrent" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    If (Found and not(StringIsEmpty(USER.SPRAK))) Begin" to TokenizerData
+            Move "        Trim USER.SPRAK to sCurrent" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeTrimCommandToFunction of ghoFuncLib (&sLine) to bChanged
+            Send Assert bChanged
+            Send AssertSAreEqual "        Move (Trim(USER.SPRAK)) to sCurrent" sLine
+            Send ClearFuncLibProperties of ghoFuncLib
+        End_Procedure
+
+        // Regression (Nils 2026-06-11): THE actual wslibrary.pkg culprit. A string literal
+        // containing "*/*" (an HTTP accept-types wildcard) sits ABOVE the function. The "/*"
+        // inside that string was mistaken for a DF23 block-comment opener; with no real "*/"
+        // after it, pbIsInDF23MultiLineComment stuck ON to end-of-file and EVERY later line was
+        // treated as a comment, so ChangeTrim (and every refactor) skipped them. The fix masks
+        // quoted content before the /* and // checks (_MaskQuotedContent), so the Trim converts.
+        {Published = True}
+        Procedure ChangeTrimCommandToFunction_AfterStarSlashStarString
+            String sLine
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get Tokenizer of ghoFuncLib 'Set psAcceptTypes of h to "*/*"' to TokenizerData
+            Get Tokenizer of ghoFuncLib "Function CurrentLanguageIs Global String sLang Returns Boolean" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    String sCurrent" to TokenizerData
+            Get Tokenizer of ghoFuncLib "    If (Found and not(StringIsEmpty(USER.SPRAK))) Begin" to TokenizerData
+            Move "        Trim USER.SPRAK to sCurrent" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeTrimCommandToFunction of ghoFuncLib (&sLine) to bChanged
+            Send Assert bChanged
+            Send AssertSAreEqual "        Move (Trim(USER.SPRAK)) to sCurrent" sLine
+            Send ClearFuncLibProperties of ghoFuncLib
+        End_Procedure
+
+        // Regression guard: a GENUINE single-line DF23 block comment "/* ... */" (no strings)
+        // must STILL be recognized - the string-mask fix must not break real block comments.
+        {Published = True}
+        Procedure DF23CommentStart_RealBlockCommentStillDetected
+            Boolean bStart bInString
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get _IsDF23CommentStart of ghoFuncLib "    /* this opens a block comment" to bStart
+            Send Assert bStart
+            // ...but a "/*" that is only INSIDE a string literal must NOT be detected.
+            Get _IsDF23CommentStart of ghoFuncLib 'Set psAcceptTypes of h to "*/*"' to bInString
+            Send AssertFalse bInString
+            Send ClearFuncLibProperties of ghoFuncLib
         End_Procedure
 
     End_Object

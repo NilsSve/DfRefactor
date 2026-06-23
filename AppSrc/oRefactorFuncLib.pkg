@@ -63,14 +63,14 @@
           values are entered in an { EnumList } meta-tag.
           If an { EnumList } meta-tag is used, it needs to be followed by two other meta-tags;
           { InitialValue } This is the default value from the EnumList, and
-          { HelpTopic } This will be the help text presented to the user when hovering the mouse
+          { ParamHelp } This will be the help text presented to the user when hovering the mouse
                         over the grid column item. This needs to be the last item.
-                        Write '\n' to insert a carrige return characters to line up HelpTopic
+                        Write '\n' to insert a carrige return characters to line up ParamHelp
                         text.
         Sample:
         { EnumList = "eSplitBySpaceAndSemicolon, eSplitBySemicolon, eSplitToBeginEndBlock" }
         { InitialValue = eSplitToBeginEndBlock }
-        { HelpTopic = Valid Values;
+        { ParamHelp = Valid Values;
         \neSplitBySpaceAndSemicolon - Split line with space and semicolon,
         \neSplitBySemicolon - Split line with semicolon,
         \neSplitToBeginEndBlock - Use a Begin/End block }
@@ -194,7 +194,9 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Changes legacy Calc/MoveInt/MoveStr/MoveNum/MoveReal -> 'Move' command.
         The legacy commands compiles but does not work with the Studio's statement completion.
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: Calc/MoveInt/MoveStr/MoveReal -> Move }
+        { ModRecipe = 4533 | command: Calc }
         """ }
     Function ChangeCalcToMoveStatement String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged bFound
@@ -228,6 +230,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Changes legacy Current_Object -> Self
         Replaces the legacy keyword 'Current_Object' with 'Self'
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: Legacy Current_Object -> Self }
         """ }
     Function ChangeCurrent_ObjectToSelf String ByRef sLine String sParameter Returns Boolean
@@ -270,6 +273,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
     { Description = """
         Replaces legacy DfTrue and DFFalse with True or False
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = DFTrue -> True }
         """ }
     Function ChangeDfTrueDfFalse String ByRef sLine String sParameter Returns Boolean
@@ -316,22 +320,47 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Replaces legacy GetAddress command with function AddressOf.
         Example: GetAddress of sVal to aAddress --> Move (AddressOf(sVal)) to aAddress
         { MethodType = eStandardFunction }
-        { SummaryText = GetAdress -> (AddressOf( }
+        { FnGroup = Modernization }
+        { SummaryText = GetAddress -> (AddressOf( }
+        { ModRecipe = 4533 | command: GetAddress }
         """ }
     Function ChangeGetAddress String ByRef sLine String sParameter Returns Boolean
         Boolean bFound
         tTokenizer TokenizerData
+        tToken Token
 
         Get pTokenizer to TokenizerData
 
-        If (TokenizerData.bLineIsReady = True or TokenizerData.bHasEndSemiColon = True or TokenizerData.bIsInFunction = True or ;
-            TokenizerData.bIsInProcedure = True or TokenizerData.bIsInCommand = True or ;
+        // Deliberately NO bIsInFunction/bIsInProcedure guard here - those are the
+        // lexer's sticky inside-a-body scope flags, and a GetAddress command lives
+        // almost exclusively inside method bodies. The old guard disabled the
+        // function on every real occurrence (cWinFunc.pkg was never changed), while
+        // the single-line fixtures carry no scope, so the tests stayed green.
+        If (TokenizerData.bLineIsReady = True or TokenizerData.bHasEndSemiColon = True or ;
+            TokenizerData.bIsInCommand = True or ;
             TokenizerData.bIsInImage = True or TokenizerData.bIsVariableDeclaration = True) Begin
             Function_Return False
         End
 
         Get IsKeywordInLine (CS_GetAddress + CS_D) TokenizerData.asLineTokens to bFound
         If (bFound = False) Begin
+            Function_Return False
+        End
+
+        // What DOES need protecting is a line that merely MENTIONS GetAddress - a
+        // declaration ("Function GetAddress Returns String") or an expression use
+        // ("Entry_Item (GetAddress(...))"). Require the COMMAND position, like
+        // ChangeSysdate4. FirstLeftCommand ONLY: an If-prefixed nose form is left
+        // untouched on purpose - the rebuild below is whole-line and would lose it.
+        Move TokenizerData.FirstLeftCommand to Token
+        If (Lowercase(Token.sCode) <> Lowercase(CS_GetAddress)) Begin
+            Function_Return False
+        End
+
+        // The rebuild needs both sides. The no-"of" variant ("GetAddress sVal to
+        // pVal") leaves OfStatement empty and would emit a broken
+        // "Move (AddressOf())" - leave that shape untouched.
+        If (TokenizerData.OfStatement.sCode = "" or TokenizerData.ToStatement.sCode = "") Begin
             Function_Return False
         End
 
@@ -350,6 +379,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Changes command "IFNOT" into an expression
         Example: IFNOT Found Begin -->  If (Not(Found)) Begin
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = IFNOT command -> If (not('indicator')) }
         """ }
     Function ChangeIfNotCommandToExpression String ByRef sLine String sParameter Returns Boolean
@@ -369,7 +399,11 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         End
         
         Move sLine to sCode
-        Move (Pos("ifnot", Lowercase(sCode))) to iPos
+        // Locate IFNOT boundary-aware on the MASKED line (position-aligned
+        // with sLine) via _FindKeywordPos - a bare Pos could match inside an
+        // identifier or a string literal before the real IFNOT (2026-06-10
+        // audit).
+        Get _FindKeywordPos (TokenizerData.sIndentation + TokenizerData.sOverstrikeLine) "ifnot" True 1 to iPos
         Move (Left(sCode, (iPos + Length("ifnot")))) to sCode
         If (iPos <> 0) Begin
             Move (Overstrike("|||||", sCode, iPos)) to sCode
@@ -397,12 +431,14 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Example: Insert "," In sText At 2 --> Move (Insert(",", sText, 2)) to sText
         If sOne Eq "A" Insert "B" in sOne at 2 --> If sOne Eq "A" Move (Insert("B", sOne, 2)) to sOne
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Insert command -> (Insert( }
+        { ModRecipe = 4531 | command: Insert }
         """ }
     Function ChangeInsertCommandToFunction String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged bFound
-        String sNose sLineLC sToken sVar1 sVar2 sText
-        Integer iPos iItem iInPos
+        String sNose sLineLC sToken sVar1 sVar2 sText sInPos
+        Integer iPos iItem
         tTokenizer TokenizerData
 
         Get pTokenizer to TokenizerData
@@ -445,7 +481,11 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         If (iItem <> -1) Begin
             Move TokenizerData.asLineTokens[iItem] to sToken
             Move (Replace(sToken, sLine, "")) to sLine
-            Move TokenizerData.asLineTokens[iItem + 1] to iInPos
+            // Keep the position as a STRING (verbatim token). It can be a variable or expression - 'at iIndex',
+            // 'at (Length(s))' - not just a literal. Moving it to an Integer makes DF EVALUATE it as a numeric
+            // expression: that faults err 54 "Invalid symbol in expression" for a non-numeric symbol, and would
+            // silently yield 0 even when it didn't fault (losing the position).
+            Move TokenizerData.asLineTokens[iItem + 1] to sInPos
         End
 
         Move "" to sText
@@ -453,7 +493,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
             Move sNose to sText
             Move (Trim(sText) + CS_S) to sText
         End
-        Append sText CS_Move CS_S "(" CS_Insert "(" sVar1 "," sVar2 "," iInPos "))" " " CS_To CS_S sVar2
+        Append sText CS_Move CS_S "(" CS_Insert "(" sVar1 "," sVar2 "," sInPos "))" " " CS_To CS_S sVar2
 
         Get AssembleOutputLine sText TokenizerData to sLine
         Function_Return True
@@ -464,6 +504,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Replaces IN command with expression operator Contains.
         It also swap places for the two variables involved and adds paranthesis.
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: 'In' to 'Contains' }
         """ }
     Function ChangeInToContains String ByRef sLine String sParameter Returns Boolean
@@ -560,7 +601,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         { MethodType = eStandardFunction }
         { EnumList = "ANY" }
         { SummaryText = Changed: index number in Find/Constrained/For_all commands }
-        { HelpTopic = Three comma-separated values: the table name, the FROM
+        { ParamHelp = Three comma-separated values: the table name, the FROM
         \nindex number, and the TO index number. Example "Customer,3,5"
         \nchanges every Index.3 / by 3 / vFind Customer.X 3 ... reference
         \nfor the Customer table to use 5 instead. Both indexes must be
@@ -785,10 +826,50 @@ Object oRefactorFuncLib is a cRefactorFuncLib
 
     { Published = True }
     { Description = """
+        Adds the default '.pkg' file extension to a Use statement that lacks one.
+        Example: Use cMyClass -> Use cMyClass.pkg
+        Leaves Use statements that already carry an extension (.pkg, .vw, ...) untouched.
+        { MethodType = eStandardFunction }
+        { FnGroup = Cleanup }
+        { SummaryText = Added '.pkg' extension to a Use statement }
+        { ModRecipe = 4535 | file extension }
+        """ }
+    Function AddUseFileExtension String ByRef sLine String sParameter Returns Boolean
+        Boolean bIsUse
+        String sLC sFileName
+        Integer iUsePos iStart iEnd
+
+        Get _IsUseLine sLine to bIsUse
+        If (bIsUse = False) ;
+            Function_Return False
+        // Locate the filename token - the word right after "Use ".
+        Move (Lowercase(sLine)) to sLC
+        Move (Pos("use ", sLC)) to iUsePos
+        Move (iUsePos + 4) to iStart
+        While (Mid(sLine, 1, iStart) = " ")
+            Increment iStart
+        Loop
+        Move iStart to iEnd
+        While (iEnd <= Length(sLine) and Mid(sLine, 1, iEnd) <> " ")
+            Increment iEnd
+        Loop
+        Move (Mid(sLine, (iEnd - iStart), iStart)) to sFileName
+        // Skip if there is no filename, or it already carries an extension.
+        If ((sFileName = "") or (sFileName contains ".")) ;
+            Function_Return False
+        // Insert ".pkg" immediately after the filename; indent + trailing comment are preserved.
+        Move (Left(sLine, (iEnd - 1)) + ".pkg" + Mid(sLine, CI_EOL, iEnd)) to sLine
+        Function_Return True
+    End_Function
+
+    { Published = True }
+    { Description = """
         Changes legacy Left command with Left.
         Example: Left sVar 5 to sLeft -> Move (Left(sVar, 5)) to sLeft
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: 'Left' command to function: 'Left' }
+        { ModRecipe = 4531 | command: Left }
         """ }
     Function ChangeLeftCommandToFunction String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged
@@ -798,29 +879,76 @@ Object oRefactorFuncLib is a cRefactorFuncLib
 
     { Published = True }
     { Description = """
+        Modernises a legacy global Indicator declaration to a Boolean global variable. DataFlex
+        Indicator declarations are always GLOBAL, so the modern form is a Global_Variable Boolean.
+        Example: Indicator User -> Global_Variable Boolean User
+        Multiple names on one line are kept: Indicator A B C -> Global_Variable Boolean A B C
+        Owns the "Indicator. Use Boolean" variant of 4538 (the DECLARATION). 4538 is a SHARED number:
+        the "Indicate. Use Move command" + "...without parentheses" ([Found] usage) variants route to
+        ChangeLegacyIndicators / ChangeSquareBracketsIndicators - hence the match-text on every 4538 tag.
+        { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Changed: Indicator declaration -> Global_Variable Boolean }
+        { ModRecipe = 4538 | Use Boolean }
+        """ }
+    Function ChangeIndicatorToBoolean String ByRef sLine String sParameter Returns Boolean
+        tTokenizer TokenizerData
+        Integer iPos
+        Get pTokenizer to TokenizerData
+        // Only a standalone global "Indicator <name> [more names]" declaration: the FIRST code token is
+        // exactly "Indicator" and at least one name follows. The first-token gate ignores incidental
+        // uses - "Move Indicator_State to x", a "Property Indicator ..." inside a class, comments, etc.
+        If (TokenizerData.bIsInCommand = True or TokenizerData.bIsInImage = True) ;
+            Function_Return False
+        If (SizeOfArray(TokenizerData.asLineTokens) < 2) ;
+            Function_Return False
+        If (Lowercase(TokenizerData.asLineTokens[0]) <> "indicator") ;
+            Function_Return False
+        // Splice the leading "Indicator" keyword (9 chars, whole word) -> "Global_Variable Boolean";
+        // the indentation, the name list, and any trailing comment after it are preserved verbatim.
+        Get _FindKeywordPos sLine "Indicator" True 1 to iPos
+        If (iPos = 0) ;
+            Function_Return False
+        Move (Left(sLine, (iPos - 1)) + "Global_Variable Boolean" + Mid(sLine, (Length(sLine) - iPos - 8), (iPos + 9))) to sLine
+        Function_Return True
+    End_Function
+
+    // ChangeLegacyIndicators - limitations + extra examples (kept as // comments to keep the
+    // {Description} under the meta-tag size limit; runtime Help reads the {Description} body only):
+    //   - Handles at most two booleans within one square bracket, e.g. [Found Select].
+    //   - Leaves the line unchanged if it contains a GROUP or ALL indicator directive.
+    //   More examples:
+    //   - [Select] Indicate Select as Windowindex Eq Fieldindex --> Move (WindowIndex = FieldIndex) to Select
+    //   - [Found|Not Found|FindErr|Not FindErr] While   -> e.g. While (Not(Found))
+    //   - [Found] Indicate Found as Invoice.CustNum eq Customer.Number -> If (Found) Move (Invoice.CustNum eq Customer.Number) to Found
+    //   - If [Not Found] Reread hTable -> If (Not(Found)) Reread hTable
+    { Published = True }
+    { Description = """
         Changes legacy 'Indicate' to expression
+        Paired with ChangeSquareBracketsIndicators: THIS function does the deep transform but
+        deliberately skips lines containing Find/Send/Constrain - the sibling sweeps those up.
+        Run both together; this one then reports the bulk of the changes.
         Examples:
-        - Indicate Found as True" --> Move True to Found
-        - [Select] Indicate Select as Windowindex Eq Fieldindex --> Move (WindowInex = FieldIndex) to Select
+        - Indicate Found as True --> Move True to Found
         - [Found] and [FindErr] indicator statements.
         - [Found| Command -> e.g. If Found Command
         - While [Not Found]   -> e.g. While (Not(Found))
-        - [Found|Not Found|FindErr|Not FindErr] While   -> e.g. While (Not(Found))
-        - [Found] Indicate Found as Invoice.CustNum eq Customer.Number -> If (Found) Move (Invoice.CustNum eq Customer.Number) to Found
-        - If [Not Found] Reread hTable -> If (Not(Found)) Reread hTable
         - [~Found] begin -> If (Not(Found)) Begin
         - [Found ~Found] Begin -> If (Found and Not(Found)) Begin
-        Known limitations:
-        - It can only handle max two booleans within the same square bracket. E.g. [Found Select]
-        - It can't handle "GROUP" and/or "ALL" indicator directives. If any of those two are found,
-          this function will leave the sLine as it is.
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: [Found] -> (Not(Found)) }
+        { EnumList = "eLeaveSelect, eModernizeSelect" }
+        { InitialValue = eLeaveSelect }
+        { ModRecipe = 4538 | Use Move command }
+        { ModRecipe = 4538 | without parentheses }
+        { ParamHelp = eLeaveSelect keeps [SELECT] as-is (safe default). eModernizeSelect also needs AddUseOldFMACCommands selected (it defines the SELECT macro). }
         """ }
     Function ChangeLegacyIndicators String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged bStartBracket bHasBracket bIndicateStart bIfStart
-        String sToken sOverstrikeLine sNot sTo sMove sIf sFirstCmd sSecondCmd sExpression sOrgLine
-        Integer iItem iSize iPos
+        String sToken sOverstrikeLine sNot sTo sMove sIf sFirstCmd sSecondCmd sExpression sOrgLine sVarName sNewCode
+        Integer iItem iSize iPos iLeftBracketNo iStart iEnd iBracketTokenCount
+        Boolean bSkip bModernizeSelect
         tTokenizer TokenizerData
 
         Get pTokenizer to TokenizerData
@@ -830,6 +958,23 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Get HasBracket TokenizerData.BooleanIndicator to bHasBracket
         If (TokenizerData.BooleanIndicator.bHasIndicateCommand = False and bHasBracket = False) Begin
             Function_Return False
+        End
+
+        // SELECT-handling gate. By default we respect CS_NonRefactorableIndicators and skip
+        // lines whose indicator has no valid modern bare form, leaving the harmless [...]
+        // warning - bare-ifying e.g. SELECT would turn that warning into a compile error.
+        // The user opts in with eModernizeSelect when OldFMACCommands.pkg is in the build.
+        // sParameter arrives as the enum NAME from the UI combo ("eModernizeSelect") or as
+        // the numeric VALUE from tests - resolve via _ParameterIsEnum; a bare Move of the
+        // name into the Integer enum left the gate at eLeaveSelect, so the opt-in never
+        // worked from the UI (2026-06-10). NO num_arguments guard: it is unreliable here
+        // (nested sends/dynamic engine dispatch can clobber it), and an omitted parameter
+        // arrives as "" which _ParameterIsEnum already treats as no-match.
+        Get _ParameterIsEnum sParameter "eModernizeSelect" eModernizeSelect to bModernizeSelect
+        If (bModernizeSelect = False) Begin
+            Get _IndicatorIsNonRefactorable TokenizerData to bSkip
+            If (bSkip = True) ;
+                Function_Return False
         End
 
         // Use sOverstrikeLine so string literal content cannot trigger a false-positive match.
@@ -847,6 +992,39 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         If (iItem <> -1) Begin
             Function_Return False
         End
+
+        // A LEADING bracket indicator + an explicit If + an Indicate command on ONE line (e.g.
+        // '[Found] If sResult ne "" Indicate Found as StatLog.Function_Name eq sData') is a 3-way compound
+        // the plain Case logic below cannot compose (it mangled such lines into e.g.
+        // "If Indicate (Found) to Found"). Build an explicit guarded block instead:
+        //     If (<indicator> and (<if-condition>)) Begin
+        //         Move (<indicate-expr>) to <indicate-target>
+        //     End
+        // _ComposeBracketIfIndicateBlock returns "" for shapes it will NOT touch (compound bracket, or the
+        // rarer no-"as" Indicate) - those fall through unchanged (no corruption). Placed AFTER the SELECT /
+        // Find-Send-Constrain / GROUP / ALL guards so those protections win. Each piece IS still supported
+        // alone elsewhere: bracket+If (test 38), If+Indicate (test 37), If-condition-bracket+Indicate (test 6).
+        // Indicate is detected via the overstrike line ("indicate " - strings are masked there, so it only
+        // matches a real command), NOT BooleanIndicator.bHasIndicateCommand: that flag keys off asLineTokens,
+        // which a PARENTHESISED If-condition leaves without a clean "Indicate" token, so it read False and the
+        // line fell through to the half-done old path.
+        If (SizeOfArray(TokenizerData.asLineTokens) > 0) Begin
+            If (Left(TokenizerData.asLineTokens[0], 1) = "[" and ;
+                TokenizerData.bHasIfCommand = True and ;
+                (Lowercase(TokenizerData.sOverstrikeLine) contains (Lowercase(CS_Indicate) + CS_S))) Begin
+                Get _ComposeBracketIfIndicateBlock TokenizerData to sNewCode
+                If (sNewCode <> "") Begin
+                    Move sNewCode to sLine
+                    Function_Return True
+                End
+                Function_Return False
+            End
+        End
+
+        // Note: a bare-ified [Select] (eModernizeSelect) needs 'Use OldFMACCommands.pkg' added at the top
+        // of the file. That is the companion AddUseOldFMACCommands' job (an eOtherFunction run after this
+        // line-by-line pass); it SCANS the rewritten file for the bare Select rather than relying on a
+        // flag set here - the engine resets per-function state before it runs, so a flag could not survive.
 
         // Has If-statement?
         Move (TokenizerData.bHasIfCommand = True) to bIfStart
@@ -910,6 +1088,40 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         // Has an "Indicate" command?
         Move (SearchArray(CS_Indicate, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
         Move (iItem <> -1) to bIndicateStart
+
+        // Plain "If [indicator] <rest>" with NO Indicate command (e.g. "If [Found] Begin"): the
+        // Case-based reconstruction further down rebuilds the line from the boolean pieces and drops
+        // the trailing part, collapsing "If [Found] Begin" into just "If". Handle this case the SAME
+        // surgical way ChangeSquareBracketsIndicators does - swap each [indicator] for its expression
+        // IN PLACE so the rest of the line (the Begin / command / comment) survives untouched. Run
+        // this BEFORE the sCode paren-wrapping below, so ConvertBracketIndicatorsToExpression sees the
+        // RAW indicator tokens it expects (pre-wrapping them would double the parentheses). A line that
+        // STARTS with a bracket is left to the bStartBracket sub (it parenthesises Move operands), and a
+        // line that carries an Indicate command still needs the full rebuild below.
+        If (bStartBracket = False and bIfStart = True and bIndicateStart = False) Begin
+            Move 0 to iBracketTokenCount
+            Move (SizeOfArray(TokenizerData.asLineTokens) - 1) to iSize
+            For iItem from 0 to iSize
+                If (Left(TokenizerData.asLineTokens[iItem], 1) = "[") Begin
+                    Increment iBracketTokenCount
+                End
+            Loop
+            Move TokenizerData.sOverstrikeLine to sOverstrikeLine
+            Move 1 to iLeftBracketNo
+            While (Pos("[", sOverstrikeLine) > 0 and iLeftBracketNo <= iBracketTokenCount)
+                Move (Pos("[", sOverstrikeLine)) to iStart
+                Move (Pos("]", sOverstrikeLine)) to iEnd
+                Move (Mid(sOverstrikeLine, (iEnd - iStart - 1), (iStart + 1))) to sVarName
+                Get ConvertBracketIndicatorsToExpression iLeftBracketNo TokenizerData to sExpression
+                Increment iLeftBracketNo
+                If (sVarName <> "") Begin
+                    Move (Replace("[" + sVarName + "]", sOverstrikeLine, sExpression)) to sOverstrikeLine
+                End
+            Loop
+            Get RestoreOverstrikeLineValues sOverstrikeLine TokenizerData to sOverstrikeLine
+            Get AssembleOutputLine sOverstrikeLine TokenizerData to sLine
+            Function_Return (sLine <> sOrgLine)
+        End
 
         // Add "Not" operator and add paranthesis to boolean expressions/variables;
         If (TokenizerData.BooleanIndicator.FirstBoolean.bHasNot = True) Begin
@@ -1064,6 +1276,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Replaces: gt, ge, lt, le, eq, ne with > >= < <= = <>
         It does not change operators in e.g. find operations.
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: lt, le, eq, ne, gt, ge to: <, <=, =, <>, >, >= }
         """ }
     Function ChangeLegacyOperators String ByRef sLine String sParameter Returns Boolean
@@ -1259,6 +1472,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Example: Set Shadow_State [of oObject] to True -> Set Enabled_State [of oObject] to False
                  Set Object_Shadow_State [of oObject] to True -> Set Enabled_State [of oObject] to False
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: Shadow_State to Enabled_State }
         """ }
     Function ChangeLegacyShadow_State String ByRef sLine Returns Boolean
@@ -1360,7 +1574,9 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Changes usage of the legacy Length command with function Length.
         Example: Length sVar to iLength -> Move (Length(sVar)) to iLength
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: 'Length' command to function 'Length' }
+        { ModRecipe = 4531 | command: Length }
         """ }
     Function ChangeLengthCommandToFunction String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged
@@ -1370,10 +1586,141 @@ Object oRefactorFuncLib is a cRefactorFuncLib
 
     { Published = True }
     { Description = """
+        Changes the obsolete Decr command to the modern Decrement command.
+        Example: Decr iCount -> Decrement iCount
+        { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Changed: 'Decr' command to 'Decrement' }
+        { ModRecipe = 4533 | command: Decr }
+        """ }
+    Function ChangeDecrToDecrement String ByRef sLine String sParameter Returns Boolean
+        Boolean bChanged
+        Get _SwapCommandKeyword (&sLine) "Decr" "Decrement" to bChanged
+        Function_Return bChanged
+    End_Function
+
+    { Published = True }
+    { Description = """
+        Changes the obsolete Incr command to the modern Increment command.
+        Example: Incr iCount -> Increment iCount
+        { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Changed: 'Incr' command to 'Increment' }
+        { ModRecipe = 4533 | command: Incr }
+        """ }
+    Function ChangeIncrToIncrement String ByRef sLine String sParameter Returns Boolean
+        Boolean bChanged
+        Get _SwapCommandKeyword (&sLine) "Incr" "Increment" to bChanged
+        Function_Return bChanged
+    End_Function
+
+    { Published = True }
+    { Description = """
+        Changes the obsolete Sub command to the modern Subtract command.
+        Example: Sub iAmount to iTotal -> Subtract iAmount from iTotal
+        { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Changed: 'Sub' command to 'Subtract' }
+        { ModRecipe = 4533 | command: Sub }
+        """ }
+    Function ChangeSubToSubtract String ByRef sLine String sParameter Returns Boolean
+        String sNose sArg1 sMid sArg2
+        Integer iItem iPos
+        tTokenizer TokenizerData
+        Get pTokenizer to TokenizerData
+        If (TokenizerData.bLineIsReady or TokenizerData.bIsInCommand or ;
+            TokenizerData.bIsInImage or TokenizerData.bIsVariableDeclaration) Begin
+            Function_Return False
+        End
+        Move (SearchArray("Sub", TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+        If (iItem = -1) ;
+            Function_Return False
+        // Legacy syntax is "Sub <value> to|from <variable>" -> needs 4 tokens from the keyword.
+        If (SizeOfArray(TokenizerData.asLineTokens) < (iItem + 4)) ;
+            Function_Return False
+        Move TokenizerData.asLineTokens[iItem + 1] to sArg1
+        Move TokenizerData.asLineTokens[iItem + 2] to sMid
+        Move TokenizerData.asLineTokens[iItem + 3] to sArg2
+        // The middle word MUST be "to" or "from", else this is not the legacy Sub command.
+        If ((Lowercase(sMid) <> "to") and (Lowercase(sMid) <> "from")) ;
+            Function_Return False
+        // Locate the keyword boundary-aware on the MASKED line (position-
+        // aligned with sLine) via _FindKeywordPos - a bare Pos("sub", ...)
+        // matched INSIDE an earlier identifier (the "sub" in
+        // "If (bSubmitted) Sub 1 from iCount") and spliced the line there
+        // (2026-06-10 audit).
+        Get _FindKeywordPos (TokenizerData.sIndentation + TokenizerData.sOverstrikeLine) "Sub" True 1 to iPos
+        If (iPos = 0) ;
+            Function_Return False
+        // Keep the indent + any nose before the command; modern Subtract always uses "from".
+        Move (Left(sLine, (iPos - 1))) to sNose
+        Move (sNose + "Subtract " + sArg1 + " from " + sArg2) to sLine
+        Function_Return True
+    End_Function
+
+    // Get_Argument_Size / Set_Argument_Size sized the legacy fixed string-argument buffer. Modern
+    // DataFlex strings are dynamic, so both are no-ops - the compiler flags them obsolete (4533). The
+    // usual idiom is save / enlarge / restore (Get_Argument_Size to v ... Set_Argument_Size n ...
+    // Set_Argument_Size v); since all three are no-ops now, commenting them out is safe. We COMMENT
+    // (not delete) so the change is visible and trivially reversible, and we match the keyword as a
+    // whole TOKEN anywhere on the line, so an inline "If (cond) Set_Argument_Size n" / "Else ..." is
+    // handled too. (After the save + restore are commented the saved-size local may go unused -
+    // cosmetic; RemoveUnusedLocals clears it.) Categorised Review (eModSuggest), not Auto-fix: the
+    // rare inline-If form drops the guarding If when the whole line is commented, so it's worth an eye.
+    { Published = True }
+    { Description = """
+        Comments out the obsolete Get_Argument_Size / Set_Argument_Size commands (legacy string-buffer
+        sizing; modern dynamic strings make them no-ops).
+        Example: Set_Argument_Size 4096 -> // Set_Argument_Size 4096
+        { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Commented out: Get_Argument_Size / Set_Argument_Size (obsolete) }
+        { ModRecipe = 4533 | Set_Argument_Size | Suggest }
+        { ModRecipe = 4533 | Get_Argument_Size | Suggest }
+        """ }
+    Function CommentOutArgumentSizeCommands String ByRef sLine String sParameter Returns Boolean
+        Integer iItem
+        tTokenizer TokenizerData
+        Get pTokenizer to TokenizerData
+        If (TokenizerData.bLineIsReady or TokenizerData.bIsInCommand or ;
+            TokenizerData.bIsInImage or TokenizerData.bIsVariableDeclaration) ;
+            Function_Return False
+        // Match either companion command as a whole token (case-insensitive), anywhere on the line - so
+        // first-token, "If (cond) Set_Argument_Size n" and "Else Get_Argument_Size to v" all qualify. A
+        // quoted string is a distinct token, so the keyword inside a literal/comment never false-matches.
+        Move (SearchArray("Set_Argument_Size", TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+        If (iItem = -1) ;
+            Move (SearchArray("Get_Argument_Size", TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+        If (iItem = -1) ;
+            Function_Return False
+        // Comment out the whole statement, preserving the original indentation.
+        Move (TokenizerData.sIndentation + "// " + (Right(sLine, (Length(sLine) - Length(TokenizerData.sIndentation))))) to sLine
+        Function_Return True
+    End_Function
+
+    { Published = True }
+    { Description = """
+        Changes legacy Mid command with function Mid.
+        Example: Mid sText to sResult 5 3 -> Move (Mid(sText, 5, 3)) to sResult
+        { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Changed: 'Mid' command to function 'Mid' }
+        { ModRecipe = 4531 | command: Mid }
+        """ }
+    Function ChangeMidCommandToFunction String ByRef sLine String sParameter Returns Boolean
+        Boolean bChanged
+        Get SingleCommandSyntaxToFunction (&sLine) CS_Mid to bChanged
+        Function_Return bChanged
+    End_Function
+
+    { Published = True }
+    { Description = """
         Changes usage of legacy Pos command with function Pos.
         Example: Pos "-"  in sIns to iPos --> Move (Pos("-",sIns)) to iPos
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: Pos command to function Pos }
+        { ModRecipe = 4531 | command: Pos }
         """ }
     Function ChangePosCommandToFunction String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged
@@ -1386,7 +1733,9 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Changes legacy Replace command with function Replace.
         Example: Replace "," In sText With "." --> Move (Replace(",",sText,".")) to sText
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: Replace command to function Replace }
+        { ModRecipe = 4531 | command: Replace }
         """ }
     Function ChangeReplaceCommandToFunction String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged
@@ -1399,7 +1748,9 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Changes legacy Right command with function Right
         Example: Right sVar 5 to sLeft -> Move (Rigth(sVar, 5)) to sLeft
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: Right command to function }
+        { ModRecipe = 4531 | command: Right }
         """ }
     Function ChangeRightCommandToFunction String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged
@@ -1409,26 +1760,267 @@ Object oRefactorFuncLib is a cRefactorFuncLib
 
     { Published = True }
     { Description = """
+        Changes legacy Character command with function Character.
+        Example: Character 13 to CR -> Move (Character(13)) to CR
+        { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Changed: 'Character' command to function 'Character' }
+        { ModRecipe = 4531 | command: Character }
+        """ }
+    Function ChangeCharacterCommandToFunction String ByRef sLine String sParameter Returns Boolean
+        Boolean bChanged
+        Get SingleCommandSyntaxToFunction (&sLine) CS_Character to bChanged
+        Function_Return bChanged
+    End_Function
+
+    { Published = True }
+    { Description = """
+        Changes legacy Pad command with function Pad.
+        Example: Pad sVar to sResult 20 -> Move (Pad(sVar, 20)) to sResult
+        { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Changed: 'Pad' command to function 'Pad' }
+        { ModRecipe = 4531 | command: Pad }
+        """ }
+    Function ChangePadCommandToFunction String ByRef sLine String sParameter Returns Boolean
+        Boolean bChanged
+        Get SingleCommandSyntaxToFunction (&sLine) CS_Pad to bChanged
+        Function_Return bChanged
+    End_Function
+
+    { Published = True }
+    { Description = """
+        Converts legacy Begin_Constraints / End_Constraints blocks into a modern OnConstrain procedure.
+        The ENTIRE block body (declarations, Get/If/Else and the Constrains they control, and any
+        Report_* lines) moves verbatim and in order into 'Procedure OnConstrain' (opened with 'Forward
+        Send OnConstrain') - nothing is reordered or moved out, since e.g. a Report_Index parameter can
+        depend on logic earlier in the block. Comments are kept, blank lines dropped. A block with no
+        matching End_Constraints is left untouched. Takes a whole source file as a string array.
+        { MethodType = eOtherFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Refactored: Begin_Constraints -> OnConstrain }
+        { ModRecipe = 4533 | command: Begin_Constraint }
+        { ModRecipe = 4533 | command: End_Constraint }
+        """ }
+    Function ChangeBeginEndConstraint String[] ByRef asCode String sParameter Returns Integer
+        String[] asOut asBody asBlockRaw asEmpty
+        Integer iCount iSize iBlocks i iMax iPos
+        String sLine sTrim sFirst sLow sIndent
+        Boolean bInBlock
+
+        Move 0 to iBlocks
+        Move False to bInBlock
+        Move (SizeOfArray(asCode)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            Move asCode[iCount] to sLine
+            Move (Trim(sLine)) to sTrim
+            // First whitespace-delimited token of the trimmed line.
+            Move (Pos(" ", sTrim)) to iPos
+            If (iPos > 0) Begin
+                Move (Trim(Left(sTrim, (iPos - 1)))) to sFirst
+            End
+            Else Begin
+                Move sTrim to sFirst
+            End
+            Move (Lowercase(sFirst)) to sLow
+
+            If (bInBlock = False) Begin
+                If ((sLow = "begin_constraints") or (sLow = "begin_constraint")) Begin
+                    // Open a block: remember the Begin_Constraints indentation, reset the buffers.
+                    Move True to bInBlock
+                    Move (Pos(sTrim, sLine)) to iPos
+                    If (iPos > 1) Begin
+                        Move (Left(sLine, (iPos - 1))) to sIndent
+                    End
+                    Else Begin
+                        Move "" to sIndent
+                    End
+                    Move asEmpty to asBody
+                    Move asEmpty to asBlockRaw
+                    Move sLine to asBlockRaw[0]
+                    Increment iBlocks
+                End
+                Else Begin
+                    Move sLine to asOut[SizeOfArray(asOut)]
+                End
+            End
+            Else Begin
+                Move sLine to asBlockRaw[SizeOfArray(asBlockRaw)]
+                If ((sLow = "end_constraints") or (sLow = "end_constraint")) Begin
+                    // The ENTIRE block body moves verbatim and IN ORDER into OnConstrain - conditional
+                    // constraints (If/Else around Constrain), declarations, AND any Report_* lines stay
+                    // exactly where they were. A Report_Index parameter can be set by logic earlier in
+                    // the block, so it must NOT be moved out.
+                    Move (sIndent + "Procedure OnConstrain") to asOut[SizeOfArray(asOut)]
+                    Move (sIndent + "    Forward Send OnConstrain") to asOut[SizeOfArray(asOut)]
+                    Move (SizeOfArray(asBody) - 1) to iMax
+                    For i from 0 to iMax
+                        Move asBody[i] to asOut[SizeOfArray(asOut)]
+                    Loop
+                    Move (sIndent + "End_Procedure") to asOut[SizeOfArray(asOut)]
+                    Move False to bInBlock
+                End
+                Else If (sTrim <> "") Begin
+                    Move sLine to asBody[SizeOfArray(asBody)]
+                End
+            End
+        Loop
+
+        // Unterminated block (no End_Constraints): restore its raw lines unchanged so nothing breaks.
+        If (bInBlock = True) Begin
+            Move (SizeOfArray(asBlockRaw) - 1) to iMax
+            For i from 0 to iMax
+                Move asBlockRaw[i] to asOut[SizeOfArray(asOut)]
+            Loop
+            Move (iBlocks - 1) to iBlocks
+        End
+
+        Move asOut to asCode
+        Function_Return iBlocks
+    End_Function
+
+    // ChangeDfTimerTocTimer - migrates safe dfTimer objects only. An object is left UNCHANGED with a
+    // //TODO comment (human judgment needed) when it relied on auto-start (no 'Set Auto_Start_State to
+    // False'), uses the Timer_Message dispatch, or uses its OnTimer params in the body. The per-object
+    // rules live in _MigrateDfTimerBlock (cRefactorFuncLib); this function finds the objects, applies it,
+    // and renames Timer_Active_State -> pbEnabled file-wide.
+    { Published = True }
+    { Description = """
+        Migrates legacy 'Object ... is a dfTimer' objects to the modern cTimer: swaps the class, drops
+        Auto_Start_State/Auto_Stop_State/Timer_object, renames Timeout -> piTimeout, strips the OnTimer
+        params, and renames Timer_Active_State -> pbEnabled file-wide. Objects that need human judgment
+        are left unchanged, each marked with a //TODO comment. Takes a whole source file as a string array.
+        { MethodType = eOtherFunction }
+        { SummaryText = Migrated: dfTimer -> cTimer }
+        { ModRecipe = 4537 | class: DFTIMER }
+        { FnGroup = Modernization }
+        """ }
+    Function ChangeDfTimerTocTimer String[] ByRef asCode String sParameter Returns Integer
+        String[] asOut asBlock asMigrated asEmpty
+        String sLine sLow sT0 sReason sIndent
+        Integer iCount iSize iMigrated i iMax iDepth iPos iN iFound
+        Boolean bInBlock
+        tTokenizer TD
+
+        Move 0 to iMigrated
+        Move False to bInBlock
+        Move 0 to iDepth
+        Move (SizeOfArray(asCode)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            // Per-file progress: nudge the status panel's bar every ~20 lines so the current file shows
+            // progress during this whole-file pass (no-op in batch mode / the test runner, where the
+            // panel isn't active). Mirrors cUnicodePointerToString.
+            If (Mod(iCount, 20) = 0 and (Active_State(ghoStatusPanel) = True)) Begin
+                Send Update_StatusPanel of ghoStatusPanel ("Source line:" * String(iCount + 1) * "of:" * String(iSize + 1))
+                Set piPosition of ghoProgressBar to (iCount + 1)
+            End
+            Move asCode[iCount] to sLine
+            // Timer_Active_State -> pbEnabled, file-wide (DFTimer-specific external on/off switch, so
+            // safe everywhere). Done first so refs inside a timer object are covered too.
+            Move (Lowercase(sLine)) to sLow
+            Move (Pos("timer_active_state", sLow)) to iPos
+            If (iPos > 0) ;
+                Move (Left(sLine, (iPos - 1)) + "pbEnabled" + Mid(sLine, Length(sLine), (iPos + 18))) to sLine
+            Get Tokenizer of Self sLine to TD
+            Move (SizeOfArray(TD.asLineTokens)) to iN
+            Move "" to sT0
+            If (iN > 0) ;
+                Move (Lowercase(TD.asLineTokens[0])) to sT0
+
+            If (bInBlock = False) Begin
+                Move (SearchArray("dfTimer", TD.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iFound
+                If ((sT0 = "object") and (iFound > -1)) Begin
+                    // Open a dfTimer object; remember its indentation for any //TODO flag line.
+                    Move True to bInBlock
+                    Move 1 to iDepth
+                    Move asEmpty to asBlock
+                    Move sLine to asBlock[0]
+                    Move (Pos(Trim(sLine), sLine)) to iPos
+                    If (iPos > 1) ;
+                        Move (Left(sLine, (iPos - 1))) to sIndent
+                    Else ;
+                        Move "" to sIndent
+                End
+                Else Begin
+                    Move sLine to asOut[SizeOfArray(asOut)]
+                End
+            End
+            Else Begin
+                Move sLine to asBlock[SizeOfArray(asBlock)]
+                If (sT0 = "object") ;
+                    Increment iDepth
+                If (sT0 = "end_object") Begin
+                    Decrement iDepth
+                    If (iDepth = 0) Begin
+                        Get _MigrateDfTimerBlock of Self asBlock (&sReason) to asMigrated
+                        If (sReason <> "") Begin
+                            // Not safe to auto-migrate - leave the object verbatim, flag it for a human.
+                            Move (sIndent + "//TODO dfTimer->cTimer (skipped): " + sReason) to asOut[SizeOfArray(asOut)]
+                            Move (SizeOfArray(asBlock) - 1) to iMax
+                            For i from 0 to iMax
+                                Move asBlock[i] to asOut[SizeOfArray(asOut)]
+                            Loop
+                        End
+                        Else Begin
+                            Move (SizeOfArray(asMigrated) - 1) to iMax
+                            For i from 0 to iMax
+                                Move asMigrated[i] to asOut[SizeOfArray(asOut)]
+                            Loop
+                            Increment iMigrated
+                        End
+                        Move False to bInBlock
+                    End
+                End
+            End
+        Loop
+
+        // Unterminated object (no matching End_Object): flush the buffered lines unchanged.
+        If (bInBlock = True) Begin
+            Move (SizeOfArray(asBlock) - 1) to iMax
+            For i from 0 to iMax
+                Move asBlock[i] to asOut[SizeOfArray(asOut)]
+            Loop
+        End
+
+        Move asOut to asCode
+        Function_Return iMigrated
+    End_Function
+
+    // ChangeSquareBracketsIndicators - limitation + extra examples (kept as // to keep the
+    // {Description} under the meta-tag size limit):
+    //   - Leaves the line unchanged if it contains a GROUP or ALL indicator directive.
+    //   More examples:
+    //   - While [Not Found]   -> e.g. While (Not(Found))
+    //   - [Not Found] While   -> e.g. While (Not(Found))
+    //   - If [Not Found] Reread hTable -> If (Not(Found)) Reread hTable
+    //   - [~Found] Begin -> If (Not(Found)) Begin
+    //   - [Found ~Found] Begin -> If (Found and Not(Found)) Begin
+    { Published = True }
+    { Description = """
         Changes legacy square brackets found indicators; [Found] [FindErr] to expressions; (Found) or (Not(Found))
         It does not change the 'Indicate' key word, only change square brackets to expressions.
+        Paired with ChangeLegacyIndicators, which runs first but skips lines containing
+        Find/Send/Constrain - THIS function sweeps those up, so reporting few or zero
+        changed lines is NORMAL when both are selected.
         Sample Code:
           - [Found] and [FindErr] indicator statements to (Found) and (FindErr).
           - [Found| Command -> e.g. If (Found) Command
-          - While [Not Found]   -> e.g. While (Not(Found))
-          - [Not Found] While   -> e.g. While (Not(Found))
-          - If [Not Found] Reread hTable -> If (Not(Found)) Reread hTable
-          - [~Found] Begin -> If (Not(Found)) Begin
-          - [Found ~Found] Begin -> If (Found and Not(Found)) Begin
-        Known limitations:
-          - It can't handle "GROUP" and/or "ALL" indicator directives. If any of those two are found,
-            the function will leave the sLine as it is.
+          - [FindErr] Send Rebuild_constraints of oDD -> If (FindErr) Send Rebuild_constraints of oDD
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: Square indicator expression [xxx] --> Paranthesis expression (xxx) }
+        { EnumList = "eLeaveSelect, eModernizeSelect" }
+        { InitialValue = eLeaveSelect }
+        { ModRecipe = 4538 | without parentheses }
+        { ParamHelp = eLeaveSelect keeps [SELECT] as-is (safe default). eModernizeSelect also needs AddUseOldFMACCommands selected (it defines the SELECT macro). }
         """ }
     Function ChangeSquareBracketsIndicators String ByRef sLine String sParameter Returns Boolean
         String sNewCode sVarName sExpression
         Boolean bFound bHasBracket bChanged
         Integer iStart iEnd iItem iLeftBracketNo iBracketTokenCount
+        Boolean bSkip bModernizeSelect
         tTokenizer TokenizerData
 
         Get pTokenizer to TokenizerData
@@ -1443,6 +2035,17 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         If (bHasBracket = False) Begin
             Function_Return False
         End
+
+        // See ChangeLegacyIndicators: a LEADING bracket + If + Indicate 3-way compound cannot be safely
+        // modernised on one line - converting the leading bracket here would yield "If (Found) If sCustCode
+        // ne "" Indicate ..." (double-If garbage). Leave it unchanged. A leading bracket is token[0]; the
+        // supported "If [bool] Indicate ..." (test 6) has token[0] = "If" and is untouched by this guard.
+        If (SizeOfArray(TokenizerData.asLineTokens) > 0) Begin
+            If (Left(TokenizerData.asLineTokens[0], 1) = "[" and ;
+                TokenizerData.bHasIfCommand = True and ;
+                (Lowercase(TokenizerData.sOverstrikeLine) contains (Lowercase(CS_Indicate) + CS_S))) ;
+                Function_Return False
+        End
         // We leave compound square bracket expessions combined withe keywords: "GROUP" and "ALL" alone:
         Move (SearchArray("GROUP", TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
         If (iItem <> -1) Begin
@@ -1452,6 +2055,27 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         If (iItem <> -1) Begin
             Function_Return False
         End
+
+        // SELECT-handling gate. By default we respect CS_NonRefactorableIndicators and skip
+        // lines whose bracket indicator has no valid modern bare form, leaving the harmless
+        // [...] warning. The user opts in with eModernizeSelect when OldFMACCommands.pkg is
+        // in the build, where bare Select compiles.
+        // sParameter arrives as the enum NAME from the UI combo ("eModernizeSelect") or as
+        // the numeric VALUE from tests - resolve via _ParameterIsEnum; a bare Move of the
+        // name into the Integer enum left the gate at eLeaveSelect, so the opt-in never
+        // worked from the UI (2026-06-10). NO num_arguments guard: it is unreliable here
+        // (nested sends/dynamic engine dispatch can clobber it), and an omitted parameter
+        // arrives as "" which _ParameterIsEnum already treats as no-match.
+        Get _ParameterIsEnum sParameter "eModernizeSelect" eModernizeSelect to bModernizeSelect
+        If (bModernizeSelect = False) Begin
+            Get _IndicatorIsNonRefactorable TokenizerData to bSkip
+            If (bSkip = True) ;
+                Function_Return False
+        End
+
+        // Note: a bare-ified [Select] (eModernizeSelect) needs 'Use OldFMACCommands.pkg' added at the top
+        // of the file - the companion AddUseOldFMACCommands (an eOtherFunction) does that by SCANNING the
+        // rewritten file for the bare Select, so nothing needs to be flagged from here.
 
         // Count the genuine bracket indicator tokens in asLineTokens.
         // The tokeniser replaces parenthesised expressions with | pipes in asLineTokens,
@@ -1498,15 +2122,170 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Function_Return bChanged
     End_Function
 
+    // AddUseOldFMACCommands - the file-level companion to ChangeLegacyIndicators /
+    // ChangeSquareBracketsIndicators. Those two (eStandardFunction, one line at a time) cannot add a
+    // top-of-file definition themselves; under eModernizeSelect they bare-ify the legacy [Select] macro
+    // indicator (e.g. [Select] -> (Select), Indicate Select as X -> Move (X) to Select). Bare SELECT only
+    // compiles where the SELECT macro is defined.
+    //
+    // This eOtherFunction runs AFTER the line-by-line pass on the SAME file (see cRefactorEngine), so by
+    // the time it sees asCode the legacy [Select] has ALREADY become the modern bare Select - there is no
+    // [Select] left to look for. It therefore SCANS the rewritten code for a bare, boundary-aware
+    // 'Select' token in real code and, when found, splices a guarded SELECT-macro definition near the top:
+    //     #IFNDEF SELECT
+    //         #Replace SELECT |!C
+    //     #ENDIF
+    // - the SAME definition the legacy REPORT command macro uses. It does NOT add 'Use OldFMACCommands.pkg':
+    // that only makes the REPORT macro available, and OldFMACCommands.pkg defines SELECT ONLY if REPORT is
+    // actually invoked - so a (Select) in a REPORT-less file would still fail to compile (the bug Nils hit).
+    // The IFNDEF guard makes the shim idempotent AND conflict-free: a no-op in a file that already defines
+    // SELECT (e.g. one that does use REPORT). The scan is the trigger - a per-file flag cannot be, because
+    // the engine sends ClearFuncLibProperties before EVERY eOtherFunction (it would wipe any flag the
+    // indicators raised during the line-by-line pass). Reading the final text also means it works when the
+    // indicators were run in an earlier, separate run.
+    //
+    // String/comment safety: the scan reads the MASKED line (string literals overstruck) and skips
+    // comment, blank, image and multi-line-string lines, so a SQL 'SELECT' inside a "..." literal or an
+    // @SQL"""...""" / ; -continuation block can never trigger it; the word-boundary match also excludes
+    // Selected / Select_State / Selection. Idempotent (skips a file that already has a #Replace SELECT),
+    // and a no-op when no bare Select is present.
+    { Published = True }
+    { Description = """
+        Defines the bare 'Select' macro indicator left behind when ChangeLegacyIndicators /
+        ChangeSquareBracketsIndicators modernise a legacy [Select] under eModernizeSelect. Splices a guarded
+        SELECT-macro definition near the top of the file (an IFNDEF-guarded Replace) - NOT a Use line, since
+        OldFMACCommands.pkg defines SELECT only via the REPORT macro. Scans the rewritten code for a bare
+        Select, string/comment-safe; run it with those two, or after. No-op when none is found or the
+        definition is already present.
+        { MethodType = eOtherFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Defined: SELECT macro }
+        { ModRecipe = 4345 | SELECT, MUST BE DEFINED }
+        """ }
+    Function AddUseOldFMACCommands String[] ByRef asCode String sParameter Returns Integer
+        String[] asOut asShim
+        String sLine sLC
+        Integer iCount iSize iInsertAt iLastUse iFirstCode iSelectPos iShim
+        Boolean bNeeds bAlreadyDefined bSeenCode bIsUseOrInc bInserted bSkipLine
+        tTokenizer TD
+
+        Move (SizeOfArray(asCode) - 1) to iSize
+        If (iSize < 0) ;
+            Function_Return 0
+
+        Move False to bNeeds
+        Move False to bAlreadyDefined
+        Move False to bSeenCode
+        Move -1 to iLastUse
+        Move -1 to iFirstCode
+
+        // ONE ordered pass (tokeniser is stateful, so top-to-bottom): detect the modernised bare Select
+        // indicator (the reason to define the macro), note an existing '#Replace SELECT' definition, and
+        // locate the top-of-file insertion point - after the leading Use/#include block, else before the
+        // first real code line (so the macro precedes every use, and never lands inside a header comment).
+        For iCount from 0 to iSize
+            // Per-file progress nudge; no-op when no panel is active. Mirrors ChangeDfTimerTocTimer.
+            If (Mod(iCount, 20) = 0 and (Active_State(ghoStatusPanel) = True)) Begin
+                Send Update_StatusPanel of ghoStatusPanel ("Source line:" * String(iCount + 1) * "of:" * String(iSize + 1))
+                Set piPosition of ghoProgressBar to (iCount + 1)
+            End
+            Move asCode[iCount] to sLine
+            Get Tokenizer of Self sLine to TD
+
+            // An existing '#Replace SELECT ...' directive (our prior shim, or a hand-written define) means
+            // SELECT is already defined in-source -> nothing to add. A REPORT-using file has NO such line
+            // in its source (REPORT defines SELECT inside the macro), so we still add the guarded shim,
+            // which the IFNDEF then makes a no-op at compile time. (Note: 'Use OldFMACCommands.pkg' is NOT
+            // a marker - it does not define SELECT on its own, so a file with only that line still needs us.)
+            Move (Lowercase(Trim(sLine))) to sLC
+            If ((Left(sLC, 8) = "#replace") and (sLC contains "select")) ;
+                Move True to bAlreadyDefined
+
+            // Detect the modernised bare Select indicator. Skip lines that are NOT real code - comment,
+            // blank, image page, or part of a multi-line string (the latter is where a multi-line SQL
+            // SELECT lives, per tTokenizer.bIsInDF23MultiLineString) - so such a 'SELECT' never triggers.
+            // On the remaining code lines, search the MASKED line (indentation + overstrike, position-
+            // aligned, with string literals blanked) boundary-aware: (Select) / Not(Select) / "to Select"
+            // all match, while Selected / Select_State / Selection and a 'SELECT' inside a "..." literal
+            // do not. Stop searching once found.
+            Move (TD.bIsComment = True or TD.bIsBlank = True or TD.bIsInImage = True or TD.bIsInDF23MultiLineString = True) to bSkipLine
+            If (bNeeds = False and bSkipLine = False) Begin
+                Get _FindKeywordPos (TD.sIndentation + TD.sOverstrikeLine) CS_Select True 1 to iSelectPos
+                If (iSelectPos > 0) ;
+                    Move True to bNeeds
+            End
+
+            If (bSeenCode = False) Begin
+                Get _IsUseOrIncludeLine sLine to bIsUseOrInc
+                If (bIsUseOrInc = True) Begin
+                    Move iCount to iLastUse
+                End
+                Else If (TD.bIsComment = False and TD.bIsBlank = False) Begin
+                    Move iCount to iFirstCode
+                    Move True to bSeenCode
+                End
+            End
+        Loop
+
+        // No bare Select anywhere -> nothing to do. Already defined -> idempotent no-op.
+        If (bNeeds = False) ;
+            Function_Return 0
+        If (bAlreadyDefined = True) ;
+            Function_Return 0
+
+        // The guarded SELECT-macro shim to splice in: a // comment + the IFNDEF/Replace/ENDIF block. The
+        // IFNDEF guard makes it idempotent and conflict-free (a no-op in a file that already defines SELECT,
+        // e.g. one using REPORT). This REPLACES the old 'Use OldFMACCommands.pkg' line, which only made
+        // REPORT available and did NOT define bare SELECT on its own. The #Replace line comes from
+        // CS_SelectMacroDefineLine - its |!C is built from Character() codes because |!C is a compile-time
+        // counter that a literal "|!C" in our source would evaluate here instead of emitting verbatim.
+        Move "// SELECT macro defined by DFRefactor (OldFMACCommands.pkg defines it only via REPORT); IFNDEF-guarded, a no-op if already defined." to asShim[0]
+        Move "#IFNDEF SELECT"        to asShim[1]
+        Move CS_SelectMacroDefineLine to asShim[2]
+        Move "#ENDIF"                to asShim[3]
+
+        // Splice point: after the last leading Use/#include; else before the first code line; else top -
+        // always before the first real code, so the #Replace precedes every (Select) use.
+        If (iLastUse >= 0) ;
+            Move (iLastUse + 1) to iInsertAt
+        Else If (iFirstCode >= 0) ;
+            Move iFirstCode to iInsertAt
+        Else ;
+            Move 0 to iInsertAt
+
+        Move False to bInserted
+        For iCount from 0 to iSize
+            If (iCount = iInsertAt) Begin
+                For iShim from 0 to (SizeOfArray(asShim) - 1)
+                    Move asShim[iShim] to asOut[SizeOfArray(asOut)]
+                Loop
+                Move True to bInserted
+            End
+            Move asCode[iCount] to asOut[SizeOfArray(asOut)]
+        Loop
+        // Insertion point past the last line (all-preamble file): append the shim.
+        If (bInserted = False) Begin
+            For iShim from 0 to (SizeOfArray(asShim) - 1)
+                Move asShim[iShim] to asOut[SizeOfArray(asOut)]
+            Loop
+        End
+
+        Move asOut to asCode
+        Function_Return 1
+    End_Function
+
     { Published = True }
     { Description = """
         Changes legacy Sysdate4 command to Sysdate command.
         Example: Sysdate4 dDate -> Sysdate dDate
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: Sysdate4 command to Sysdate }
+        { ModRecipe = 4533 | command: Sysdate4 }
         """ }
     Function ChangeSysdate4 String ByRef sLine String sParameter Returns Boolean
         Boolean bFound
+        Integer iPos
         tTokenizer TokenizerData
         tToken Token
 
@@ -1526,7 +2305,15 @@ Object oRefactorFuncLib is a cRefactorFuncLib
             End
         End
 
-        Move (Replace("4", sLine, "")) to sLine
+        // Remove the keyword's OWN trailing "4" positionally - a bare
+        // Replace("4", ...) eats the FIRST "4" anywhere on the line (a "4"
+        // in a variable or expression before the command; 2026-06-10 audit).
+        // Locate the keyword boundary-aware on the MASKED line (position-
+        // aligned with sLine) and splice that exact character out.
+        Get _FindKeywordPos (TokenizerData.sIndentation + TokenizerData.sOverstrikeLine) CS_Sysdate4 True 1 to iPos
+        If (iPos = 0) ;
+            Function_Return False
+        Move (Left(sLine, (iPos + Length(CS_Sysdate4) - 2)) + Mid(sLine, CI_EOL, (iPos + Length(CS_Sysdate4)))) to sLine
         Function_Return True
     End_Function
 
@@ -1535,13 +2322,15 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Changes lecacy Trim command with function Trim.
         Example: Trim sVal to sVal -> Move (Trim(sVal)) to sVal
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: Trim command to function Trim }
+        { ModRecipe = 4531 | command: Trim }
         """ }
     Function ChangeTrimCommandToFunction String ByRef sLine String sParameter Returns Boolean
-        Boolean bChanged bFound
-        Integer iItem iPos
+        Boolean bFound
+        Integer iPos iStart iTrimPos iArgStart iArgEnd iToPos
         tTokenizer TokenizerData
-        String sVarName sKeyword sKeywordLC sLineLC
+        String sOverFull sCh
 
         Get pTokenizer to TokenizerData
         If (TokenizerData.bLineIsReady = True or TokenizerData.bIsInCommand = True or ;
@@ -1554,24 +2343,145 @@ Object oRefactorFuncLib is a cRefactorFuncLib
             Function_Return False
         End
 
-        Move False to bChanged
-        Move CS_Trim              to sKeyword
-        Move (Lowercase(CS_Trim)) to sKeywordLC
-        Move (Lowercase(sLine))   to sLineLC
-        Move (SearchArray(sKeywordLC, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
-        Move TokenizerData.asLineTokens[iItem + 1] to sVarName
-        If (sVarName = "") Begin
+        // Work on the MASKED line (indentation + overstrike) - position-aligned with sLine,
+        // with string content hidden, so a "Trim"/"to" inside a literal can never match.
+        Move (TokenizerData.sIndentation + TokenizerData.sOverstrikeLine) to sOverFull
+
+        // Locate the legacy Trim COMMAND: a boundary-aware "Trim" FOLLOWED BY WHITESPACE.
+        // A "Trim(" function call has "(" right after the name, so it is never taken as the
+        // command - that is what keeps a Trim(...) call on the same line untouched.
+        Move 1 to iStart
+        Move 0 to iTrimPos
+        While (iTrimPos = 0)
+            Get _FindKeywordPos sOverFull CS_Trim True iStart to iPos
+            If (iPos = 0) ;
+                Function_Return False
+            Move (Mid(sOverFull, 1, (iPos + Length(CS_Trim)))) to sCh
+            If (sCh = CS_S or sCh = Character(9)) ;
+                Move iPos to iTrimPos
+            Else ;
+                Move (iPos + 1) to iStart
+        Loop
+
+        // Argument = the RAW text from the first non-blank after "Trim" up to the command
+        // "to". Extracting by POSITION (not asLineTokens[next]) captures ANY argument shape -
+        // a simple var, a table.field (USER.SPRAK), or a parenthesised expression
+        // (Trim (Val(hDD,"X")) to y). The old single-token grab missed the paren form and
+        // corrupted the dotted form into "Move (Trim(USER)).SPRAK" (Nils 2026-06-11).
+        Move (iTrimPos + Length(CS_Trim)) to iArgStart
+        While (iArgStart <= Length(sOverFull) and (Mid(sOverFull, 1, iArgStart) = CS_S or Mid(sOverFull, 1, iArgStart) = Character(9)))
+            Increment iArgStart
+        Loop
+
+        Get _FindKeywordPos sOverFull CS_To True iArgStart to iToPos
+        If (iToPos = 0 or iToPos <= iArgStart) ;
+            Function_Return False
+
+        // Last non-blank before "to" = the argument's end; the gap before "to" is kept verbatim.
+        Move (iToPos - 1) to iArgEnd
+        While (iArgEnd >= iArgStart and (Mid(sOverFull, 1, iArgEnd) = CS_S or Mid(sOverFull, 1, iArgEnd) = Character(9)))
+            Decrement iArgEnd
+        Loop
+        If (iArgEnd < iArgStart) ;
+            Function_Return False
+
+        // Rebuild on the RAW line: <indent/nose> + Move (Trim(<arg>)) + <original gap> to <dest>.
+        Move (Left(sLine, (iTrimPos - 1)) + CS_Move + " (" + CS_Trim + "(" + Mid(sLine, (iArgEnd - iArgStart + 1), iArgStart) + "))" + Mid(sLine, CI_EOL, (iArgEnd + 1))) to sLine
+        Function_Return True
+    End_Function
+
+    // Generic "<Cmd> <arg> to <dest>" -> "Move (<Cmd>(<arg>)) to <dest>" rewrite for a single-argument
+    // legacy string command (Uppercase, Lowercase, ...). Same robust approach as ChangeTrimCommandToFunction,
+    // generalised by the keyword: the argument is extracted by POSITION (raw text from after the command
+    // keyword up to the command "to"), so any shape survives - a simple var, a table.field (USER.SPRAK),
+    // or a parenthesised expression. A "<Cmd>(" function CALL is left untouched (the keyword must be
+    // FOLLOWED BY WHITESPACE, not "("). Requires an explicit "to <dest>".
+    Function _SingleArgCommandToFunction String ByRef sLine String sKeyWord Returns Boolean
+        Boolean bFound
+        Integer iPos iStart iCmdPos iArgStart iArgEnd iToPos
+        tTokenizer TokenizerData
+        String sOverFull sCh
+
+        Get pTokenizer to TokenizerData
+        If (TokenizerData.bLineIsReady = True or TokenizerData.bIsInCommand = True or ;
+            TokenizerData.bIsInImage = True or TokenizerData.bIsVariableDeclaration = True) Begin
             Function_Return False
         End
-        // Search for "trim <varname>" (keyword + space + varname) rather than just "trim", so that
-        // a Trim(...) function call earlier on the same line is not mistakenly targeted.
-        // Use an in-place Replace so surrounding whitespace is preserved exactly.
-        Move (Pos(sKeywordLC + CS_S + Lowercase(sVarName), sLineLC)) to iPos
-        If (iPos <> 0) Begin
-            Move (Replace(sKeyword + CS_S + sVarName, sLine, CS_Move + " (" + CS_Trim + "(" + String(sVarName) + "))")) to sLine
-            Move True to bChanged
+
+        Get IsKeywordInLine sKeyWord TokenizerData.asLineTokens to bFound
+        If (bFound = False) Begin
+            Function_Return False
         End
 
+        // Work on the MASKED line (indentation + overstrike) - position-aligned with sLine, string
+        // content hidden, so a keyword/"to" inside a literal can never match.
+        Move (TokenizerData.sIndentation + TokenizerData.sOverstrikeLine) to sOverFull
+
+        // Locate the legacy COMMAND: a boundary-aware keyword FOLLOWED BY WHITESPACE (a "<Cmd>(" call
+        // has "(" right after the name, so it is never taken as the command - keeps a call untouched).
+        Move 1 to iStart
+        Move 0 to iCmdPos
+        While (iCmdPos = 0)
+            Get _FindKeywordPos sOverFull sKeyWord True iStart to iPos
+            If (iPos = 0) ;
+                Function_Return False
+            Move (Mid(sOverFull, 1, (iPos + Length(sKeyWord)))) to sCh
+            If (sCh = CS_S or sCh = Character(9)) ;
+                Move iPos to iCmdPos
+            Else ;
+                Move (iPos + 1) to iStart
+        Loop
+
+        // Argument = RAW text from the first non-blank after the keyword up to the command "to".
+        Move (iCmdPos + Length(sKeyWord)) to iArgStart
+        While (iArgStart <= Length(sOverFull) and (Mid(sOverFull, 1, iArgStart) = CS_S or Mid(sOverFull, 1, iArgStart) = Character(9)))
+            Increment iArgStart
+        Loop
+
+        Get _FindKeywordPos sOverFull CS_To True iArgStart to iToPos
+        If (iToPos = 0 or iToPos <= iArgStart) ;
+            Function_Return False
+
+        // Last non-blank before "to" = the argument's end; the gap before "to" is kept verbatim.
+        Move (iToPos - 1) to iArgEnd
+        While (iArgEnd >= iArgStart and (Mid(sOverFull, 1, iArgEnd) = CS_S or Mid(sOverFull, 1, iArgEnd) = Character(9)))
+            Decrement iArgEnd
+        Loop
+        If (iArgEnd < iArgStart) ;
+            Function_Return False
+
+        // Rebuild on the RAW line: <indent/nose> + Move (<Cmd>(<arg>)) + <original gap> to <dest>.
+        Move (Left(sLine, (iCmdPos - 1)) + CS_Move + " (" + sKeyWord + "(" + Mid(sLine, (iArgEnd - iArgStart + 1), iArgStart) + "))" + Mid(sLine, CI_EOL, (iArgEnd + 1))) to sLine
+        Function_Return True
+    End_Function
+
+    { Published = True }
+    { Description = """
+        Changes legacy Uppercase command to the Uppercase function.
+        Example: Uppercase sVal to sVal -> Move (Uppercase(sVal)) to sVal
+        { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Changed: Uppercase command to function Uppercase }
+        { ModRecipe = 4531 | command: Uppercase }
+        """ }
+    Function ChangeUppercaseCommandToFunction String ByRef sLine String sParameter Returns Boolean
+        Boolean bChanged
+        Get _SingleArgCommandToFunction (&sLine) CS_Uppercase to bChanged
+        Function_Return bChanged
+    End_Function
+
+    { Published = True }
+    { Description = """
+        Changes legacy Lowercase command to the Lowercase function.
+        Example: Lowercase sVal to sVal -> Move (Lowercase(sVal)) to sVal
+        { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
+        { SummaryText = Changed: Lowercase command to function Lowercase }
+        { ModRecipe = 4531 | command: Lowercase }
+        """ }
+    Function ChangeLowercaseCommandToFunction String ByRef sLine String sParameter Returns Boolean
+        Boolean bChanged
+        Get _SingleArgCommandToFunction (&sLine) CS_Lowercase to bChanged
         Function_Return bChanged
     End_Function
 
@@ -1579,6 +2489,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
     { Description = """
         Changes legacy Get Create U_Class to: Get Create (RefClass(Class))
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: 'Create U_Class' to 'Create (RefClass(Class))' }
         """ }
     Function ChangeUClassToRefClass String ByRef sLine String sParameter Returns Boolean
@@ -1602,7 +2513,12 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Get RemoveStringsFromLine sTest to sTest            // If this is in a string then obviously leave it alone too
         If (Pos(" create u_", sTest)) Begin
             Move (Lowercase(sLine)) to sTest
-            Move (Pos("u_", sTest)) to iPos
+            // Locate the U_ class token on the MASKED line (position-aligned
+            // with sLine) with a LEFT boundary only - "u_" is a PREFIX, so
+            // bWholeWord is False. A bare Pos could land inside an earlier
+            // identifier ("hU_x") or a string literal and rewrite the wrong
+            // text (2026-06-10 audit).
+            Get _FindKeywordPos (TokenizerData.sIndentation + TokenizerData.sOverstrikeLine) "u_" False 1 to iPos
             Get IsValidClassCharacter sTest iPos to bValid
             While (bValid)
                 Move (sClassName + Mid(sLine, 1, iPos)) to sClassName
@@ -1625,7 +2541,9 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Changes legacy ZeroString command with function ZeroString.
         Example: ZeroString iLength to sParameter --> Move (ZeroString(iLength)) to sParameter
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: ZeroString command to function }
+        { ModRecipe = 4532 | ZeroString }
         """ }
     Function ChangeZeroStringCommandToFunction String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged
@@ -1640,6 +2558,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         A visible (paged) instantiation of the cScintillaEdit class is needed for this function to operate properly.
         The DFRefactor program's 'Editor' view is used for this.
         { MethodType = eEditorFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Changed: Proper Upper and lowercasing }
         """ }
     Function EditorNormalizeCase String[] ByRef asCode String sParameter Returns Boolean
@@ -1669,10 +2588,11 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         A visible (paged) instantiation of the cScintillaEdit class is needed for this function to operate properly.
         The DFRefactor program's 'Editor' view is used for this.
         { MethodType = eEditorFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Reindented code }
         { EnumList = 1,2,3,4,5,6,7,8}
         { InitialValue = 4}
-        { HelpTopic = Select the indent size you want to use for spaces when indenting code
+        { ParamHelp = Select the indent size you want to use for spaces when indenting code
         \nand when breaking a line on rewriting a single line to multiple lines.
         \nIt is the same value that can be set on the Editor Settings dialog tab size.
         """ }
@@ -1707,6 +2627,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
          A array variable declaration like e.g. "String [] asAddress", is changed to: "String[] asAddress"
          (Note the removed SPACE between "String" and "[]".
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Changed: NormalizeArrayNotation }
         """ }
     Function NormalizeArrayNotation String ByRef sLine String sParameter Returns Boolean
@@ -1719,6 +2640,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
     { Description = """
         Removes end of line comments for: End_Class, End_Object, End_Function & End_Procedure.
         { MethodType = eStandardFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Removed: End comments }
         """ }
     Function RemoveEndComments String ByRef sLine String sParameter Returns Boolean
@@ -1751,6 +2673,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
     { Description = """
         Removes 'Local' keyword if present from procedures and functions variable declaration lines.
         { MethodType = eStandardFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Removed: 'Local' key word }
         """ }
     Function RemoveLocalKeyWord String ByRef sLine String sParameter Returns Boolean
@@ -1788,10 +2711,11 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Takes a source file as a string array as a parameter.
         Returns the passed string array with removed duplicated empty lines.
         { MethodType = eOtherFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Removed: Consecutive blank Lines }
         { EnumList = 1,2,3,4,5,6}
         { InitialValue = 2 }
-        { HelpTopic = Select max number of consecutive blank lines allowed in source files. }
+        { ParamHelp = Select max number of consecutive blank lines allowed in source files. }
         """ }
     Function RemoveMultipleBlankLines String[] ByRef asCode String sParameter Returns Integer
         String[] asCodeOut
@@ -1852,6 +2776,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Removes legacy IDE markers '//AB-Store' etc.
         Returns True if at least one legacy IDE (Studio) source code marker was found.
         { MethodType = eRemoveFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Removed: Legacy IDE markers }
         """ }
     // ToDo: Make this into a MethodType = eRemoveFunctionAll, and pass a string array containing one source file?
@@ -1948,6 +2873,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         It removes old style Studio 'Project Object Structures"
         It does not do so for WebApp (*.wo) files.
         { MethodType = eRemoveFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Removed: Register_Object structures }
         """ }
     Function RemoveProjectObjectStructure String ByRef sLine String sParameter Returns Boolean
@@ -2004,7 +2930,9 @@ Object oRefactorFuncLib is a cRefactorFuncLib
     { Description = """
         Removes 'Private' keyword from Property declaration lines.
         { MethodType = eStandardFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Removed: 'Private' property key word }
+        { ModRecipe = 4535 | Private or Public keyword }
         """ }
     Function RemovePropertyPrivate String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged
@@ -2016,7 +2944,9 @@ Object oRefactorFuncLib is a cRefactorFuncLib
     { Description = """
         Removes 'Public' property members from property declaration lines.
         { MethodType = eStandardFunction }
-        { SummaryText = Removed: 'Puplic' property key word }
+        { FnGroup = Cleanup }
+        { SummaryText = Removed: 'Public' property key word }
+        { ModRecipe = 4535 | Private or Public keyword }
         """ }
     Function RemovePropertyPublic String ByRef sLine String sParameter Returns Boolean
         Boolean bChanged
@@ -2028,6 +2958,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
     { Description = """
         Removes "MS Sans Serif" font source lines.
         { MethodType = eRemoveFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Removed: 'MS Sans Serif' lines }
         """ }
     Function RemoveSansSerif String byref sLine Returns Boolean
@@ -2055,6 +2986,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         // Visual DataFlex xx.x Migration Utility
         ...and so on
         { MethodType = eRemoveFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Removed: Studio generated comments }
         """ }
     Function RemoveStudioGeneratedComments String ByRef sLine Returns Boolean
@@ -2128,6 +3060,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Removes spaces at the end of lines (trailing spaces).
         { MethodType = eStandardFunction }
         { SummaryText = Removed: Spaces at end of line }
+        { FnGroup = Cleanup }
         """ }
     Function RemoveTrailingSpaces String ByRef sLine Returns Boolean
         Integer iBefore iAfter
@@ -2150,6 +3083,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Removes all unusad locally defined, in Procedures & Functions, for the
         passed string array. Returns number of removed unused local variables.
         { MethodType = eOtherFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Removed: Unused local variables }
         """ }
     Function RemoveUnusedLocals String[] ByRef asCode String sParameter Returns Integer
@@ -2189,10 +3123,11 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         <TableName>_DD - o<TableName>DD (eDDStudioStyle)
         <TableName>_DD - o<TableName>_dd (neDDNewStyle)
       { MethodType = eOtherFunctionAll }
+      { FnGroup = Modernization }
       { SummaryText = Renamed DataDictionary objects }
       { EnumList = "eDDStudioStyle, eDDNewStyle, eDDOldStyle" }
       { InitialValue = eDDNewStyle }
-      { HelpTopic = Valid values;
+      { ParamHelp = Valid values;
       \neDDStudioStyle - o<TableName>DD
       \neDDNewStyle - o<TableName>_dd
       \noDDOldStyle - <TableName>_DD }
@@ -2200,6 +3135,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
     Function RestyleDDOs String[] ByRef asFiles String sParameter Returns Integer
         String sHomePath
         Handle ho
+        Boolean bIsStyle
         Integer iRetval iSize iCount eDDOStyle
         tRefactorSettings RefactorSettings
         tWorkspacePaths TargetWS OrgWS
@@ -2214,9 +3150,22 @@ Object oRefactorFuncLib is a cRefactorFuncLib
             Function_Return 0
         End
 
-        If (num_arguments > 1) Begin
-            Move sParameter to eDDOStyle
-        End
+        // sParameter arrives as the enum NAME from the UI combo or as the numeric VALUE
+        // from tests - resolve each member explicitly via _ParameterIsEnum (a bare Move
+        // of the name into the Integer enum yields eDDUnknown; and NOTE the {EnumList}
+        // display order differs from the Enum_List value order here, so positional
+        // mapping would be wrong). Unmatched/blank keeps eDDUnknown, as before. NO
+        // num_arguments guard - it is unreliable after nested sends/dynamic dispatch,
+        // and an omitted parameter arrives as "" (no member matches).
+        Get _ParameterIsEnum sParameter "eDDStudioStyle" eDDStudioStyle to bIsStyle
+        If (bIsStyle = True) ;
+            Move eDDStudioStyle to eDDOStyle
+        Get _ParameterIsEnum sParameter "eDDNewStyle" eDDNewStyle to bIsStyle
+        If (bIsStyle = True) ;
+            Move eDDNewStyle to eDDOStyle
+        Get _ParameterIsEnum sParameter "eDDOldStyle" eDDOldStyle to bIsStyle
+        If (bIsStyle = True) ;
+            Move eDDOldStyle to eDDOStyle
 
         // Path for the workspace we are refactoring: target if selected,
         // otherwise DFRefactor's own (defensive - RestyleDDOs is normally
@@ -2252,14 +3201,16 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         The function accepts a parameter controlling the If/Else or Begin/End block constructs.
         Valid sParameters, See: EnumList;
         { MethodType = eStandardFunction }
+        { FnGroup = Cleanup }
         { SummaryText = Split If/Else line }
         { EnumList = "eSplitBySpaceAndSemicolon, eSplitBySemicolon, eSplitToBeginEndBlock" }
         { InitialValue = eSplitToBeginEndBlock }
-        { HelpTopic = Valid values;
+        { ParamHelp = Valid values;
         \neSplitBySpaceAndSemicolon - Split line with space and semicolon
         \neSplitBySemicolon - Split line with semicolon
         \neSplitToBeginEndBlock - Use a Begin/End block }
         """ }
+
     Function SplitInlineIfElseLine String ByRef sLine String sParameter Returns Boolean
         Boolean bStop bChanged bFound
         Integer iIndent eSplitBy iTabSize iItem
@@ -2299,7 +3250,17 @@ Object oRefactorFuncLib is a cRefactorFuncLib
             Function_Return False
         
         Move False to bChanged
-        Move sParameter to eSplitBy
+        // sParameter arrives as the enum NAME from the UI combo or as the numeric VALUE
+        // from tests - resolve via _ParameterIsEnum (a bare Move of the name into the
+        // Integer enum yielded eSplitUnknown from the UI). Default = the documented
+        // {InitialValue}, eSplitToBeginEndBlock.
+        Move eSplitToBeginEndBlock to eSplitBy
+        Get _ParameterIsEnum sParameter "eSplitBySpaceAndSemicolon" eSplitBySpaceAndSemicolon to bFound
+        If (bFound = True) ;
+            Move eSplitBySpaceAndSemicolon to eSplitBy
+        Get _ParameterIsEnum sParameter "eSplitBySemicolon" eSplitBySemicolon to bFound
+        If (bFound = True) ;
+            Move eSplitBySemicolon to eSplitBy
         Get piTabSize to iTabSize
         If (eSplitBy = eSplitToBeginEndBlock) Begin
             Move (SearchArray(CS_Begin, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
@@ -2352,9 +3313,15 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         standard DataFlex classes cDbCJGrid and cDbCJGridColumn are used as targets.
         Returns the total number of grid objects transformed across all files.
         { MethodType = eOtherFunctionAll }
+        { FnGroup = Modernization }
         { EnumList = "ANY" }
         { InitialValue = DbGrid,cDbCJGrid,cDbCJGridColumn }
         { SummaryText = Refactored: DbGrid -> cDbCJGrid }
+        { ModRecipe = 4537 | class: DBGRID }
+        { ParamHelp = Three comma separated class names;
+        \nMyDbGrid - Your subclass of DbGrid,
+        \nMycDbCJGrid - Your subclass of cDbCJGrid,
+        \nMycDbCJGridColumn - Your subclass of cDbCJGridColumn }
         """ }
     Function RefactorDbGridTocDbCJGrid String[] ByRef asFiles String sParameter Returns Integer
         Handle  ho
@@ -2412,9 +3379,15 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         detected, and the standard DataFlex classes cCJGrid and cCJGridColumn are used as the target.
         Returns the total number of grid objects transformed across all files.
         { MethodType = eOtherFunctionAll }
+        { FnGroup = Modernization }
         { EnumList = "ANY" }
         { InitialValue = Grid,cCJGrid, cCJGridColumn }
         { SummaryText = Refactored: Grid -> cCJGrid }
+        { ModRecipe = 4537 | class: GRID }
+        { ParamHelp = Three comma separated class names;
+        \nMyGrid - Your subclass of Grid,
+        \nMycCJGrid - Your subclass of cCJGrid,
+        \nMycCJGridColumn - Your subclass of cCJGridColumn }
         """ }
     Function RefactorGridToCJGrid String[] ByRef asFiles String sParameter Returns Integer
         Handle  ho
@@ -2466,9 +3439,15 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         standard DataFlex classes cDbCJGridPromptList and cDbCJGridColumn are used as targets.
         Returns the total number of list objects transformed across all files.
         { MethodType = eOtherFunctionAll }
+        { FnGroup = Modernization }
         { EnumList = "ANY" }
         { InitialValue = dbList,cDbCJGridPromptList,cDbCJGridColumn }
         { SummaryText = Refactored: dbList -> cDbCJGridPromptList }
+        { ModRecipe = 4537 | class: DBLIST }
+        { ParamHelp = Three comma separated class names;
+        \nMyDbList - Your subclass of DbList,
+        \nMycDbCJGridPromptList - Your subclass of cDbCJGridPromptList,
+        \nMycDbCJGridColumn - Your subclass of cDbCJGridColumn }
         """ }
     Function RefactorDbListTocDbCJGridPromptList String[] ByRef asFiles String sParameter Returns Integer
         Handle  ho
@@ -2513,7 +3492,9 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         local declarations. Pass one source file as a string array; returns the
         number of rewrites.
         { MethodType = eOtherFunction }
+        { FnGroup = Modernization }
         { SummaryText = Wrapped: Pointer/Address -> String with PointerToString() }
+        { ModRecipe = 4539 | pointer to string }
         """ }
     Function UnicodePointerToString String[] ByRef asCode String sParameter Returns Integer
         Handle  ho
@@ -2550,7 +3531,9 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         rewrites only when both operand types are known from declarations/parameters.
         Pass one source file as a string array; returns the number of rewrites.
         { MethodType = eOtherFunction }
+        { FnGroup = Modernization }
         { SummaryText = Rewrite: String -> Pointer with MemCopy() }
+        { ModRecipe = 4539 | string to pointer }
         """ }
     Function UnicodeStringToPointer String[] ByRef asCode String sParameter Returns Integer
         Handle  ho
@@ -2582,7 +3565,10 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         idempotent (an already-converted Utf8ToOem is left alone); skips strings and
         comments.
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Renamed: ToOEM/ToANSI -> Utf8ToOem/Utf8ToAnsi }
+        { ModRecipe = 4534 | use of ToOEM }
+        { ModRecipe = 4534 | use of ToANSI }
         """ }
     Function UnicodeOemAnsiFunctions String ByRef sLine String sParameter Returns Boolean
         String   sNewLine sOverFull
@@ -2628,6 +3614,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         parameters in an ANSI ("...A") entry-point wrapper that should be WString.
         Already-correct declarations are never flagged. See the 'Other Log Files' toolbar button.
         { MethodType = eReportFunctionAll }
+        { FnGroup = Modernization }
         { SummaryText = Report: External_Function types to modernize for 64-bit/Unicode }
         """ }
     Function UnicodeWin64ReportExternalFunction String[] ByRef asFiles String sParameter Returns Integer
@@ -2659,6 +3646,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         For iFile from 0 to iFileLast
             Move asFiles[iFile] to sFilePath
             If (bPanel = True) Begin
+                Set Caption_Text of ghoStatusPanel to ("External_Function audit - File No:" * String(iFile + 1) * "of:" * String(iFileLast + 1))
                 Set Title_Text of ghoStatusPanel to ("Auditing External_Function declarations:" * sFilePath)
                 Send DoAdvanceTot of ghoStatusPanel
             End
@@ -2717,6 +3705,252 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Function_Return iTotal
     End_Function
 
+    // Report-only worksheet for the legacy buffer-offset Type system (4532). PART 1: each
+    // "Type ... End_Type" with its proposed modern "Struct" (built by _TypeDefToStruct). PART 2:
+    // every buffer accessor (Put / Put_String / StoreField / GETBUFF / RETRIEVEFIELD /
+    // GetBuff_String / FillType / ZeroType / Offset_of_Field / Size_of_Field) with file + line.
+    // These are byte-level ops needing human judgement (which String buffer is which instance), so
+    // they are LISTED, never rewritten - review each (some "Put" lines may be unrelated). Logs to
+    // the Backup folder; surfaced via the 'Other Log Files' toolbar button.
+    { Published = True }
+    { Description = """
+        Reports Only! Makes no changes to the source code.
+        Pass an array with *all selected source files*.
+        Lists every legacy Type definition with a proposed modern Struct, plus the buffer accessors
+        (Put / GETBUFF / StoreField / ...) to hand-migrate. See the 'Other Log Files' toolbar button.
+        { MethodType = eReportFunctionAll }
+        { FnGroup = Modernization }
+        { SummaryText = Report: Type definitions -> proposed Structs + buffer-accessor usage sites }
+        { ModRecipe = 4532 | Suggest }
+        { ModRecipe = 4536 | Dftypes | Suggest }
+        { ModRecipe = 4533 | ArrayPut | Suggest }
+        { ModRecipe = 4534 | CVTtoBytes | Suggest }
+        """ }
+    Function TypeToStructReport String[] ByRef asFiles String sParameter Returns Integer
+        String sHomePath sLogFile sFilePath sCmd sTok sPkg sMask sUsedName sCachePath sSuggest
+        String[] asCode asEmpty asBlock asStruct asAccessors asOtherLogFiles asUsedTypes asFileUsed asWords
+        Integer iCh iFile iFileLast iLine iLineLast iBlk iStart iTypes iUsages iTok iN iAcc
+        Integer i j iUsed iDup iDefLast iTickA
+        Boolean bPanel bFoundEnd bHeader bFound bCacheHit bHasCvt
+        tTypeDef[] aCatalog aDefs
+        tRFSearchResult[] aPkgFiles
+
+        Get psHomePath of ghoApplication to sHomePath
+        Move (vFolderFormat(sHomePath) + CS_BackupFolder + CS_DirSeparator + CS_TypeToStructReportLogFile) to sLogFile
+        Get rfOpenOutput sLogFile to iCh
+        If (iCh < 0) ;
+            Function_Return 0
+
+        Writeln channel iCh "Type -> Struct migration worksheet  (report only - no changes made)."
+        Writeln channel iCh "Legacy Type/Field is a byte-offset buffer system, used mainly to marshal to"
+        Writeln channel iCh "External_Functions. PART 1 proposes a modern Struct for each Type; PART 2 lists"
+        Writeln channel iCh "the buffer accessors to hand-migrate to Struct + Move (which buffer maps to which"
+        Writeln channel iCh "instance is a human decision, so nothing here is rewritten - review each line)."
+        Writeln channel iCh ""
+
+        Move "Put"             to asAccessors[0]
+        Move "Put_String"      to asAccessors[1]
+        Move "StoreField"      to asAccessors[2]
+        Move "GETBUFF"         to asAccessors[3]
+        Move "RETRIEVEFIELD"   to asAccessors[4]
+        Move "GetBuff_String"  to asAccessors[5]
+        Move "FillType"        to asAccessors[6]
+        Move "ZeroType"        to asAccessors[7]
+        Move "Offset_of_Field" to asAccessors[8]
+        Move "Size_of_Field"   to asAccessors[9]
+        Move "ArrayPut"        to asAccessors[10]   // Put into a Struct[] element (At <Type>.<field>)
+
+        Move 0 to iTypes
+        Move 0 to iUsages
+        Move (SizeOfArray(asFiles)) to iFileLast
+        Decrement iFileLast
+        Move (ghoStatusPanel <> 0 and Active_State(ghoStatusPanel) = True) to bPanel
+        // The TOTAL bar spans all three passes: Phase A (install-Pkg catalogue; its
+        // count joins the budget once the search below has run), Phase B (selected
+        // files) and PART 2 (selected files again). Previously only Phase B advanced
+        // it, so the panel froze through the whole Phase A scan and PART 2. The
+        // per-file bar is driven in PART 2's line loop (the only line-local pass).
+        If (bPanel = True) Begin
+            Set piMaximumTot of ghoStatusPanel to (2 * (iFileLast + 1))
+            Set piPosition  of ghoProgressBar to 0
+            Set piAdvanceBy of ghoProgressBar to 1
+        End
+
+        // ---- Phase A: catalogue Type defs from the TARGET install's packages (DfTypes.pkg & co.) ----
+        // The Type definitions live in the system packages, not the user's code (which only USES them),
+        // so resolve them from psTargetPkgFolder - the same Pkg folder the ModAnalyzer scans. Those
+        // packages change on a DataFlex version bump (different version folder -> different cache name)
+        // AND on an in-place update (same folder): the cache stamps the newest *.pkg write time and a
+        // cache READ self-invalidates when a package is newer (ReadTypeDefsCache / _PkgScanIsStale), so
+        // no manual JSON delete is needed. CACHED per version in Data\TypeDefs-<ver>.json; a SHARED
+        // install-Pkg walk (ghoFuncLib.EnsureInstallCaches) builds it AND the ModAnalyzer recipe scan
+        // in ONE pass; a fresh cache hit skips the walk entirely.
+        Move (GetTickCount()) to iTickA
+        Get TypeDefsCacheJsonPath of Self to sCachePath
+        // Try the cache first (ONE parse on the common hit path - do NOT pre-probe, which would parse
+        // this potentially-large JSON twice). A peer ModAnalyzer Analyze earlier this session may have
+        // filled it via the shared walk's piggyback, so even a "first" report run can hit here.
+        Get ReadTypeDefsCache of Self (&aCatalog) to bCacheHit
+        If (bCacheHit = True) Begin
+            If (bPanel = True) ;
+                Set Title_Text of ghoStatusPanel to "Type catalogue loaded from cache..."
+            Writeln channel iCh ("Type catalogue: " + String(SizeOfArray(aCatalog)) + " definitions loaded from cache (" + sCachePath + ") in " + String(GetTickCount() - iTickA) + " ms - install-package scan skipped.")
+        End
+        Else Begin
+            // Stale - the ONE shared install-package walk reads every package ONCE and refreshes this
+            // Type-def cache AND (if it too is stale) the ModAnalyzer recipe scan; it drives the
+            // per-package total bar itself (bShowProgress = True). Then re-read the now-fresh cache.
+            If (bPanel = True) ;
+                Set Title_Text of ghoStatusPanel to "Cataloguing Type definitions from the packages..."
+            Send EnsureInstallCaches of Self False True True
+            Get ReadTypeDefsCache of Self (&aCatalog) to bCacheHit
+            Writeln channel iCh ("Type catalogue: rebuilt from the install packages -> " + String(SizeOfArray(aCatalog)) + " definitions in " + String(GetTickCount() - iTickA) + " ms; cached to " + sCachePath + " for next run.")
+        End
+        Writeln channel iCh ""
+
+        // ---- Phase B: add any user-defined Types to the catalogue, and collect the Types USED ----
+        For iFile from 0 to iFileLast
+            Move asFiles[iFile] to sFilePath
+            If (bPanel = True) Begin
+                // "File No: x of: y" counter (the engine sets this for line-by-line functions; an
+                // eReportFunctionAll gets all files at once, so we set it ourselves - see cRefactorEngine).
+                Set Caption_Text   of ghoStatusPanel to ("Type usage - File No:" * String(iFile + 1) * "of:" * String(iFileLast + 1))
+                Set Title_Text of ghoStatusPanel to "Scanning Type usage:"
+                Set TableName_Text of ghoStatusPanel to sFilePath
+                Send DoAdvanceTot of ghoStatusPanel
+            End
+            Move (RFReadEncodedFileAsStringArray(sFilePath)) to asCode
+            Get _TypeDefsFromLines of Self asCode to aDefs
+            Move (SizeOfArray(aDefs) - 1) to iDefLast
+            For j from 0 to iDefLast
+                Move aDefs[j] to aCatalog[SizeOfArray(aCatalog)]
+            Loop
+            Get _UsedTypeNamesFromLines of Self asCode to asFileUsed
+            Move (SizeOfArray(asFileUsed) - 1) to iDefLast
+            For j from 0 to iDefLast
+                Move (SearchArray(asFileUsed[j], asUsedTypes, Desktop, RefFunc(DFSTRICMP))) to iDup
+                If (iDup = -1) ;
+                    Move asFileUsed[j] to asUsedTypes[SizeOfArray(asUsedTypes)]
+            Loop
+        Loop
+
+        // ---- PART 1: proposed Struct for each Type used in your code ----
+        Writeln channel iCh "=== PART 1: proposed Struct for each Type used in your code ==="
+        Writeln channel iCh ""
+        Move (SizeOfArray(asUsedTypes) - 1) to iN
+        For iUsed from 0 to iN
+            Move asUsedTypes[iUsed] to sUsedName
+            Move False to bFound
+            Move asEmpty to asBlock
+            Move (SizeOfArray(aCatalog) - 1) to iDefLast
+            Move 0 to j
+            While (j <= iDefLast and bFound = False)
+                If (Lowercase(aCatalog[j].sName) = Lowercase(sUsedName)) Begin
+                    Move True to bFound
+                    Move aCatalog[j].asBlock to asBlock
+                End
+                Increment j
+            Loop
+            If (bFound = True) Begin
+                Writeln channel iCh ("--- " + sUsedName + " ---")
+                Get _TypeDefToStruct of Self asBlock to asStruct
+                Move (SizeOfArray(asStruct) - 1) to iTok
+                Move 0 to iBlk
+                While (iBlk <= iTok)
+                    Writeln channel iCh ("    " + asStruct[iBlk])
+                    Increment iBlk
+                Loop
+                Writeln channel iCh ""
+                Increment iTypes
+            End
+            Else Begin
+                Writeln channel iCh ("--- " + sUsedName + "  (definition not found - check it is a Type) ---")
+                Writeln channel iCh ""
+            End
+        Loop
+
+        // ---- PART 2: buffer accessor usage sites ----
+        Writeln channel iCh "=== PART 2: buffer accessor usage sites to hand-migrate ==="
+        Writeln channel iCh "  A 'suggest:' line gives the mechanical Struct rewrite: the buffer becomes a Struct local"
+        Writeln channel iCh "  named 'TheData' (rename its other uses to match) and the byte-offset Type. prefix drops."
+        Writeln channel iCh "  REVIEW each: a buffer passed to an External_Function by AddressOf (e.g. a Windows API) must"
+        Writeln channel iCh "  pass the Struct's address instead, and the field types must be 64-bit-correct (see the"
+        Writeln channel iCh "  Win64StructPadding report). Nothing here is auto-applied."
+        Writeln channel iCh ""
+        For iFile from 0 to iFileLast
+            Move asFiles[iFile] to sFilePath
+            If (bPanel = True) Begin
+                Set Caption_Text   of ghoStatusPanel to ("Buffer accessors - File No:" * String(iFile + 1) * "of:" * String(iFileLast + 1))
+                Set Title_Text of ghoStatusPanel to "Scanning buffer accessors:"
+                Set TableName_Text of ghoStatusPanel to sFilePath
+                Send DoAdvanceTot of ghoStatusPanel
+            End
+            Move (RFReadEncodedFileAsStringArray(sFilePath)) to asCode
+            Move (SizeOfArray(asCode)) to iLineLast
+            Move False to bHeader
+            If (bPanel = True) Begin
+                Set piPosition of ghoProgressBar to 0
+                Set piMaximum  of ghoProgressBar to iLineLast
+            End
+            If (iLineLast > 0) Begin
+                Decrement iLineLast
+                For iLine from 0 to iLineLast
+                    // Per-file bar: the canonical ~20-line nudge (no-op without a panel).
+                    If (Mod(iLine, 20) = 0 and bPanel = True) Begin
+                        Send Update_StatusPanel of ghoStatusPanel ("Source line:" * String(iLine + 1) * "of:" * String(iLineLast + 1))
+                        Set piPosition of ghoProgressBar to (iLine + 1)
+                    End
+                    // Stateless split (no engine Tokenizer): a report makes no source
+                    // changes, so it never needed position accuracy; this is the cheap
+                    // first-token check, with strings/// comments already masked out.
+                    Get _SplitSourceWords of Self asCode[iLine] to asWords
+                    Move -1 to iAcc
+                    Move False to bHasCvt
+                    If (SizeOfArray(asWords) > 0) Begin
+                        Move (SearchArray(asWords[0], asAccessors, Desktop, RefFunc(DFSTRICMP))) to iAcc
+                        // CVTtoBytes is a FUNCTION used mid-line ("Move (CVTtoBytes(...)) to x"), not a
+                        // leading command, so the first-token check misses it - detect it by content on
+                        // the masked split (strings / comments already stripped, so no false match).
+                        Move (SizeOfArray(asWords) - 1) to iTok
+                        For j from 0 to iTok
+                            If (Uppercase(asWords[j]) contains "CVTTOBYTES") ;
+                                Move True to bHasCvt
+                        Loop
+                    End
+                    If (iAcc <> -1 or bHasCvt = True) Begin
+                        If (bHeader = False) Begin
+                            Writeln channel iCh ("--- " + sFilePath + " ---")
+                            Move True to bHeader
+                        End
+                        Writeln channel iCh ("  Line " + String(iLine + 1) + ":  " + Trim(asCode[iLine]))
+                        If (iAcc <> -1) Begin
+                            Get _SuggestStructLine of Self asWords aCatalog to sSuggest
+                            If (sSuggest <> "") ;
+                                Writeln channel iCh ("      suggest:  " + sSuggest)
+                        End
+                        Else ;
+                            Writeln channel iCh ("      suggest:  byte-packing - a Struct assignment ('Move <value> to TheData.<field>') lays out the bytes; no CVTtoBytes needed.")
+                        Increment iUsages
+                    End
+                Loop
+                If (bHeader = True) ;
+                    Writeln channel iCh ""
+            End
+        Loop
+
+        If (bPanel = True) ;
+            Set Title_Text of ghoStatusPanel to ""
+        Writeln channel iCh ("Total: " + String(iTypes) + " Type definition(s), " + String(iUsages) + " accessor line(s).")
+        Send rfCloseOutput iCh
+
+        If ((iTypes + iUsages) > 0) Begin
+            Get pasOtherLogFiles to asOtherLogFiles
+            Move sLogFile to asOtherLogFiles[SizeOfArray(asOtherLogFiles)]
+            Set pasOtherLogFiles to asOtherLogFiles
+        End
+        Function_Return (iTypes + iUsages)
+    End_Function
+
     { Published = True }
     { Description = """
       Reports Only! Makes no changes to the source code.
@@ -2728,6 +3962,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
       quarantine sub-folder, so the cleanup is reversible. Running it is entirely optional;
       the report's footnote points to the .bat and explains how to undo it.
       { MethodType = eReportFunctionAll }
+      { FnGroup = Cleanup }
       { SummaryText = Creates a report of never-used files plus an optional .bat to quarantine them }
       """ }
     Function UnusedSourceFiles String[] ByRef asFiles String sParameter Returns Integer
@@ -2765,6 +4000,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
       Results are accumulated across all files into a single log file.
       See the DFRefactor programs: 'Other Log Files' toolbar button for results.
       { MethodType = eReportFunctionAll }
+      { FnGroup = Cleanup }
       { SummaryText = Creates a report with unused Use statements }
       """ }
     Function UnusedUseStatements String[] ByRef asFiles String sParameter Returns Integer
@@ -2812,6 +4048,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Property and Global_Variable declarations. Whole-word and idempotent; never touches
         AddressOf, fields, or a variable named "Address". Params/Returns types are out of scope.
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Renamed type: Address -> Pointer }
         """ }
     Function Win64AddressToPointer String ByRef sLine String sParameter Returns Boolean
@@ -2846,6 +4083,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         parameter, or an AddressOf() result, assigned into an Integer/DWord. Per-method scope.
         See the 'Other Log Files' toolbar button for results.
         { MethodType = eReportFunctionAll }
+        { FnGroup = Modernization }
         { SummaryText = Reported: pointer-to-Integer truncation risks (64-bit) }
         """ }
     Function Win64PointerTruncation String[] ByRef asFiles String sParameter Returns Integer
@@ -2885,6 +4123,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         For iFile from 0 to iFileLast
             Move asFiles[iFile] to sFilePath
             If (bPanel = True) Begin
+                Set Caption_Text of ghoStatusPanel to ("Pointer truncation - File No:" * String(iFile + 1) * "of:" * String(iFileLast + 1))
                 Set Title_Text of ghoStatusPanel to ("Scanning for pointer truncation:" * sFilePath)
                 Send DoAdvanceTot of ghoStatusPanel
             End
@@ -2918,6 +4157,97 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         Function_Return iTotal
     End_Function
 
+    // Win64StructPadding is a REPORT-ONLY audit (makes no changes) for the 64-bit
+    // struct-padding bug: DataFlex structs do not auto-pad like C, so a pointer-sized
+    // member that does not land on an 8-byte boundary in a Win32-mirror struct needs an
+    // explicit "#IFDEF Is$Win64 / Integer iAlign / #ENDIF" filler. The per-struct analysis
+    // lives in the worker class cWin64StructPadding; this wrapper walks each selected file,
+    // resets the lexer, runs the audit, and writes a consolidated log (surfaced via the
+    // 'Other Log Files' toolbar button, like the other report functions).
+    { Published = True }
+    { Description = """
+        Reports Only! Makes no changes to the source code.
+        Pass an array with *all selected source files*.
+        64-bit struct-padding audit: in each Struct...End_Struct, flags a pointer-sized member
+        (Pointer/Address/Handle/Longptr/ULongptr) that does not land on an 8-byte-aligned offset
+        and so needs an Is$Win64 filler. A struct with an indeterminate-size member, or that
+        already uses an Is$Win64 conditional, is noted/skipped. See the 'Other Log Files' button.
+        Report-only - apply the actual fix with DAW's "Structure Padding Helper" tool.
+        { MethodType = eReportFunctionAll }
+        { FnGroup = Modernization }
+        { SummaryText = Reported: struct pointer-member alignment risks (64-bit) }
+        """ }
+    Function Win64StructPadding String[] ByRef asFiles String sParameter Returns Integer
+        Handle ho
+        String sHomePath sLogFile sFilePath
+        String[] asCode asFindings asEmpty asOtherLogFiles
+        Integer iCh iFile iFileLast iN iFind iFindLast iTotal
+        Boolean bPanel
+
+        Get psHomePath of ghoApplication to sHomePath
+        Move (vFolderFormat(sHomePath) + CS_BackupFolder + CS_DirSeparator + CS_Win64StructPaddingLogFile) to sLogFile
+        Get rfOpenOutput sLogFile to iCh
+        If (iCh < 0) Begin
+            Function_Return 0
+        End
+
+        Writeln channel iCh "Win64 struct-padding audit  (report only - no changes made)."
+        Writeln channel iCh "Flags a pointer-sized struct member that is not 8-byte aligned on x64"
+        Writeln channel iCh "and so needs an Is$Win64 filler. DataFlex structs do not auto-pad like C."
+        Writeln channel iCh ""
+
+        Get Create (RefClass(cWin64StructPadding)) to ho
+        If (ho = 0) Begin
+            Send rfCloseOutput iCh
+            Error "Could not create cWin64StructPadding object."
+            Function_Return 0
+        End
+
+        Move 0 to iTotal
+        Move (SizeOfArray(asFiles)) to iFileLast
+        Decrement iFileLast
+        // This report loops files itself (eReportFunctionAll), so drive the status panel per
+        // file - otherwise it looks frozen when Win64StructPadding is the only function run.
+        Move (ghoStatusPanel <> 0 and Active_State(ghoStatusPanel) = True) to bPanel
+        If (bPanel = True) ;
+            Set piMaximumTot of ghoStatusPanel to (iFileLast + 1)
+        For iFile from 0 to iFileLast
+            Move asFiles[iFile] to sFilePath
+            If (bPanel = True) Begin
+                Set Caption_Text of ghoStatusPanel to ("Struct padding - File No:" * String(iFile + 1) * "of:" * String(iFileLast + 1))
+                Set Title_Text of ghoStatusPanel to ("Scanning structs for 64-bit padding:" * sFilePath)
+                Send DoAdvanceTot of ghoStatusPanel
+            End
+            Move (RFReadEncodedFileAsStringArray(sFilePath)) to asCode
+            Move asEmpty to asFindings
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get AuditFile of ho asCode (&asFindings) to iN
+            If (iN > 0) Begin
+                Writeln channel iCh ("=== " + sFilePath + " ===")
+                Move (SizeOfArray(asFindings)) to iFindLast
+                Decrement iFindLast
+                For iFind from 0 to iFindLast
+                    Writeln channel iCh asFindings[iFind]
+                Loop
+                Writeln channel iCh ""
+                Add iN to iTotal
+            End
+        Loop
+
+        If (bPanel = True) ;
+            Set Title_Text of ghoStatusPanel to ""
+        Send Destroy of ho
+        Writeln channel iCh ("Total: " + String(iTotal) + " alignment finding(s).")
+        Send rfCloseOutput iCh
+
+        If (iTotal > 0) Begin
+            Get pasOtherLogFiles to asOtherLogFiles
+            Move sLogFile to asOtherLogFiles[SizeOfArray(asOtherLogFiles)]
+            Set pasOtherLogFiles to asOtherLogFiles
+        End
+        Function_Return iTotal
+    End_Function
+
     // Win64WindowLongFunctions modernizes the Get/Set Window/Class Long Win32 calls for
     // 64-bit (the "GetWindowLong/SetWindowLong/GetClassLong/SetClassLong truncate a
     // pointer" gotcha in the 64-bit guide): each is renamed to its *Ptr variant, which is
@@ -2934,6 +4264,7 @@ Object oRefactorFuncLib is a cRefactorFuncLib
         (GetWindowLongPtr, etc.), which are pointer-safe on both 32- and 64-bit.
         Whole-word and idempotent; skips strings and comments.
         { MethodType = eStandardFunction }
+        { FnGroup = Modernization }
         { SummaryText = Renamed: Get/SetWindowLong + Get/SetClassLong -> *Ptr }
         """ }
     Function Win64WindowLongFunctions String ByRef sLine String sParameter Returns Boolean

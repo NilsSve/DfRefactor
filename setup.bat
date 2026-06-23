@@ -53,7 +53,7 @@ if errorlevel 1 (
     echo [ERROR] One or more submodules could not be fetched.
     echo         Check your internet connection and that you can reach:
     echo           - https://github.com/NilsSve/Library-DFUnit.git
-    echo           - https://github.com/NilsSve/DbUpdateFramework.git
+    echo           - https://github.com/NilsSve/Library-DUF.git
     echo           - https://github.com/NilsSve/Library-SciControlLib.git
     echo         Then run setup.bat again.
     echo.

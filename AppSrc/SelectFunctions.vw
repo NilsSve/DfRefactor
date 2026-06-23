@@ -19,7 +19,6 @@ Object oSelectFunctions_vw is a cRDCDbView
     Set Size to 193 636
     Set Label to "Select Functions"
     Set Border_Style to Border_Thick
-    Set pbAutoActivate to True   
     Set Icon to "FunctionLookup.ico"
     Set Maximize_Icon to True
 
@@ -76,7 +75,7 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Set peTextAlignment to xtpAlignmentCenter
             End_Object
 
-            Object oFunctions_Function_Name is a cDbCJGridColumnSuggestionNew //cDbCJGridColumnSuggestion
+            Object oFunctions_Function_Name is a cDbCJGridColumnSuggestionNew
                 Entry_Item Functions.Function_Name
                 Set piWidth to 180
                 Set psCaption to "Function Name (Suggestion list)"    
@@ -144,6 +143,26 @@ Object oSelectFunctions_vw is a cRDCDbView
                 End_Function
             
             End_Object                    
+
+            Object oFunctions_FnGroup is a cRDCDbCJGridColumn
+                Entry_Item Functions.FnGroup
+                Set piWidth to 100
+                Set psCaption to "Group"
+                Set psToolTip to "The functional group this refactoring belongs to: Modernization (brings legacy code up to current DataFlex), Cleanup (tidies or removes), or Other. Set via the function's { FnGroup } meta-tag."
+                Set Status_Help to (psToolTip(Self))
+                Set peHeaderAlignment to xtpAlignmentCenter
+                Set peTextAlignment to xtpAlignmentCenter
+                Set pbComboButton to True
+                // pbEditable *must* be set after the pbComboButton setting.
+                Set pbEditable to False
+                Set pbComboEntryState to False
+
+                Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                    Get psToolTip to sText
+                    Function_Return sText
+                End_Function
+
+            End_Object
 
             Object oFunctions_Parameter is a cRDCDbCJGridColumn
                 Entry_Item Functions.Parameter

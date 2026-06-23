@@ -2,7 +2,7 @@
 Home=..\
 AppSrcPath=AppSrc
 AppHTMLPath=AppHtml
-BitmapPath=Bitmaps
+BitmapPath=Bitmaps\DK
 IdeSrcPath=IdeSrc
 DataPath=Data
 DDSrcPath=DDSrc

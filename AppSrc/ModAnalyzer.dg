@@ -1,0 +1,741 @@
+﻿//****************************************************************************
+// $Module type: Dialog (dockable tool panel)
+// $Module name: ModAnalyzer
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : Modernization Analyzer view (triage + explain, READ-ONLY).
+//               A SEPARATE dockable tool panel (NOT the live-output dock) that reads
+//               the compiler .prn listing (WARNINGS + errors - the .prn carries the
+//               warnings the .err omits), runs each message through cModAnalyzer's
+//               recipe registry, and shows a triaged worklist:
+//                 Fix-category | Msg# | File | Line | Suggested fix | Refactor fn
+//               Double-click (or Enter) jumps to the error's source line, reusing the
+//               same psProduct-aware logic as the compiler-output dock.
+//
+//               Modeled on CompilerOutput.dg (the shared cCJToolPanel + dark cCJGrid).
+//               Shares ONE .err parser with that dock via cCompileErrorParser.pkg.
+//               Makes NO source changes. Opened via the global ActivateModAnalyzer
+//               (from the Test Compile panel's "Analyse" button + a toolbar button).
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS for a PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//****************************************************************************
+Use Windows.pkg
+Use cRDCCJGrid.pkg
+Use cCJGrid.pkg
+Use cCJGridColumn.pkg
+Use cCJToolPanel.pkg
+Use cCompileErrorParser.pkg   // ReadErrorFile / MassageErrorFile / tCompileError (shared parser)
+Use cModAnalyzer.pkg          // ClassifyMessage + tModAnalyzer + eMod* categories
+Use oRefactorPlanDialog.dg    // ShowPlan - preview dialog for "Start Refactoring"
+Use Cursor.pkg                // Cursor_Wait/Ready while the plan loads
+Use cEncodingHelpers.pkg      // RFReadEncodedFileAsStringArray - editor-free source read for the auto-fix guard
+
+Register_Procedure DoFreshGrids
+
+Object oModAnalyzer_dg is a cCJToolPanel
+    Set Size to 60 400
+    Set piMinSize to 56 211
+    Set Location to 20 14
+    Set Color to clBlack
+    Set Border_Style to Border_None
+    Set peNeighborhood to nhPublic
+    Set peBarPosition to xtpBarBottom
+    Move Self to ghoModAnalyzerDock
+
+    // The .err file to analyse. Set by ActivateModAnalyzer before the panel is shown.
+    Property String psErrorFile ""
+
+    // Summary line, PINNED above the grid (was grid row 0). Moved out so the grid can be
+    // header-click sorted without scattering the summary into the data (Nils 2026-06-11).
+    // Read-only display; the full text is also its tooltip in case it overflows the width.
+    // (First cut - colours/size may want a visual tweak.)
+    Object oSummary_fm is a Form
+        Set Size to 11 392
+        Set Location to 2 4
+        Set peAnchors to anTopLeftRight
+        Set Entry_State to False
+        Set Color to clBlack
+        Set TextColor to clWhite
+        Set Form_Border to Border_None
+    End_Object
+
+    Object oModAnalyzer_grd is a cCJGrid
+        Set Size to 45 392
+        Set piMinSize to 30 100
+        Set Location to 15 4
+        Set peVisualTheme to xtpGridThemeVisualStudio2012Dark
+        Set peHorizontalGridStyle to xtpGridNoLines
+        Set peVerticalGridStyle to xtpGridNoLines
+        Set peBorderStyle to xtpBorderNone
+        Set pbGrayIfDisable to False
+        Set pbShowHeader to True
+        Set pbShowRowFocus to True
+        Set psNoItemsText to "No warnings or errors to analyse"
+        Set pbAutoSave to False
+        Set TextColor to clWhite
+        Set piFocusCellBackColor to clLtGray
+        Set piFocusCellForeColor to clWhite
+        Set pbAllowAppendRow to False
+        Set pbAllowColumnRemove to False
+        Set pbAllowColumnReorder to False
+        Set pbAllowDeleteRow to False
+        Set pbAllowInsertRow to False
+        Set pbAutoAppend to False
+        Set pbRestoreLayout to True
+        Set pbSelectionEnable to True
+        Set pbMultipleSelection to True
+        Set pbSelectTextOnEdit to False
+        Set psLayoutSection to "oModAnalyzer_grd"
+        Set piHighlightBackColor to clLtGray
+        Set piHighlightForeColor to clBlack
+        Set piHScrollStep to 1
+        Set phoContextMenu to (phoToolPanelContextMenu(Self))
+        Set peAnchors to anAll
+
+        // Header-click column sorting (the grid sorts its OWN static data source on click -
+        // see cCJGrid.HeaderReorder -> SortGridByColumn). pbHeaderTogglesDirection lets a
+        // second click on the same header flip asc/desc; the shaded column + sort triangle
+        // show which column drives the order. The first ("#") column restores the original
+        // load order - see oRowNum_Col / DisplayFiltered.
+        Set pbHeaderReorders to True
+        Set pbHeaderTogglesDirection to True
+        Set pbShadeSortColumn to True
+        // (peDrawSortTriangleStyle defaults to xtpGridDrawSortTriangleAlways - the
+        //  ascending/descending triangle on the sorted header is already shown.)
+
+        // When False (default) the grid hides the informational Explain/Unknown rows, keeping the
+        // focus on the actionable Auto-fix/Review work. Ctrl+I (ToggleInformational) flips it.
+        Property Boolean pbShowInformational False
+
+        // Cache of the last full (unfiltered) analyze build, so Ctrl+I (ToggleInformational) can
+        // re-apply the show/hide instantly - no re-parse of the .prn. Set by LoadData, read by
+        // DisplayFiltered. paieCatFull[i] is row i's resolved category; psSummaryBase is the header
+        // breakdown WITHOUT the leading row count or the "(N hidden)" note - DisplayFiltered prepends
+        // the count of rows actually shown and appends the hidden note, so row 0 tracks the grid.
+        Property tDataSourceRow[] pTheDataFull
+        Property Integer[] paieCatFull
+        Property String psSummaryBase
+
+        // The parsed + workspace-scoped compiler messages from the last analyze. The grid is the
+        // SINGLE parser: StartAutoSelect (the refactor plan) reads THIS instead of re-reading and
+        // re-filtering the .prn a second time. Set by LoadData; read via
+        // (oModAnalyzer_grd(ghoModAnalyzerDock)); StartAutoSelect falls back to a fresh parse if
+        // it is ever empty.
+        Property tCompileError[] paScopedMessages
+
+        // Original load-order column. Click its header to restore the order the grid loaded
+        // in (the sortable peers below have no natural "original order" to click back to).
+        // peDataType Mask_Numeric_Window so it sorts 1,2,..,10,11 numerically, not as text.
+        // DisplayFiltered writes a contiguous 1..N here over the rows actually shown.
+        Object oRowNum_Col is a cCJGridColumn
+            Set piWidth to 34
+            Set psCaption to "#"
+            Set psToolTip to "Original order - click this header to restore it after sorting another column"
+            Set peDataType to Mask_Numeric_Window
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Object oCategory_Col is a cCJGridColumn
+            Set piWidth to 70
+            Set psCaption to "Fix"
+            Set psToolTip to "How it's handled - Auto-fix: applied cleanly. Review: applied, but check the result. Explain: no auto-fix, do it by hand. Unknown: not mapped yet."
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Object oErrNo_Col is a cCJGridColumn
+            Set piWidth to 56
+            Set psCaption to "Msg#"
+            Set psToolTip to "W = Warning, E = Error"
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Object oFile_Col is a cCJGridColumn
+            Set piWidth to 260
+            Set psCaption to "File"
+            Set psToolTip to "Source file (double-click the row to open it at the error line)"
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Object oLine_Col is a cCJGridColumn
+            Set piWidth to 50
+            Set psCaption to "Line"
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Object oHint_Col is a cCJGridColumn
+            Set piWidth to 380
+            Set psCaption to "Suggested fix"
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Object oFn_Col is a cCJGridColumn
+            Set piWidth to 160
+            Set psCaption to "Refactor function"
+            Set psToolTip to "The DFRefactor function that addresses this error (if any)"
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Procedure Delete_Data
+            tDataSourceRow[] TheData
+            If (not(IsComObjectCreated(Self))) Begin
+                Procedure_Return
+            End
+            Send InitializeData TheData
+        End_Procedure
+
+        // Read the .err, classify every error via cModAnalyzer, and fill the grid.
+        // The summary is pinned in oSummary_fm above the grid (not a grid row), so the
+        // grid is pure data and can be header-click sorted; DisplayFiltered builds it.
+        Procedure LoadData
+            String sFileName sPrnFile sSummary
+            String sFile sLn sKey sMsgTok sFn sExisting sGuardFile sSrcLine
+            Integer iSize iCount iItem iAuto iSuggest iWarn iErr iRow iPump iGuardLn iFiltered
+            Integer iCategory_Col iErrNo_Col iFile_Col iLine_Col iHint_Col iFn_Col
+            Boolean bExists bNeedsGuard
+            tCompileError[] asCompileError
+            tModAnalyzer Recipe
+            Handle ho hoDataSource
+            tDataSourceRow[] TheData TheDataEmpty
+            String[] asKey asGuardLines
+            Integer[] aieCat aiCount
+
+            If (not(IsComObjectCreated(Self))) Begin
+                Procedure_Return
+            End
+
+            // On the FIRST Analyze, Send Activate (in ActivateModAnalyzer) creates + docks this
+            // panel for the first time, and that initial docking flashes the outgoing Compiler
+            // Output dock's pixels over the editor - the deferred repaint doesn't clear until the
+            // next pump (later clicks just re-show an already-docked panel, so they never ghost).
+            // Pump here, right after the docking and before the heavy parse below, so the editor
+            // repaints cleanly on the first click too.
+            Send PumpMsgQueue of Desktop
+
+            Get psErrorFile to sFileName
+            // Prefer the .prn listing beside the .err: it carries the WARNINGS (the
+            // modernization goldmine) that the .err omits. Fall back to the .err if no
+            // .prn is present. ReadCompilerMessages filters to the diagnostic lines.
+            Move (Left(sFileName, Length(sFileName) - 4) + ".prn") to sPrnFile
+            Get vFilePathExists sPrnFile to bExists
+            If (bExists = False) ;
+                Move sFileName to sPrnFile
+            Get ReadCompilerMessages sPrnFile to asCompileError
+            // Drop diagnostics for files OUTSIDE the workspace source tree (DataFlex install
+            // packages etc.). The run only touches the workspace's own folders, so those rows
+            // are pure noise here - but the summary row reports HOW MANY were dropped
+            // (iFiltered), so an emptied grid explains itself.
+            Get FilterToWorkspaceFiles asCompileError (&iFiltered) to asCompileError
+            // Share the parsed + scoped set with the refactor plan (StartAutoSelect) so the .prn
+            // is parsed ONCE - here - not again to build the plan.
+            Set paScopedMessages to asCompileError
+            Move (SizeOfArray(asCompileError)) to iSize
+
+            Get phoDataSource to hoDataSource
+            Get DataSource of hoDataSource to TheData
+            Move TheDataEmpty to TheData
+
+            Get piColumnId of oCategory_Col to iCategory_Col
+            Get piColumnId of oErrNo_Col    to iErrNo_Col
+            Get piColumnId of oFile_Col     to iFile_Col
+            Get piColumnId of oLine_Col     to iLine_Col
+            Get piColumnId of oHint_Col     to iHint_Col
+            Get piColumnId of oFn_Col       to iFn_Col
+
+            Get Create (RefClass(cModAnalyzer)) to ho
+
+            Move 0 to iAuto
+            Move 0 to iSuggest
+            Move 0 to iWarn
+            Move 0 to iErr
+            Move 0 to iItem                 // data rows start at 0 (summary is pinned above the grid now)
+            Move 0 to iPump
+            Decrement iSize
+            For iCount from 0 to iSize
+                Get ClassifyMessage of ho asCompileError[iCount].iErrorNo asCompileError[iCount].sErrorTxt to Recipe
+                // Source-guard against the real source line: a refactor only applies if its obsolete
+                // construct is ON that line. If it sits inside a macro/command expansion (File_Exist_OEM's
+                // body calls ToOEM; Deferred_View's body has [Found ~Found]), VerifyAutoFix demotes it to
+                // Explain. Guard "use of X" auto-fixes + the legacy-indicator review. Read lazily (only the
+                // guarded recipes), cache the last file, and only verify when the line is actually
+                // available - never demote on a failed read.
+                // Same predicate the refactor PLAN uses (PlanFromMessages), so the grid and Auto
+                // Select can never disagree on which messages need the line-level source-guard.
+                Get RecipeNeedsSourceGuard of ho Recipe to bNeedsGuard
+                If (bNeedsGuard = True) Begin
+                    If (asCompileError[iCount].sFileName <> sGuardFile) Begin
+                        Move (RFReadEncodedFileAsStringArray(asCompileError[iCount].sFileName)) to asGuardLines
+                        Move asCompileError[iCount].sFileName to sGuardFile
+                    End
+                    Move asCompileError[iCount].iLine to iGuardLn
+                    If (iGuardLn >= 1 and iGuardLn <= SizeOfArray(asGuardLines)) Begin
+                        Move asGuardLines[iGuardLn - 1] to sSrcLine
+                        Get VerifyAutoFix of ho Recipe sSrcLine to Recipe
+                    End
+                End
+                Move asCompileError[iCount].sFileName       to sFile
+                Move (String(asCompileError[iCount].iLine)) to sLn
+                Move (Trim(Recipe.sRefactorFn))             to sFn
+                // Any refactor-mapped message collapses to ONE row per (file, function): the refactor
+                // runs file-wide, not per line, so a file's 50 indicators (or a dbGrid's many
+                // Begin_Rows) become a single row with an occurrence count. Function-less
+                // (informational) messages stay one row per source line.
+                If (sFn <> "") ;
+                    Move (Lowercase(sFile) + "|fn|" + Lowercase(sFn)) to sKey
+                Else ;
+                    Move (Lowercase(sFile) + "|" + sLn)               to sKey
+                If (asCompileError[iCount].bError) Begin
+                    Move ("E " + String(asCompileError[iCount].iErrorNo)) to sMsgTok
+                    Increment iErr
+                End
+                Else Begin
+                    Move ("W " + String(asCompileError[iCount].iErrorNo)) to sMsgTok
+                    Increment iWarn
+                End
+                // One row per source line: the first message creates the row; later messages on
+                // the same line merge in (most-actionable Fix wins, Msg# + function lists grow).
+                Move (SearchArray(sKey, asKey)) to iRow
+                If (iRow = -1) Begin
+                    Move iItem                        to iRow
+                    Move sKey                         to asKey[iRow]
+                    Move 1                            to aiCount[iRow]
+                    Move Recipe.eCategory             to aieCat[iRow]
+                    Move Recipe.sCategoryText         to TheData[iRow].sValue[iCategory_Col]
+                    Move sMsgTok                      to TheData[iRow].sValue[iErrNo_Col]
+                    Move sFile                        to TheData[iRow].sValue[iFile_Col]
+                    Move asCompileError[iCount].iLine to TheData[iRow].sValue[iLine_Col]
+                    Move Recipe.sHint                 to TheData[iRow].sValue[iHint_Col]
+                    Move sFn                          to TheData[iRow].sValue[iFn_Col]
+                    Increment iItem
+                End
+                Else Begin
+                    Increment aiCount[iRow]
+                    If (Recipe.eCategory > aieCat[iRow]) Begin
+                        Move Recipe.eCategory     to aieCat[iRow]
+                        Move Recipe.sCategoryText to TheData[iRow].sValue[iCategory_Col]
+                        Move Recipe.sHint         to TheData[iRow].sValue[iHint_Col]
+                    End
+                    Move TheData[iRow].sValue[iErrNo_Col] to sExisting
+                    If (not(sExisting contains sMsgTok)) ;
+                        Move (sExisting + ", " + sMsgTok) to TheData[iRow].sValue[iErrNo_Col]
+                    If (sFn <> "") Begin
+                        Move TheData[iRow].sValue[iFn_Col] to sExisting
+                        If (sExisting = "") Begin
+                            Move sFn to TheData[iRow].sValue[iFn_Col]
+                        End
+                        Else Begin
+                            If (not(sExisting contains sFn)) ;
+                                Move (sExisting + ", " + sFn) to TheData[iRow].sValue[iFn_Col]
+                        End
+                    End
+                End
+                // Keep the message pump alive every ~150 messages so the marquee animates and
+                // the panel stays painted during a large parse (the loop is synchronous - without
+                // this the bar would freeze). pbAnalyzing on the Test Compile panel blocks re-entry.
+                Increment iPump
+                If (iPump >= 150) Begin
+                    Send PumpMsgQueue of Desktop
+                    Move 0 to iPump
+                End
+            Loop
+
+            Send Destroy of ho
+
+            // Tally LINES by their resolved (most-actionable) category for the summary.
+            Move 0 to iAuto
+            Move 0 to iSuggest
+            For iRow from 0 to (iItem - 1)
+                If (aieCat[iRow] = eModAutoFix) ;
+                    Increment iAuto
+                If (aieCat[iRow] = eModSuggest) ;
+                    Increment iSuggest
+                // Per-(file,function) rows: show the occurrence count beside the first line.
+                If (aiCount[iRow] > 1) ;
+                    Move (TheData[iRow].sValue[iLine_Col] + "  (x" + String(aiCount[iRow]) + ")") to TheData[iRow].sValue[iLine_Col]
+            Loop
+
+            // Summary (pinned above the grid via DisplayFiltered): per-line fix paths + the
+            // underlying message tally (warnings vs errors). psSummaryBase holds the breakdown
+            // WITHOUT the leading row count; DisplayFiltered prepends the count of rows shown.
+            Move "" to sSummary
+            Append sSummary " row(s):  " iAuto " auto-fixable,  " iSuggest " to review,  rest explain/manual   (" (iWarn + iErr) " message(s): " iWarn " warning, " iErr " error)"
+            // Filtered-out messages must not vanish silently: when the compiler reported
+            // diagnostics for files OUTSIDE the workspace (e.g. 4536 "obsolete package"
+            // warnings pinned to the DataFlex install's own Pkg files), say so - otherwise
+            // "compiler: 4 warnings" vs "analyzer: 0 message(s)" looks broken.
+            If (iFiltered > 0) ;
+                Append sSummary "   (" iFiltered " message(s) in files outside the workspace filtered out, e.g. the DataFlex system packages)"
+            // This grid is MESSAGE-driven, but several refactoring functions fix constructs
+            // the compiler never warns about (legacy operators, Shadow_State, cleanup, ...).
+            // One standing reminder here, so they aren't forgotten just because no warning
+            // points at them. (The planned follow-through: function groups + a construct
+            // Deep Scan - see the coverage backlog.)
+            Append sSummary "   Tip: more refactorings exist that the compiler never warns about - browse the Select Functions view."
+
+            // Cache the full (unfiltered) build so Ctrl+I re-filters instantly - no re-parse of the
+            // .prn, re-classify, or source-guard reads. DisplayFiltered applies the show/hide,
+            // numbers the visible rows in the # column, pins the summary, and paints.
+            Set pTheDataFull  to TheData
+            Set paieCatFull   to aieCat
+            Set psSummaryBase to sSummary
+            Send DisplayFiltered
+        End_Procedure
+
+        // Apply the informational show/hide to the cached full build, number the visible rows
+        // in the "#" column, pin the summary in oSummary_fm, then paint. Called by LoadData
+        // (after a fresh parse) and by Ctrl+I (ToggleInformational) - the latter re-filters the
+        // cache with NO re-parse, so the toggle is instant. Keeps the Auto-fix/Review rows when
+        // informational is hidden; shows everything otherwise. (Re-filtering resets any active
+        // header sort to the load order - expected, since the row set changed.)
+        Procedure DisplayFiltered
+            Integer iRow iKeep iHidden iCount iRowNum_Col
+            tDataSourceRow[] TheData TheDataFull TheDataEmpty TheDataFiltered
+            Integer[] aieCat
+            String sSummary
+            If (not(IsComObjectCreated(Self))) ;
+                Procedure_Return
+            Get pTheDataFull  to TheDataFull
+            Get paieCatFull   to aieCat
+            Get psSummaryBase to sSummary
+            Get piColumnId of oRowNum_Col to iRowNum_Col
+            Move (SizeOfArray(TheDataFull)) to iCount
+            If (iCount = 0) Begin
+                Set Value     of oSummary_fm to ("0" + sSummary)
+                Set psToolTip of oSummary_fm to ("0" + sSummary)
+                Send InitializeData TheDataEmpty
+                Procedure_Return
+            End
+
+            // Build the rows to SHOW: hide the informational (Explain/Unknown) rows unless
+            // Ctrl+I has toggled them on. Data rows now start at index 0 (the summary is no
+            // longer a grid row - it is pinned in oSummary_fm below).
+            Move 0 to iHidden
+            If (pbShowInformational(Self) = False) Begin
+                Move TheDataEmpty to TheDataFiltered
+                Move 0 to iKeep
+                For iRow from 0 to (iCount - 1)
+                    If (aieCat[iRow] = eModAutoFix or aieCat[iRow] = eModSuggest) Begin
+                        Move TheDataFull[iRow] to TheDataFiltered[iKeep]
+                        Increment iKeep
+                    End
+                Loop
+                Move (iCount - iKeep) to iHidden
+                Move TheDataFiltered to TheData
+            End
+            Else Begin
+                Move TheDataFull to TheData
+            End
+
+            // Number the VISIBLE rows 1..K in this (original load) order, so clicking the "#"
+            // header restores it after the user has sorted by another column. Re-numbered on
+            // every Ctrl+I so the column is always a clean 1..K over what's shown.
+            Move (SizeOfArray(TheData) - 1) to iCount
+            For iRow from 0 to iCount
+                Move (String(iRow + 1)) to TheData[iRow].sValue[iRowNum_Col]
+            Loop
+
+            // Pin the summary above the grid: the count of rows SHOWN + the hidden note.
+            Move (String(SizeOfArray(TheData)) + sSummary) to sSummary
+            If (iHidden > 0) ;
+                Move (sSummary + "   (" + String(iHidden) + " informational hidden - Ctrl+I to show)") to sSummary
+            Set Value     of oSummary_fm to sSummary
+            Set psToolTip of oSummary_fm to sSummary
+            Send InitializeData TheData
+        End_Procedure
+
+        // Keep only diagnostics whose file is inside the workspace source tree - the home
+        // folder plus the workspace's library source roots (psHomePath +
+        // GetWorkspaceLibrarySourceFolders). Everything else (the DataFlex install Pkg, other
+        // external includes) is something the run can't touch, so it's dropped from the grid.
+        // If no workspace home is known, the list is left untouched (can't scope safely).
+        // iDropped (ByRef) receives the number of messages dropped, so the summary row can
+        // SAY they were filtered - on a workspace whose only warnings are 4536 "obsolete
+        // package" messages pinned to the install's own files, the grid would otherwise show
+        // "0 message(s)" while the compiler reported several: looks broken (Nils 2026-06-10).
+        Function FilterToWorkspaceFiles tCompileError[] aMessages Integer ByRef iDropped Returns tCompileError[]
+            tCompileError[] aKept
+            String[] asRoots asLibRoots
+            String sHome sSWS
+            Integer i iLib iAll iKeep
+            Boolean bInScope
+
+            Move 0 to iDropped
+            Get psHomePath of ghoApplication to sHome
+            If (sHome = "") ;
+                Function_Return aMessages
+            Move (vFolderFormat(sHome)) to asRoots[0]
+            Get psSWSFile of ghoApplication to sSWS
+            Get GetWorkspaceLibrarySourceFolders of ghoApplication sSWS to asLibRoots
+            Move (SizeOfArray(asLibRoots) - 1) to iLib
+            For i from 0 to iLib
+                Move (vFolderFormat(asLibRoots[i])) to asRoots[SizeOfArray(asRoots)]
+            Loop
+
+            Move (SizeOfArray(aMessages) - 1) to iAll
+            Move 0 to iKeep
+            For i from 0 to iAll
+                Get IsFileUnderRoots aMessages[i].sFileName asRoots to bInScope
+                If (bInScope = True) Begin
+                    Move aMessages[i] to aKept[iKeep]
+                    Increment iKeep
+                End
+                Else Begin
+                    Increment iDropped
+                End
+            Loop
+            Function_Return aKept
+        End_Function
+
+        // True if sFile sits under any of the folder roots (case-insensitive prefix). The
+        // roots are pre-normalized with a trailing separator (vFolderFormat) so this won't
+        // mistake "...\Foo" for a sibling "...\FooBar".
+        Function IsFileUnderRoots String sFile String[] asRoots Returns Boolean
+            Integer iRoot iRoots
+            String sLowFile sLowRoot
+            Move (Lowercase(Trim(sFile))) to sLowFile
+            Move (SizeOfArray(asRoots) - 1) to iRoots
+            For iRoot from 0 to iRoots
+                Move (Lowercase(Trim(asRoots[iRoot]))) to sLowRoot
+                If ((sLowRoot <> "") and (Left(sLowFile, Length(sLowRoot)) = sLowRoot)) Begin
+                    Function_Return True
+                End
+            Loop
+            Function_Return False
+        End_Function
+
+        // Open the selected error's source file at its line. Mirrors CompilerOutput.dg's
+        // jump: psProduct picks the path (TestBench's editor already holds the code; in
+        // DFRefactor we open the file first). A blank-file row (shouldn't occur now the summary
+        // is out of the grid) just no-ops the jump.
+        Procedure DisplayCurrentSourceLine
+            Integer iLine_Col iFile_Col iLine iItem iPos
+            String sFileName sProduct sLineCell
+            Handle hoDataSource hoEditor
+            tDataSourceRow[] TheData
+
+            Get piColumnId of oLine_Col to iLine_Col
+            Get piColumnId of oFile_Col to iFile_Col
+            Get phoDataSource to hoDataSource
+            Get SelectedRow of hoDataSource to iItem
+            Get DataSource of hoDataSource to TheData
+            Move TheData[iItem].sValue[iFile_Col] to sFileName
+            // The Line cell may carry a per-file occurrence count, e.g. "156  (x2)" - keep only the
+            // leading number so the Move to the Integer iLine does not choke on the "(x2)" suffix
+            // ("Bad format in expression"). A plain per-line row ("893") has no suffix and passes through.
+            Move TheData[iItem].sValue[iLine_Col] to sLineCell
+            Move (Pos("(x", sLineCell)) to iPos
+            If (iPos > 0) ;
+                Move (Trim(Left(sLineCell, iPos - 1))) to sLineCell
+            Move sLineCell to iLine
+            If (sFileName = "") Begin
+                Procedure_Return
+            End
+
+            Get psProduct of ghoApplication to sProduct
+            If (sProduct = "Test Bench") Begin
+                If (iLine <> -1) Begin
+                    Decrement iLine
+                    Send JumpToSourceLine of (Client_Id(phoMainPanel(ghoApplication))) iLine
+                    Send Activate of (phoEditorRefactored(ghoApplication))
+                End
+            End
+            Else Begin
+                Get phoEditor of ghoApplication to hoEditor
+                If (hoEditor <> 0 and sFileName <> "" and iLine > 0) Begin
+                    Send Activate of hoEditor
+                    Send LoadFile of hoEditor sFileName
+                    Send JumpToSourceLine of hoEditor (iLine - 1)
+                End
+            End
+        End_Procedure
+
+        Procedure Initialize
+            Send LoadData
+        End_Procedure
+
+        Procedure OnComRowDblClick Variant llRow Variant llItem
+            Send DisplayCurrentSourceLine
+        End_Procedure
+
+        // Right-click context menu - the shared cCJToolPanel menu, same one CompilerOutput.dg uses.
+        Procedure OnComRowRClick Variant llRow Variant llItem
+            Send Popup to (phoToolPanelContextMenu(Self))
+        End_Procedure
+
+        // Tells the shared context menu which grid invoked it, so its items act on us.
+        Procedure Add_Focus Handle hoParent Returns Integer
+            Forward Send Add_Focus hoParent
+            Set phInvokingObject to Self
+        End_Procedure
+
+        // "Copy content to Clipboard": every SELECTED row (multi-select via pbMultipleSelection),
+        // each as tab-separated columns, one row per line. Falls back to the focused row when
+        // nothing is multi-selected. Reuses the RFOpenOutput("Clipboard:") pattern from CompilerOutput.dg.
+        Procedure Copy
+            Integer iCat iErr iFile iLn iHint iFn iItem iCh i iSel
+            Integer[] aiRows
+            Handle hoDataSource
+            tDataSourceRow[] TheData
+            String sOut sLine sCRLF
+            Get piColumnId of oCategory_Col to iCat
+            Get piColumnId of oErrNo_Col    to iErr
+            Get piColumnId of oFile_Col     to iFile
+            Get piColumnId of oLine_Col     to iLn
+            Get piColumnId of oHint_Col     to iHint
+            Get piColumnId of oFn_Col       to iFn
+            Get phoDataSource to hoDataSource
+            Get DataSource of hoDataSource to TheData
+            Get GetIndexesForSelectedRows to aiRows
+            If (SizeOfArray(aiRows) = 0) Begin
+                Get SelectedRow of hoDataSource to iItem
+                If (iItem >= 0) ;
+                    Move iItem to aiRows[0]
+            End
+            Move (SizeOfArray(aiRows)) to iSel
+            Move (Character(13) + Character(10)) to sCRLF
+            Move "" to sOut
+            For i from 0 to (iSel - 1)
+                Move aiRows[i] to iItem
+                Move (TheData[iItem].sValue[iCat]) to sLine
+                Append sLine (Character(9)) (TheData[iItem].sValue[iErr])
+                Append sLine (Character(9)) (TheData[iItem].sValue[iFile])
+                Append sLine (Character(9)) (TheData[iItem].sValue[iLn])
+                Append sLine (Character(9)) (TheData[iItem].sValue[iHint])
+                Append sLine (Character(9)) (TheData[iItem].sValue[iFn])
+                Move (sOut + sLine + sCRLF) to sOut
+            Loop
+            If (sOut = "") ;
+                Procedure_Return
+            Get RFOpenOutput ("Clipboard:") to iCh
+            If (iCh < 0) ;
+                Procedure_Return
+            Write channel iCh sOut
+            Send RFCloseOutput iCh
+            Set StatusText of (Statusbar_Id(Self)) to (String(iSel) * "row(s) copied to Windows clipboard.")
+        End_Procedure
+
+        // "Copy ln number to Clipboard": just the Line cell (mirrors CompilerOutput.dg).
+        Procedure CopyErrorLineNo
+            Integer iLn iItem iCh
+            Handle hoDataSource
+            tDataSourceRow[] TheData
+            String sData
+            Get piColumnId of oLine_Col to iLn
+            Get phoDataSource to hoDataSource
+            Get SelectedRow of hoDataSource to iItem
+            If (iItem < 0) ;
+                Procedure_Return
+            Get DataSource of hoDataSource to TheData
+            Move (TheData[iItem].sValue[iLn]) to sData
+            If (sData = "" or sData = "0") ;
+                Procedure_Return
+            Get RFOpenOutput ("Clipboard:") to iCh
+            If (iCh < 0) ;
+                Procedure_Return
+            Write channel iCh sData
+            Send RFCloseOutput iCh
+            Set StatusText of (Statusbar_Id(Self)) to "Line number copied to Windows clipboard."
+        End_Procedure
+
+        // Ctrl+A selects every row, so the whole list can be copied in one go.
+        // Toogles between marking all and if all rows are selected,
+        // all rows are deselected.
+        Procedure SelectAllRows
+            Integer iCount iSelected
+            Handle hoDataSource
+    
+            Get phoDataSource to hoDataSource
+            Get RowCount of hoDataSource to iCount
+            Get GetSelectedRowsCount to iSelected
+            If (iCount <> iSelected) Begin
+                Send SetSelectedRowsAll True
+            End
+            Else Begin
+                Send SetSelectedRowsAll False
+            End
+        End_Procedure
+
+        // Toggle the informational (Explain/Unknown) rows on/off and rebuild the grid. Re-runs
+        // LoadData (re-parses the .prn) - fine for typical builds; if it drags on a very large
+        // .prn we can cache the parsed messages and re-filter without re-reading.
+        Procedure ToggleInformational
+            Set pbShowInformational to (not(pbShowInformational(Self)))
+            Send Cursor_Wait of Cursor_Control
+            Send DisplayFiltered
+            Send Cursor_Ready of Cursor_Control
+        End_Procedure
+
+        On_Key kEnter Send DisplayCurrentSourceLine
+        On_Key Key_Ctrl+Key_C Send Copy
+        On_Key Key_Ctrl+Key_A Send SelectAllRows
+        On_Key Key_Ctrl+Key_I Send ToggleInformational
+    End_Object
+
+    Procedure OnCreateToolPanel Handle hoToolPane
+        Set ComContextMenuPresent of hoToolPane to True
+    End_Procedure
+
+    Procedure OnUpdate
+        Send Initialize to oModAnalyzer_grd
+    End_Procedure
+
+    Procedure Close_Panel
+        Forward Send Close_Panel
+    End_Procedure
+
+    On_Key Key_Alt+Key_C  Send Close_Panel
+    On_Key Key_Escape     Send Close_Panel
+End_Object
+
+// *** Public access methods for this panel ***
+//
+// Open the analysis panel for the given .err file (parse + classify + show).
+Procedure ActivateModAnalyzer String sErrorFile
+    Handle ho
+    Boolean bExists
+
+    Get vFilePathExists sErrorFile to bExists
+    If (bExists = False) Begin
+        Send Info_Box ("The .err file doesn't exist:\n" * String(sErrorFile))
+        Procedure_Return
+    End
+
+    Set psErrorFile of ghoModAnalyzerDock to sErrorFile
+    // "One at a time": hide the Compiler Output dock so the analyzer takes the shared
+    // bottom slot and the editor keeps its height. (CommandBars dialog bars don't expose
+    // native auto-hide, so we just toggle pbVisible - exactly what ShowCompileOutputLive does.)
+    // "One at a time": hide the Compiler Output dock so the analyzer takes the shared bottom
+    // slot and the editor keeps its height (CommandBars dialog bars have no native auto-hide,
+    // so we just toggle pbVisible - exactly what ShowCompileOutputLive does). The first show
+    // also docks this panel for the first time; LoadData pumps right after that, before its
+    // heavy parse, so the one-time docking doesn't leave the outgoing dock ghosted over the editor.
+    Set pbVisible of ghoCompilerOutputDock to False
+    Set pbVisible of ghoModAnalyzerDock    to True
+    Send Activate of ghoModAnalyzerDock
+End_Procedure
+
+// Close the analysis panel.
+Procedure CloseModAnalyzer
+    Set psErrorFile  of ghoModAnalyzerDock to ""
+    Set pbVisible    of ghoModAnalyzerDock to False
+    Send Close_Panel of ghoModAnalyzerDock
+End_Procedure
+

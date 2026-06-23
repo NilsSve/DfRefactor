@@ -1,0 +1,515 @@
+﻿    // Unit tests for cModAnalyzer.ClassifyMessage - the .err triage "brain" (Phase 1).
+    // Pure lookup: a compiler error number (+ its text) -> a fix recipe (category,
+    // human label, one-line hint, and the refactor function that addresses it).
+    // Read-only; makes no source changes. String compares use boolean Assert (not
+    // AssertSAreEqual) to match the rest of the Win64/Unicode fixtures.
+    Object oModAnalyzer is a cTestFixture
+        Set psFunctionName to "ModAnalyzer"
+
+        // Helper: create the analyzer, classify one error, return the recipe.
+        Function MakeRecipe Integer iErrorNo String sErrorTxt Returns tModAnalyzer
+            Handle ho
+            tModAnalyzer Recipe
+            tModAnalyzer[] aRecipes
+            Get Create (RefClass(cModAnalyzer)) to ho
+            // Classify against the in-memory defaults (the seed source) - keeps the
+            // unit tests pure: no ModAnalyzer table / database access needed.
+            Get BuildDefaultRecipes of ho to aRecipes
+            Get ClassifyFromRecipes of ho iErrorNo sErrorTxt aRecipes to Recipe
+            Send Destroy of ho
+            Function_Return Recipe
+        End_Function
+
+        // 4539 Pointer->String: Auto-fix, routes to UnicodePointerToString.
+        {Published = True}
+        Procedure ModAnalyzer_4539_PointerToString_AutoFix
+            tModAnalyzer Recipe
+            Get MakeRecipe 4539 "Conversion from Pointer to String is not allowed, use PointerToString function" to Recipe
+            Send Assert (Recipe.eCategory = eModAutoFix)
+            Send Assert (Recipe.sRefactorFn = "UnicodePointerToString")
+        End_Procedure
+
+        // 4539 String->Pointer: Auto-fix, routes to UnicodeStringToPointer.
+        {Published = True}
+        Procedure ModAnalyzer_4539_StringToPointer_AutoFix
+            tModAnalyzer Recipe
+            Get MakeRecipe 4539 "Conversion from String to Pointer is not allowed, use MemCopy function" to Recipe
+            Send Assert (Recipe.eCategory = eModAutoFix)
+            Send Assert (Recipe.sRefactorFn = "UnicodeStringToPointer")
+        End_Procedure
+
+        // 4534 ToOEM/ToANSI: Auto-fix via UnicodeOemAnsiFunctions (the auto-rewritable OEM/ANSI calls).
+        {Published = True}
+        Procedure ModAnalyzer_4534_ToOem_AutoFix
+            tModAnalyzer Recipe
+            Get MakeRecipe 4534 "Obsolete use of ToOEM, use Utf8ToOem or AnsiToUtf8 instead." to Recipe
+            Send Assert (Recipe.sRefactorFn = "UnicodeOemAnsiFunctions")
+        End_Procedure
+
+        // 4534 other OEM/ANSI calls (e.g. File_Exist_Oem) are NOT auto-rewritable -> Explain, no fn.
+        {Published = True}
+        Procedure ModAnalyzer_4534_OtherOem_Explain
+            tModAnalyzer Recipe
+            Get MakeRecipe 4534 "Obsolete use of File_Exist_Oem, not unicode safe" to Recipe
+            Send Assert (Recipe.eCategory = eModExplain)
+            Send Assert (Recipe.sRefactorFn = "")
+        End_Procedure
+
+        // 4533 ArrayPut -> Suggest, routed to TypeToStructReport (the byte-buffer/Type -> Struct
+        // migration). The function-bearing meta-tag recipe beats the scanned function-less
+        // "Obsolete Command: ArrayPut" row (meta-tags are added before the appended scan).
+        {Published = True}
+        Procedure ModAnalyzer_4533_ArrayPut_Suggest
+            tModAnalyzer Recipe
+            Get MakeRecipe 4533 "Obsolete Command: ArrayPut" to Recipe
+            Send Assert (Recipe.eCategory = eModSuggest)
+            Send Assert (Recipe.sRefactorFn = "TypeToStructReport")
+        End_Procedure
+
+        // 4534 CVTtoBytes -> Suggest, routed to TypeToStructReport (a Struct assignment packs the
+        // bytes). Specific match-text beats the generic 4534 Explain.
+        {Published = True}
+        Procedure ModAnalyzer_4534_CvtToBytes_Suggest
+            tModAnalyzer Recipe
+            Get MakeRecipe 4534 "Obsolete use of CVTtoBytes, not unicode safe" to Recipe
+            Send Assert (Recipe.eCategory = eModSuggest)
+            Send Assert (Recipe.sRefactorFn = "TypeToStructReport")
+        End_Procedure
+
+        // 4534 ToOEM/ToANSI inside a custom macro/command (e.g. File_Exist_OEM, whose body calls
+        // ToOEM): the warning fires at the call site, but the token isn't on that line, so the
+        // line-based fix can't act -> VerifyAutoFix demotes to Explain. A direct call stays Auto-fix.
+        {Published = True}
+        Procedure ModAnalyzer_4534_MacroExpansion_Demoted
+            Handle ho
+            tModAnalyzer Recipe rDirect rMacro
+            Get MakeRecipe 4534 "Obsolete use of ToOEM, use Utf8ToOem or AnsiToUtf8 instead." to Recipe
+            Send Assert (Recipe.eCategory = eModAutoFix)
+            Get Create (RefClass(cModAnalyzer)) to ho
+            Get VerifyAutoFix of ho Recipe "Move (ToOEM(sName)) to sOem" to rDirect
+            Send Assert (rDirect.eCategory = eModAutoFix)
+            Send Assert (rDirect.sRefactorFn = "UnicodeOemAnsiFunctions")
+            Get VerifyAutoFix of ho Recipe "File_Exist_OEM (Trim(Kund_dok.dok)) bFileExists" to rMacro
+            Send Assert (rMacro.eCategory = eModExplain)
+            Send Assert (rMacro.sRefactorFn = "")
+            Send Destroy of ho
+        End_Procedure
+
+        // 4538 "Obsolete command: Indicator. Use Boolean" -> ChangeIndicatorToBoolean owns it (the
+        // global Indicator DECLARATION). Source-guarded like the other line-construct refactors: a
+        // genuine "Indicator X" line stays Auto-fix; a 4538 that fires inside a macro expansion (whose
+        // call-site line has no literal "Indicator") demotes to Explain.
+        {Published = True}
+        Procedure ModAnalyzer_4538_MacroExpansion_Demoted
+            Handle ho
+            tModAnalyzer Recipe rGenuine rMacro
+            Get MakeRecipe 4538 "Obsolete command: Indicator. Use Boolean" to Recipe
+            Send Assert (Recipe.sRefactorFn = "ChangeIndicatorToBoolean")
+            Get Create (RefClass(cModAnalyzer)) to ho
+            Get VerifyAutoFix of ho Recipe "Indicator User" to rGenuine
+            Send Assert (rGenuine.sRefactorFn = "ChangeIndicatorToBoolean")
+            Get VerifyAutoFix of ho Recipe "Deferred_View Activate_oFoo For ;" to rMacro
+            Send Assert (rMacro.eCategory = eModExplain)
+            Send Assert (rMacro.sRefactorFn = "")
+            Send Destroy of ho
+        End_Procedure
+
+        // The shared source-guard predicate that keeps the triage GRID and the refactor PLAN in
+        // lock-step (the divergence Nils found: UnicodeOemAnsiFunctions in the Plan but not the
+        // grid). Both call RecipeNeedsSourceGuard, so a "use of X" auto-fix or the legacy-indicator
+        // review is line-guarded in BOTH, while a plain command->function fix (e.g. Pointer->String)
+        // is guarded in NEITHER (it always applies). (Nils 2026-06-12.)
+        {Published = True}
+        Procedure ModAnalyzer_RecipeNeedsSourceGuard_Predicate
+            Handle ho
+            tModAnalyzer rOem rLegacy rPlain
+            Boolean bOem bLegacy bPlain
+            Get Create (RefClass(cModAnalyzer)) to ho
+            Get MakeRecipe 4534 "Obsolete use of ToOEM, use Utf8ToOem or AnsiToUtf8 instead." to rOem
+            Get RecipeNeedsSourceGuard of ho rOem to bOem
+            Send Assert bOem
+            // 4538 "Use Move command" variant -> ChangeLegacyIndicators (the [Found]/Indicate USAGE review).
+            // Must use a real match-text variant: the old "Obsolete indicators" text matched NO recipe after
+            // 4538 became match-text-routed (v26), so it resolved to no function and the guard read False.
+            Get MakeRecipe 4538 "Obsolete command: Indicate. Use Move command" to rLegacy
+            Get RecipeNeedsSourceGuard of ho rLegacy to bLegacy
+            Send Assert bLegacy
+            Get MakeRecipe 4539 "Conversion from Pointer to String is not allowed, use PointerToString function" to rPlain
+            Get RecipeNeedsSourceGuard of ho rPlain to bPlain
+            Send AssertFalse bPlain
+            Send Destroy of ho
+        End_Procedure
+
+        // Regression (2026-06-19): ChangeSquareBracketsIndicators must be source-guarded too - it shares
+        // the [bracket]/Indicate domain with ChangeLegacyIndicators. It was missing from
+        // RecipeNeedsSourceGuard, so a 4538 on a NON-bracket line - the legacy "Obsolete command:
+        // Indicator. Use Boolean" type declaration, which neither function fixes - slipped it into the
+        // refactor PLAN (MatchingRecipesFromList, unguarded) while the GRID demoted it, so the two
+        // disagreed. Both must guard identically.
+        {Published = True}
+        Procedure ModAnalyzer_SquareBracketsIndicators_SourceGuarded
+            Handle ho
+            tModAnalyzer rRecipe rChecked
+            Boolean bGuard
+            Get Create (RefClass(cModAnalyzer)) to ho
+            Move 4538 to rRecipe.iMsgNumber
+            Move eModSuggest to rRecipe.eCategory
+            Move "ChangeSquareBracketsIndicators" to rRecipe.sRefactorFn
+            // (a) it needs source-guarding
+            Get RecipeNeedsSourceGuard of ho rRecipe to bGuard
+            Send Assert bGuard
+            // (b) the "Indicator" type-declaration line (no "[" / no "indicate") demotes it to Explain
+            Get VerifyAutoFix of ho rRecipe "Property Indicator gbFlag" to rChecked
+            Send Assert (rChecked.eCategory = eModExplain)
+            Send Assert (rChecked.sRefactorFn = "")
+            // (c) a real bracket line keeps it actionable
+            Get VerifyAutoFix of ho rRecipe "If [Found] Begin" to rChecked
+            Send Assert (rChecked.sRefactorFn = "ChangeSquareBracketsIndicators")
+            Send Destroy of ho
+        End_Procedure
+
+        // 4544 ambiguous Get_ in an expression: no refactor fn -> Explain (informational, manual fix).
+        {Published = True}
+        Procedure ModAnalyzer_4544_Explain
+            tModAnalyzer Recipe
+            Get MakeRecipe 4544 "Function return value is ambiguous in this context" to Recipe
+            Send Assert (Recipe.eCategory = eModExplain)
+            Send Assert (Recipe.sRefactorFn = "")
+        End_Procedure
+
+        // 4345 reserved name (iEntry/iExit/iValidate): no refactor fn -> Explain (manual rename). The
+        // text has no "SELECT, MUST BE DEFINED", so it must NOT match the SELECT variant below.
+        {Published = True}
+        Procedure ModAnalyzer_4345_ReservedName_Explain
+            tModAnalyzer Recipe
+            Get MakeRecipe 4345 "iExit should not be defined" to Recipe
+            Send Assert (Recipe.eCategory = eModExplain)
+            Send Assert (Recipe.sRefactorFn = "")
+        End_Procedure
+
+        // 4345 bare predefined SELECT (no OldFMACCommands.pkg): Auto-fix, routes to AddUseOldFMACCommands.
+        // The function-bearing specific (4345 | SELECT, MUST BE DEFINED) beats the function-less generic.
+        {Published = True}
+        Procedure ModAnalyzer_4345_Select_AutoFix
+            tModAnalyzer Recipe
+            Get MakeRecipe 4345 "Type check error SELECT, MUST BE DEFINED" to Recipe
+            Send Assert (Recipe.eCategory = eModAutoFix)
+            Send Assert (Recipe.sRefactorFn = "AddUseOldFMACCommands")
+        End_Procedure
+
+        // 4345 SELECT also enters the refactoring PLAN: MatchingRecipesFromList (the multi-match plan
+        // path) returns the AddUseOldFMACCommands recipe for the SELECT variant, and NOT for the
+        // reserved-name variant. (MakeMatches / MatchesContainFn are defined below; message dispatch is
+        // runtime so definition order does not matter.)
+        {Published = True}
+        Procedure ModAnalyzer_4345_Select_InPlan
+            tModAnalyzer[] aSelect aReserved
+            Boolean bSelectHasFn bReservedHasFn
+            Get MakeMatches 4345 "Type check error SELECT, MUST BE DEFINED" to aSelect
+            Get MatchesContainFn aSelect "AddUseOldFMACCommands" to bSelectHasFn
+            Send Assert (bSelectHasFn = True)
+            Get MakeMatches 4345 "iExit should not be defined" to aReserved
+            Get MatchesContainFn aReserved "AddUseOldFMACCommands" to bReservedHasFn
+            Send Assert (bReservedHasFn = False)
+        End_Procedure
+
+        // 4379 wrong argument count: Explain (needs human judgement).
+        {Published = True}
+        Procedure ModAnalyzer_4379_ArgCount_Explain
+            tModAnalyzer Recipe
+            Get MakeRecipe 4379 "Wrong number of arguments" to Recipe
+            Send Assert (Recipe.eCategory = eModExplain)
+        End_Procedure
+
+        // 4537 obsolete class LIST: deliberately Explain-ONLY (decided 2026-06-10) - the class
+        // swap is trivial but the Add_Item/Current_Item call sites need a manual datasource
+        // redesign, so no refactor function is planned. The specific recipe must beat the
+        // generic 4537 one and carry the migration-shape hint.
+        {Published = True}
+        Procedure ModAnalyzer_4537_List_Explain
+            tModAnalyzer Recipe
+            Get MakeRecipe 4537 "Obsolete Class Obsolete class: LIST" to Recipe
+            Send Assert (Recipe.eCategory = eModExplain)
+            Send Assert (Recipe.sRefactorFn = "")
+            Send Assert (Recipe.sHint contains "cCJGrid")
+        End_Procedure
+
+        // Unrecognized error number: Unknown category, blank fn, non-blank hint.
+        {Published = True}
+        Procedure ModAnalyzer_Unknown_Default
+            tModAnalyzer Recipe
+            Get MakeRecipe 9999 "Some unrecognized error" to Recipe
+            Send Assert (Recipe.eCategory = eModUnknown)
+            Send Assert (Recipe.sRefactorFn = "")
+            Send Assert (Recipe.sHint <> "")
+        End_Procedure
+
+        // The category label is derived from the category value.
+        {Published = True}
+        Procedure ModAnalyzer_CategoryText_AutoFix
+            tModAnalyzer Recipe
+            Get MakeRecipe 4539 "Conversion from Pointer to String is not allowed" to Recipe
+            Send Assert (Recipe.sCategoryText = "Auto-fix")
+        End_Procedure
+
+        // Helper: create the analyzer, return ALL recipes that match one message - the
+        // multi-match counterpart to ClassifyFromRecipes' single-return, used by the refactor
+        // plan so one warning can pull in more than one class-specific refactor.
+        Function MakeMatches Integer iErrorNo String sErrorTxt Returns tModAnalyzer[]
+            Handle ho
+            tModAnalyzer[] aRecipes aMatched
+            Get Create (RefClass(cModAnalyzer)) to ho
+            Get BuildDefaultRecipes of ho to aRecipes
+            Get MatchingRecipesFromList of ho iErrorNo sErrorTxt aRecipes to aMatched
+            Send Destroy of ho
+            Function_Return aMatched
+        End_Function
+
+        // Helper: True if any matched recipe routes to the named refactor function.
+        Function MatchesContainFn tModAnalyzer[] aMatched String sFn Returns Boolean
+            Integer i iCount
+            Move (SizeOfArray(aMatched)) to iCount
+            For i from 0 to (iCount - 1)
+                If (aMatched[i].sRefactorFn = sFn) ;
+                    Function_Return True
+            Loop
+            Function_Return False
+        End_Function
+
+        // 4537 obsolete-class warnings carry the ACTUAL declared class name - "DBGRID" for a dbGrid,
+        // "DBLIST" for a dbList. The compiler does NOT collapse both to a shared "DBGRID" widget, so
+        // each routes to its OWN class-specific refactor. (Regression 2026-06-19: the dbList recipe
+        // was mistakenly keyed on "class: DBGRID", so every dbList object - which warns as
+        // "Obsolete class: DBLIST" - fell through to the generic 4537 Explain.)
+        {Published = True}
+        Procedure ModAnalyzer_4537_DbGrid_Family
+            tModAnalyzer[] aGrid aList
+            Boolean bGridIsGrid bGridIsList bListIsList bListIsGrid
+            Get MakeMatches 4537 "Obsolete class: DBGRID" to aGrid
+            Get MatchesContainFn aGrid "RefactorDbGridTocDbCJGrid"           to bGridIsGrid
+            Get MatchesContainFn aGrid "RefactorDbListTocDbCJGridPromptList" to bGridIsList
+            Send Assert (bGridIsGrid = True)
+            Send Assert (bGridIsList = False)
+            Get MakeMatches 4537 "Obsolete class: DBLIST" to aList
+            Get MatchesContainFn aList "RefactorDbListTocDbCJGridPromptList" to bListIsList
+            Get MatchesContainFn aList "RefactorDbGridTocDbCJGrid"           to bListIsGrid
+            Send Assert (bListIsList = True)
+            Send Assert (bListIsGrid = False)
+        End_Procedure
+
+        // 4533 "command: Begin_Row" no longer routes to a grid refactor (2026-06-18): the
+        // legacy grid is flagged at its object via the 4537 class anchor (DBGRID / DBLIST), so the
+        // Begin_Row line demotes to the generic 4533 Explain (no refactor function) - one
+        // clean actionable row per grid, not one per Begin_Row inside it.
+        {Published = True}
+        Procedure ModAnalyzer_4533_BeginRow_NoFunction
+            tModAnalyzer Recipe
+            Get MakeRecipe 4533 "Obsolete command: Begin_Row" to Recipe
+            Send Assert (Recipe.eCategory = eModExplain)
+            Send Assert (Recipe.sRefactorFn = "")
+        End_Procedure
+
+        // Regression (2026-06-11): a function-less SPECIFIC hint (the install-catalog
+        // scan seeds one Explain row per obsolete command) must not SHADOW a
+        // function-bearing GENERIC recipe out of the plan - TypeToStructReport
+        // (generic 4532 | Suggest) never appeared in Auto Select because the scanned
+        // specific always won the precedence.
+        {Published = True}
+        Procedure ModAnalyzer_4532_GenericFnNotShadowed
+            Handle ho
+            tModAnalyzer[] aRecipes aMatched
+            Boolean bFound
+            Get Create (RefClass(cModAnalyzer)) to ho
+            // The scanned, function-less specific hint...
+            Get AddRecipe of ho aRecipes 4532 True "Obsolete command (not unicode safe): Type." "" eModExplain "scanned hint" to aRecipes
+            // ...and the function-bearing generic that must survive the precedence.
+            Get AddRecipe of ho aRecipes 4532 True "" "TypeToStructReport" eModSuggest "report" to aRecipes
+            Get MatchingRecipesFromList of ho 4532 "Obsolete Type Command Obsolete command (not unicode safe): Type. Use Struct/End_Struct" aRecipes to aMatched
+            Send Destroy of ho
+            Get MatchesContainFn aMatched "TypeToStructReport" to bFound
+            Send Assert (bFound = True)
+        End_Procedure
+
+        // Same shadow, the GRID (single-result) path: ClassifyFromRecipes must also classify the
+        // Type-family 4532 as TypeToStructReport / Review, NOT the function-less Explain specific -
+        // so the triage grid agrees with what Auto Select runs (Nils 2026-06-11).
+        {Published = True}
+        Procedure ModAnalyzer_4532_ClassifyNotShadowed
+            Handle ho
+            tModAnalyzer[] aRecipes
+            tModAnalyzer Recipe
+            Get Create (RefClass(cModAnalyzer)) to ho
+            Get AddRecipe of ho aRecipes 4532 True "Obsolete command (not unicode safe): Type." "" eModExplain "scanned hint" to aRecipes
+            Get AddRecipe of ho aRecipes 4532 True "" "TypeToStructReport" eModSuggest "report" to aRecipes
+            Get ClassifyFromRecipes of ho 4532 "Obsolete Type Command Obsolete command (not unicode safe): Type. Use Struct/End_Struct" aRecipes to Recipe
+            Send Destroy of ho
+            Send Assert (Recipe.sRefactorFn = "TypeToStructReport")
+            Send Assert (Recipe.eCategory = eModSuggest)
+        End_Procedure
+
+        // 4535 wears two faces under one code, so the match-text must route them apart.
+        // Private/Public keyword -> the property-keyword removers, NOT the file-extension recipe.
+        {Published = True}
+        Procedure ModAnalyzer_4535_PropertyKeyword
+            tModAnalyzer[] aMatched
+            Boolean bPriv bPub bFileExt
+            Get MakeMatches 4535 "Use of Private or Public keyword in property command is obsolete" to aMatched
+            Get MatchesContainFn aMatched "RemovePropertyPrivate" to bPriv
+            Get MatchesContainFn aMatched "RemovePropertyPublic" to bPub
+            Get MatchesContainFn aMatched "AddUseFileExtension" to bFileExt
+            Send Assert (bPriv = True)
+            Send Assert (bPub = True)
+            Send Assert (bFileExt = False)
+        End_Procedure
+
+        // 4535 filename form -> AddUseFileExtension, NOT the property-keyword removers.
+        {Published = True}
+        Procedure ModAnalyzer_4535_FileExtension
+            tModAnalyzer[] aMatched
+            Boolean bFileExt bProp
+            Get MakeMatches 4535 "Filenames in use command should contain a file extension (e.g., .pkg)" to aMatched
+            Get MatchesContainFn aMatched "AddUseFileExtension" to bFileExt
+            Get MatchesContainFn aMatched "RemovePropertyPrivate" to bProp
+            Send Assert (bFileExt = True)
+            Send Assert (bProp = False)
+        End_Procedure
+
+        // 4537 Obsolete Class: GRID -> the non-data-aware grid refactor.
+        {Published = True}
+        Procedure ModAnalyzer_4537_Grid_Class
+            tModAnalyzer Recipe
+            Get MakeRecipe 4537 "Obsolete class: GRID" to Recipe
+            Send Assert (Recipe.sRefactorFn = "RefactorGridToCJGrid")
+        End_Procedure
+
+        // 4537 Obsolete Class: DBGRID -> the data-aware grid refactor (must NOT collide with GRID).
+        {Published = True}
+        Procedure ModAnalyzer_4537_DbGrid_Class
+            tModAnalyzer Recipe
+            Get MakeRecipe 4537 "Obsolete class: DBGRID" to Recipe
+            Send Assert (Recipe.sRefactorFn = "RefactorDbGridTocDbCJGrid")
+        End_Procedure
+
+        // 4537 Obsolete Class: DFTimer -> the dfTimer-to-cTimer refactor ({ ModRecipe = 4537 | class: DFTIMER }).
+        {Published = True}
+        Procedure ModAnalyzer_4537_DfTimer_Class
+            tModAnalyzer Recipe
+            Get MakeRecipe 4537 "Obsolete class: DFTimer" to Recipe
+            Send Assert (Recipe.sRefactorFn = "ChangeDfTimerTocTimer")
+        End_Procedure
+
+        // 4531 Obsolete String command: Character -> the Character command-to-function refactor.
+        {Published = True}
+        Procedure ModAnalyzer_4531_Character_Command
+            tModAnalyzer Recipe
+            Get MakeRecipe 4531 "Obsolete String command: Character. Use Character() Function" to Recipe
+            Send Assert (Recipe.sRefactorFn = "ChangeCharacterCommandToFunction")
+        End_Procedure
+
+        // 4531 Obsolete String command: Pad -> the Pad command-to-function refactor.
+        {Published = True}
+        Procedure ModAnalyzer_4531_Pad_Command
+            tModAnalyzer Recipe
+            Get MakeRecipe 4531 "Obsolete String command: Pad. Use Pad() Function" to Recipe
+            Send Assert (Recipe.sRefactorFn = "ChangePadCommandToFunction")
+        End_Procedure
+
+        // The package scanner parses #COMMAND ... WarningEx ... OBSOLETE_<suffix> "<msg>" defs into
+        // Explain recipes (number from the constant suffix; hint = the message with its replacement).
+        {Published = True}
+        Procedure ModAnalyzer_Scan_ParsesObsoleteDefs
+            String[] asLines
+            tModAnalyzer[] aRec
+            Move '#COMMAND BEGIN_CONSTRAINTS' to asLines[0]
+            Move '    WarningEx GENERAL DFERR_COMP_WARNING_OBSOLETE_CMD "Obsolete command: Begin_Constraint. Use OnConstrain"' to asLines[1]
+            Move '    Procedure Constrain' to asLines[2]
+            Move '#ENDCOMMAND' to asLines[3]
+            Move '#COMMAND TYPE' to asLines[4]
+            Move '    WarningEx GENERAL DFERR_COMP_WARNING_OBSOLETE_TYPE_CMD "Obsolete command (not unicode safe): Type. Use Struct/End_Struct"' to asLines[5]
+            Move '#ENDCOMMAND' to asLines[6]
+            Move '// a plain comment - not a warning definition' to asLines[7]
+            // The extractor was relocated to cRefactorFuncLib (the shared install-Pkg walk); call it
+            // on ghoFuncLib (no throwaway cModAnalyzer instance needed - it is pure).
+            Get _ObsoleteRecipesFromLines of ghoFuncLib asLines to aRec
+            Send Assert (SizeOfArray(aRec) = 2)
+            Send Assert (aRec[0].iMsgNumber = 4533)
+            Send Assert (aRec[0].eCategory = eModExplain)
+            Send Assert (aRec[0].sHint contains "OnConstrain")
+            Send Assert (aRec[1].iMsgNumber = 4532)
+            Send Assert (aRec[1].sHint contains "Struct")
+        End_Procedure
+
+        // The plan must pull in AddUseOldFMACCommands as a COMPANION whenever ChangeLegacyIndicators or
+        // ChangeSquareBracketsIndicators is present - they modernise [Select] only with OldFMACCommands.pkg
+        // in the build, and being line-by-line they can't add the file-level Use line (AddUseOldFMACCommands,
+        // eOtherFunction, does). No warning drives AddUseOldFMACCommands, so it never enters via a recipe.
+        {Published = True}
+        Procedure ModAnalyzer_Plan_AddUseOldFMACCompanion
+            Handle ho
+            tModRefactorPlan PlanLegacy PlanSquare PlanNone PlanDup
+            Get Create (RefClass(cModAnalyzer)) to ho
+            // ChangeLegacyIndicators present -> companion added; the hint array stays parallel.
+            Move "ChangeLegacyIndicators" to PlanLegacy.asFunctions[0]
+            Move "" to PlanLegacy.asFunctionHints[0]
+            Get _AddIndicatorUseCompanion of ho PlanLegacy to PlanLegacy
+            Send Assert (SearchArray("AddUseOldFMACCommands", PlanLegacy.asFunctions) <> -1)
+            Send Assert (SizeOfArray(PlanLegacy.asFunctions) = SizeOfArray(PlanLegacy.asFunctionHints))
+            // ChangeSquareBracketsIndicators present -> companion added.
+            Move "ChangeSquareBracketsIndicators" to PlanSquare.asFunctions[0]
+            Move "" to PlanSquare.asFunctionHints[0]
+            Get _AddIndicatorUseCompanion of ho PlanSquare to PlanSquare
+            Send Assert (SearchArray("AddUseOldFMACCommands", PlanSquare.asFunctions) <> -1)
+            // No indicator function -> companion NOT added.
+            Move "ChangeCalcToMoveStatement" to PlanNone.asFunctions[0]
+            Move "" to PlanNone.asFunctionHints[0]
+            Get _AddIndicatorUseCompanion of ho PlanNone to PlanNone
+            Send Assert (SearchArray("AddUseOldFMACCommands", PlanNone.asFunctions) = -1)
+            // Already present -> not duplicated.
+            Move "ChangeLegacyIndicators" to PlanDup.asFunctions[0]
+            Move "AddUseOldFMACCommands" to PlanDup.asFunctions[1]
+            Move "" to PlanDup.asFunctionHints[0]
+            Move "" to PlanDup.asFunctionHints[1]
+            Get _AddIndicatorUseCompanion of ho PlanDup to PlanDup
+            Send Assert (SizeOfArray(PlanDup.asFunctions) = 2)
+            Send Destroy of ho
+        End_Procedure
+
+        // Regression (2026-06-20): the saved-plan path (PlanFromSavedRows - dashboard "Run Modernization
+        // Plan" / "View last plan") applies the AddUseOldFMACCommands companion AND the accuracy prune. A
+        // plan whose file does NOT need the SELECT macro must NOT carry AddUseOldFMACCommands - the post-run
+        // false positive. Here the saved row's file is a missing path, which RFReadEncodedFileAsStringArray
+        // returns empty for, so the prune's dry-run probe returns 0 and drops it; ChangeLegacyIndicators
+        // stays. (The complementary "KEEP it when a file truly needs the macro" path is the probe returning
+        // 1 - covered by the AddUseOldFMACCommands insertion tests in oAddUseOldFMACCommands-Tests. We avoid a
+        // real temp file here - writing one is unreliable in the headless DFUnit runner.)
+        {Published = True}
+        Procedure ModAnalyzer_PlanFromSavedRows_PrunesWhenNotNeeded
+            Handle ho
+            tSavedPlanRow[] aRows
+            tModRefactorPlan Plan
+            Get Create (RefClass(cModAnalyzer)) to ho
+            Move eModSuggest              to aRows[0].eCategory
+            Move "ChangeLegacyIndicators" to aRows[0].sFn
+            Move "ZZ_does_not_exist_oldfmac.tmp" to aRows[0].sFile
+            Get PlanFromSavedRows of ho aRows to Plan
+            Send Destroy of ho
+            Send Assert (SearchArray("ChangeLegacyIndicators", Plan.asFunctions) <> -1)
+            Send Assert (SearchArray("AddUseOldFMACCommands", Plan.asFunctions) = -1)
+        End_Procedure
+
+        // Prune is a no-op when AddUseOldFMACCommands isn't in the plan (it returns before reading any file).
+        {Published = True}
+        Procedure ModAnalyzer_PruneOldFMAC_NoOpWhenAbsent
+            Handle ho
+            tModRefactorPlan Plan
+            Get Create (RefClass(cModAnalyzer)) to ho
+            Move "ChangeLegacyIndicators" to Plan.asFunctions[0]
+            Move ""                       to Plan.asFunctionHints[0]
+            Move "ZZ_does_not_exist.tmp"  to Plan.asFiles[0]
+            Get _PruneUnneededOldFMAC of ho Plan to Plan
+            Send Destroy of ho
+            Send Assert (SearchArray("ChangeLegacyIndicators", Plan.asFunctions) <> -1)
+            Send Assert (SizeOfArray(Plan.asFunctions) = 1)
+        End_Procedure
+
+    End_Object

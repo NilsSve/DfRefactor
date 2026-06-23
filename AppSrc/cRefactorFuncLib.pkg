@@ -37,6 +37,13 @@ Use cRefactorStatusLog.pkg
 Use cBaseFuncLib.pkg
 Use SupplementalRefactoringClasses.pkg
 Use cFunctionsDataDictionary.dd
+Use cJsonObject.pkg            // DataTypeToJson / JsonToDataType - the TypeToStructReport catalogue cache
+
+// GetTickCount (ms since boot) for the TypeToStructReport catalogue timing. Guard-declared once -
+// the symbol collides case-insensitively across packages if redeclared.
+#IFNDEF get_GetTickCount
+    External_Function GetTickCount "GetTickCount" Kernel32.Dll Returns Integer
+#ENDIF
 
 { Visibility = Private }
 { Description = "Helper function for the Procedure RegisterInterface." }
@@ -61,10 +68,16 @@ Function IsMetaTag Global String sMetaTag Integer eTagType Returns Boolean
             Move (sMetaTag contains "{initialvalue=") to bFound
             Case Break
         Case (eTagType = eHelpTopic)
-            Move (sMetaTag contains "{helptopic=") to bFound
+            Move (sMetaTag contains "{paramhelp=") to bFound
             Case Break
         Case (eTagType = ePrivate)
             Move (sMetaTag contains "{private=") to bFound
+            Case Break
+        Case (eTagType = eModRecipe)
+            Move (sMetaTag contains "{modrecipe=") to bFound
+            Case Break
+        Case (eTagType = eFnGroup)
+            Move (sMetaTag contains "{fngroup=") to bFound
             Case Break
         Case Else
             Move False to bfound
@@ -181,7 +194,7 @@ Class cRefactorFuncLib is a cBaseFuncLib
         tFuncLib FuncLib
         tFuncEnumList FuncEnumList
         String[] asComments asEnumList
-        String sFunctionType sInitialValue sSummaryText sPrivate
+        String sFunctionType sInitialValue sSummaryText sPrivate sModRecipe sFnGroup
         Integer iSize iCount iItem i iPos
         Boolean bIsMultiLine bFound
         
@@ -225,6 +238,19 @@ Class cRefactorFuncLib is a cBaseFuncLib
                 Case (IsMetaTag(asComments[iCount], ePrivate) = True)
                     Get ParseVariable asComments[iCount] to sPrivate
                     Move (Lowercase(Trim(sPrivate)) = "true") to FuncLib.bPrivate
+                    Case Break
+
+                Case (IsMetaTag(asComments[iCount], eModRecipe) = True)
+                    Get ParseVariable asComments[iCount] to sModRecipe
+                    Move sModRecipe to FuncLib.asModRecipe[SizeOfArray(FuncLib.asModRecipe)]
+                    Case Break
+
+                Case (IsMetaTag(asComments[iCount], eFnGroup) = True)
+                    Get ParseVariable asComments[iCount] to sFnGroup
+                    // Resolve the { FnGroup } tag's human text (e.g. "Modernization") to its
+                    // enum via the explicit converter - NOT a bare 'Move name-string to Integer'
+                    // (that yields 0 / faults under DF26 on a non-Define string; see _ParameterIsEnum).
+                    Move (FnGroupValue(sFnGroup)) to FuncLib.eFunctionGroup
                     Case Break
 
                 // Note: keep eHelpTopic last -- ParseHelpTopic terminates the
@@ -727,6 +753,12 @@ Class cRefactorFuncLib is a cBaseFuncLib
         If (bVariableDeclaration = False) Begin
             Set pbIgnoreErrorState to True  
             Send Ignore_Error of ghoErrorHandler DFERR_BAD_SYMBOL_EXPRESSION
+            // Some tokens (e.g. "Field_Changed_State") make Eval("_struct_"+token) raise FUNCTION_NOT_FOUND_IN_
+            // EXPRESSION (4367) instead of BAD_SYMBOL_EXPRESSION (54) - ignore that too, or it ESCAPES during
+            // plan-building (cModAnalyzer._PruneUnneededOldFMAC's tokenizer dry-run) and crashes. The engine's
+            // pbIgnoreErrorState handler only suppresses errors while the ENGINE is the active error object (a
+            // refactor RUN), NOT here; this probe should treat ANY resolution failure as "not a struct type".
+            Send Ignore_Error of ghoErrorHandler DFERR_FUNCTION_NOT_FOUND_IN_EXPRESSION
             Move Err to bErr
             Move LastErr to iLastErr
             Move False to Err
@@ -735,6 +767,7 @@ Class cRefactorFuncLib is a cBaseFuncLib
                 Move False to bVariableDeclaration
             End
             Send Trap_Error of ghoErrorHandler DFERR_BAD_SYMBOL_EXPRESSION
+            Send Trap_Error of ghoErrorHandler DFERR_FUNCTION_NOT_FOUND_IN_EXPRESSION
             Move bErr to Err        
             Move iLastErr to LastErr
             Set pbIgnoreErrorState to False
@@ -799,6 +832,103 @@ Class cRefactorFuncLib is a cBaseFuncLib
         Function_Return sOverstrikeLine
     End_Function 
     
+    // Compose the explicit guarded block for a LEADING bracket + If + "Indicate ... as ..." compound, e.g.
+    //     [Found] If sResult ne "" Indicate Found as StatLog.Function_Name eq sData
+    // becomes (original indentation preserved):
+    //     If (Found and (sResult ne "")) Begin
+    //         Move (StatLog.Function_Name eq sData) to Found
+    //     End
+    // The plain single-line indicator transform cannot compose this 3-way shape (it produced garbage like
+    // "If Indicate (Found) to Found"), so ChangeLegacyIndicators delegates that exact shape here.
+    //   - Keyword POSITIONS (If / Indicate / as) are found in the string-masked overstrike line, so a keyword
+    //     inside a string or a parenthesised expression is never matched.
+    //   - The condition / target / expression TEXT is then sliced from sLine (the UNTOUCHED original) so a
+    //     parenthesised condition like "(sCust<>"")" - which the overstrike line masks with "|" fill, and
+    //     which a string-only restore could not rebuild - comes through verbatim. Masking preserves length,
+    //     so one offset (the indent sLine keeps but the overstrike line drops) maps positions across.
+    // The bracket is read from the overstrike line (a spaced/negated form is captured whole). Guards are
+    // AND-combined with the condition parenthesised (DataFlex would otherwise parse "a and b ne c" as
+    // "(a and b) ne c"), and the Indicate expression parenthesised for the Move - but NEITHER is double-
+    // wrapped when already a single parenthesised token. ne/eq/<> are left as-is (a separate operator refactor
+    // handles those). Returns "" for shapes it will NOT touch (compound bracket, missing/out-of-order
+    // If/Indicate/as) - which the caller then leaves unchanged (no corruption).
+    Function _ComposeBracketIfIndicateBlock tTokenizer TokenizerData Returns String
+        String sOver sLine sBracket sVar sBracketExpr sCond sTarget sExpr sExprW sBlock sIndent sGuard
+        Integer iBrEnd iIfPos iIndPos iAsPos iOffset
+        Boolean bNeg bCondParen
+
+        Move (Trim(TokenizerData.sOverstrikeLine)) to sOver
+        Move TokenizerData.sLine to sLine
+        If (Left(sOver, 1) <> "[") ;
+            Function_Return ""
+
+        // --- leading bracket -> indicator expression (single indicator only), from the overstrike line ---
+        Move (Pos("]", sOver)) to iBrEnd
+        If (iBrEnd < 3) ;                                      // need at least "[x]"
+            Function_Return ""
+        Move (Trim(Mid(sOver, (iBrEnd - 2), 2))) to sBracket   // content between [ and ]
+        Move sBracket to sVar
+        Move False to bNeg
+        If (Left(sVar, 1) = CS_Tilde) Begin
+            Move True to bNeg
+            Move (Trim(Mid(sVar, (Length(sVar) - 1), 2))) to sVar
+        End
+        Else If (Lowercase(Left(sVar, 4)) = "not ") Begin
+            Move True to bNeg
+            Move (Trim(Mid(sVar, (Length(sVar) - 4), 5))) to sVar
+        End
+        If (sVar = "" or (Pos(" ", sVar) > 0)) ;               // compound bracket e.g. [Found ~Found] -> skip
+            Function_Return ""
+        If (bNeg = True) ;
+            Move (CS_Not + "(" + sVar + ")") to sBracketExpr
+        Else ;
+            Move sVar to sBracketExpr
+
+        // --- locate If / Indicate / as by POSITION in the masked overstrike line (so a keyword inside a
+        //     string or a parenthesised expression is never matched), then slice the TEXT from sLine (the
+        //     UNTOUCHED original). The overstrike line masks a parenthesised condition "(sCust<>"")" with "|"
+        //     fill and a string-only restore could not rebuild it - sLine has the real text. Masking
+        //     preserves length, so one offset (the indent sLine keeps but the overstrike line drops) maps
+        //     the positions across. ---
+        Get _FindKeywordPos sOver CS_If       True (iBrEnd + 1)  to iIfPos
+        If (iIfPos = 0) ;
+            Function_Return ""
+        Get _FindKeywordPos sOver CS_Indicate True (iIfPos + 2)  to iIndPos
+        If (iIndPos = 0) ;
+            Function_Return ""
+        Get _FindKeywordPos sOver CS_As       True (iIndPos + 8) to iAsPos
+        If (iAsPos = 0) ;                                      // no-"as" Indicate form -> skip
+            Function_Return ""
+        Move (Pos("[", sLine) - Pos("[", sOver)) to iOffset    // sLine keeps the indent; sOver does not
+
+        Move (Trim(Mid(sLine, (iIndPos - iIfPos - 2),        (iIfPos + 2 + iOffset))))   to sCond    // If..Indicate
+        Move (Trim(Mid(sLine, (iAsPos - iIndPos - 8),        (iIndPos + 8 + iOffset))))  to sTarget  // Indicate..as
+        Move (Trim(Mid(sLine, (Length(sOver) - iAsPos - 1),  (iAsPos + 2 + iOffset))))   to sExpr    // after as
+        If (sCond = "" or sTarget = "" or sExpr = "" or (Pos(" ", sTarget) > 0)) ;
+            Function_Return ""
+
+        // --- guard: AND-combine; parenthesise cond + expr for precedence, but do NOT double-wrap one that is
+        //     already a single parenthesised expression (e.g. cond "(sCust<>"")"). ---
+        Move ((Left(sCond, 1) = "(") and (Right(sCond, 1) = ")")) to bCondParen
+        If (bCondParen = True) ;
+            Move (sBracketExpr + " and " + sCond) to sGuard
+        Else ;
+            Move (sBracketExpr + " and (" + sCond + ")") to sGuard
+        If ((Left(sExpr, 1) = "(") and (Right(sExpr, 1) = ")")) ;
+            Move sExpr to sExprW
+        Else ;
+            Move ("(" + sExpr + ")") to sExprW
+
+        // --- assemble the block (indent each line; keep the end comment) ---
+        Move TokenizerData.sIndentation to sIndent
+        Move (sIndent + CS_If + " (" + sGuard + ") " + CS_Begin) to sBlock
+        Append sBlock CS_CRLF sIndent "    " CS_Move CS_S sExprW CS_S CS_To CS_S sTarget
+        If (TokenizerData.sEndComment <> "") ;
+            Append sBlock CS_S TokenizerData.sEndComment
+        Append sBlock CS_CRLF sIndent "End"
+        Function_Return sBlock
+    End_Function
+
     // The usage of legacy indicator variables, sometimes was combined with some
     // strange programming styles. Amongst them are to apply square bracket indicators,
     // before 'Loop' and 'Repeat'(!)
@@ -1023,9 +1153,1084 @@ Class cRefactorFuncLib is a cBaseFuncLib
         Function_Return bTrue
     End_Function
 
+    // Swaps an obsolete COMMAND keyword for its modern equivalent IN PLACE (e.g. Decr -> Decrement),
+    // preserving the line's indent, any nose (If/Else/...), and the arguments. Acts only when sOld
+    // appears as a WHOLE token at the command position (tokenizer-confirmed), so a substring or a
+    // variable named like the command is left untouched. Line-by-line (eStandardFunction) helper.
+    Function _SwapCommandKeyword String ByRef sLine String sOld String sNew Returns Boolean
+        tTokenizer TokenizerData
+        Integer iItem iPos
+        Get pTokenizer to TokenizerData
+        If (TokenizerData.bLineIsReady or TokenizerData.bIsInCommand or ;
+            TokenizerData.bIsInImage or TokenizerData.bIsVariableDeclaration) Begin
+            Function_Return False
+        End
+        Move (SearchArray(sOld, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+        If (iItem = -1) ;
+            Function_Return False
+        Move (Pos(Lowercase(sOld), Lowercase(sLine))) to iPos
+        If (iPos = 0) ;
+            Function_Return False
+        Move (Left(sLine, (iPos - 1)) + sNew + Mid(sLine, Length(sLine), (iPos + Length(sOld)))) to sLine
+        Function_Return True
+    End_Function
+
+    // Strips ONE redundant outer parenthesis pair when it wraps the WHOLE value, so a
+    // pre-parenthesised command argument (e.g. "Character (9)") yields Character(9), not ((9)).
+    // Leaves the value untouched when the outer parens do not enclose the entire expression
+    // (e.g. "(a) + (b)").
+    Function _StripRedundantParens String sVal Returns String
+        Integer iLen i iDepth
+        String sChar
+        Move (Trim(sVal)) to sVal
+        Move (Length(sVal)) to iLen
+        If (iLen < 2) ;
+            Function_Return sVal
+        If ((Left(sVal, 1) <> "(") or (Right(sVal, 1) <> ")")) ;
+            Function_Return sVal
+        Move 0 to iDepth
+        For i from 1 to iLen
+            Move (Mid(sVal, 1, i)) to sChar
+            If (sChar = "(") Begin
+                Move (iDepth + 1) to iDepth
+            End
+            Else If (sChar = ")") Begin
+                Move (iDepth - 1) to iDepth
+            End
+            // Outer pair closes before the end => it does NOT wrap everything; leave as-is.
+            If ((iDepth = 0) and (i < iLen)) Begin
+                Function_Return sVal
+            End
+        Loop
+        Function_Return (Trim(Mid(sVal, (iLen - 2), 2)))
+    End_Function
+
+    // Given the lines of a legacy "Type ... End_Type" block, returns the proposed modern
+    // "Struct ... End_Struct" lines: Type X -> Struct X; Field <name> AS <type> [count] ->
+    // <type>[count] <name> (or <type> <name>); End_Type -> End_Struct. Any other line (comment /
+    // blank / non-canonical Field) passes through unchanged. PURE (no file I/O) -> unit-testable;
+    // powers the report-only TypeToStructReport worksheet and never rewrites source itself.
+    // Lightweight STATELESS word splitter for the report-only Type scanners. Strips
+    // string literals (RemoveStringsFromLine) and a trailing "//" comment
+    // (_RemoveEndComment - a line whose FIRST non-blank chars are "//" is left intact,
+    // so its leading "//" token simply matches no command), normalizes tabs, and
+    // splits on whitespace into word tokens shaped like the stateful Tokenizer's
+    // asLineTokens - but with NO cross-line/cross-call state. Report functions make no
+    // source changes, so they never needed the heavy position-accurate Tokenizer;
+    // calling it per line over 1000+ files made TypeToStructReport crawl, AND because
+    // the engine Tokenizer is a shared singleton, skipping lines leaked stale
+    // multi-line state between calls (the bogus "1" type-name; Nils 2026-06-11). PURE
+    // -> unit-testable, and safe to call from any of the report scanners.
+    // LIMITATION (acceptable for a REPORT): unlike the engine Tokenizer it does NOT
+    // track /* */ block comments across lines, so a Type/accessor keyword written
+    // inside a /* */ block would be picked up (a harmless extra worksheet line). If a
+    // MUTATING refactor ever reuses this, add a cross-line bInBlockComment guard first.
+    Function _SplitSourceWords String sLine Returns String[]
+        String[] asRaw asWords
+        Integer i iLast
+
+        Get RemoveStringsFromLine sLine to sLine
+        Get _RemoveEndComment sLine to sLine
+        Move (Replaces(Character(9), sLine, " ")) to sLine
+        Move (Trim(sLine)) to sLine
+        // A whole-line comment has no source words. _RemoveEndComment deliberately LEAVES a leading
+        // "//" in place (its other callers skip such lines themselves), and RemoveStringsFromLine ran
+        // first, so the line still begins with "//" - return empty here so the stateless callers (the
+        // used-type harvest, the accessor/CVTtoBytes scan) never tokenize the prose. Without this, a
+        // comment like "...no rounding at all." was mis-read as the Type "all".
+        If (sLine = "" or Left(sLine, 2) = CS_CommentSymbol) ;
+            Function_Return asWords
+        Move (StrSplitToArray(sLine, " ")) to asRaw
+        Move (SizeOfArray(asRaw) - 1) to iLast
+        For i from 0 to iLast
+            // Drop the empty cells StrSplitToArray emits for runs of spaces.
+            If (asRaw[i] <> "") ;
+                Move asRaw[i] to asWords[SizeOfArray(asWords)]
+        Loop
+        Function_Return asWords
+    End_Function
+
+    // Hungarian/type prefix for a Struct member of the given DataFlex data type (drops any array
+    // suffix first, e.g. "Integer[5]" -> "Integer" -> "i"). "" for an unmapped type, so the member
+    // keeps its bare name. Used by _HungarianMember (PART 1 struct members + PART 2 field refs).
+    Function _TypePrefix String sType Returns String
+        Integer iBracket
+        Move (Pos("[", sType)) to iBracket
+        If (iBracket > 1) ;
+            Move (Left(sType, (iBracket - 1))) to sType
+        Move (Trim(Lowercase(sType))) to sType
+        Case Begin
+            Case (sType = "integer")
+                Function_Return "i"
+            Case (sType = "uinteger")
+                Function_Return "u"
+            Case (sType = "bigint")
+                Function_Return "bi"
+            Case (sType = "ubigint")
+                Function_Return "ubi"
+            Case (sType = "number")
+                Function_Return "n"
+            Case (sType = "string")
+                Function_Return "s"
+            Case (sType = "boolean")
+                Function_Return "b"
+            Case (sType = "handle")
+                Function_Return "h"
+            Case (sType = "pointer")
+                Function_Return "p"
+            Case (sType = "dword")
+                Function_Return "dw"
+            Case (sType = "word")
+                Function_Return "w"
+            Case (sType = "char")
+                Function_Return "c"
+            Case (sType = "uchar")
+                Function_Return "uc"
+            Case (sType = "date")
+                Function_Return "dt"
+            Case (sType = "datetime")
+                Function_Return "dt"
+            Case (sType = "variant")
+                Function_Return "v"
+            Case Else
+                Function_Return ""
+        Case End
+    End_Function
+
+    // Apply the Hungarian convention: <prefix> + the bare member name with its first letter
+    // upper-cased ("Integer","message" -> "iMessage"). To avoid doubling a prefix, a member that
+    // ALREADY starts with its type prefix is left unchanged ("Handle","hwnd" -> "hwnd";
+    // "Pointer","pt" -> "pt"; "String","sName" -> "sName"). An unmapped type returns the bare name.
+    // PURE.
+    Function _HungarianMember String sType String sBareName Returns String
+        String sPrefix
+        If (sBareName = "") ;
+            Function_Return ""
+        Get _TypePrefix sType to sPrefix
+        If (sPrefix = "") ;
+            Function_Return sBareName
+        If (Lowercase(Left(sBareName, Length(sPrefix))) = sPrefix) ;
+            Function_Return sBareName
+        Function_Return (sPrefix + Uppercase(Left(sBareName, 1)) + Mid(sBareName, (Length(sBareName) - 1), 2))
+    End_Function
+
+    // Parse ONE Type-block line into a field's bare member name + data type + optional [count].
+    // Handles both legacy forms: "Field <Type>.<field> as <datatype> [count]" and the type-first
+    // "<datatype> <Type>.<field> [count]". The "<Type>." byte-offset prefix is stripped. Returns
+    // False (outputs blank) for Type / End_Type / comment / blank / non-field lines. The single home
+    // for field-line parsing - used by _TypeDefToStruct (PART 1) and _FieldDataType (PART 2). PURE.
+    Function _ParseTypeField String sLine String ByRef sBareName String ByRef sDataType String ByRef sCount Returns Boolean
+        String[] asWords
+        String sCmd sNm sDt sCt
+        Integer iNT iDot
+     
+        Move "" to sBareName
+        Move "" to sDataType
+        Move "" to sCount
+        Move "" to sCt
+        Get _SplitSourceWords sLine to asWords
+        Move (SizeOfArray(asWords)) to iNT 
+
+        If (iNT < 2) ;
+            Function_Return False
+        Move (Lowercase(asWords[0])) to sCmd
+        If (sCmd = "type" or sCmd = "end_type") ;
+            Function_Return False
+        If (sCmd = "field") Begin
+            // Field <name> as <datatype> [count]
+            If (iNT < 4 or Lowercase(asWords[2]) <> "as") ;
+                Function_Return False
+            Move asWords[1] to sNm
+            Move asWords[3] to sDt
+            If (iNT > 4) ;
+                Move asWords[4] to sCt
+        End
+        Else Begin
+            // type-first "<datatype> <Type>.<field>": the 2nd token must be dotted.
+            If (Pos(".", asWords[1]) < 1) ;
+                Function_Return False
+            Move asWords[0] to sDt
+            Move asWords[1] to sNm
+            If (iNT > 2) ;
+                Move asWords[2] to sCt
+        End
+        // Strip the "<Type>." prefix from the member name.
+        Move (Pos(".", sNm)) to iDot
+        If (iDot >= 1 and iDot < Length(sNm)) ;
+            Move (Mid(sNm, (Length(sNm) - iDot), (iDot + 1))) to sNm
+        // Keep the size/dimension VERBATIM (a numeric literal OR a constant like 'CchFormName'). Do NOT
+        // "Move sCt to <Integer>" to test it numeric: DF EVALUATES the string as a numeric expression, which
+        // faults err 54 "Invalid symbol in expression" for a constant/identifier dimension (the
+        // TypeToStructReport CCHFORMNAME error). The worksheet keeping the real dimension beats dropping it.
+        If (sCt <> "") ;
+            Move sCt to sCount
+        If (sNm = "" or sDt = "") ;
+            Function_Return False
+        Move sNm to sBareName
+        Move sDt to sDataType
+        Function_Return True
+    End_Function
+
+    // The DataFlex data type of <sField> within the Type <sTypeName>, looked up in the Type catalog
+    // (each tTypeDef.asBlock holds the raw Type-block lines). "" if the type or field is not found.
+    // Lets PART 2 prefix a field reference (TheData.iMessage) consistently with PART 1's member. PURE.
+    Function _FieldDataType tTypeDef[] aCatalog String sTypeName String sField Returns String
+        Integer iK iKLast iL iLLast
+        String sBare sDt sCt
+        Boolean bField
+        Move (SizeOfArray(aCatalog) - 1) to iKLast
+        For iK from 0 to iKLast
+            If (Lowercase(aCatalog[iK].sName) = Lowercase(sTypeName)) Begin
+                Move (SizeOfArray(aCatalog[iK].asBlock) - 1) to iLLast
+                For iL from 0 to iLLast
+                    Get _ParseTypeField aCatalog[iK].asBlock[iL] (&sBare) (&sDt) (&sCt) to bField
+                    If (bField and (Lowercase(sBare) = Lowercase(sField))) ;
+                        Function_Return sDt
+                Loop
+            End
+        Loop
+        Function_Return ""
+    End_Function
+
+    Function _TypeDefToStruct String[] asBlock Returns String[]
+        String[] asOut asWords
+        String sLine sCmd sName sBare sDataType sCount
+        Integer i iLast iOut iNTokens
+        Boolean bField
+        Move (SizeOfArray(asBlock) - 1) to iLast
+        Move 0 to iOut
+        For i from 0 to iLast
+            Move asBlock[i] to sLine
+            Get _SplitSourceWords sLine to asWords
+            Move (SizeOfArray(asWords)) to iNTokens
+            Move "" to sCmd
+            If (iNTokens > 0) ;
+                Move (Lowercase(asWords[0])) to sCmd
+            Case Begin
+                Case (sCmd = "type")
+                    Move "" to sName
+                    If (iNTokens > 1) ;
+                        Move asWords[1] to sName
+                    Move ("Struct " + sName) to asOut[iOut]
+                    Increment iOut
+                    Case Break
+                Case (sCmd = "end_type")
+                    Move "End_Struct" to asOut[iOut]
+                    Increment iOut
+                    Case Break
+                Case Else
+                    // A field line (either "Field <Type>.<field> as <dt> [count]" or the type-first
+                    // "<dt> <Type>.<field>")? _ParseTypeField strips the "<Type>." prefix; _HungarianMember
+                    // adds the type prefix (Integer message -> Integer iMessage). Comments / blanks /
+                    // non-field lines pass through unchanged so the worksheet flags them.
+                    Get _ParseTypeField sLine (&sBare) (&sDataType) (&sCount) to bField
+                    If (bField = True) Begin
+                        Get _HungarianMember sDataType sBare to sBare
+                        If (sCount <> "") ;
+                            Move (sDataType + "[" + sCount + "]") to sDataType
+                        Move ("    " + sDataType + " " + sBare) to asOut[iOut]
+                    End
+                    Else Begin
+                        Move sLine to asOut[iOut]
+                    End
+                    Increment iOut
+            Case End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // ---- TypeToStructReport install-package catalogue cache -------------------------------------
+    // The Type definitions live in the DataFlex install packages (psTargetPkgFolder), normally
+    // changing only on a version bump - so scan them ONCE per target version and reuse. An in-place
+    // update (same version folder) is caught too: each cache stamps the newest *.pkg write time and
+    // self-invalidates when a package is later found newer (_PkgScanIsStale - shared by BOTH install
+    // caches). Mirrors the ModAnalyzer recipe cache (cModAnalyzer: RecipeJsonPath / WriteRecipesToJson
+    // / ReadRecipesFromJson).
+
+    // ---- Install-package change watermark (shared by both install caches) -----------------------
+    // The version-keyed cache filename detects a target SWITCH (different version folder), but not an
+    // in-place update to the SAME version. These helpers fingerprint the install's *.pkg set by its
+    // newest write time so a cache READ can self-invalidate when the packages were revised under the
+    // same version. Stored/compared as a sortable string - lossless through JSON, locale-independent.
+
+    // Newest last-write DateTime across a set of file-search results; NullDateTime() for an empty
+    // set. Shared by the install-scan watermark writer (WalkInstallPackages) and the staleness probe.
+    Function _NewestWriteTime tRFSearchResult[] aFiles Returns DateTime
+        DateTime dtNewest dtThis
+        Integer i iLast
+        Boolean bHave
+        Move (NullDateTime()) to dtNewest
+        Move False to bHave
+        Move (SizeOfArray(aFiles) - 1) to iLast
+        For i from 0 to iLast
+            Move aFiles[i].dtLastWriteDateTime to dtThis
+            If (bHave = False or (dtThis > dtNewest)) Begin
+                Move dtThis to dtNewest
+                Move True to bHave
+            End
+        Loop
+        Function_Return dtNewest
+    End_Function
+
+    // Sortable "YYYYMMDDHHMMSS" stamp for a DateTime at whole-second precision; "" for a null/zero
+    // DateTime. Lexicographic order == chronological order, so the watermark is stored and compared
+    // as a plain string - lossless through JSON, with no DateTime-in-JSON round-trip or decimal-
+    // separator concerns. Second precision survives the round-trip cleanly (sub-second is dropped).
+    Function _PkgTimeStamp DateTime dt Returns String
+        Integer iY iMo iD iH iMi iS
+        String sOut
+        Move (DateGetYear(dt)) to iY
+        If (iY <= 0) ;                                      // NullDateTime / unset -> no stamp
+            Function_Return ""
+        Move (DateGetMonth(dt))  to iMo
+        Move (DateGetDay(dt))    to iD
+        Move (DateGetHour(dt))   to iH
+        Move (DateGetMinute(dt)) to iMi
+        Move (DateGetSecond(dt)) to iS
+        Move       (Right(("000" + String(iY)),  4)) to sOut
+        Move (sOut + Right(("0"  + String(iMo)), 2)) to sOut
+        Move (sOut + Right(("0"  + String(iD)),  2)) to sOut
+        Move (sOut + Right(("0"  + String(iH)),  2)) to sOut
+        Move (sOut + Right(("0"  + String(iMi)), 2)) to sOut
+        Move (sOut + Right(("0"  + String(iS)),  2)) to sOut
+        Function_Return sOut
+    End_Function
+
+    // The newest *.pkg last-write time in the TARGET install's Pkg folder as a sortable stamp (see
+    // _PkgTimeStamp); "" when the folder is missing/empty (can't fingerprint). A metadata-only
+    // directory search - no file contents are read - so it is cheap enough to run on every cache read.
+    Function _NewestPkgTimeStamp Returns String
+        tRFSearchResult[] aFiles
+        DateTime dtNewest
+        String sPkg sMask sStamp
+        Get psTargetPkgFolder of ghoApplication to sPkg
+        If (sPkg = "" or rfDirectoryExists(sPkg) = False) ;
+            Function_Return ""
+        Move (vFolderFormat(sPkg) + "*.pkg") to sMask
+        Get rfFileSearchRecursive sMask DIRMODE_FILES_ONLY False to aFiles
+        Get _NewestWriteTime aFiles to dtNewest
+        Get _PkgTimeStamp dtNewest to sStamp
+        Function_Return sStamp
+    End_Function
+
+    // True when the live install's newest *.pkg is newer than the watermark captured when a cache was
+    // written - i.e. the system packages were revised under the SAME version folder (e.g. an in-place
+    // DataFlex update / hotfix), which the version-keyed filename alone can't detect. A blank LIVE
+    // stamp (folder missing/unreadable now) is NOT stale: we can't fingerprint, so keep the cache
+    // rather than churn. A blank STORED stamp (a pre-watermark cache) is older than any real live
+    // stamp, so such a cache re-walks once to acquire its watermark.
+    Function _PkgScanIsStale String sStoredStamp Returns Boolean
+        String sLive
+        Get _NewestPkgTimeStamp to sLive
+        If (sLive = "") ;
+            Function_Return False
+        Function_Return (sLive > sStoredStamp)
+    End_Function
+
+    // Full path to the per-version catalogue cache: DFRefactor's Data folder + TypeDefs-<ver>.json.
+    // phoWorkspace(ghoApplication) (NOT Self) resolves the app's workspace data path.
+    Function TypeDefsCacheJsonPath Returns String
+        String sData sVer sFile
+        Get psDataPath of (phoWorkspace(ghoApplication)) to sData
+        Get psTargetDfVersion of ghoApplication to sVer
+        Move CS_TypeDefsCacheJson to sFile
+        If (Trim(sVer) <> "") ;
+            Move (Replace(".json", sFile, ("-" + sVer + ".json"))) to sFile
+        Function_Return (vFolderFormat(sData) + sFile)
+    End_Function
+
+    // Write the install-package Type catalogue + cache-format version + install change watermark
+    // (sPkgNewest) to the JSON (pretty, NO BOM - a BOM breaks ParseUtf8). Mirrors WriteRecipesToJson.
+    Procedure WriteTypeDefsCache tTypeDef[] aDefs String sPkgNewest
+        Handle hoJson
+        tTypeDefCacheFile CacheFile
+        UChar[] ucJson
+        Integer iCh
+        String sFile
+        Move CI_TypeDefsCacheVersion to CacheFile.iVersion
+        Move sPkgNewest to CacheFile.sPkgNewest
+        Move aDefs to CacheFile.aDefs
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson CacheFile
+        Set peWhiteSpace of hoJson to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoJson to ucJson
+        Send Destroy of hoJson
+        Get TypeDefsCacheJsonPath to sFile
+        Get RFOpenOutput sFile to iCh
+        If (iCh < 0) ;
+            Procedure_Return
+        Write channel iCh ucJson
+        Send RFCloseOutput iCh
+    End_Procedure
+
+    // Load the cached catalogue. Returns False (aDefs untouched) if the file is absent, won't parse,
+    // carries a stale cache-format version (CI_TypeDefsCacheVersion), OR a system package is newer
+    // than the cache's watermark (an in-place install update - see _PkgScanIsStale); the caller then
+    // re-scans (no manual JSON delete needed). Mirrors cModAnalyzer.ReadRecipesFromJson.
+    Function ReadTypeDefsCache tTypeDef[] ByRef aDefs Returns Boolean
+        Handle hoJson
+        Boolean bOK bExists bStale
+        Integer iCh
+        UChar[] ucData
+        tTypeDefCacheFile CacheFile
+        String sFile
+        Get TypeDefsCacheJsonPath to sFile
+        // MUST check existence first: rfOpenInput does a bare Direct_Input, which RAISES Error 33
+        // (NOT a < 0 return) on a missing file - on the first run (no cache yet) that crashed the
+        // report with "Can't open input file" + a follow-on Invalid-JSON (4528) on the empty read.
+        // vFilePathExists is reachable here (used by cRefactorUtilities, the funclib's base class).
+        Get vFilePathExists sFile to bExists
+        If (bExists = False) ;
+            Function_Return False
+        Get RFOpenInput sFile to iCh
+        If (iCh < 0) ;
+            Function_Return False
+        Read_Block channel iCh ucData -1
+        Send RFCloseInput iCh
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Set pbRequireAllMembers of hoJson to False
+        Get ParseUtf8 of hoJson ucData to bOK
+        If (bOK = False) Begin
+            Send Destroy of hoJson
+            Function_Return False
+        End
+        Get JsonToDataType of hoJson to CacheFile
+        Send Destroy of hoJson
+        If (CacheFile.iVersion <> CI_TypeDefsCacheVersion) ;
+            Function_Return False
+        // Same-version install change? A package newer than the stored watermark means the system
+        // packages were revised under the same version folder - treat as stale so the caller re-walks.
+        Get _PkgScanIsStale CacheFile.sPkgNewest to bStale
+        If (bStale = True) ;
+            Function_Return False
+        Move CacheFile.aDefs to aDefs
+        Function_Return True
+    End_Function
+
+    // Scans a file's lines for every legacy "Type ... End_Type" block and returns them as catalog
+    // entries (type name + raw block lines). Used to catalog Types from the system packages
+    // (DfTypes.pkg etc. under psTargetPkgFolder) - and from the user files too, so a user-defined
+    // Type is found as well. PURE (no file I/O) -> unit-testable.
+    Function _TypeDefsFromLines String[] asLines Returns tTypeDef[]
+        tTypeDef[] aOut
+        String[] asBlock asEmpty asWords
+        String sCmd sName
+        Integer i iLast iOut iBlk
+        Boolean bFoundEnd
+        // Stateless: each line is split locally (_SplitSourceWords) - no shared
+        // engine Tokenizer, so this is fast and free of cross-call state leakage.
+        Move (SizeOfArray(asLines) - 1) to iLast
+        Move 0 to iOut
+        Move 0 to i
+        While (i <= iLast)
+            Get _SplitSourceWords asLines[i] to asWords
+            Move "" to sCmd
+            If (SizeOfArray(asWords) > 0) ;
+                Move (Lowercase(asWords[0])) to sCmd
+            If (sCmd = "type") Begin
+                Move "" to sName
+                If (SizeOfArray(asWords) > 1) ;
+                    Move asWords[1] to sName
+                Move asEmpty to asBlock
+                Move 0 to iBlk
+                Move False to bFoundEnd
+                While (i <= iLast and bFoundEnd = False)
+                    Move asLines[i] to asBlock[iBlk]
+                    Increment iBlk
+                    Get _SplitSourceWords asLines[i] to asWords
+                    If (SizeOfArray(asWords) > 0) Begin
+                        If (Lowercase(asWords[0]) = "end_type") ;
+                            Move True to bFoundEnd
+                    End
+                    Increment i
+                Loop
+                If (sName <> "") Begin
+                    Move sName to aOut[iOut].sName
+                    Move asBlock to aOut[iOut].asBlock
+                    Increment iOut
+                End
+            End
+            Else ;
+                Increment i
+        Loop
+        Function_Return aOut
+    End_Function
+
+    // ============================================================================================
+    // Shared install-package walk - ONE pass over the TARGET install's Pkg folder that feeds BOTH the
+    // ModAnalyzer obsolete-warning scan (ObsoleteScan-<ver>.json, consumed by cModAnalyzer) and the
+    // TypeToStructReport Type catalogue (TypeDefs-<ver>.json, consumed by Phase A above). The two
+    // scans used to walk the same hundreds of packages independently; this reads each *.pkg ONCE and
+    // runs both pure extractors, so when both caches are cold (e.g. just after a target-version
+    // switch) a single walk refreshes them both. Each cache keeps its own FORMAT version, so a bump
+    // to one (e.g. a recipe edit) does NOT force the other to re-walk.
+    // ============================================================================================
+
+    // Parse ONE DataFlex system-package file's lines for obsolete-command / -type-command / -package
+    // warning DEFINITIONS, returning Explain recipes. The packages DEFINE these as:
+    //   #COMMAND <Name> ... WarningEx GENERAL DFERR_COMP_WARNING_OBSOLETE_<suffix> "<message>" ...
+    // so the quoted <message> IS the authoritative warning text (and carries the replacement).
+    // match-text + hint both = the message (a guaranteed substring of the .prn warning); function-
+    // backed recipes (added BEFORE these in BuildDefaultRecipes) win on first-match, so a gap command
+    // shows as Explain while a covered one still auto-fixes. Only CMD/TYPE_CMD/PACKAGE suffixes are
+    // mapped. PURE (no file I/O) -> unit-testable. RELOCATED here from cModAnalyzer so the shared walk
+    // can run it next to _TypeDefsFromLines in one pass; cModAnalyzer reaches it via ghoFuncLib. The
+    // Explain row is built inline (the old AddRecipe / CategoryText stay on cModAnalyzer).
+    Function _ObsoleteRecipesFromLines String[] asLines Returns tModAnalyzer[]
+        tModAnalyzer[] aOut
+        Integer i iSize iNum iP1 iP2 k
+        String sLine sUp sSuffix sMsg sRest
+        Move (SizeOfArray(asLines) - 1) to iSize
+        For i from 0 to iSize
+            Move asLines[i] to sLine
+            Move (Uppercase(sLine)) to sUp
+            If ((sUp contains "WARNINGEX") and (sUp contains "DFERR_") and (sUp contains "OBSOLETE_")) Begin
+                // Suffix after the constant's "OBSOLETE_" (e.g. CMD, TYPE_CMD, PACKAGE).
+                Move (Pos("OBSOLETE_", sUp)) to iP1
+                Move (Mid(sUp, 30, (iP1 + 9))) to sSuffix
+                Move (Pos(" ", sSuffix)) to iP2
+                If (iP2 > 0) ;
+                    Move (Left(sSuffix, (iP2 - 1))) to sSuffix
+                Move 0 to iNum
+                Case Begin
+                    Case (sSuffix = "CMD")
+                        Move 4533 to iNum
+                        Case Break
+                    Case (sSuffix = "TYPE_CMD")
+                        Move 4532 to iNum
+                        Case Break
+                    Case (sSuffix = "PACKAGE")
+                        Move 4536 to iNum
+                        Case Break
+                    Case Else
+                        Move 0 to iNum
+                Case End
+                // Message = the text inside the first pair of double quotes on the line.
+                Move "" to sMsg
+                Move (Pos('"', sLine)) to iP1
+                If (iP1 > 0) Begin
+                    Move (Mid(sLine, Length(sLine), (iP1 + 1))) to sRest
+                    Move (Pos('"', sRest)) to iP2
+                    If (iP2 > 0) ;
+                        Move (Left(sRest, (iP2 - 1))) to sMsg
+                End
+                Move (Trim(sMsg)) to sMsg
+                If ((iNum > 0) and (sMsg <> "")) Begin
+                    // Inline Explain recipe (was: Get AddRecipe aOut iNum True sMsg "" eModExplain sMsg).
+                    // sCategoryText for eModExplain is "Explain" (cModAnalyzer.CategoryText).
+                    Move (SizeOfArray(aOut)) to k
+                    Move iNum        to aOut[k].iMsgNumber
+                    Move True        to aOut[k].bIsWarning
+                    Move sMsg        to aOut[k].sMatchText
+                    Move eModExplain to aOut[k].eCategory
+                    Move "Explain"   to aOut[k].sCategoryText
+                    Move sMsg        to aOut[k].sHint
+                    Move ""          to aOut[k].sRefactorFn
+                End
+            End
+        Loop
+        Function_Return aOut
+    End_Function
+
+    // Full path to the per-version raw obsolete-warning scan cache: Data\ObsoleteScan-<ver>.json.
+    // Mirrors TypeDefsCacheJsonPath / cModAnalyzer.RecipeJsonPath. phoWorkspace(ghoApplication) (NOT
+    // Self) resolves the app's workspace data path.
+    Function ObsoleteScanCacheJsonPath Returns String
+        String sData sVer sFile
+        Get psDataPath of (phoWorkspace(ghoApplication)) to sData
+        Get psTargetDfVersion of ghoApplication to sVer
+        Move CS_ObsoleteScanJson to sFile
+        If (Trim(sVer) <> "") ;
+            Move (Replace(".json", sFile, ("-" + sVer + ".json"))) to sFile
+        Function_Return (vFolderFormat(sData) + sFile)
+    End_Function
+
+    // Write the raw obsolete-warning scan + cache-format version + install change watermark
+    // (sPkgNewest) to the JSON (pretty, NO BOM - a BOM breaks ParseUtf8). Reuses the tModRecipeFile
+    // wrapper. Mirrors WriteTypeDefsCache.
+    Procedure WriteObsoleteScanCache tModAnalyzer[] aRecipes String sPkgNewest
+        Handle hoJson
+        tModRecipeFile ScanFile
+        UChar[] ucJson
+        Integer iCh
+        String sFile
+        Move CI_ObsoleteScanVersion to ScanFile.iVersion
+        Move sPkgNewest to ScanFile.sPkgNewest
+        Move aRecipes to ScanFile.aRecipes
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson ScanFile
+        Set peWhiteSpace of hoJson to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoJson to ucJson
+        Send Destroy of hoJson
+        Get ObsoleteScanCacheJsonPath to sFile
+        Get RFOpenOutput sFile to iCh
+        If (iCh < 0) ;
+            Procedure_Return
+        Write channel iCh ucJson
+        Send RFCloseOutput iCh
+    End_Procedure
+
+    // Load the cached raw scan. Returns False (aRecipes untouched) if the file is absent, won't parse,
+    // carries a stale cache-format version (CI_ObsoleteScanVersion), OR a system package is newer than
+    // the cache's watermark (an in-place install update - see _PkgScanIsStale). Mirrors ReadTypeDefsCache.
+    Function ReadObsoleteScanCache tModAnalyzer[] ByRef aRecipes Returns Boolean
+        Handle hoJson
+        Boolean bOK bExists bStale
+        Integer iCh
+        UChar[] ucData
+        tModRecipeFile ScanFile
+        String sFile
+        Get ObsoleteScanCacheJsonPath to sFile
+        // MUST check existence first: RFOpenInput does a bare Direct_Input, which RAISES Error 33 on a
+        // missing file (NOT a < 0 return) - guard with vFilePathExists (reachable via cRefactorUtilities).
+        Get vFilePathExists sFile to bExists
+        If (bExists = False) ;
+            Function_Return False
+        Get RFOpenInput sFile to iCh
+        If (iCh < 0) ;
+            Function_Return False
+        Read_Block channel iCh ucData -1
+        Send RFCloseInput iCh
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Set pbRequireAllMembers of hoJson to False
+        Get ParseUtf8 of hoJson ucData to bOK
+        If (bOK = False) Begin
+            Send Destroy of hoJson
+            Function_Return False
+        End
+        Get JsonToDataType of hoJson to ScanFile
+        Send Destroy of hoJson
+        If (ScanFile.iVersion <> CI_ObsoleteScanVersion) ;
+            Function_Return False
+        // Same-version install change? A package newer than the stored watermark means the system
+        // packages were revised under the same version folder - treat as stale so the caller re-walks.
+        Get _PkgScanIsStale ScanFile.sPkgNewest to bStale
+        If (bStale = True) ;
+            Function_Return False
+        Move ScanFile.aRecipes to aRecipes
+        Function_Return True
+    End_Function
+
+    // True when the raw obsolete-warning scan cache is missing / unparseable / a stale format version
+    // / has a package newer than its watermark (i.e. the install packages must be (re)walked for
+    // recipes). ReadObsoleteScanCache enforces the version + watermark check.
+    Function _ObsoleteScanCacheStale Returns Boolean
+        tModAnalyzer[] aScan
+        Boolean bOK
+        Get ReadObsoleteScanCache (&aScan) to bOK
+        Function_Return (not(bOK))
+    End_Function
+
+    // True when the Type-def catalogue cache is missing / unparseable / a stale format version / has
+    // a package newer than its watermark. ReadTypeDefsCache enforces the version + watermark check.
+    Function _TypeDefsCacheStale Returns Boolean
+        tTypeDef[] aDefs
+        Boolean bOK
+        Get ReadTypeDefsCache (&aDefs) to bOK
+        Function_Return (not(bOK))
+    End_Function
+
+    // The ONE shared walk: enumerate the TARGET install's *.pkg ONCE and run whichever extractors are
+    // requested, then write the corresponding cache(s). bShowProgress drives the per-package total bar
+    // via ghoStatusPanel (the TypeToStructReport path passes True; the silent recipe path passes
+    // False, preserving its old behaviour). Best-effort: a blank / missing Pkg folder writes nothing
+    // (callers fall back to an empty scan / re-walk next time the install appears).
+    Procedure WalkInstallPackages Boolean bDoRecipes Boolean bDoTypeDefs Boolean bShowProgress
+        tModAnalyzer[] aRecipes aFileRecs
+        tTypeDef[] aDefs aFileDefs
+        tRFSearchResult[] aFiles
+        String[] asCode
+        String sPkg sMask sNewestStamp
+        Integer i iLast j jLast iCurMax
+        Boolean bPanel
+        DateTime dtNewest
+        If (bDoRecipes = False and bDoTypeDefs = False) ;
+            Procedure_Return
+        Get psTargetPkgFolder of ghoApplication to sPkg
+        If (sPkg = "" or rfDirectoryExists(sPkg) = False) ;
+            Procedure_Return
+        Move (vFolderFormat(sPkg) + "*.pkg") to sMask
+        Get rfFileSearchRecursive sMask DIRMODE_FILES_ONLY False to aFiles
+        Move (SizeOfArray(aFiles) - 1) to iLast
+        // Fingerprint the install up front: the newest *.pkg write time, stamped into both caches so a
+        // later read detects a same-version install update (a package newer than this -> _PkgScanIsStale).
+        Get _NewestWriteTime aFiles to dtNewest
+        Get _PkgTimeStamp dtNewest to sNewestStamp
+        Move (bShowProgress and (ghoStatusPanel <> 0) and (Active_State(ghoStatusPanel) = True)) to bPanel
+        If (bPanel = True) Begin
+            // Budget the (now-known) package count into the running total bar so it keeps moving
+            // through the scan instead of freezing (mirrors the per-file passes that follow).
+            Get piMaximumTot of ghoStatusPanel to iCurMax
+            Set piMaximumTot of ghoStatusPanel to (iCurMax + iLast + 1)
+        End
+        For i from 0 to iLast
+            If (bPanel = True) Begin
+                // "Package No: x of: y" counter, mirroring the engine's per-file caption for line-by-line
+                // functions (cRefactorEngine.pkg) - the install-Pkg scan is the long cold-cache phase.
+                Set Caption_Text   of ghoStatusPanel to ("Package No:" * String(i + 1) * "of:" * String(iLast + 1))
+                Set TableName_Text of ghoStatusPanel to (aFiles[i].sFilename)
+                Send DoAdvanceTot of ghoStatusPanel
+            End
+            Move (RFReadEncodedFileAsStringArray(aFiles[i].sFilename)) to asCode
+            If (bDoRecipes = True) Begin
+                Get _ObsoleteRecipesFromLines asCode to aFileRecs
+                Move (SizeOfArray(aFileRecs) - 1) to jLast
+                For j from 0 to jLast
+                    Move aFileRecs[j] to aRecipes[SizeOfArray(aRecipes)]
+                Loop
+            End
+            If (bDoTypeDefs = True) Begin
+                Get _TypeDefsFromLines asCode to aFileDefs
+                Move (SizeOfArray(aFileDefs) - 1) to jLast
+                For j from 0 to jLast
+                    Move aFileDefs[j] to aDefs[SizeOfArray(aDefs)]
+                Loop
+            End
+        Loop
+        If (bDoRecipes = True) ;
+            Send WriteObsoleteScanCache aRecipes sNewestStamp
+        If (bDoTypeDefs = True) ;
+            Send WriteTypeDefsCache aDefs sNewestStamp
+    End_Procedure
+
+    // Ensure the install caches the caller needs are fresh, walking ONCE if needed. When a walk IS
+    // required it opportunistically refreshes EVERY stale install cache in that single pass (so the
+    // other consumer later finds a hit) - this is what makes "one walk feeds both" real. bShowProgress
+    // is handed to the walk for the per-package progress bar.
+    Procedure EnsureInstallCaches Boolean bForRecipes Boolean bForTypeDefs Boolean bShowProgress
+        Boolean bRecipesStale bTypeDefsStale bNeedWalk
+        // Probe only the cache(s) the CALLER needs, to decide IF we walk - so a fresh-cache call costs
+        // one small read, not also a parse of the (potentially large) other cache.
+        If (bForRecipes = True) ;
+            Get _ObsoleteScanCacheStale to bRecipesStale
+        If (bForTypeDefs = True) ;
+            Get _TypeDefsCacheStale to bTypeDefsStale
+        Move ((bForRecipes and bRecipesStale) or (bForTypeDefs and bTypeDefsStale)) to bNeedWalk
+        If (bNeedWalk = False) ;
+            Procedure_Return
+        // Walking anyway: re-probe the OTHER cache (unconditioned) so this single pass refreshes it
+        // too if it is also stale - the piggyback that makes "one walk feeds both" real.
+        If (bForRecipes = False) ;
+            Get _ObsoleteScanCacheStale to bRecipesStale
+        If (bForTypeDefs = False) ;
+            Get _TypeDefsCacheStale to bTypeDefsStale
+        Send WalkInstallPackages bRecipesStale bTypeDefsStale bShowProgress
+    End_Procedure
+
+    // The install's obsolete-warning catalogue (Explain recipes) via the shared cache: ensures the
+    // ObsoleteScan cache is fresh (walking iff stale, piggybacking the Type-def cache if it too is
+    // stale) and returns the cached scan. Replaces cModAnalyzer.ScanInstallPackages - the walk lives
+    // here so it runs ONCE for both the recipe scan and the TypeToStructReport catalogue. Silent (no
+    // progress bar): the recipe scan never drove one. Empty array if the install can't be located.
+    Function InstallScanRecipes Returns tModAnalyzer[]
+        tModAnalyzer[] aScan
+        Boolean bOK
+        Send EnsureInstallCaches True False False
+        Get ReadObsoleteScanCache (&aScan) to bOK
+        Function_Return aScan
+    End_Function
+
+    // True when the raw install obsolete-warning scan is stale: the ObsoleteScan-<ver>.json cache is
+    // missing / unparseable / a stale format version / OR a package is newer than its watermark (an
+    // in-place DataFlex update under the same version). cModAnalyzer's RefreshRecipeTable consults this
+    // so it RE-MERGES the recipe set (re-walking the packages via InstallScanRecipes) when the install
+    // changed - otherwise a present-and-current merged ModAnalyzerRecipes-<ver>.json would short-circuit
+    // the merge and the raw cache (and the recipe table) would never refresh. Public peer of
+    // InstallScanRecipes; the underlying _ObsoleteScanCacheStale is the same probe EnsureInstallCaches uses.
+    Function InstallScanIsStale Returns Boolean
+        Boolean bStale
+        Get _ObsoleteScanCacheStale to bStale
+        Function_Return bStale
+    End_Function
+
+    // Returns the legacy Type names a file's lines reference, so the report knows which catalogued
+    // Types to propose Structs for. Two reliable signals: (1) the first argument of a type-first
+    // command (ZeroType / FillType / Offset_of_Field / Size_of_Field); (2) the "<type>.<field>"
+    // operand after "At" in a Put / GETBUFF / StoreField / ... accessor (the part before the dot).
+    // Candidates are de-duplicated; the caller filters them against the Type catalog, so a stray
+    // non-type candidate is harmless. PURE (no file I/O) -> unit-testable.
+    Function _UsedTypeNamesFromLines String[] asLines Returns String[]
+        String[] asOut asWords
+        String sCmd sTok sCand
+        Integer i iLast iOut iNTok iAt iDot iDup
+        // Stateless: each line is split locally (_SplitSourceWords) - no shared engine
+        // Tokenizer. Two signals: (1) a type-first command (ZeroType/FillType/
+        // Offset_of_Field/Size_of_Field) -> arg 1 is the type name; (2) "At <type>.<field>"
+        // -> the token after At, part before the dot.
+        Move (SizeOfArray(asLines) - 1) to iLast
+        Move 0 to iOut
+        For i from 0 to iLast
+            Get _SplitSourceWords asLines[i] to asWords
+            Move (SizeOfArray(asWords)) to iNTok
+            If (iNTok > 1) Begin
+                Move (Lowercase(asWords[0])) to sCmd
+                // (1) Type-first commands: argument 1 is the type name.
+                Move "" to sCand
+                If (sCmd = "zerotype" or sCmd = "filltype" or ;
+                    sCmd = "offset_of_field" or sCmd = "size_of_field") ;
+                    Move asWords[1] to sCand
+                If (sCand <> "") Begin
+                    Move (SearchArray(sCand, asOut, Desktop, RefFunc(DFSTRICMP))) to iDup
+                    If (iDup = -1) Begin
+                        Move sCand to asOut[iOut]
+                        Increment iOut
+                    End
+                End
+                // (2) "At <type>.<field>" -> the token after At, part before the dot.
+                Move (SearchArray("At", asWords, Desktop, RefFunc(DFSTRICMP))) to iAt
+                Move "" to sCand
+                If (iAt <> -1 and iNTok > (iAt + 1)) Begin
+                    Move asWords[iAt + 1] to sTok
+                    Move (Pos(".", sTok)) to iDot
+                    If (iDot > 1) ;
+                        Move (Left(sTok, (iDot - 1))) to sCand
+                End
+                If (sCand <> "") Begin
+                    Move (SearchArray(sCand, asOut, Desktop, RefFunc(DFSTRICMP))) to iDup
+                    If (iDup = -1) Begin
+                        Move sCand to asOut[iOut]
+                        Increment iOut
+                    End
+                End
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // The field name after the dot in a "<Type>.<field>" operand token; "" if there is no dotted
+    // field. Used by _SuggestStructLine to drop the byte-offset Type prefix.
+    Function _FieldAfterDot String sTok Returns String
+        Integer iDot
+        Move (Pos(".", sTok)) to iDot
+        If (iDot < 1 or iDot >= Length(sTok)) ;
+            Function_Return ""
+        Function_Return (Mid(sTok, (Length(sTok) - iDot), (iDot + 1)))
+    End_Function
+
+    // Suggest a modern Struct-based rewrite for ONE legacy byte-buffer accessor line, from its split
+    // words (asWords[0] = the accessor verb, as produced by _SplitSourceWords) + the Type catalog
+    // (so a field reference can be prefixed to match PART 1's Hungarian member, e.g. message ->
+    // iMessage; aCatalog comes from TypeToStructReport's Phase A/B). The buffer becomes a Struct local
+    // named 'TheData' (an abstract, readable name - the 's' String prefix is misleading once it is a
+    // Struct; the user renames the buffer's other uses to match) and the "<Type>." byte-offset prefix
+    // drops (a Struct addresses members by name). Returns "" when there is no safe 1:1 rewrite (the
+    // line is still LISTED, just without a suggestion). PURE -> unit-testable. Operands are read off the
+    // (string-masked) word split, so a string-literal operand can show garbled - the banner says review.
+    //   GetBuff[_String] from <buf> At <Type>.<field> to <dest>  ->  Move TheData.<field> to <dest>
+    //   Put[_String]     <src> to <buf> At <Type>.<field>        ->  Move <src> to TheData.<field>
+    //   ZeroType         <Type> to <buf>                          ->  declare '<Type> TheData' (zeroed)
+    Function _SuggestStructLine String[] asWords tTypeDef[] aCatalog Returns String
+        Integer iN iFrom iAt iTo iDot
+        String sVerb sBuf sDest sSrc sField sType sTok sTypeName sFieldType
+        Move (SizeOfArray(asWords)) to iN
+        If (iN < 2) ;
+            Function_Return ""
+        Move (Lowercase(asWords[0])) to sVerb
+        Move (SearchArray("from", asWords, Desktop, RefFunc(DFSTRICMP))) to iFrom
+        Move (SearchArray("At",   asWords, Desktop, RefFunc(DFSTRICMP))) to iAt
+        Move (SearchArray("to",   asWords, Desktop, RefFunc(DFSTRICMP))) to iTo
+        Move "" to sField
+        If (iAt <> -1 and (iAt + 1) <= (iN - 1)) Begin
+            Move asWords[iAt + 1] to sTok
+            Get _FieldAfterDot sTok to sField
+            // Prefix the field to match PART 1's Hungarian member: the "<Type>." prefix on the operand
+            // names the Type; look its field's data type up in the catalog. Fall back to the bare name.
+            Move "" to sTypeName
+            Move (Pos(".", sTok)) to iDot
+            If (iDot > 1) ;
+                Move (Left(sTok, (iDot - 1))) to sTypeName
+            If (sField <> "" and sTypeName <> "") Begin
+                Get _FieldDataType aCatalog sTypeName sField to sFieldType
+                If (sFieldType <> "") ;
+                    Get _HungarianMember sFieldType sField to sField
+            End
+        End
+        Case Begin
+            Case (sVerb = "getbuff" or sVerb = "getbuff_string" or sVerb = "retrievefield")
+                // <verb> from <buf> At <Type>.<field> to <dest>
+                If (iFrom = -1 or iAt = -1 or iTo = -1 or sField = "" or (iTo + 1) > (iN - 1)) ;
+                    Function_Return ""
+                Move asWords[iTo + 1] to sDest
+                Function_Return ("Move TheData." + sField + " to " + sDest)
+                Case Break
+            Case (sVerb = "put" or sVerb = "put_string" or sVerb = "storefield")
+                // <verb> <src> to <buf> At <Type>.<field>
+                If (iTo = -1 or iAt = -1 or sField = "" or (iTo + 1) > (iN - 1)) ;
+                    Function_Return ""
+                Move asWords[1] to sSrc
+                Function_Return ("Move " + sSrc + " to TheData." + sField)
+                Case Break
+            Case (sVerb = "arrayput")
+                // ArrayPut <src> to <arr> At <Type>.<field> <idx>  ->  a write into a Struct[] element.
+                If (iTo = -1 or iAt = -1 or sField = "" or (iTo + 1) > (iN - 1)) ;
+                    Function_Return ""
+                Move asWords[1] to sSrc
+                Function_Return ("Move " + sSrc + " to TheData[i]." + sField + "  (TheData is the Struct[] element - supply the index)")
+                Case Break
+            Case (sVerb = "zerotype")
+                // ZeroType <Type> to <buf>  ->  the buffer becomes a Struct local (auto-zeroed)
+                If (iTo = -1 or (iTo + 1) > (iN - 1)) ;
+                    Function_Return ""
+                Move asWords[1]       to sType
+                Move asWords[iTo + 1] to sBuf
+                Function_Return ("declare '" + sType + " TheData' as a Struct local (starts zeroed); rename " + sBuf + " -> TheData and drop the String buffer")
+                Case Break
+            Case (sVerb = "filltype")
+                If (iTo = -1 or (iTo + 1) > (iN - 1)) ;
+                    Function_Return ""
+                Move asWords[1]       to sType
+                Move asWords[iTo + 1] to sBuf
+                Function_Return ("no direct Struct form - declare '" + sType + " TheData' then set its members explicitly; rename " + sBuf + " -> TheData")
+                Case Break
+            Case (sVerb = "offset_of_field" or sVerb = "size_of_field")
+                Function_Return ("byte offset/size is obsolete with a Struct - address the member by name and rework the surrounding pointer/length logic by hand")
+                Case Break
+            Case Else
+                Function_Return ""
+        Case End
+    End_Function
+
+    // Migrate one "Object ... is a dfTimer ... End_Object" block to the modern cTimer. Returns the
+    // migrated lines. When the block is NOT safe to auto-migrate it sets sReason (ByRef) and returns
+    // the block UNCHANGED, so the caller leaves it in place and logs the flag. Unsafe when:
+    //   - it has no "Set Auto_Start_State to False" (it relied on the default auto-start; cTimer never
+    //     auto-starts, so a hand-placed "Set pbEnabled to True" is needed),
+    //   - "Set Timer_Message" is set (the old message-dispatch pattern; needs a hand-written OnTimer),
+    //   - the OnTimer body uses its params beyond the "Forward Send OnTimer".
+    // Safe blocks: swap the class, drop Auto_Start_State/Auto_Stop_State/Timer_object, rename
+    // Timeout -> piTimeout, and strip the OnTimer params (declaration + Forward). PURE (tokenizes each
+    // line locally; no engine pTokenizer state), so it is unit-testable. Caller handles Timer_Active_State.
+    Function _MigrateDfTimerBlock String[] asBlock String ByRef sReason Returns String[]
+        String[] asOut asParams
+        String sLine sLow sT0 sT1 sDecl sNew sObjName sSelfRef
+        Integer i iLast iOut iN iP iPLast iPos
+        Boolean bAutoStartFalse bHasMessage bParamUsed bDrop
+        tTokenizer TD
+
+        Move "" to sReason
+        Move (SizeOfArray(asBlock) - 1) to iLast
+
+        // The object name is the 2nd token of "Object <name> is a dfTimer" (asBlock[0]). Inside this
+        // object's own body, "of (<name>(Self))" is a redundant self-reference we strip below.
+        Move "" to sObjName
+        Get Tokenizer of Self asBlock[0] to TD
+        If (SizeOfArray(TD.asLineTokens) > 1) ;
+            Move TD.asLineTokens[1] to sObjName
+
+        // --- Pass 1: classify (find the unsafe patterns) ---
+        Move False to bAutoStartFalse
+        Move False to bHasMessage
+        Move "" to sDecl
+        For i from 0 to iLast
+            Get Tokenizer of Self asBlock[i] to TD
+            Move (SizeOfArray(TD.asLineTokens)) to iN
+            Move "" to sT0
+            Move "" to sT1
+            If (iN > 0) ;
+                Move (Lowercase(TD.asLineTokens[0])) to sT0
+            If (iN > 1) ;
+                Move (Lowercase(TD.asLineTokens[1])) to sT1
+            If (sT0 = "set" and sT1 = "auto_start_state" and iN > 3 and (Lowercase(TD.asLineTokens[3]) = "false")) ;
+                Move True to bAutoStartFalse
+            If (sT0 = "set" and sT1 = "timer_message") ;
+                Move True to bHasMessage
+            If (sT0 = "procedure" and sT1 = "ontimer" and iN > 2) ;
+                Move asBlock[i] to sDecl
+        Loop
+
+        // OnTimer param-usage: pull the param names from the declaration, then scan the body for them
+        // (skipping the declaration + the Forward line). Any hit means we can't safely drop the params.
+        Move False to bParamUsed
+        If (sDecl <> "") Begin
+            Get Tokenizer of Self sDecl to TD
+            Move (SizeOfArray(TD.asLineTokens)) to iN
+            Move 3 to iP                              // Procedure(0) OnTimer(1) Integer(2) name(3) Integer(4) name(5) ...
+            While (iP < iN)
+                If (TD.asLineTokens[iP] <> "") ;
+                    Move TD.asLineTokens[iP] to asParams[SizeOfArray(asParams)]
+                Move (iP + 2) to iP
+            Loop
+            Move (SizeOfArray(asParams) - 1) to iPLast
+            For i from 0 to iLast
+                Move (Lowercase(Trim(asBlock[i]))) to sLow
+                If ((Left(sLow, 18) <> "procedure ontimer ") and (Left(sLow, 20) <> "forward send ontimer")) Begin
+                    // Whole-token match (not substring): a short param name like "w" must not
+                    // false-match every line that merely contains the letter w.
+                    Get Tokenizer of Self asBlock[i] to TD
+                    For iPos from 0 to iPLast
+                        If (SearchArray(asParams[iPos], TD.asLineTokens, Desktop, RefFunc(DFSTRICMP)) > -1) ;
+                            Move True to bParamUsed
+                    Loop
+                End
+            Loop
+        End
+
+        If (bAutoStartFalse = False) Begin
+            Move "Relied on auto-start (no 'Set Auto_Start_State to False'); cTimer never auto-starts - add 'Set pbEnabled to True' where it should run, then migrate by hand." to sReason
+            Function_Return asBlock
+        End
+        If (bHasMessage = True) Begin
+            Move "Uses the Timer_Message/Timer_object dispatch - rewrite OnTimer by hand." to sReason
+            Function_Return asBlock
+        End
+        If (bParamUsed = True) Begin
+            Move "OnTimer body uses its params; cTimer's OnTimer takes none - migrate by hand." to sReason
+            Function_Return asBlock
+        End
+
+        // --- Pass 2: safe mechanical migration ---
+        Move 0 to iOut
+        For i from 0 to iLast
+            Move asBlock[i] to sLine
+            Get Tokenizer of Self sLine to TD
+            Move (SizeOfArray(TD.asLineTokens)) to iN
+            Move "" to sT0
+            Move "" to sT1
+            If (iN > 0) ;
+                Move (Lowercase(TD.asLineTokens[0])) to sT0
+            If (iN > 1) ;
+                Move (Lowercase(TD.asLineTokens[1])) to sT1
+            // Drop the properties cTimer has no equivalent for (their effect is cTimer's default).
+            Move False to bDrop
+            If (sT0 = "set" and (sT1 = "auto_start_state" or sT1 = "auto_stop_state" or sT1 = "timer_object")) ;
+                Move True to bDrop
+            If (bDrop = False) Begin
+                Move sLine to sNew
+                Move (Lowercase(sNew)) to sLow
+                // class swap (case-insensitive, first occurrence - also fixes a "dfTimer" mention in a comment)
+                Move (Pos("dftimer", sLow)) to iPos
+                If (iPos > 0) ;
+                    Move (Left(sNew, (iPos - 1)) + "cTimer" + Mid(sNew, Length(sNew), (iPos + 7))) to sNew
+                // Timeout -> piTimeout, only on a "Set Timeout ..." line (Timeout is a common word elsewhere)
+                If (sT0 = "set" and sT1 = "timeout") Begin
+                    Move (Pos("timeout", Lowercase(sNew))) to iPos
+                    If (iPos > 0) ;
+                        Move (Left(sNew, (iPos - 1)) + "piTimeout" + Mid(sNew, Length(sNew), (iPos + 7))) to sNew
+                End
+                // strip the OnTimer params on the declaration and the Forward (cTimer's OnTimer has none)
+                If ((sT0 = "procedure" and sT1 = "ontimer") or (sT0 = "forward" and sT1 = "send")) Begin
+                    Move (Pos("ontimer", Lowercase(sNew))) to iPos
+                    If (iPos > 0) ;
+                        Move (Left(sNew, (iPos + 6))) to sNew
+                End
+                // Strip the redundant self-reference: inside this object's own body, "of (oTimer1(Self))"
+                // just points back at itself. External refs (another object's "of <obj>") are untouched.
+                If (sObjName <> "") Begin
+                    Move ("of (" + Lowercase(sObjName) + "(self))") to sSelfRef
+                    Move (Pos(sSelfRef, Lowercase(sNew))) to iPos
+                    If (iPos > 1) ;
+                        Move (Left(sNew, (iPos - 2)) + Mid(sNew, Length(sNew), (iPos + Length(sSelfRef)))) to sNew
+                End
+                Move sNew to asOut[iOut]
+                Increment iOut
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
     Function SingleCommandSyntaxToFunction String ByRef sLine String sKeyWord Returns Boolean
         Boolean bFound
-        String sText sNose sVar1 sVar2 sVar3
+        String sText sNose sVar1 sVar2 sVar3 sVar4
         Integer iPos iItem iParam
         tTokenizer TokenizerData
         
@@ -1046,13 +2251,18 @@ Class cRefactorFuncLib is a cBaseFuncLib
             Function_Return False
         End
         
-        Move "" to sNose  
+        Move "" to sNose
         Move (Trim(sLine)) to sLine
-        // Remove the keyword
-        Move (Pos(Lowercase(sKeyWord), Lowercase(sLine))) to iPos
+        // Remove the keyword. Located on the MASKED, left-trimmed line
+        // (sOverstrikeLine, position-aligned with the trimmed sLine) at a
+        // TOKEN BOUNDARY via _FindKeywordPos: a bare Pos could land inside an
+        // identifier in the nose ("iLeftMargin" before a Left command) or
+        // inside a string literal, splicing the line at the wrong place
+        // (2026-06-10 audit).
+        Get _FindKeywordPos TokenizerData.sOverstrikeLine sKeyWord True 1 to iPos
         If (iPos > 0) Begin
             Move (Left(sLine, (iPos -1))) to sNose
-            Move (Replace(sNose, sLine, "")) to sLine
+            Move (Mid(sLine, CI_EOL, iPos)) to sLine
         End
 
         // Get the first variable
@@ -1067,10 +2277,12 @@ Class cRefactorFuncLib is a cBaseFuncLib
         If (bFound = True) Begin
             Get _ExtractFirstStringConstant sLine to sVar1    
         End
+        // Drop a redundant outer parenthesis pair so "Character (9)" -> Character(9), not ((9)).
+        Get _StripRedundantParens sVar1 to sVar1
         Move 0 to iParam
-        
+
         Case Begin
-            Case (Lowercase(sKeyWord) = Lowercase(CS_Length))
+            Case ((Lowercase(sKeyWord) = Lowercase(CS_Length)) or (Lowercase(sKeyWord) = Lowercase(CS_Character)))
                 Move (SearchArray(CS_To, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
                 If (iItem <> -1) Begin
                     Move TokenizerData.asLineTokens[iItem +1] to sVar2
@@ -1130,6 +2342,28 @@ Class cRefactorFuncLib is a cBaseFuncLib
                 End
                 Case Break  
                 
+            Case (Lowercase(sKeyWord) = Lowercase(CS_Mid))
+                Move "" to sVar3
+                Move "" to sVar4
+                Move (SearchArray(CS_To, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+                If (iItem <> -1) Begin
+                    Move TokenizerData.asLineTokens[iItem +1] to sVar2
+                    Get _IsStringArrayConstant sVar2 to bFound
+                    If (bFound = True) Begin
+                        Move (Pos((CS_S + Lowercase(CS_To) + CS_S), Lowercase( sLine))) to iPos
+                        Move (Mid(sLine, Length(sLine), (iPos + 1))) to sText
+                        Get _ExtractFirstStringConstant sText to sVar2
+                    End
+                    If (iItem + 2 < SizeOfArray(TokenizerData.asLineTokens)) Begin
+                        Move TokenizerData.asLineTokens[iItem +2] to sVar3
+                    End
+                    If (iItem + 3 < SizeOfArray(TokenizerData.asLineTokens)) Begin
+                        Move TokenizerData.asLineTokens[iItem +3] to sVar4
+                    End
+                End
+                Move ("(" + String(sKeyWord) + "(" + String(sVar1) + ", " + String(sVar3) + ", " + String(sVar4) + "))" * CS_To * String(sVar2)) to sLine
+                Case Break
+
             Case (Lowercase(sKeyWord) = Lowercase(CS_Pos))
                 Move (SearchArray(CS_In, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
                 If (iItem <> -1) Begin
@@ -1202,7 +2436,27 @@ Class cRefactorFuncLib is a cBaseFuncLib
                     End 
                 End
                 Move ("(" + String(sKeyWord) + "(" + String(sVar1) + "))" * CS_To * String(sVar2)) to sLine
-                Case Break 
+                Case Break
+
+            // Pad: source, "to" result, then ONE trailing length arg.
+            // e.g.  Pad sVar to sResult 20  ->  Move (Pad(sVar, 20)) to sResult
+            Case (Lowercase(sKeyWord) = Lowercase(CS_Pad))
+                Move "" to sVar3
+                Move (SearchArray(CS_To, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+                If (iItem <> -1) Begin
+                    Move TokenizerData.asLineTokens[iItem +1] to sVar2
+                    Get _IsStringArrayConstant sVar2 to bFound
+                    If (bFound = True) Begin
+                        Move (Pos((CS_S + Lowercase(CS_To) + CS_S), Lowercase(sLine))) to iPos
+                        Move (Mid(sLine, Length(sLine), (iPos + 1))) to sText
+                        Get _ExtractFirstStringConstant sText to sVar2
+                    End
+                    If (iItem + 2 < SizeOfArray(TokenizerData.asLineTokens)) Begin
+                        Move TokenizerData.asLineTokens[iItem +2] to sVar3
+                    End
+                End
+                Move ("(" + String(sKeyWord) + "(" + String(sVar1) + ", " + String(sVar3) + "))" * CS_To * String(sVar2)) to sLine
+                Case Break
             Case Else
         Case End
                          

@@ -20,9 +20,9 @@
 //               pOrgWS for TestBench-style "compile my own sample" or
 //               pTargetWS for the Test Compile dialog targeting the
 //               user-selected workspace):
-//                   Get CompileErrorFileForProgram sProgram   Returns String
 //                   Get DeleteCompileErrorsFile sProgram WS   Returns Boolean
 //                   Get CompileProgram sProgram WS (&sErrTxt) Returns Boolean
+//                   Get ResolveCompiledFile sProgram WS sExt  Returns String
 //
 // This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
 // without even the implied warranty of MERCHANTABILITY or FITNESS for a PARTICULAR PURPOSE.
@@ -33,6 +33,7 @@
 Use RefactorConstants.h.pkg
 Use RFRunProgram.pkg
 Use vWin32fh.pkg
+Use cIniFile.pkg
 
 // Host-class properties used by the mixin. The mixin lives in its own
 // class so the compiler needs these declared up-front; runtime dispatch
@@ -47,26 +48,138 @@ Class cCompileMixin is a Mixin
     Procedure Define_cCompileMixin
     End_Procedure
 
-    // Returns the .err file name that the compiler will produce for the
-    // given program (just the file name, no path). Handles the x64 suffix.
-    //   sProgram - program name, with or without ".src" extension.
-    // Example:  "MyApp" or "MyApp.src" -> "MyApp.x64.err" (Win64)
-    //                                  or "MyApp.err"     (Win32)
-    Function CompileErrorFileForProgram String sProgram Returns String
-        String sErrFile
-        Integer iPos
+    // NOTE: the old CompileErrorFileForProgram (predicted "<prog>.x64.err" off this
+    // binary's OWN build platform via #IFDEF Is$Win64) was REMOVED 2026-06-11: the
+    // prediction broke as soon as the configured compiler produced the other bitness
+    // (TestBench + df-cli built windows-32 -> plain ".err" -> a failed self-compile
+    // was reported as a SUCCESS). Always resolve by existence: ResolveCompiledFile.
 
-        // Strip any extension so we don't end up with "MyApp.src.err".
-        If (sProgram contains ".") Begin
-            Move (Pos(".", sProgram)) to iPos
-            Move (Left(sProgram, iPos - 1)) to sProgram
+    // Per-program output-file suffix (x64 / x32)
+    // The compiler names .err/.prn/.exe with a per-PROGRAM suffix taken from that
+    // program's own <program>.cfg [Compiler] section: 32BitSuffix (default "")
+    // and 64BitSuffix (default "x64"). Both are configurable, so we READ them
+    // rather than hard-coding ".x64". A pre-DF20.1 .cfg has neither key (nor a
+    // Platform line) -> the defaults reproduce the classic "<prog>.err" /
+    // "<prog>.x64.err" pair. We never decide the bitness ourselves: post-compile
+    // we resolve by EXISTENCE (whichever the compiler actually wrote, freshest);
+    // only the pre-compile live-poll predicts, off the target's cfg [Compiler]Platform.
+
+    // One value from sProgram's <program>.cfg [Compiler] section - a suffix (32BitSuffix/
+    // 64BitSuffix) or Platform (sDefault when the key - or the file - is absent).
+    Function CfgCompileValue String sProgram tWorkspacePaths WS String sKey String sDefault Returns String
+        String sBase sCfg sVal
+        Handle hoIni
+
+        Move sProgram to sBase
+        If (sBase contains ".") ;
+            Move (Left(sBase, Pos(".", sBase) - 1)) to sBase
+        Move (vFolderFormat(WS.sAppSrc) + sBase + ".cfg") to sCfg
+
+        Get Create (RefClass(cIniFile)) to hoIni
+        Set psFilename of hoIni to sCfg
+        Get ReadString of hoIni "Compiler" sKey sDefault to sVal
+        Send Destroy of hoIni
+        Function_Return sVal
+    End_Function
+
+    // Builds <AppSrc>\<base>[.<suffix>].<ext>  (the dot is added only when the
+    // suffix is non-empty, so an empty 32-bit suffix yields plain "<base>.<ext>").
+    Function CompiledFileCandidate String sProgram tWorkspacePaths WS String sExt String sSuffix Returns String
+        String sBase
+
+        Move sProgram to sBase
+        If (sBase contains ".") ;
+            Move (Left(sBase, Pos(".", sBase) - 1)) to sBase
+        If (sSuffix <> "") ;
+            Move (sBase + "." + sSuffix) to sBase
+        Function_Return (vFolderFormat(WS.sAppSrc) + sBase + "." + sExt)
+    End_Function
+
+    // Resolves the <ext> file the compiler ACTUALLY wrote for sProgram: tries the
+    // 32- and 64-bit-suffix candidates (from the .cfg) and returns whichever
+    // exists, freshest by write time. "" when neither is present.
+    Function ResolveCompiledFile String sProgram tWorkspacePaths WS String sExt Returns String
+        String s32 s64 sCand32 sCand64
+        Boolean bE32 bE64
+        DateTime dt32 dt64
+
+        Get CfgCompileValue sProgram WS "32BitSuffix" ""    to s32
+        Get CfgCompileValue sProgram WS "64BitSuffix" "x64" to s64
+        Get CompiledFileCandidate sProgram WS sExt s32 to sCand32
+        Get CompiledFileCandidate sProgram WS sExt s64 to sCand64
+
+        Get vFilePathExists sCand32 to bE32
+        Get vFilePathExists sCand64 to bE64
+        If (bE32 = False and bE64 = False) ;
+            Function_Return ""
+        If (bE64 = True and bE32 = False) ;
+            Function_Return sCand64
+        If (bE32 = True and bE64 = False) ;
+            Function_Return sCand32
+
+        // Both present (compiler switched between runs): take the freshest.
+        Move (rfFileDate(sCand32)) to dt32
+        Move (rfFileDate(sCand64)) to dt64
+        If (dt64 >= dt32) ;
+            Function_Return sCand64
+        Function_Return sCand32
+    End_Function
+
+    // Resolves the runnable .exe for sProgram in the workspace's Programs folder by
+    // EXISTENCE - the same cfg-driven, never-decide-the-bitness-ourselves rule as
+    // ResolveCompiledFile, but for the executable. The suffix comes from sProgram's own
+    // <program>.cfg [Compiler] 32BitSuffix / 64BitSuffix: DFRefactor's 64BitSuffix=x64
+    // -> "DFRefactorx64.exe"; TestBench's / DFUnit's 64BitSuffix=64 -> "...64.exe".
+    // NOTE: unlike the .err/.prn the compiler DOT-separates, the exe appends the suffix
+    // with NO dot. Returns the freshest existing candidate, or "" when neither is present.
+    Function ResolveProgramExe String sProgram tWorkspacePaths WS Returns String
+        String sBase s32 s64 sDir sCand32 sCand64
+        Boolean bE32 bE64
+        DateTime dt32 dt64
+
+        Move sProgram to sBase
+        If (sBase contains ".") ;
+            Move (Left(sBase, Pos(".", sBase) - 1)) to sBase
+        Move (vFolderFormat(WS.sPrograms)) to sDir
+        Get CfgCompileValue sProgram WS "32BitSuffix" ""    to s32
+        Get CfgCompileValue sProgram WS "64BitSuffix" "x64" to s64
+        Move (sDir + sBase + s32 + ".exe") to sCand32
+        Move (sDir + sBase + s64 + ".exe") to sCand64
+
+        Get vFilePathExists sCand32 to bE32
+        Get vFilePathExists sCand64 to bE64
+        If (bE32 = False and bE64 = False) ;
+            Function_Return ""
+        If (bE64 = True and bE32 = False) ;
+            Function_Return sCand64
+        If (bE32 = True and bE64 = False) ;
+            Function_Return sCand32
+
+        // Both present (compiled both ways): launch the freshest.
+        Move (rfFileDate(sCand32)) to dt32
+        Move (rfFileDate(sCand64)) to dt64
+        If (dt64 >= dt32) ;
+            Function_Return sCand64
+        Function_Return sCand32
+    End_Function
+
+    // Pre-compile predicted name (no file exists yet, so resolve-by-existence can't apply). The
+    // output suffix follows the program's TARGET platform (its .cfg [Compiler]Platform), NOT the
+    // compiler we picked - a Bin64 df-cli still builds 32-bit when the cfg has no Platform line.
+    // Default (Platform absent, or not containing "64") is the 32-bit suffix. Best-effort only, for
+    // the live-error poll; the authoritative post-compile lookup is ResolveCompiledFile (by existence).
+    Function PredictedCompiledFile String sProgram tWorkspacePaths WS String sExt Returns String
+        String sPlatform sSuffix sCand
+
+        Get CfgCompileValue sProgram WS "Platform" "" to sPlatform
+        If (Lowercase(sPlatform) contains "64") Begin
+            Get CfgCompileValue sProgram WS "64BitSuffix" "x64" to sSuffix
         End
-        #IFDEF Is$Win64
-            Move (sProgram + ".x64" + ".err") to sErrFile
-        #ELSE
-            Move (sProgram + ".err") to sErrFile
-        #ENDIF
-        Function_Return sErrFile
+        Else Begin
+            Get CfgCompileValue sProgram WS "32BitSuffix" "" to sSuffix
+        End
+        Get CompiledFileCandidate sProgram WS sExt sSuffix to sCand
+        Function_Return sCand
     End_Function
 
     // Deletes any left over .err file for the given program from the given
@@ -78,16 +191,28 @@ Class cCompileMixin is a Mixin
     // Returns False only when an existing .err file could not be deleted
     // (True when the file did not exist OR was successfully removed).
     Function DeleteCompileErrorsFile String sProgram tWorkspacePaths WS Returns Boolean
-        String sPath sErrFile
-        Boolean bExists bOK
+        String s32 s64 sCand
+        Boolean bExists bOK bDel
 
         Move True to bOK
-        Move (vFolderFormat(WS.sAppSrc)) to sPath
-        Get CompileErrorFileForProgram sProgram to sErrFile
-        Move (sPath + sErrFile) to sErrFile
-        Get vFilePathExists sErrFile to bExists
+        Get CfgCompileValue sProgram WS "32BitSuffix" ""    to s32
+        Get CfgCompileValue sProgram WS "64BitSuffix" "x64" to s64
+
+        // Delete BOTH suffix candidates - a stale .err from the other toolchain must
+        // not survive to fool the freshest-by-date resolve after the next compile.
+        Get CompiledFileCandidate sProgram WS "err" s32 to sCand
+        Get vFilePathExists sCand to bExists
         If (bExists = True) Begin
-            Move (rfDeleteFile(sErrFile)) to bOK
+            Move (rfDeleteFile(sCand)) to bDel
+            If (bDel = False) ;
+                Move False to bOK
+        End
+        Get CompiledFileCandidate sProgram WS "err" s64 to sCand
+        Get vFilePathExists sCand to bExists
+        If (bExists = True) Begin
+            Move (rfDeleteFile(sCand)) to bDel
+            If (bDel = False) ;
+                Move False to bOK
         End
         Function_Return bOK
     End_Function
@@ -161,6 +286,33 @@ Class cCompileMixin is a Mixin
         Function_Return iVal
     End_Function
 
+    // Resolves the configured compiler executable - psCompiler, falling back
+    // to the install's own CS_Compiler - to a lowercased full path, and
+    // existence-checks it. Shared by BuildCompileCommand and
+    // BuildPrecompileCommand so the fallback + check live in ONE place.
+    // Returns False with sErrorText populated when the executable cannot be
+    // found.
+    { Visibility=Private }
+    Function ResolveConfiguredCompiler String ByRef sCompPath String ByRef sErrorText Returns Boolean
+        String  sBinPath
+        Boolean bExists
+
+        Get psCompiler of ghoApplication to sCompPath
+        If (sCompPath = "") Begin
+            Get DFBinPath of ghoApplication to sBinPath
+            Move (vFolderFormat(sBinPath)) to sBinPath
+            Move (sBinPath + CS_Compiler) to sCompPath
+        End
+        Move (Lowercase(sCompPath)) to sCompPath
+
+        Get vFilePathExists sCompPath to bExists
+        If (bExists = False) Begin
+            Move ("The compiler program and path, that is setup with the 'Program Properties' dialog, cannot be found: " + sCompPath) to sErrorText
+            Function_Return False
+        End
+        Function_Return True
+    End_Function
+
     // Builds the command-line invocation for compiling sProgram against WS.
     //   sProgram   - program name; ".src" optional, stripped if present.
     //   WS         - workspace to compile against (WS.sSWSFile is passed
@@ -184,21 +336,13 @@ Class cCompileMixin is a Mixin
              String ByRef sErrorText String ByRef sCmdPath String ByRef sCmdArgs ;
              Returns Boolean
 
-        String  sBinPath sCompPath sComOptions sCompilerVer
-        Boolean bExists bDfCli
+        String  sCompPath sComOptions sCompilerVer
+        Boolean bOK bDfCli
         Integer iCompilerMajor iWsMajor
 
-        // ---- Locate the compiler executable ----
-        Get psCompiler to sCompPath
-        If (sCompPath = "") Begin
-            Get DFBinPath of ghoApplication to sBinPath
-            Move (vFolderFormat(sBinPath)) to sBinPath
-            Move (sBinPath + CS_Compiler) to sCompPath
-        End
-        Move (Lowercase(sCompPath)) to sCompPath
-//#IFDEF Is$Win64
-//        Move (Replace("\bin\", sCompPath, "\bin64\")) to sCompPath
-//#ENDIF
+        Get ResolveConfiguredCompiler (&sCompPath) (&sErrorText) to bOK
+        If (bOK = False) ;
+            Function_Return False
 
         // Classify the resolved compiler once: df-cli (DF26+) speaks the
         // "build-file" command line; the older DFComp/DFCompConsole speak
@@ -207,14 +351,8 @@ Class cCompileMixin is a Mixin
         // not a build-time one: a DF26 build may be pointed at an older
         // compiler (e.g. to test-compile a DF19.1 workspace with that Studio's
         // own compiler), and a DF25 build may be pointed at df-cli. sCompPath
-        // is already lowercased above.
+        // is already lowercased (by ResolveConfiguredCompiler).
         Move (sCompPath contains "df-cli") to bDfCli
-
-        Get vFilePathExists sCompPath to bExists
-        If (bExists = False) Begin
-            Move ("The compiler program and path, that is setup with the 'Program Properties' dialog, cannot be found: " + sCompPath) to sErrorText
-            Function_Return False
-        End
 
         // Resolve the workspace's MAJOR version up front (locale-safe Integer)
         // for the compiler/workspace pre-flight check below. (The command-line
@@ -227,7 +365,7 @@ Class cCompileMixin is a Mixin
         // Integer, which is locale-neutral.
         Get MajorVersionFromVersionString WS.sDfVersion to iWsMajor
 
-        // ---- Pre-flight: compiler/workspace version compatibility ----
+        // *** Pre-flight: compiler/workspace version compatibility ***
         // CreateProcess will happily launch a DF25 compiler against a DF26
         // JSON .sws — the compiler then pops a "File X.src not found" dialog
         // because it couldn't parse the workspace to find AppSrc, exits
@@ -250,40 +388,94 @@ Class cCompileMixin is a Mixin
                 Function_Return False
             End
         End
+        Move sCompPath to sCmdPath
         
+        Get psCompOpt of ghoApplication to sComOptions
         // Build options (the "-x ..." flags) apply only to the legacy console
         // compiler; df-cli's directives are hard-coded in the build-file
         // command below, so only read/strip them when we are NOT using df-cli.
         If (bDfCli = False) Begin
-            Get ReadString CS_Settings CS_Build_Options CS_CompOptions to sComOptions
+            // Read the options from psCompOpt (the shared SysFile-backed setting), NOT the old
+            // per-program registry key (CS_Settings/CS_Build_Options) - that key is stale now that
+            // the options live in SysFile, so it would feed the legacy compiler leftover df-cli flags.
             Move (Replace("-x-", Lowercase(sComOptions), "")) to sComOptions
             Move (Replace("-x",  Lowercase(sComOptions), "")) to sComOptions
         End
-
-        // Workaround: when invoking df-cli, force the compiler path back to
-        // \bin\ even if the Is$Win64 substitution above flipped it (or the
-        // user picked it) to \bin64\. The 64-bit df-cli.exe in the DF26.0
-        // release returns exit code 23 on otherwise-valid invocations; the
-        // 32-bit binary in \bin\ works. Re-evaluate / remove this once DAW
-        // ships a fix (open issue: <link to ticket>). Keying off bDfCli (not
-        // the workspace version) also covers a DF26 build pointed at df-cli to
-        // compile an older workspace.
-//        If (bDfCli = True) Begin
-//            Move (Replace("\bin64\", sCompPath, "\bin\")) to sCompPath
-//        End
-        Move sCompPath to sCmdPath
 
         // Emit the command line in the dialect the chosen compiler speaks:
         // df-cli (DF26+) uses "build-file"; the legacy DFComp/DFCompConsole
         // use "-x". For test-compiling we always build against the workspace
         // and force a full rebuild, so the df-cli directives are hard-coded.
         If (bDfCli = True) Begin
-            Move " --workspace" to sComOptions
-            Append sCmdArgs "build-file" " " ('"' + WS.sAppSrc + "\" + sProgram + '"') " " sComOptions " " ('"' + WS.sSWSFile + '"') " --rebuild --force --no-warnings --write-errors --verbose"
+            // NOTE: keep a space before sComOptions, else the first option glues onto the
+            // quoted --workspace value (e.g. "...meterconnector.sws"--rebuild) and df-cli reads
+            // the workspace path with the flag stuck on -> "WORKSPACE FILE NOT FOUND" -> no
+            // include paths -> every "Include file not found". The legacy -x branch below already
+            // separates with a space; this branch was missing it.
+            Append sCmdArgs "build-file" " " ('"' + WS.sAppSrc + "\" + sProgram + '"') " --workspace " ('"' + WS.sSWSFile + '"') " " sComOptions
         End
         Else Begin
-            Move ("-x" + '"' + WS.sSWSFile + '"' * sComOptions * sProgram) to sCmdArgs
+            // Both legacy compilers - DfCompConsole.exe AND DFComp.exe - want the SOURCE FIRST, then
+            // -x <workspace>, then the -opts. Confirmed by running each directly (Start-Process -Wait):
+            // with the source LAST, DFComp ignores it and compiles the workspace .sws ITSELF (its INI
+            // lines parse as "Command not found VERSION=..."), writing outputs to the workspace root.
+            // Source-FIRST compiles the real program and drops .err/.prn into AppSrc. (The DataFlex help
+            // shows DFComp source-LAST - that is wrong for this -x invocation.) Full source path so it
+            // resolves regardless of the launch working directory.
+            Append sCmdArgs ('"' + WS.sAppSrc + "\" + sProgram + '"') ' -x "' WS.sSWSFile '"' " " sComOptions
         End
+        Function_Return True
+    End_Function
+
+    // Builds the command line for PRECOMPILING a package (df-cli only).
+    // Used by TestCompile.dg's Error-4522 handler: when a compile bails with
+    // "Changes detected in precompiled package, please precompile <PKG>"
+    // (a stale .pkd), the dialog precompiles that package and re-runs the
+    // compile. df-cli's "build-file --precompile" is dependency-checked and
+    // idempotent - it skips the build when the .pkd is already current.
+    //   sPkgFile   - FULL path to the package source (<AppSrc>\<name>.pkg).
+    //   WS         - workspace to precompile against (include paths come
+    //                from the .sws, exactly like the program compile).
+    //   sErrorText - ByRef; populated when the command cannot be built.
+    //   sCmdPath   - ByRef; receives the compiler executable's full path.
+    //   sCmdArgs   - ByRef; receives the argument string.
+    // Returns False (with sErrorText set) when the configured compiler is
+    // missing or is not df-cli - the legacy compilers' precompile invocation
+    // differs and is out of scope (the caller surfaces a manual hint).
+    //
+    // Deliberately does NOT append psCompOpt (it serves the PROGRAM compile;
+    // its flags - e.g. --write-errors - don't belong on a package build),
+    // but DOES hard-code --rebuild: the program compile's staleness verdict
+    // and build-file's own dependency check have been observed to DISAGREE
+    // (2026-06-10: the compile bailed with 4522 while a dependency-checked
+    // precompile of the same package reported "No changes detected, skipping
+    // build"). The user just confirmed the precompile, so force it - the
+    // .pkd is then guaranteed rewritten and the next compile cannot bail on
+    // the same package. No --toolchain: the same df-cli exe + workspace
+    // defaults as the main compile produce the matching-platform .pkd
+    // (revisit with cfg [Compiler]Platform if an x64-TARGET workspace ever
+    // needs it - same caveat as PredictedCompiledFile).
+    Function BuildPrecompileCommand String sPkgFile tWorkspacePaths WS ;
+             String ByRef sErrorText String ByRef sCmdPath String ByRef sCmdArgs ;
+             Returns Boolean
+
+        String  sCompPath
+        Boolean bOK bDfCli
+
+        Get ResolveConfiguredCompiler (&sCompPath) (&sErrorText) to bOK
+        If (bOK = False) ;
+            Function_Return False
+
+        Move (sCompPath contains "df-cli") to bDfCli
+        If (bDfCli = False) Begin
+            Move "Automatic precompile is only supported for the df-cli compiler." to sErrorText
+            Function_Return False
+        End
+
+        Move sCompPath to sCmdPath
+        // Keep the space before --workspace's neighbour args - same glue
+        // hazard as documented in BuildCompileCommand's df-cli branch.
+        Append sCmdArgs "build-file" " " ('"' + sPkgFile + '"') " --precompile --rebuild --workspace " ('"' + WS.sSWSFile + '"')
         Function_Return True
     End_Function
 
@@ -297,12 +489,13 @@ Class cCompileMixin is a Mixin
     Function CheckCompileSucceeded String sProgram tWorkspacePaths WS ;
              String ByRef sErrorText Returns Boolean
         
-        String sAppSrc sErrFile
+        String sErrFile
         Boolean bExists
 
-        Move (vFolderFormat(WS.sAppSrc)) to sAppSrc
-        Get CompileErrorFileForProgram sProgram to sErrFile
-        Get vFilePathExists (sAppSrc + sErrFile) to bExists
+        // Resolve the .err the compiler actually wrote (32- or 64-bit suffix per the
+        // program's .cfg); a non-empty path means an .err exists => compile failed.
+        Get ResolveCompiledFile sProgram WS "err" to sErrFile
+        Move (sErrFile <> "") to bExists
         If (bExists = True) Begin
             // Strip extension before composing the message, otherwise a
             // caller that passed "MyApp.src" gets "MyApp.src.src program".
@@ -341,6 +534,10 @@ Class cCompileMixin is a Mixin
         String sCmdPath sCmdArgs
         Boolean bOK
 
+        Move (Lowercase(sProgram) contains ".src") to bOK
+        If (bOK = False) Begin
+            Append sProgram ".src"
+        End
         Get BuildCompileCommand sProgram WS (&sErrorText) (&sCmdPath) (&sCmdArgs) to bOK
         If (bOK = False) Begin
             Function_Return False

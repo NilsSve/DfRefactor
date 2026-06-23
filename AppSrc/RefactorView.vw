@@ -229,6 +229,26 @@ Object oRefactorView is a cRDCDbView
             
                     End_Object                    
 
+                    Object oFunctions_FnGroup is a cRDCDbCJGridColumn
+                        Entry_Item Functions.FnGroup
+                        Set piWidth to 100
+                        Set psCaption to "Group"
+                        Set psToolTip to "The functional group this refactoring belongs to: Modernization (brings legacy code up to current DataFlex), Cleanup (tidies or removes), or Other. Set via the function's { FnGroup } meta-tag."
+                        Set Status_Help to (psToolTip(Self))
+                        Set peHeaderAlignment to xtpAlignmentCenter
+                        Set peTextAlignment to xtpAlignmentCenter
+                        Set pbComboButton to True
+                        // pbEditable *must* be set after the pbComboButton setting.
+                        Set pbEditable to False
+                        Set pbComboEntryState to False
+
+                        Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                            Get psToolTip to sText
+                            Function_Return sText
+                        End_Function
+
+                    End_Object
+
                     Object oFunctions_Parameter is a cRDCDbCJGridColumn
                         Entry_Item Functions.Parameter
                         Set piWidth to 122
@@ -1188,6 +1208,7 @@ Object oRefactorView is a cRDCDbView
         End
 
         // Start the Engine!
+        Set peRunOrigin of ghoEngine to eRunManual
         Send StartEngine of ghoEngine RefactorFiles hoEditor
     End_Procedure
 
@@ -1212,6 +1233,15 @@ Object oRefactorView is a cRDCDbView
         Set piActiveView of ghoApplication to CI_CleanupSource Self
     End_Procedure
 
+    Procedure DoFreshGrids
+        If (IsComObjectCreated(oFunctionSelection_grd)) Begin
+            Send RefreshDataFromDD of oFunctionSelection_grd 0
+        End
+        If (IsComObjectCreated(oDbFolders_grd)) Begin
+            Send RefreshDataFromDD of oDbFolders_grd 0
+        End
+    End_Procedure
+    
     Procedure OnWorkspaceLoaded
         Integer iSelectedFolders  
         Handle hoFolderSelHeaDD hoDD

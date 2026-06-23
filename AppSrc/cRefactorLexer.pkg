@@ -101,12 +101,16 @@ Class cRefactorLexer is a cRefactorUtilities
     Function _IsDF23CommentEnd String sOverstrikeLine Returns Boolean
         Boolean bOK
         Integer iPos iPos2
+        String  sMasked
 
+        // Ignore a "*/" that sits inside a string literal: callers pass the RAW line here,
+        // before string overstriking, so mask quoted content first (see _IsDF23CommentStart).
+        Get _MaskQuotedContent sOverstrikeLine to sMasked
         Move 0 to iPos2
         Move False to bOK
-        Move (Pos(CS_DF23CommentEnd, sOverstrikeLine)) to iPos
+        Move (Pos(CS_DF23CommentEnd, sMasked)) to iPos
         If (iPos <> 0) Begin
-            Move (Pos(CS_CommentSymbol, sOverstrikeLine))  to iPos2
+            Move (Pos(CS_CommentSymbol, sMasked))  to iPos2
             If (iPos2 <> 0) Begin
                 Move (iPos < iPos2) to bOK
             End
@@ -121,9 +125,19 @@ Class cRefactorLexer is a cRefactorUtilities
     Function _IsDF23CommentStart String sOverstrikeLine Returns Boolean
         Integer iPos iPos2
         Boolean bFound
+        String  sMasked
+
+        // Ignore a "/*" that sits inside a string literal (e.g. an HTTP "*/*" accept header).
+        // The Tokenizer calls this on the RAW line, BEFORE _OverstrikeStrings masks string
+        // content - so without this an in-string "/*" falsely OPENS a block comment, and with no
+        // real "*/" after it pbIsInDF23MultiLineComment sticks ON to end-of-file: every later
+        // line is then treated as a comment and EVERY refactor skips it. (Nils 2026-06-11, found
+        // as `Set psAcceptTypes of h to "*/*"` in wslibrary.pkg silently killing all refactors
+        // below it.)
+        Get _MaskQuotedContent sOverstrikeLine to sMasked
         Move False to bFound
-        Move (Pos(CS_DF23CommentStart, sOverstrikeLine)) to iPos
-        Move (Pos(CS_CommentSymbol, sOverstrikeLine))    to iPos2
+        Move (Pos(CS_DF23CommentStart, sMasked)) to iPos
+        Move (Pos(CS_CommentSymbol, sMasked))    to iPos2
         If (iPos > 0) Begin
             If (iPos2 = 0) Begin
                 Move True to bFound
@@ -759,6 +773,17 @@ Class cRefactorLexer is a cRefactorUtilities
                 Decrement iSize
                 Decrement iCount
             End
+            Else If (asLineTokens[iCount] = "[" and iCount < iSize) Begin
+                // A lone "[" comes from a space right after the bracket, e.g. "[ Found]" splits to
+                // "[" + "Found]". Merge it into the NEXT token so the indicator parses identically to
+                // "[Found]" (mirrors the lone-"]" merge above, which handles "[Found ]"). Without this the
+                // lone "[" seeds an empty FirstBoolean in _ExtractLegacyBooleanContent and the bracket flag
+                // is lost, so the line is not refactored at all.
+                Move ("[" + asLineTokens[iCount + 1]) to asLineTokens[iCount + 1]
+                Move (RemoveFromArray(asLineTokens, iCount)) to asLineTokens
+                Decrement iSize
+                Decrement iCount
+            End
         Loop
 
         // If there are any string constants, replace the overstriked value with the original text string:
@@ -1300,6 +1325,10 @@ Class cRefactorLexer is a cRefactorUtilities
         Boolean bHasIf bHasMove bHasTo bIndicateCmd
         tExpression Expression
 
+        // Guard against a tokenless line (asLineTokens[0] would fault err 4509). The caller normally ensures a
+        // bracket / Indicate is present (so the array is non-empty), but be safe.
+        If (SizeOfArray(TokenizerData.asLineTokens) = 0) ;
+            Function_Return sOverStrikeLine
         Move TokenizerData.asLineTokens[iItem] to sToken
         If (Left(sToken, 1) <> "[") Begin
             Function_Return sOverStrikeLine
@@ -1538,7 +1567,11 @@ Class cRefactorLexer is a cRefactorUtilities
                     If (TokenizerData.BooleanIndicator.FirstBoolean.bHasNot = True) Begin
                         Increment iItem
                     End
-                    Move TokenizerData.asLineTokens[iItem] to sFirstCmd
+                    // Guard the index: a bare "[indicator]" with no command token after it leaves iItem past the
+                    // last token, so this unguarded read faulted err 4509 "Referenced Array Index Out of Bounds".
+                    // Out of range -> leave sFirstCmd "" (nothing to transform after the indicator).
+                    If (iItem < SizeOfArray(TokenizerData.asLineTokens)) ;
+                        Move TokenizerData.asLineTokens[iItem] to sFirstCmd
                 End
                 Append sOverstrikeLine CS_S sFirstCmd
                 Move 1 to iItem

@@ -93,7 +93,7 @@ Object DFUnitTestRunner_vw is a View
         Set Location to 24 175
         Set Label to "Next Error"
         Set piImageSize to 16
-        Set psImage to "ActionFind.ico"
+        Set psImage to "ActionNext.ico"
         Set psToolTip to "Find next '[Failed!]' line (Ctrl+N)"
 
         Procedure OnClick

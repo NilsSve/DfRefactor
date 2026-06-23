@@ -17,7 +17,7 @@ REM
 REM  THEN run this script. It:
 REM     - refuses to run unless the standalone clone is clean AND pushed
 REM     - fast-forwards DUF's nested RDCToolsLib to that published commit,
-REM       commits the gitlink, pushes DUF  (NilsSve/DbUpdateFramework.git)
+REM       commits the gitlink, pushes DUF  (NilsSve/Library-DUF.git)
 REM     - bumps DfRefactor's DUF pin, commits, pushes DfRefactor
 REM
 REM  Safety: stages ONLY the submodule gitlink at each level (never -A, so

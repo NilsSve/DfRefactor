@@ -103,15 +103,23 @@ Class cRefactorUtilities is a cObject
     End_Function
 
     // Private helper for ChangeCalcToMoveStatement.
-    // Searches for sKeyword (lowercase) followed by a space in sLine and replaces it with CS_Move.
-    // iKeywordLen is Length(sKeyword). Returns True if a substitution was made.
+    // Locates sKeyword at a TOKEN BOUNDARY followed by whitespace in sLine
+    // and replaces it with CS_Move. iKeywordLen is Length(sKeyword). Returns
+    // True if a substitution was made. Boundary-aware via _FindKeywordPos -
+    // a bare Pos matched the keyword INSIDE an earlier identifier ("calc "
+    // at the tail of "iCalc " in "MoveInt iCalc to iX") and spliced the line
+    // there (2026-06-10 audit).
     Function _SubstituteCalcKeyword String ByRef sLine String sKeyword Integer iKeywordLen Returns Boolean
-        String sTest sStart sStop
+        String sStart sStop sNext
         Integer iPos
 
-        Move (Lowercase(sLine)) to sTest
-        Move (Pos(sKeyword + CS_S, sTest)) to iPos
+        Get _FindKeywordPos sLine sKeyword True 1 to iPos
         If (iPos = 0) Begin
+            Function_Return False
+        End
+        // The command form requires whitespace right after the keyword.
+        Move (Mid(sLine, 1, (iPos + iKeywordLen))) to sNext
+        If (sNext <> CS_S and sNext <> Character(9)) Begin
             Function_Return False
         End
         Move (Left(sLine, (iPos - 1)))               to sStart
@@ -131,9 +139,59 @@ Class cRefactorUtilities is a cObject
         Function_Return (Pos(Lowercase(sCh), "abcdefghijklmnopqrstuvwxyz0123456789_") > 0)
     End_Function
 
+    // Locates sKeyword in sText at a TOKEN BOUNDARY, searching from iStart
+    // (1-based): the character before a match must be a non-identifier char
+    // (or the start of the text) and - when bWholeWord is True - the
+    // character after it must be a non-identifier char too (or the end of
+    // the text). Pass bWholeWord False for PREFIX matches such as "u_".
+    // Case-insensitive. Returns the 1-based position of the first qualifying
+    // occurrence, 0 when none.
+    //
+    // Use this instead of a bare Pos() when locating a command keyword on a
+    // source line AFTER a token-array gate: a bare Pos can land inside an
+    // earlier identifier (e.g. "sub" inside "bSubmitted", "calc" inside
+    // "iCalc") and splice the line at the wrong place (the 2026-06-10 audit;
+    // same bug family as the space-before-paren fix in _RenameMaskedCalls).
+    // Prefer passing the MASKED line (sIndentation + sOverstrikeLine, which
+    // is position-aligned with the raw line) so string literals and comments
+    // can never match either.
+    Function _FindKeywordPos String sText String sKeyword Boolean bWholeWord Integer iStart Returns Integer
+        String  sTextLC sKwLC
+        Integer iLen iKwLen iPos
+        Boolean bIdent
+
+        Move (Lowercase(sText))    to sTextLC
+        Move (Lowercase(sKeyword)) to sKwLC
+        Move (Length(sText))       to iLen
+        Move (Length(sKeyword))    to iKwLen
+        If (iKwLen = 0 or iLen < iKwLen) ;
+            Function_Return 0
+        Move iStart to iPos
+        If (iPos < 1) ;
+            Move 1 to iPos
+        While (iPos <= (iLen - iKwLen + 1))
+            If (Mid(sTextLC, iKwLen, iPos) = sKwLC) Begin
+                Move False to bIdent
+                If (iPos > 1) ;
+                    Get _IsIdentifierChar (Mid(sTextLC, 1, (iPos - 1))) to bIdent
+                If (bIdent = False) Begin
+                    If (bWholeWord = True) ;
+                        Get _IsIdentifierChar (Mid(sTextLC, 1, (iPos + iKwLen))) to bIdent
+                    If (bIdent = False) ;
+                        Function_Return iPos
+                End
+            End
+            Increment iPos
+        Loop
+        Function_Return 0
+    End_Function
+
     // Rename function CALLS on one line: for each asFrom[i], every occurrence of
-    // "<asFrom[i]>(" that is a whole word - preceded by a non-identifier char (or the
-    // start of line) and immediately followed by "(" - is replaced with asTo[i].
+    // asFrom[i] that is a whole word - preceded by a non-identifier char (or the
+    // start of line) and followed by "(" - is replaced with asTo[i]. Whitespace
+    // between the name and the "(" is allowed: DataFlex accepts "ToOEM (sPath)"
+    // as a call, and real code writes it (the gap Nils caught 2026-06-10 - such
+    // calls were silently skipped when the "(" had to be adjacent).
     // Matches are located in sOver (the overstruck line, with strings/comments masked,
     // and position-aligned with sLine) so literals and comments are never touched, then
     // emitted into the rebuilt line from sLine. Case-insensitive on the name; the left
@@ -141,7 +199,7 @@ Class cRefactorUtilities is a cObject
     // "Utf8ToOem(" is not re-matched). Returns the (possibly rebuilt) line.
     Function _RenameMaskedCalls String sLine String sOver String[] asFrom String[] asTo Returns String
         String  sOverLC sOut sNew sSeg
-        Integer iLen iPos iP iPairs iFromLen iMatchLen iCopyFrom
+        Integer iLen iPos iP iPairs iFromLen iMatchLen iCopyFrom iNext
         Boolean bMatch bBoundaryOk bPrevIsIdent
 
         Move (Length(sOver)) to iLen
@@ -168,10 +226,21 @@ Class cRefactorUtilities is a cObject
                 For iP from 0 to iPairs
                     If (bMatch = False) Begin
                         Move (Length(asFrom[iP])) to iFromLen
-                        If (Mid(sOverLC, iFromLen, iPos) = Lowercase(asFrom[iP]) and Mid(sOverLC, 1, (iPos + iFromLen)) = "(") Begin
-                            Move True       to bMatch
-                            Move iFromLen   to iMatchLen
-                            Move asTo[iP]   to sNew
+                        If (Mid(sOverLC, iFromLen, iPos) = Lowercase(asFrom[iP])) Begin
+                            // The "(" need not be adjacent - skip any spaces/tabs
+                            // between the name and the "(" before testing for it.
+                            // Only the NAME is replaced (iMatchLen below), so the
+                            // original spacing survives the rename and positions
+                            // stay aligned.
+                            Move (iPos + iFromLen) to iNext
+                            While (iNext <= iLen and (Mid(sOverLC, 1, iNext) = " " or Mid(sOverLC, 1, iNext) = Character(9)))
+                                Increment iNext
+                            Loop
+                            If (Mid(sOverLC, 1, iNext) = "(") Begin
+                                Move True       to bMatch
+                                Move iFromLen   to iMatchLen
+                                Move asTo[iP]   to sNew
+                            End
                         End
                     End
                 Loop
@@ -487,13 +556,71 @@ Class cRefactorUtilities is a cObject
         Function_Return bMethodEnd
     End_Function
 
-    // Is the line a command declaration?
-    Function _IsCommandDeclaration String sOverstrikeLine Returns Boolean
-        Function_Return (Pos(Lowercase("#" + CS_Command), Lowercase(sOverstrikeLine)) <> 0)
+    // Returns sLine with the CONTENT of single/double-quoted string literals replaced by "_"
+    // (length and positions preserved; the quote chars themselves kept). Lets marker checks
+    // ignore "/*", "*/", "//" etc. that sit INSIDE a string literal - e.g. an HTTP "*/*" accept
+    // header or a "http://" URL. Per-line only (does not track old-school ';'-continued multi-
+    // line strings). Mirrors RemoveStringsFromLine (cRefactorFuncLib) but lives here at the
+    // lexer/utilities level so the Tokenizer's PRE-overstrike comment checks can use it - and is
+    // length-preserving so position comparisons stay valid (Nils 2026-06-11).
+    Function _MaskQuotedContent String sLine Returns String
+        Integer iLength iPos
+        Boolean bSep1 bSep2
+        String  sChar sSep1 sSep2 sReturn
+
+        Move False to bSep1
+        Move False to bSep2
+        Move "'" to sSep1
+        Move '"' to sSep2
+        Move ""  to sReturn
+        Move (Length(sLine)) to iLength
+        For iPos from 1 to iLength
+            Move (Mid(sLine, 1, iPos)) to sChar
+            If (bSep1 = False and bSep2 = False) Begin
+                // Outside any string: keep the char (an opening quote also opens a string).
+                If (sChar = sSep1) Begin
+                    Move True to bSep1
+                End
+                Else If (sChar = sSep2) Begin
+                    Move True to bSep2
+                End
+                Move (sReturn + sChar) to sReturn
+            End
+            Else Begin
+                // Inside a string: keep the matching closing quote, mask everything else.
+                If (bSep1 and sChar = sSep1) Begin
+                    Move False to bSep1
+                    Move (sReturn + sChar) to sReturn
+                End
+                Else If (bSep2 and sChar = sSep2) Begin
+                    Move False to bSep2
+                    Move (sReturn + sChar) to sReturn
+                End
+                Else Begin
+                    Move (sReturn + "_") to sReturn
+                End
+            End
+        Loop
+        Function_Return sReturn
     End_Function
 
+    // Is the line a "#Command" declaration? Start-anchored on the trimmed line so a real
+    // (possibly indented) directive matches but a stray "#command" inside masked text/a later
+    // token cannot falsely turn pbInCommand ON (which would then never clear). Symmetric with
+    // _IsCommandEnd below (Nils 2026-06-11).
+    Function _IsCommandDeclaration String sOverstrikeLine Returns Boolean
+        Function_Return (Left(Uppercase(Trim(sOverstrikeLine)), Length("#" + CS_Command)) = Uppercase("#" + CS_Command))
+    End_Function
+
+    // Is the line a "#EndCommand"? TRIM first: the lexer passes the RAW line here
+    // (cRefactorLexer.pkg ~1898), so an INDENTED #EndCommand - common inside #IF/#IFDEF blocks -
+    // must still close the command. Without the Trim, the column-1 Left() check missed it and
+    // pbInCommand stuck ON: every following line then looked "inside a command", so ChangeTrim /
+    // Calc / Length / etc. silently skipped a whole function. _IsCommandDeclaration already
+    // tolerated indentation (left-trimmed sOverstrikeLine), so the ON/OFF was asymmetric and the
+    // flag could never be cleared (Nils 2026-06-11).
     Function _IsCommandEnd String sOverstrikeLine Returns Boolean
-        Function_Return (Left(Uppercase(sOverstrikeLine), Length("#ENDCOMMAND")) = "#ENDCOMMAND")
+        Function_Return (Left(Uppercase(Trim(sOverstrikeLine)), Length("#ENDCOMMAND")) = "#ENDCOMMAND")
     End_Function
 
     Function _IsRegisterObjectLine String sLine Returns Boolean
@@ -754,10 +881,15 @@ Class cRefactorUtilities is a cObject
 
     // To check if the sToken from a Tokenizer.asLineTokens array is a string constant
     Function _IsStringArrayConstant String sToken Returns Boolean
-        String sOrg
-        Move sToken to sOrg
-        Move (Replaces("_", sToken, "")) to sToken
-        Function_Return (sOrg <> sToken)
+        String sStripped
+        // The lexer overstrikes a string literal's CONTENT with '_' but KEEPS the quotes
+        // (e.g. "hello" -> "_____"), so a string-constant token is ONLY quotes + underscores.
+        // A real identifier (ADM_VER, sF_Name, Functions.Function_NAME) keeps its letters/digits
+        // and must NOT be treated as a string constant - else the name gets wrongly blanked to ''.
+        Move (Replaces("_", sToken, "")) to sStripped
+        Move (Replaces('"', sStripped, "")) to sStripped
+        Move (Replaces("'", sStripped, "")) to sStripped
+        Function_Return ((Pos("_", sToken) > 0) and (Trim(sStripped) = ""))
     End_Function
 
     // Returns False if the first line in the passed file is _not_ an automatically generated

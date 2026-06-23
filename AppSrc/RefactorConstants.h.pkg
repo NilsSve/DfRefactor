@@ -43,6 +43,20 @@ CONSOLE_FONTSIZE 12 8
     Move 0 to ghoEngine
 #ENDIF
 
+// Handle of the Compiler Output dock (oCompilerOutput_dg), set when it is shown.
+#IFNDEF ghoCompilerOutputDock
+    Global_Variable Handle ghoCompilerOutputDock
+    Move 0 to ghoCompilerOutputDock
+#ENDIF
+
+// Handle of the Modernization Analyzer dock (oModAnalyzer_dg), set when it is shown.
+// Lets the earlier-Used CompilerOutput.dg / TestCompile.dg hide it (one-at-a-time docks)
+// without naming oModAnalyzer_dg directly, since that object is Used later.
+#IFNDEF ghoModAnalyzerDock
+    Global_Variable Handle ghoModAnalyzerDock
+    Move 0 to ghoModAnalyzerDock
+#ENDIF
+
 // Needs to be _before_ the cApplication object as we refer to it there.
 // However, the package itself must be Used _after_ the ghoApplication object,
 // as it contains references to the phoWorkspace property. (Kind of catch 22).
@@ -72,6 +86,8 @@ Enum_List
     Define eInitValue   for 3
     Define eHelpTopic   for 4
     Define ePrivate     for 5    // { Private = True } meta-tag; sets Functions.bPrivate
+    Define eModRecipe   for 6    // { ModRecipe = "msg# | match-text | [category]" } - maps a compiler message to this function
+    Define eFnGroup     for 7    // { FnGroup = Modernization | Cleanup } - groups the function in the Select Functions picker
 End_Enum_List
 
 Struct tFuncEnumList
@@ -96,6 +112,159 @@ Struct tFuncLib
     Boolean bFuncEnumList       // True if the FuncEnumList struct contains data.
     tFuncEnumList FuncEnumList
     Boolean bPrivate            // True when the function carries a { Private = True } meta-tag.
+    String[] asModRecipe        // Raw { ModRecipe } tag values (msg# | match-text | [category]); one per compiler message this function fixes.
+    Integer eFunctionGroup      // { FnGroup } value: eFnGroupOther(0) / eFnGroupModernization(1) / eFnGroupCleanup(2). Groups the Select Functions picker. Mirrors eFunctionType.
+End_Struct
+
+// One legacy "Type ... End_Type" definition captured from a (usually system) package - the type
+// name plus its raw block lines - so the report can propose a modern Struct for a USED type.
+Struct tTypeDef
+    String sName
+    String[] asBlock
+End_Struct
+
+// Cache file for the install-package Type catalogue (Phase A of TypeToStructReport). The system
+// packages normally change only on a DataFlex version bump, but an in-place update (same version
+// folder) can revise them too - so sPkgNewest stamps the newest *.pkg write time captured at scan
+// time and the cache self-invalidates when a package is later found newer (see _PkgScanIsStale).
+// Keyed by the target DF version in the filename (Data\TypeDefs-<ver>.json); iVersion is the cache
+// FORMAT version - bump CI_TypeDefsCacheVersion to force a reseed if the extraction/format changes.
+Struct tTypeDefCacheFile
+    Integer iVersion
+    String sPkgNewest       // Newest install *.pkg write time at scan time, "YYYYMMDDHHMMSS" (see _PkgTimeStamp); "" = unknown.
+    tTypeDef[] aDefs
+End_Struct
+
+// --- .err analysis track: compiler-error triage (see cModAnalyzer.pkg) ---
+// eCategory ranks how a parsed .err error can be handled. Phase 1 only classifies
+// and explains (read-only); Suggest / AutoFix drive the later apply phases.
+Enum_List
+    Define eModUnknown      for 0   // No recipe yet - review manually.
+    Define eModExplain      for 1   // Explain only; manual fix (needs judgement).
+    Define eModSuggest      for 2   // A concrete fix can be suggested (Phase 2).
+    Define eModAutoFix      for 3   // An existing refactor function already fixes it.
+End_Enum_List
+
+Struct tModAnalyzer
+    Integer iMsgNumber      // Compiler message number (e.g. 4538). 0 in a pure classify-result.
+    Boolean bIsWarning      // True = compiler warning, False = error.
+    String sMatchText       // Message substring that disambiguates this row (blank = any text for the number).
+    Integer eCategory       // One of the eMod* values above.
+    String sCategoryText    // Human-readable category label for the analysis grid.
+    String sHint            // One-line "how to fix" guidance.
+    String sRefactorFn      // Refactor function that addresses it ("" if none / Explain-only).
+End_Struct
+
+Define CR_LF for (Character(13) + Character(10))
+// Filename for the editable recipe JSON. Lives in DFRefactor's OWN Data folder - it's data,
+// and global to DFRefactor (not per-target-workspace).  
+// It is used as a base name for the file. In function RecipeJsonPath (cModAnalyzer.pkg),
+// the TARGET DataFlex version is added after "ModAnalyzerRecipes", so that each DataFlex get
+// its own unique json file.
+Define CS_ModAnalyzerRecipesJson for "ModAnalyzerRecipes.json"
+
+// Base name for the TypeToStructReport install-package Type catalogue cache (the target DF version
+// is appended -> Data\TypeDefs-<ver>.json). CI_TypeDefsCacheVersion is the cache FORMAT version:
+// bump it to invalidate every cached catalogue at once (e.g. if _TypeDefsFromLines changes).
+// v2 added sPkgNewest (the install-package change watermark).
+Define CS_TypeDefsCacheJson      for "TypeDefs.json"
+Define CI_TypeDefsCacheVersion   for 2
+
+// Base name for the RAW install-package obsolete-warning scan cache (the target DF version is
+// appended -> Data\ObsoleteScan-<ver>.json). This is the product of the SHARED install-Pkg walk
+// (cRefactorFuncLib: WalkInstallPackages / InstallScanRecipes) that feeds BOTH the ModAnalyzer recipe
+// scan and the TypeToStructReport Type catalogue in ONE pass. cModAnalyzer reads it back and merges
+// it with its built-in defaults into the editable ModAnalyzerRecipes-<ver>.json. Split out from the
+// recipe JSON so a recipe (defaults / meta-tag) version bump re-merges WITHOUT re-walking the
+// packages. CI_ObsoleteScanVersion is the scan FORMAT version - bump it if _ObsoleteRecipesFromLines
+// changes. v2 added sPkgNewest (the install-package change watermark). Reuses the tModRecipeFile
+// wrapper struct (below).
+Define CS_ObsoleteScanJson       for "ObsoleteScan.json"
+Define CI_ObsoleteScanVersion    for 2
+
+// The recipe set as it lives in that JSON: a version stamp + the rows. cModAnalyzer treats the
+// JSON as the canonical source (falling back to BuildDefaultRecipes if absent); the higher of
+// the JSON version / built-in CI_ModAnalyzerRecipeVersion wins and reseeds the ModAnalyzer table.
+// Also wraps the raw ObsoleteScan-<ver>.json, where sPkgNewest stamps the newest install *.pkg
+// write time at scan time (the change watermark; see _PkgTimeStamp). The editable recipe JSON
+// leaves sPkgNewest blank - it is consulted only for the raw install-scan cache.
+Struct tModRecipeFile
+    Integer iVersion
+    String sPkgNewest       // ObsoleteScan cache only: newest install *.pkg write time, "YYYYMMDDHHMMSS"; "" = unknown / not an install scan.
+    tModAnalyzer[] aRecipes
+End_Struct
+
+// The actionable plan the Modernization Analyzer hands to the engine: the distinct
+// refactor function NAMES to select + run, and the distinct workspace-source files to
+// process. System/library files (e.g. the DataFlex install packages flagged by 4536)
+// are filtered out during aggregation - never refactor files outside the workspace.
+Struct tModRefactorPlan
+    String[] asFunctions
+    String[] asFunctionHints   // parallel to asFunctions: each function's hint (preview tooltip)
+    String[] asFiles
+End_Struct
+
+// Per-workspace snapshot of the LAST Modernize/analyze run, cached in the per-EXE registry
+// (cRefactorApplication WriteAnalyzeSnapshot / ReadAnalyzeSnapshot, keyed by the .sws path) so the FT
+// dashboard's Last-analyze tile can show the prior counts when a workspace is re-opened in a later run.
+// sDate (ISO yyyy-mm-dd) labels them "last run <date>" - the staleness cue. bFound = a snapshot existed.
+Struct tAnalyzeSnapshot
+    Integer iWarn       // compiler warning messages
+    Integer iErr        // compiler error messages
+    Integer iAuto       // auto-fixable rows
+    Integer iSuggest    // rows to review
+    String  sDate       // ISO yyyy-mm-dd the snapshot was taken
+    String  sProgram    // the program (.src) these counts are for (the LAST analyzed in this workspace)
+    Boolean bFound      // True = a stored snapshot was read back
+End_Struct
+
+// Workspace-wide roll-up across the per-program analyze snapshots (the FT dashboard's "N of M analyzed"
+// line). iTotal = all programs in the .sws [Projects]; iAnalyzed = those with a stored snapshot; iWarnTotal
+// = the sum of their warning counts. See cRefactorApplication.AnalyzeRollup.
+Struct tAnalyzeRollup
+    Integer iAnalyzed
+    Integer iTotal
+    Integer iWarnTotal
+End_Struct
+
+// ---- Saved "last refactoring plan" -------------------------------------------------------------
+// The full Modernization-Analyzer triage from the LAST analyze, frozen so it can be VIEWED again
+// later (the Modernize tile's "View last plan" link re-loads it into the read-only analyzer grid).
+// Unlike the recipe / typedef caches (keyed by TARGET DF version, in DFRefactor's Data folder), this
+// is per-WORKSPACE like the analyze snapshot - SavedPlanJsonPath (cModAnalyzer) keys the filename by
+// the AnalyzeSnapshotKey fold of the .sws. Latest-only: each analyze overwrites it. Carries the same
+// headline stats as tAnalyzeSnapshot so the file is a COMPLETE record (the registry snapshot stays as
+// the dashboard's fast-read cue; both are written together from the same numbers so they can't drift).
+// Bump CI_SavedPlanVersion if tSavedPlanRow / tSavedPlan change, so a stale file is detected + dropped.
+Define CS_SavedPlanJson    for "LastPlan.json"
+Define CI_SavedPlanVersion for 1
+
+// One frozen analyzer row. Named fields (NOT the grid's column-id-indexed sValue[]) so the JSON is
+// decoupled from the grid layout; the viewer maps these back onto its columns on load. iLine is the
+// numeric first-occurrence line (jump-to-source); sLineDisplay is the "10  (x3)" string as shown.
+Struct tSavedPlanRow
+    Integer eCategory       // eMod* numeric - drives the informational hide + the row icon
+    String  sCategory       // category display label ("Auto-fix" / "Review" / ...)
+    String  sMsg            // message token(s): "W 4538" or "W 4538, E 4501"
+    String  sFile
+    Integer iLine           // numeric first-occurrence source line
+    String  sLineDisplay    // line as shown, may carry the "(xN)" occurrence suffix
+    String  sHint           // suggested-fix guidance
+    String  sFn             // refactor function name(s), "" for explain / manual
+End_Struct
+
+// The saved-plan file payload: a version stamp, the run context, the headline stats, and the rows.
+Struct tSavedPlan
+    Integer iVersion
+    String  sDate           // ISO yyyy-mm-dd the analyze ran (mirrors tAnalyzeSnapshot.sDate)
+    String  sWorkspace      // the .sws this plan was built for
+    String  sDfVersion      // target DataFlex version at build time
+    String  sSourcePrn      // the .prn / .err it was parsed from
+    Integer iWarn           // headline stats (same four as tAnalyzeSnapshot)
+    Integer iErr
+    Integer iAuto
+    Integer iSuggest
+    tSavedPlanRow[] aRows
 End_Struct
 
 // Aren't modern DD classes named o<tablename>_DataDictionary ?
@@ -110,12 +279,21 @@ Define CS_DDOldStyle      for "<tablename>_DD"
 Define CS_DDLegacyStyle   for "o<tablename>_DD"
 Define CS_DDNewStyle      for "o<tablename>_dd"
 
-Enum_List 
+Enum_List
    Define eEngineOK         for 0
    Define eEngineUserCancel for 1
-   Define eEngineError      for 2  
-   Define eEngineSelError   for 3 
+   Define eEngineError      for 2
+   Define eEngineSelError   for 3
    Define eEngineBackupErr  for 4
+End_Enum_List
+
+// Which UI action triggered an engine run - recorded on the engine (peRunOrigin) and shown as
+// "Run source:" in the summary log, so a saved summary says WHAT kicked it off.
+Enum_List
+    Define eRunManual    for 0 // user-selected functions + files ("Start Refactoring")
+    Define eRunPlan      for 1 // analyzer "Refactor Plan" (Auto Select from Analyze)
+    Define eRunBatch     for 2 // headless command-line (/bm) run
+    Define eRunTestBench for 3 // the interactive Test Bench (LegacyCode.pkg)
 End_Enum_List
 
 Enum_List
@@ -139,6 +317,65 @@ Define CS_ReportFunction         for "eReportFunction - One File"   // Makes no 
 Define CS_ReportFunctionAll      for "eReportFunctionAll - All Files"  // Makes no source changes.
 Define CS_OtherFunction          for "eOtherFunction - One File"
 Define CS_OtherFunctionAll       for "eOtherFunctionAll - All Files"
+
+// { FnGroup } meta-tag VALUE enum + display strings (mirrors the eXxxFunction / CS_*Function pair above).
+// eFnGroupOther MUST be 0: an untagged function never enters the eFnGroup parse case
+// (cRefactorFuncLib.pkg ParseComment), so its Integer member stays at the DataFlex default 0.
+// NOTE: this VALUE enum is distinct from the meta-tag-TYPE 'Define eFnGroup for 7' above.
+Enum_List
+    Define eFnGroupOther          for 0   // Unclassified / no { FnGroup } tag.
+    Define eFnGroupModernization  for 1   // Brings legacy code up to current DataFlex.
+    Define eFnGroupCleanup        for 2   // Tidies or removes.
+End_Enum_List
+
+// "No FnGroup filter / all groups" sentinel (mirrors eAllFunctions for the Type filter). NOT a real group
+// value - used by SelectFunctionsFT's FnGroup constraint + the dashboard's Manual tile (vs Cleanup).
+Define eFnGroupAll for (-1)
+
+Define CS_FnGroupOther           for "Other"
+Define CS_FnGroupModernization   for "Modernization"
+Define CS_FnGroupCleanup         for "Cleanup"
+
+// { FnGroup } enum <-> text converters (mirrors cModAnalyzer's CategoryText). Used INSTEAD of an
+// implicit 'Move a name-string into an Integer' resolution, which turns a non-Define string into 0
+// and faults under DF26 - see _ParameterIsEnum in cBaseFuncLib. Global so both the meta-tag parser
+// (cRefactorFuncLib ParseComment) and the Functions DD value-table can reach them.
+Function FnGroupText Global Integer eGroup Returns String
+    If (eGroup = eFnGroupModernization) ;
+        Function_Return CS_FnGroupModernization
+    If (eGroup = eFnGroupCleanup) ;
+        Function_Return CS_FnGroupCleanup
+    Function_Return CS_FnGroupOther
+End_Function
+
+// Resolve a { FnGroup } meta-tag's text (e.g. "Modernization") to its enum value, case-insensitively.
+// Unknown / blank -> eFnGroupOther (0), the same default an untagged function gets.
+Function FnGroupValue Global String sText Returns Integer
+    String sTrim
+    Move (Trim(Lowercase(sText))) to sTrim
+    If (sTrim = Lowercase(FnGroupText(eFnGroupModernization))) ;
+        Function_Return eFnGroupModernization
+    If (sTrim = Lowercase(FnGroupText(eFnGroupCleanup))) ;
+        Function_Return eFnGroupCleanup
+    Function_Return eFnGroupOther
+End_Function
+
+// Indicator names the indicator-refactoring functions (ChangeLegacyIndicators /
+// ChangeSquareBracketsIndicators) must NOT bare-ify - they have no valid modern bare form.
+// SELECT is an old-FMAC #Replace macro (OldFMACCommands.pkg) not defined in modern builds;
+// refactoring [SELECT] -> Select would turn a harmless warning into a compile error.
+// Comma-separated, case-insensitive; extend as other old-FMAC macro indicators surface.
+Define CS_NonRefactorableIndicators for "SELECT"
+
+// SELECT-handling mode for ChangeLegacyIndicators / ChangeSquareBracketsIndicators (their
+// sParameter). eLeaveSelect (default) respects CS_NonRefactorableIndicators - it leaves
+// [SELECT] / Indicate Select untouched (safe; their bare form does not compile without
+// OldFMACCommands.pkg). eModernizeSelect refactors them too - only pick it when
+// OldFMACCommands.pkg is in the build, where bare Select compiles.
+Enum_List
+    Define eLeaveSelect
+    Define eModernizeSelect
+End_Enum_List
 
 Enum_List
     Define cx_RegKeyAlreadyExist
@@ -212,7 +449,6 @@ End_Struct
 // takes a tWorkspacePaths argument instead).
 Struct tWorkspacePaths
     String sSWSFile      // Full path to the .sws file in the workspace Home folder
-                         // (what DataFlex Studio + the compiler use via -x).
     String sWSFile       // Full path to the .ws config file in Programs\ (legacy
                          // folder-paths configuration). Equal to psWorkspaceWSFile
                          // of phoWorkspace at startup.
@@ -609,7 +845,7 @@ Define CS_CmdConfigFile2            for "-c"
 Define CS_CmdConfigFile3            for "--console"
 
 // This is the default ini-file name, but it can be named anything.
-Define CS_CmdIniFileName            for "DFRefactorCmdLine.ini"
+Define CS_CmdIniFileName            for "CmdLineData.ini"
 // *** End Command Line Interface ***
 
 // *** "DFRefactorCmdLine.ini" Sections ***
@@ -645,6 +881,8 @@ Define CS_GridFontSize              for "GridFontSize"
 Define CS_GridTheme                 for "GridTheme"
 Define CS_GridCaptionColor          for "GridCaptionColor"
 Define CS_TabPosition               for "TabPosition"
+Define CS_ModernizePanelPosition    for "ModernizePanelPosition"
+Define CS_BottomDockHeight          for "BottomDockHeight"
 Define CS_StarZenSourceExplorer     for "StarZenSourceExplorer"
 Define CS_FileCompareProgram        for "FileCompareProgram"
 Define CS_ToolbarIconSize           for "ToolbarIconSize"
@@ -658,6 +896,11 @@ Define CS_WorkspacesKey             for "Workspaces"
 Define CS_WorkspacePaths            for "WorkspacePaths"
 Define CS_ConfigFile                for "ConfigFile"
 Define CS_WorkspaceRecentKey        for "Recent"
+Define CS_AnalyzeSnapshotKey        for "AnalyzeSnapshot"   // registry section: per-workspace last-analyze counts (FT dashboard)
+// Per-workspace "last compiled program" (CS_Settings section, value-name = prefix + .sws path). Set by the
+// Test Compile program combo; read by WriteAnalyzeSnapshot to tag the snapshot with WHICH program it is for.
+// Promoted here from TestCompile(FT).dg so cRefactorApplication can read it (was a local Define in both docks).
+Define CS_LastCompileKeyPrefix      for "LastCompileProgram_"
 Define CS_PropertiesKeyWord         for "Properties"
 Define CS_ThemeKeyWord              for "Theme"
 Define CS_VersionKeyWord            for "Version"
@@ -695,6 +938,8 @@ Define CS_SummaryLogfileName        for "DFRefactorLogFile.txt"
 Define CS_UnusedSourceLogFile       for "UnusedSourceFiles.log.txt"
 Define CS_UnicodeWin64ReportLogFile for "UnicodeWin64ReportExternalFunction.log.txt"
 Define CS_Win64PointerTruncationLogFile for "Win64PointerTruncation.log.txt"
+Define CS_Win64StructPaddingLogFile for "Win64StructPadding.log.txt"
+Define CS_TypeToStructReportLogFile for "TypeToStructReport.log.txt"
 
 // Careful, these cannot end on a semicolumn as you will introduce variable type equal to ""
 Define CS_VarTypes                  for "indicator;string;integer;number;date;datetime;boolean;handle;real;variant;timespan;rowid;decimal;bigint;uchar;address;char;currency;dword;float;pointer;short;time;ubigint;ushort;wstring;longptr;ulongptr;uinteger;xmlhandle"
@@ -772,14 +1017,15 @@ Define CS_Build_Options  for "Build_Options"
 
 #IF (!@ < 260)
     Define CS_Compiler    for "DFCompConsole.exe"
-    Define CS_CompOptions for "-x -ce0fwv2i0r" // Note: The "c" makes the comiler to always recompile the program.
+    Define CS_CompOptions for "-x -ce1fwv2i0r" // Note: The "c" makes the comiler to always recompile the program.
 #ELSE
     Define CS_Compiler    for "df-cli.exe"
-    Define CS_CompOptions for "build-file -- workspace"
+    Define CS_CompOptions for "--rebuild --force --write-errors --verbose"
 #ENDIF
 
 Define CS_Splitters      for "Splitters"
 Define CS_TestBenchViewSplitterPos for "TestBenchViewSplitterPos"
+Define CS_PlanDialogSplitterPos    for "PlanDialogSplitterPos"
 
 #IF (!@ = 230)
     Define CS_SWSFile    for "DFRefactor23.0.sws"
@@ -809,9 +1055,14 @@ Define CS_Trim           for "Trim"
 Define CS_Length         for "Length"  
 Define CS_Left           for "Left"
 Define CS_Right          for "Right"
-Define CS_Pos            for "Pos"   
+Define CS_Mid            for "Mid"
+Define CS_Pos            for "Pos"
 Define CS_Replace        for "Replace"
-Define CS_In             for "In" 
+Define CS_Character      for "Character"
+Define CS_Pad            for "Pad"
+Define CS_Uppercase      for "Uppercase"
+Define CS_Lowercase      for "Lowercase"
+Define CS_In             for "In"
 Define CS_If             for "If"   
 Define CS_Else           for "Else"
 Define CS_Begin          for "Begin"
@@ -857,7 +1108,14 @@ Define CS_FunctionEnd    for "End_Function"
 Define CS_Procedure      for "Procedure"
 Define CS_ProcedureEnd   for "End_Procedure"
 Define CS_Contains       for "contains"
-Define CS_Select         for "Select" 
+Define CS_Select         for "Select"
+// The guarded SELECT-macro definition line AddUseOldFMACCommands splices into modernised files (the indented
+// #Replace inside an #IFNDEF SELECT / #ENDIF block). The '!C' part is built from Character() codes on PURPOSE:
+// |!C is a DataFlex compile-time auto-increment COUNTER, so a literal "|!C" in our OWN source would be
+// evaluated here (to "|17", "|18", ...) instead of stored as text. Building "!" + "C" via Character keeps the
+// counter out of DFRefactor's compilation while the WRITTEN output still carries the real |!C for the target
+// to evaluate. (124='|' is fine literal - only !C triggers the counter.)
+Define CS_SelectMacroDefineLine for ("    #Replace SELECT |" + Character(33) + Character(67))
 Define CS_Shadow_State   for "Shadow_State"
 Define CS_Object_Shadow_State for "Object_Shadow_State"  
 Define CS_Operators       for "=|<>|<|<=|>|>="
