@@ -1,0 +1,173 @@
+//****************************************************************************
+// $Module type: Program
+// $Module name: MetaTagCheck
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-23
+//
+// Description : SERVICE PROGRAM - maintainer tool, not shipped to end users.
+//
+//               Checks every multi-line meta-tag value in a folder of DataFlex source against
+//               the two DataFlex 26 compiler limits, either of which kills a build with an
+//               access violation and NO error message: the build prints its "Compiling ..."
+//               line and then nothing, exits 0, and leaves a zero-byte .err file.
+//
+//                 RULE 1  a body line indented less than the closing triple-quote. Size is
+//                         irrelevant - this is what happens when prose is pasted into a
+//                         { Description } and lands flush left.
+//                 RULE 2  a block past the size limit, counting indentation, line breaks and
+//                         every embedded sub-tag.
+//
+// WHY THIS IS ITS OWN PROGRAM, and why it links almost nothing:
+//     It has to work when oRefactorFuncLib.pkg is broken - that is the entire point of it. So
+//     it must not link the function library, and it reads the source FROM DISK at run time
+//     rather than binding it as a resource, which would only ever show the state of things when
+//     this program was last built. It links MetaTagHealth.pkg (the shared scan, dependency-free
+//     by design), the file I/O and nothing else, so a broken meta-tag anywhere cannot stop it
+//     compiling or running. Keep it that way: adding a Use of the funclib chain would defeat it.
+//     Note that a failed link DELETES the executable, so a tool that shared the funclib's fate
+//     would be gone exactly when it was needed.
+//
+// Usage : MetaTagCheck64.exe [folder]
+//         With no argument it checks the AppSrc folder of its own workspace. Results go to a
+//         MetaTagCheck.log.txt beside the checked folder, and a summary box names the count.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use DFAllEnt.pkg
+Use RefactorConstants.h.pkg
+Use vWin32fh.pkg                // vFolderFormat
+Use cEncodingHelpers.pkg        // rfFileSize - RefactorFileIO needs it defined first
+Use RefactorFileIO.pkg          // rfFileSearch / rfOpenOutput / rfReadEncodedFileAsStringArray
+Use MetaTagHealth.pkg           // rfMetaTagHealthScan - the shared scan
+Use RDCRunProgram.pkg            // RDCRevealInExplorer
+
+Object oApplication is a cApplication
+    Set psProduct to "DFRefactor Meta-tag Check"
+    Set psCompany to "RDC Tools International"
+
+    // The whole job lives here rather than in a global procedure: Send needs an object
+    // context, and a file-scope Procedure has none - the compiler reports it obscurely,
+    // as "Unresolved control block / Mismatch in method" against End_Procedure.
+    Procedure MtcRun
+        String sFolder sArg sLog sFile sHome sMsg sCRLF
+        String[] asExt asCode asReport asEmpty
+        tRFSearchResult[] FoundFiles
+        // NOTE: never name a variable iF - DataFlex is case-insensitive, so it collides with
+        // the If keyword and every "If (...)" line then fails with "Reserved word used".
+        Integer iCh iExt iExtLast iFile iFileLast iN iTotal iFiles iHitFiles iLine iArgs
+        Handle hoCmdLine
+
+        // Folder: the command-line argument if given, else this workspace's AppSrc.
+        Move "" to sArg
+        Get phoCommandLine of ghoApplication to hoCmdLine
+        If (hoCmdLine <> 0) Begin
+            Get CountOfArgs of hoCmdLine to iArgs
+            If (iArgs >= 1) ;
+                Move (Argument(hoCmdLine, 1)) to sArg
+        End
+        // Explicit Begin/End on both arms: a ';'-continuation If does NOT pair with a block Else -
+        // the compiler unbalances its block stack and the errors then surface further down the file.
+        If (Trim(sArg) <> "") Begin
+            Move (Trim(sArg)) to sFolder
+        End
+        Else Begin
+            Get psHome of (phoWorkspace(ghoApplication)) to sHome
+            Move (vFolderFormat(sHome) + "AppSrc") to sFolder
+        End
+        If (rfDirectoryExists(sFolder) = False) Begin
+            Send Stop_Box ("Folder not found:" * sFolder) "Meta-tag check"
+            Procedure_Return
+        End
+
+        // The log goes to the workspace ROOT, never into the folder being scanned - that folder
+        // is source, and a tool has no business dropping files in it.
+        Get psHome of (phoWorkspace(ghoApplication)) to sHome
+        Move (vFolderFormat(sHome) + "MetaTagCheck.log.txt") to sLog
+        Get rfOpenOutput sLog to iCh
+        If (iCh < 0) Begin
+            Send Stop_Box ("Could not write:" * sLog) "Meta-tag check"
+            Procedure_Return
+        End
+
+        Writeln channel iCh "Meta-tag health check"
+        Writeln channel iCh ""
+        Writeln channel iCh ("Folder: " + sFolder)
+        Writeln channel iCh ""
+        Writeln channel iCh "Both problems below kill the DataFlex 26 compiler with an access violation rather than an"
+        Writeln channel iCh "error: the build prints its 'Compiling ...' line and then NOTHING, exits 0, and leaves a"
+        Writeln channel iCh "zero-byte .err file. Measured on df-cli 1.0.0 (DF 26 GA), 2026-08-23."
+        Writeln channel iCh ""
+        Writeln channel iCh "  RULE 1  A line inside a triple-quoted value indented LESS than the closing delimiter."
+        Writeln channel iCh "          Size is irrelevant - a five-line tag dies exactly like a fifty-line one. This is"
+        Writeln channel iCh "          what happens when prose is pasted in and lands flush left. Indent it and rebuild."
+        Writeln channel iCh ""
+        Writeln channel iCh ("  RULE 2  A block over " + String(CI_MetaTagCrashChars) + " characters, counting indentation, line breaks and every")
+        Writeln channel iCh ("          embedded sub-tag. Warned from " + String(CI_MetaTagMaxSafeChars) + " up, so that a function is never one")
+        Writeln channel iCh "          added sub-tag away from a build that breaks without saying why. Out of room? Move"
+        Writeln channel iCh "          examples and limitation prose into the block comment above the { Published } tag."
+        Writeln channel iCh ""
+        Writeln channel iCh "A commented-out meta-tag is reported too: it would break the build the day it is uncommented."
+        Writeln channel iCh ""
+
+        Move 0 to iTotal
+        Move 0 to iFiles
+        Move 0 to iHitFiles
+        // The extensions worth checking. A meta-tag can appear in any DataFlex source, but in
+    // practice the { Description } blocks live in packages and the occasional view or dialog.
+    Move "*.pkg" to asExt[0]
+    Move "*.src" to asExt[1]
+    Move "*.vw"  to asExt[2]
+    Move "*.dg"  to asExt[3]
+        Move (SizeOfArray(asExt)) to iExtLast
+        Decrement iExtLast
+        For iExt from 0 to iExtLast
+            Move (rfFileSearch((vFolderFormat(sFolder) + asExt[iExt]), DIRMODE_FILES_ONLY, False)) to FoundFiles
+            Move (SizeOfArray(FoundFiles)) to iFileLast
+            Decrement iFileLast
+            For iFile from 0 to iFileLast
+                // rfFileSearch returns LEAF names - rebuild the full path before reading.
+                Move (vFolderFormat(sFolder) + FoundFiles[iFile].sFilename) to sFile
+                Move (rfReadEncodedFileAsStringArray(sFile)) to asCode
+                Move asEmpty to asReport
+                Move (rfMetaTagHealthScan(&asCode, &asReport)) to iN
+                Increment iFiles
+                If (iN > 0) Begin
+                    Writeln channel iCh ("=== " + FoundFiles[iFile].sFilename + " ===")
+                    For iLine from 0 to (SizeOfArray(asReport) - 1)
+                        Writeln channel iCh asReport[iLine]
+                    Loop
+                    Writeln channel iCh ""
+                    Add iN to iTotal
+                    Increment iHitFiles
+                End
+            Loop
+        Loop
+
+        Writeln channel iCh ""
+        If (iTotal = 0) Begin
+            Writeln channel iCh ("No problems found in " + String(iFiles) + " file(s) - every meta-tag block is within both limits.")
+        End
+        Else Begin
+            Writeln channel iCh ("Total: " + String(iTotal) + " problem(s) in " + String(iHitFiles) + " of " + String(iFiles) + " file(s).")
+            Writeln channel iCh "Anything marked THIS CRASHES THE COMPILER breaks the build today. Fix those first."
+        End
+        Send rfCloseOutput iCh
+
+        Move ((Character(13)) + (Character(10))) to sCRLF
+        If (iTotal = 0) Begin
+            Move ("Checked" * String(iFiles) * "file(s) - no meta-tag problems found.") to sMsg
+            Send Info_Box sMsg "Meta-tag check"
+        End
+        Else Begin
+            Move ("Detected" * String(iTotal) * "problem(s) in" * String(iHitFiles) * "of" * String(iFiles) * "file(s).") to sMsg
+            Move (sMsg + sCRLF + sCRLF + "Report:" * sLog) to sMsg
+            Send Info_Box sMsg "Meta-tag check"
+            Send RDCRevealInExplorer sLog
+        End
+    End_Procedure
+End_Object
+
+
+Send MtcRun of ghoApplication

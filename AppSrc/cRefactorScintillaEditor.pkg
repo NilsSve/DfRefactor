@@ -1,11 +1,35 @@
 ﻿Use cCJStandardMenuItemClasses.pkg
 Use cRefactorApplication.pkg
-Use cEditorHotKey_Mixin.pkg
-Use cSciLexerRefactor.pkg
-Use oEditorProperties.pkg 
+Use cRefactorEditorHotKeys.pkg          // DFRefactor's own hotkey mixin (new vocabulary)
+Use cRefactorEditorCommands.pkg         // the bridge + Normalize Case / Re-indent / Drop Self
+Use cEditorColourScheme.pkg             // the theme's own selection settings
+Use cDeepScanner.pkg                    // BuildDefaultDeepScanRules - the obsolete-symbol list F1 gates on
+Use cRefactorEditorSettings.pkg
+Use cQuickMarkStack.pkg                 // the Push / Pop Quick Mark stack - pure; the Scintilla side is below
+Use cSymbolIndex.pkg                    // Go to definition's name -> file/line index - pure; built on first use below
+// A program with a Go to definition chooser of its own Uses it before this package, and that file
+// defines C_OwnGotoDefinitionPicker - then this one stays out.
+#IFNDEF C_OwnGotoDefinitionPicker
+Use GotoDefinitionPicker.dg             // the chooser for a name defined in several places
+#ENDIF
+Use cShadowedPackageFiles.pkg           // NewestListingFile / IncludedFileFromPrnLine - the index scope's fallback
+Use Cursor.pkg                          // the wait cursor over the index build
+Use RefactorLineSplit.pkg               // RefactorSplitLine - replaces the library's
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+                                        // Array-derived cLineParser
 
 Declare_Datafile FunctionsA
 
+// The fold and bookmark margin icons come from Scintilla's image DLL. Declared here
+// because the editor is the only thing that draws them - the control class has no
+// opinion about appearance. (Guarded: the declaration used to live in cSciLexer.pkg,
+// which other programs may still pull in.)
+// SCIMAGE_DLL / SciEditorIconXpm - the fold-margin and bookmark pixmaps - are declared
+// in cScintillaSchemeView.pkg, which is where ApplyFoldingStyle now lives.
+
+// Authoritative copy is in RefactorConstants.h.pkg; this guard only covers a program that pulls
+// this package in without that header.
 #IFNDEF C_CtrlShiftTab
     Define C_CtrlShiftTab for 7170
 #ENDIF
@@ -14,11 +38,56 @@ Register_Object oOpenFolderMenuItem
 // can reference them at compile time.
 Register_Procedure CloseFile
 Register_Function psCodeFile Returns String
+Register_Function QuickMarkCount Returns Integer   // Quick Marks - the Pop item's IsEnabled asks it
+// Defined on cRefactorScintillaEditor below, claimed by On_Key statements in its
+// Construct_Object - which is compiled before the procedure bodies.
+Register_Procedure SelectSourceFileHotKey
+Register_Procedure WorkspaceDialogHotKey
+Register_Procedure SourceExplorerHotKey
+Register_Procedure SettingsDialogHotKey
+Register_Procedure SwallowEditorHotKey
+/* The three application actions those handlers reach are defined in DFRefactorFT.src's
+   oClientArea, which is compiled AFTER this package - and is not part of the
+   UnitTests build AT ALL. Without these the editor package compiles in the FT app
+   (the definition arrives later in the same program) but fails the test runner with
+   "4306 Forward reference not resolved", which is how this was caught. Registering the
+   messages satisfies both: the Send resolves up the delegation chain to oClientArea where
+   it exists, and is an inert no-op in the programs where it does not. */
+Register_Procedure ActivateWorkspaceDialog
+Register_Procedure ActivateSourceExplorer
+Register_Procedure ActivateSettings
 
 Object oSciContextMenu is a cCJContextMenu
     Property Handle phoServedObject 0
 
+    /* Go to definition - first, as in the Studio. The caption names the word under the caret
+       and is set as the menu pops (OnBeforeFloatingMenu in the editor below: the bridge sends
+       it just before Popup, after Scintilla has already moved the caret to the right-click). */
+    Object oGotoDefinitionMenuItem is a cCJMenuItem
+        Set psCaption to "Go to definition"
+        Set psToolTip to "Go to definition"
+        Set psDescription to "Jumps to where the word under the cursor is defined - in this file, the workspace or the DataFlex packages (Ctrl+Shift+G, or F12)"
+        Set psShortcut to "Ctrl+Shift+G / F12"
+        Set psImage to "LocateInEditor2.ico"
+
+        Procedure OnExecute Variant vCommandBarControl
+            Send GotoDefinition of (phoServedObject(Self))
+        End_Procedure
+
+        Function IsEnabled Returns Boolean
+            Handle ho
+            String sFile sWord
+            Move (phoServedObject(Self)) to ho
+            Get psCodeFile of ho to sFile
+            If (sFile = "") ;
+                Function_Return False
+            Get WordAtCaret of ho to sWord
+            Function_Return (Trim(sWord) <> "")
+        End_Function
+    End_Object
+
     Object oSourceFileText_MenuItem is a cCJMenuItem
+        Set pbControlBeginGroup to True
         Set psCaption to "Select Source File"
         Set psDescription to "Displays an Open File dialog to select a source file from (Ctrl+O)"
         Set psImage to "ActionOpen.ico"
@@ -38,6 +107,87 @@ Object oSciContextMenu is a cCJContextMenu
             Move (sSWSFile <> "") to bState
 
             Function_Return bState
+        End_Function
+
+    End_Object
+
+    Object oRefreshFile_MenuItem is a cCJMenuItem
+        Set psCaption to "Refresh File"
+        Set psDescription to "Refresh the file by loading it again from disk"
+        Set psImage to "Refresh.ico"
+
+        Procedure OnExecute Variant vCommandBarControl
+            Integer iCurrentLine iRet
+            String sFileName
+            Handle ho
+            
+            Move (phoServedObject(Self)) to ho
+            Get CurrentLine of ho to iCurrentLine
+            Get psCodeFile of ho to sFileName
+            Get OpenFile of ho sFileName to iRet
+            Send EditorMessage of ho SCI_SETSAVEPOINT
+            If (iCurrentLine <> 0) Begin
+                Send EditorMessage of ho SCI_GOTOLINE iCurrentLine
+            End
+            Send FillFileTimeStamp of ho sFileName // Update the file modified datetime.
+        End_Procedure
+
+        Function IsEnabled Returns Boolean
+            String sFile
+            Get psCodeFile of (phoServedObject(Self)) to sFile
+            Function_Return (sFile <> "")
+        End_Function
+
+    End_Object
+
+    Object oOpenFileUnderCursor_MenuItem is a cCJMenuItem
+        Set psCaption to "Open File Under Cursor"
+        Set psDescription to "Opens the file under the cursor in the editor"
+        Set psImage to "ActionOpenContainingFolder.ico"
+
+        Procedure OnExecute Variant vCommandBarControl
+            String sFileName sExt sSystemMakePath sPkgPath
+            String[] asPaths
+            Handle ho
+            Boolean bExists 
+            Integer iSize i
+            
+            Move (phoServedObject(Self)) to ho
+            Get WordAtCaretIncludingDots of ho to sFileName
+            Get ParseFileExtension sFileName to sExt
+
+            If (sFileName = "" or Lowercase(sExt) = "") Begin
+                Send Info_Box "OpenFileUnderCursor: There is no file to open under the cursor."
+                Procedure_Return
+            End
+            Get ResolveSourceFileInTree of ghoApplication sFileName to sFileName
+            // If not found in the workspace, it might be a system file:
+            If (sFileName = "") Begin                         
+                Get psSystemMakePath of (phoWorkspace(ghoApplication)) to sSystemMakePath
+                Move (StrSplitToArray(sSystemMakePath, ";")) to asPaths
+                Move (SizeOfArray(asPaths) -1) to iSize
+                For i from 0 to iSize
+                    If (Lowercase(asPaths[i]) contains "\pkg") Begin
+                        Move asPaths[i] to sPkgPath
+                        Get vFolderFormat sPkgPath to sPkgPath
+                        Get WordAtCaretIncludingDots of ho to sFileName
+                        Move (sPkgPath + sFileName) to sFileName
+                    End
+                Loop
+            End
+            Get vFilePathExists sFileName to bExists
+            If (bExists = False) Begin
+                Send Info_Box ("The file could not be found:" * (String(sFileName)))
+                Procedure_Return
+            End
+            Send OnFileNameUpdate of ghoApplication sFileName
+            Send LoadFile of (phoEditor(ghoApplication)) sFileName
+        End_Procedure
+
+        Function IsEnabled Returns Boolean
+            String sFile
+            Get psCodeFile of (phoServedObject(Self)) to sFile
+            Function_Return (sFile <> "")
         End_Function
 
     End_Object
@@ -130,6 +280,45 @@ Object oSciContextMenu is a cCJContextMenu
         End_Procedure
     End_Object
 
+    /* Quick Marks - a stack of places. Push records where you are; Pop returns you to the
+       newest place recorded, in another file if that is where it was pushed. In Goto Line's
+       group because it is the other way of moving the caret somewhere on purpose. */
+    Object oPushQuickMarkMenuItem is a cCJMenuItem
+        Set psCaption to "Push Quick Mark"
+        Set psToolTip to "Push Quick Mark"
+        Set psDescription to "Pushes the current line onto the Quick Mark stack"
+        Set psShortcut to "Ctrl+Q"
+        Set psImage to "PushQuickMark.ico"
+
+        Procedure OnExecute Variant vCommandBarControl
+            Send PushQuickMark of (phoServedObject(Self))
+        End_Procedure
+
+        Function IsEnabled Returns Boolean
+            String sFile
+            Get psCodeFile of (phoServedObject(Self)) to sFile
+            Function_Return (sFile <> "")
+        End_Function
+    End_Object
+
+    Object oPopQuickMarkMenuItem is a cCJMenuItem
+        Set psCaption to "Pop Quick Mark"
+        Set psToolTip to "Pop Quick Mark"
+        Set psDescription to "Pops the newest Quick Mark and returns to it"
+        Set psShortcut to "Ctrl+Shift+Q"
+        Set psImage to "PopQuickMark.ico"
+
+        Procedure OnExecute Variant vCommandBarControl
+            Send PopQuickMark of (phoServedObject(Self))
+        End_Procedure
+
+        Function IsEnabled Returns Boolean
+            Integer iCount
+            Get QuickMarkCount of (phoServedObject(Self)) to iCount
+            Function_Return (iCount > 0)
+        End_Function
+    End_Object
+
     Object oSelectAllMenuItem is a cCJMenuItem
         Set psCaption to "Select &All"
         Set psToolTip to "Select All"
@@ -152,6 +341,45 @@ Object oSciContextMenu is a cCJContextMenu
         Procedure OnExecute Variant vCommandBarControl
             Send CME_UndoAction of (phoServedObject(Self))
         End_Procedure
+    End_Object
+
+    Object oWhitespaceItem is a cCJMenuItem
+        Set pbControlBeginGroup to True
+        Set psCaption   to "Toggle Whitespace"
+        Set psToolTip to "Toggle Whitespace"
+        Set psDescription to "Show Whitespace in an Editor Window"
+        Set psImage to "ToggleWhiteSpace.ico"
+        Set pbActiveUpdate to True
+        Set psCategory to C_$CategoryEdit
+
+        Procedure OnExecute Variant vCommandBarControl
+            Boolean bIsWhiteSpace
+            Handle hoEditor
+            
+            Move (Focus(Self)) to hoEditor
+            Get IsWhitespaceVisible of hoEditor to bIsWhiteSpace
+            Send ShowWhitespace of hoEditor (not(bIsWhiteSpace))
+        End_Procedure
+        
+    End_Object
+
+    // Works on the SELECTION, so it is enabled only when there is one - a menu item that
+    // can only report "select something first" is a dead click.
+    Object oConvertCDeclMenuItem is a cCJMenuItem
+        Set psCaption to "Convert C Declaration to External_Function"
+        Set psToolTip to "Convert a C prototype to an External_Function"
+        Set psDescription to "Converts the selected C function prototype into a DataFlex External_Function declaration"
+        Set psImage to "Functions.ico"
+
+        Procedure OnExecute Variant vCommandBarControl
+            Send ConvertCDeclaration of (phoServedObject(Self))
+        End_Procedure
+
+        Function IsEnabled Returns Boolean
+            String sSel
+            Get SelectedText of (phoServedObject(Self)) to sSel
+            Function_Return (Trim(sSel) <> "")
+        End_Function
     End_Object
 
     Object oNormalizeCaseMenuItem is a cCJMenuItem
@@ -188,11 +416,44 @@ Object oSciContextMenu is a cCJContextMenu
         End_Procedure
     End_Object
 
+    /* The shortcut shown beside a menu item used to be a literal string, so rebinding a
+       command in the settings dialog left the menu advertising the old key. These read
+       the live binding instead. The literal stays as the fallback for when a command
+       has no binding configured - the hardcoded On_Key in the editor's Construct_Object
+       still answers it, so the menu would otherwise show nothing at all.
+
+       The config renders a shortcut as "Ctrl + Shift + H"; the menu wants it without
+       the spaces. */
+    Procedure ApplyConfiguredShortcut Handle hoItem Integer iCmd String sDefault
+        String sKey
+        Get CommandHotKeyText iCmd to sKey
+        Move (Replaces(" ", sKey, "")) to sKey
+        If (sKey = "") ;
+            Move sDefault to sKey
+        Set psShortcut of hoItem to sKey
+    End_Procedure
+
+    // Called once the hotkey config has been applied - at startup and again after the
+    // settings dialog saves. "Select Source File" is not in the editor's command
+    // registry (it is an application action), so its shortcut stays literal.
+    Procedure RefreshShortcutCaptions
+        Send ApplyConfiguredShortcut (oGotoDefinitionMenuItem(Self)) CMD_GotoDefinition "Ctrl+Shift+G / F12"
+        Send ApplyConfiguredShortcut (oFindMenuItem(Self))         CMD_FIND        "Ctrl+F"
+        Send ApplyConfiguredShortcut (oFindNextMenuItem(Self))     CMD_FINDNEXT    "F3"
+        Send ApplyConfiguredShortcut (oFindPreviousMenuItem(Self)) CMD_FINDPREV    "Shift+F3"
+        Send ApplyConfiguredShortcut (oFindReplaceMenuItem(Self))  CMD_FINDREPLACE "Ctrl+Alt+F3"
+        Send ApplyConfiguredShortcut (oGotoLineMenuItem(Self))     CMD_GOTOLINE    "Ctrl+G"
+        Send ApplyConfiguredShortcut (oPushQuickMarkMenuItem(Self)) CMD_QuickMarkPush "Ctrl+Q"
+        Send ApplyConfiguredShortcut (oPopQuickMarkMenuItem(Self))  CMD_QuickMarkPop  "Ctrl+Shift+Q"
+        Send ApplyConfiguredShortcut (oSelectAllMenuItem(Self))    CMD_SELECTALL   "Ctrl+A"
+        Send ApplyConfiguredShortcut (oUndoMenuItem(Self))         CMD_UNDO        "Ctrl+Z"
+    End_Procedure
+
 End_Object
 
-Class cRefactorScintillaEditor is a cSciLexerRefactor
-    
-    Import_Class_Protocol cEditorHotKey_Mixin
+Class cRefactorScintillaEditor is a cRefactorEditorCommands
+
+    Import_Class_Protocol cRefactorEditorHotKeys
 
     Procedure Construct_Object
         Forward Send Construct_Object
@@ -201,6 +462,8 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         // Changed this to True as it is how the Studio works by default.
         Set pbFindDocumentStart to True
         
+        // Session cache for ObsoleteHelpTokens (the F1 legacy-word gate).
+        Property String[] pasObsoleteHelpTokens
         Property Boolean piInSetFocus False
         // Should we check for the file being changed externally?
         Property Boolean pbExternalModifyCheck True
@@ -212,10 +475,23 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         // rebuild "<base> - <full path>" or restore the bare base on Close File.
         Property String psBaseMainCaption ""
 
-        Property Handle phoCodeMaxEditor   (Self)
+        Property Handle phoEditorControl    (Self)
         Property Handle phoEditorEditView  0 // This is only needed in The Hammer where an editor view has also components such as a treeview on the left
 
-        Send Define_cEditorHotKey_Mixin
+        /* Quick Marks. The stack is pure and lives in its own object; the editor adds the margin
+           glyph, keeps each mark's line fresh and does the jump - see the QUICK MARKS section
+           below. piQuickMarkDocGen counts buffer replacements: a marker handle is trusted only
+           while its generation is the current one. */
+        Object oQuickMarks is a cQuickMarkStack
+        End_Object
+        Property Integer piQuickMarkDocGen     0
+        Property Boolean pbQuickMarkGlyphReady False
+        // Go to definition's index, built on first use (EnsureSymbolIndex) for the workspace psSymbolIndexKey names.
+        Property Handle  phoSymbolIndex        0
+        Property String  psSymbolIndexKey      ""
+        Property Boolean pbSymbolIndexBuilding False
+
+        Send Define_cRefactorEditorHotKeys
         
         Set pbUtf8Mode to False
         Set pbOemMode  to True
@@ -227,19 +503,147 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         
         On_Key Key_Ctrl+Key_F   Send CME_Find
         On_Key Key_F3           Send CME_FindNext
-        On_Key Key_Shift+Key_F3 Send CME_FindPrevious   
-        On_Key Key_Ctrl+Key_G   Send CME_GotoLine  
-        On_Key Key_Ctrl+Key_Alt+Key_F3 Send CME_FindReplace  
+        On_Key Key_Shift+Key_F3 Send CME_FindPrevious
+        On_Key Key_Ctrl+Key_G   Send CME_GotoLine
+        /* Push Quick Mark, claimed here as well as through the hotkey table - Ctrl+G's pattern. A
+           settings file saved before the command existed has no binding for it, and the table
+           cannot supply one: its serializer omits an unbound command, so a NEW command and one
+           the user deliberately unbound look the same, and filling in defaults would rebind the
+           latter at every start. The key must therefore work without the table. The handler
+           clears the queue itself, so the leak Ctrl+Q was swallowed for (below) stays fixed.
+
+           Pop (Ctrl+Shift+Q) and Go to definition (Ctrl+Shift+G) are NOT here as chords: an On_Key
+           with Key_Shift on a letter compiles and never fires (2026-09-10). Those chords arrive
+           through the Key override in cRefactorEditorHotKeys, which carries the same built-in
+           fallback. Go to definition ALSO answers to F12 - Visual Studio's key, a plain function
+           key On_Key holds without any of that - kept whatever the table says, as Ctrl+G is. */
+        On_Key Key_Ctrl+Key_Q           Send HKSC_QuickMarkPush
+        On_Key Key_F12                  Send HKSC_GotoDefinition
+        On_Key Key_Ctrl+Key_Alt+Key_F3 Send CME_FindReplace
+        /* THE KEYS THAT WERE TYPING THEMSELVES INTO THE SOURCE (Nils 2026-08-03).
+
+           Claiming a key HERE, on the editor, is what stops it reaching the text window.
+           Each line below is a key Nils OBSERVED leaking a control character - the list is
+           empirical, and deliberately so: two attempts to derive it from a rule both failed
+           (see the WHY-THIS-IS-A-LIST note on the handlers below), so nothing is claimed
+           here that was not seen misbehaving. That also keeps the blast radius small - a key
+           claimed here is a key taken away from Scintilla and from the hotkey config.
+
+           Left alone on purpose, all confirmed working: Ctrl+Z (undo), Ctrl+M (the editor
+           view claims it for the Modernize-dock toggle), Ctrl+I (inserts a TAB - which is
+           what Ctrl+I should do in an editor). Ctrl+E was the one inference, and Nils
+           confirmed it after the fact. */
+        On_Key Key_Ctrl+Key_O   Send SelectSourceFileHotKey
+        On_Key Key_Ctrl+Key_W   Send WorkspaceDialogHotKey
+        On_Key Key_Ctrl+Key_E   Send SourceExplorerHotKey
+        On_Key Key_Ctrl+Key_T   Send SettingsDialogHotKey
+        On_Key Key_Ctrl+Key_N   Send SwallowEditorHotKey
+        On_Key Key_Ctrl+Key_R   Send SwallowEditorHotKey
+        On_Key Key_Ctrl+Key_Y   Send SwallowEditorHotKey
+        // Ctrl+Q left this list on 2026-09-10 - it is Push Quick Mark now, claimed above.
+        On_Key Key_Ctrl+Key_P   Send SwallowEditorHotKey
+        On_Key Key_Ctrl+Key_B   Send SwallowEditorHotKey
+    End_Procedure
+
+    /* ---- APPLICATION SHORTCUTS RE-CLAIMED ON THE EDITOR ------------------------------
+
+       These are APPLICATION actions, not editor commands. They have no entry in the
+       editor's command registry (RefreshShortcutCaptions above says so of Select Source
+       File in as many words), so DefineOnKey never saw them, and their only claim was an
+       On_Key over in DFRefactorFT.src's oClientArea. That claim runs the command but does
+       NOT take the keystroke off the Windows message queue, so the key arrived at the text
+       window a moment later and was typed in.
+
+       Re-claiming the key HERE fixes it because a nearer On_Key shadows the outer one: the
+       command still runs (these handlers send the same message oClientArea's binding does,
+       and it resolves back up to oClientArea - the editor sits inside the client area), and
+       the keystroke no longer reaches Scintilla. Verified on Ctrl+O.
+
+       DispatchAnyKey is the house remedy for the queue - see the header of
+       RefactorMessageQueue.pkg ("a hotkey that DataFlex has claimed with On_Key still
+       leaves its keystroke sitting in the queue... you press Alt+B for a bookmark and get
+       a stray character"); SaveFile and the HKSC_* handlers in cRefactorEditorHotKeys open
+       the same way. Strictly it is insurance - CME_Find does not call it and Ctrl+F never
+       leaked, so the On_Key claim is what does the work - but it costs nothing and covers
+       the case where the command pops a modal, which delivers a queued keystroke wherever
+       focus lands afterwards. Hence: drain FIRST, act second.
+
+       NOT DispatchHotkey, which only drains WM_HOTKEY - the Alt combinations its own
+       comment describes. A Ctrl combination arrives as WM_KEYDOWN; DispatchAnyKey covers
+       both. ---------------------------------------------------------------------------- */
+    Procedure SelectSourceFileHotKey
+        Send DispatchAnyKey   // don't leak a shortcut key into the text window
+        Send SelectSourceFile of ghoApplication
+    End_Procedure
+
+    Procedure WorkspaceDialogHotKey
+        Send DispatchAnyKey   // don't leak a shortcut key into the text window
+        Send ActivateWorkspaceDialog
+    End_Procedure
+
+    Procedure SourceExplorerHotKey
+        Send DispatchAnyKey   // don't leak a shortcut key into the text window
+        Send ActivateSourceExplorer
+    End_Procedure
+
+    Procedure SettingsDialogHotKey
+        Send DispatchAnyKey   // don't leak a shortcut key into the text window
+        Send ActivateSettings
+    End_Procedure
+
+    /* Ctrl+N, R, Y, Q, P and B have NO application action while the editor has focus. The
+       app's Ctrl+N is a grid command (SelectNone, bound on the selection grids, which keep
+       it because On_Key is per object); Ctrl+R is bound only in TestBench; the rest are
+       bound nowhere in this build. So they were pure damage - no command, just a control
+       character typed into the source by whoever reached for them out of habit from another
+       editor.
+
+       Claimed and swallowed. Inert beats corrupting - but they ARE now inert, so if any of
+       them should do something here, this is the place to say so.
+
+       WHY THIS IS A LIST AND NOT A RULE. Two attempts to derive the set from first
+       principles both failed against what the app actually does, and the reason is worth
+       recording so the next person does not spend the same afternoon:
+
+         - "Scintilla is not consuming the key, so fix its key map" - wrong. Swapping
+           SCI_CLEARCMDKEY for SCI_ASSIGNCMDKEY/SCI_NULL changed nothing, and it turns out
+           RemoveKeyBinding never runs here at all: its caller is gated on
+           phoEditorEditView = Self, and phoEditorEditView is 0 in this application (it
+           exists for The Hammer). Scintilla's default key map is untouched.
+         - "DataFlex intercepts every Ctrl key, so Scintilla never sees a KeyDown" - also
+           wrong. Ctrl+Z undoes, so Scintilla plainly does see and consume some of them.
+
+       But Ctrl+Y and Ctrl+T are Scintilla defaults too (SCI_REDO, SCI_LINETRANSPOSE) and
+       they leak. Whatever decides between those two groups is not visible from this source
+       tree, so the honest thing is an observed list rather than a confident rule. If a new
+       shortcut ever types itself into a file, add it here - do not try to predict it. */
+    Procedure SwallowEditorHotKey
+        Send DispatchAnyKey   // don't leak a shortcut key into the text window
+    End_Procedure
+
+    // The bridge sends this just before the right-click menu pops, with the caret already at
+    // the click. Names the word on the Go to definition item, the way the Studio does.
+    Procedure OnBeforeFloatingMenu
+        String sWord
+        Forward Send OnBeforeFloatingMenu
+        Get WordAtCaret to sWord
+        Move (Trim(sWord)) to sWord
+        If (sWord = "") ;
+            Set psCaption of (oGotoDefinitionMenuItem(oSciContextMenu)) to "Go to definition"
+        Else ;
+            Set psCaption of (oGotoDefinitionMenuItem(oSciContextMenu)) to ("Go to definition" * sWord)
     End_Procedure
     
-    // DFRefactor is a refactoring tool, not a debugger, so the leftmost status/breakpoint margin is wasted
-    // space. The base (cSciLexer.ApplyEditorOptions) gives MARGIN_STATUS (margin 0) width 16; hide it here
-    // after the base runs. Line numbers (MARGIN_LINE_NUMBERS = margin 2) are untouched, and ApplyEditorOptions
-    // is the ONLY place MARGIN_STATUS width is set, so a width of 0 here is final. (Submodule left unchanged.)
-    Procedure ApplyEditorOptions
-        Forward Send ApplyEditorOptions
-        Send EditorMessage SCI_SETMARGINWIDTHN MARGIN_STATUS 0
-    End_Procedure
+    // The status/breakpoint margin this used to hide is gone: DFRefactor is a
+    // refactoring tool, not a debugger, so the new chain's margin layout never gives it
+    // one (CI_Margin* in cScintillaEditorBridge - line numbers, bookmarks, folding).
+
+    // The colour-scheme rendering that used to sit here - SetAppearance, the DataFlex
+    // style map, ApplyColourScheme, ApplySelectionAppearance, ApplyFoldingStyle and the
+    // phoColourScheme it paints from - now lives one level down, in
+    // cScintillaSchemeView.pkg. It moved because the editor was not the only thing that
+    // has to render a scheme: the Editor Settings preview does too, and while the
+    // rendering lived here the preview had to re-implement it. See that package's header.
 
     Function ReadImageDataToStringArray Integer iImg Returns String[]
         Integer iCh iCount
@@ -278,76 +682,182 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         Send SaveFile
     End_Procedure
     
+    /* The legacy vocabulary, taken from the Deep Scan catalogue - the tool's OWN authority on what
+       is obsolete, and the same list it flags in the user's source, so F1 and the scanner can never
+       disagree about which words are legacy. Built once per session and cached: an F1 press must
+       not pay for ~200 rule rows, and the seed never changes at run time. */
+    Function ObsoleteHelpTokens Returns String[]
+        Handle           hoScanner
+        tDeepScanRule[]  aRules
+        String[]         asTokens
+        Integer          i iLast
+
+        Get pasObsoleteHelpTokens to asTokens
+        If (SizeOfArray(asTokens) > 0) ;
+            Function_Return asTokens
+        Get Create (RefClass(cDeepScanner)) to hoScanner
+        Get BuildDefaultDeepScanRules of hoScanner to aRules
+        Send Destroy of hoScanner
+        Move (SizeOfArray(aRules) - 1) to iLast
+        For i from 0 to iLast
+            // sToken is already LOWERCASE (see tDeepScanRule). A two-word token cannot be a single
+            // caret word, so it simply never matches - no need to filter it out.
+            If (aRules[i].sToken <> "") ;
+                Move aRules[i].sToken to asTokens[SizeOfArray(asTokens)]
+        Loop
+        Set pasObsoleteHelpTokens to asTokens
+        Function_Return asTokens
+    End_Function
+
+    /* F1 ON THE WORD AT THE CARET -> the DataFlex online help (Nils 2026-07-26: "clicking the list
+       to see the source line makes me miss the Studio's ability to click on a word and press F1").
+       DataFlex sends Help to the focused object, so this override IS the F1 handler - no key
+       trapping needed, and it matches the Studio muscle memory exactly.
+
+       WHICH URL. Three page shapes on docs.dataflex.dev were fetched and confirmed to resolve:
+           /LanguageReference/<Word>_Command/    Move_Command      -> "Move - DataFlex Documentation"
+           /LanguageReference/<Word>_Function/   Trim_Function     -> "Trim"
+           /VdfClassRef/Windows/<Class>/         cCJGrid           -> "cCJGrid"
+
+       COMMAND OR FUNCTION is decided by how the word is USED, not by a lookup table - DataFlex
+       documents BOTH forms for many names (Trim_Command is the obsolete command, Trim_Function the
+       modern function; same for Uppercase and friends), so a table keyed on the name alone lands on
+       the wrong topic half the time. The '(' immediately after the word is the language's own
+       distinction and it is right there at the caret, so that is what we read.
+
+       OBSOLETE SYMBOLS GET THE LIST, NOT A DERIVED URL. Their page names are hand-authored and
+       inconsistent in a way no rule can reproduce - read the site's own obsolete index:
+           Type          -> Type_Command/            (capital C)
+           Field         -> Field_Command/
+           ZeroType      -> ZeroType_command/        (lowercase c)
+           Getbuff_String-> Getbuff_string_Command/  (lowercase s)
+           Size_of_Field -> Size_of_field_Command/   (lowercase f)
+       Deriving <Word>_Command therefore 404s on part of the set - Nils hit exactly that on
+       ZeroType (2026-07-26). So a word this tool's own Deep Scan catalogue knows to be obsolete
+       goes to the OBSOLETE INDEX instead: it lists the whole legacy vocabulary with working links,
+       never 404s, and is what Nils asked for ("It is fine with a list, because it is a good start
+       to search deeper"). The catalogue is the right authority - it is the same list the scanner
+       flags in his source, and it is maintained.
+
+       Checked BEFORE the keyword deep link, or ZeroType would take the 404 path again.
+
+       THERE IS NO LINKABLE SEARCH URL. docs.dataflex.dev strips both ?q= and #q= on navigation
+       (verified in a browser: each redirects to the bare root), so a search fallback cannot be
+       reached by URL - Material only writes ?q= while you type in its own box. An unknown word
+       therefore opens the Language Reference index, a real page with the site's search box on it,
+       rather than a URL that silently loses the term.
+
+       Unknown means anything not in the keyword set - a customer identifier, an object name, a
+       subclass like cTrDbView. Those must NOT be deep-linked: the class pattern above covers only
+       DataFlex's own classes, and this tool is pointed at workspaces full of customer subclasses
+       that would 404. A wrong deep link is worse than an index page.
+
+       No word under the caret (blank line, punctuation) opens the docs root. */
     Procedure Help
-       Delegate Send Help
+        String   sWord sUrl sLow
+        String[] asKeyWords asObsolete
+        Integer  iFound iPos iEnd iChar
+
+        Get WordAtCaret to sWord
+        Move (Trim(sWord)) to sWord
+        If (sWord = "") Begin
+            Runprogram Shell Background CS_DfDocsRootUrl
+            Procedure_Return
+        End
+        Move (Lowercase(sWord)) to sLow
+        // OBSOLETE first - see the note above on why these are never derived.
+        Get ObsoleteHelpTokens to asObsolete
+        Move (SearchArray(sLow, asObsolete, Desktop, RefFunc(DFSTRICMP))) to iFound
+        If (iFound >= 0) Begin
+            Move (CS_DfDocsRootUrl + "LanguageReference/Obsolete_Commands_Functions_and_Other_Symbols/") to sUrl
+            Runprogram Shell Background sUrl
+            Procedure_Return
+        End
+        Move -1 to iFound
+        If (ghoFuncLib <> 0) Begin
+            // The FULL Scintilla keyword set: commands, functions and the obsolete symbols alike -
+            // every word that has a LanguageReference page. (pasCommands drops the particles and
+            // took "Field" with them.)
+            Get pasKeyWords of ghoFuncLib to asKeyWords
+            Move (SearchArray(sLow, asKeyWords, Desktop, RefFunc(DFSTRICMP))) to iFound
+        End
+        If (iFound < 0) Begin
+            Move (CS_DfDocsRootUrl + "LanguageReference/Language_Reference/") to sUrl
+            Runprogram Shell Background sUrl
+            Procedure_Return
+        End
+        // Used as a function call? The next character after the word decides. 40 = "(".
+        Get EditorMessage SCI_GETCURRENTPOS to iPos
+        Get EditorMessage SCI_WORDENDPOSITION iPos True to iEnd
+        Get EditorMessage SCI_GETCHARAT iEnd to iChar
+        If (iChar = 40) ;
+            Move (CS_DfDocsRootUrl + "LanguageReference/" + sWord + "_Function/") to sUrl
+        Else ;
+            Move (CS_DfDocsRootUrl + "LanguageReference/" + sWord + "_Command/") to sUrl
+        Runprogram Shell Background sUrl
     End_Procedure
 
     Procedure SaveFile
         Boolean bOK
+        String  sFileName sMsg sNote
+
         Send DispatchAnyKey
         Get WriteFileToDisk to bOK
         If (bOK = False) Begin
-            Error DFERR_PROGRAM "An error occured and the file couldn't be saved properly."
+            // Name the file and the WHY (read-only attribute / folder gone / locked), and - for a file
+            // inside a DfPkg or package-cache folder - why the attribute is not the thing to change.
+            // Replaces "An error occurred and the file couldn't be saved properly." (2026-08-18).
+            Get psCodeFile to sFileName
+            Move (rfPackageManagedPathNote(sFileName)) to sNote
+            Move ("The file could not be saved - " + rfWriteFailureReason(sFileName) + ":\n" + sFileName) to sMsg
+            If (sNote <> "") ;
+                Move (sMsg + "\n\n" + sNote) to sMsg
+            Error DFERR_PROGRAM sMsg
         End
         Else Begin
-            Set ActionText of (StatusBar_Id(Self))  to "Changes saved!"
+            Set ActionText of (Statusbar_Id(Self))  to "Changes saved!"
+            Send RefreshSymbolIndexForCurrentFile
         End
     End_Procedure
     
     // Helper function (to SaveFile)
     Function WriteFileToDisk Returns Boolean
+        Boolean bSaved
         String sFileName
-        Integer eResult
 
         Get psCodeFile to sFileName
-        Get CM_SaveFile sFileName False to eResult
+        Get SaveFile sFileName to bSaved
         Send FillFileTimeStamp sFileName // Update the filetime.
 
-        Function_Return (eResult = CME_SUCCESS)
+        Function_Return bSaved
     End_Function
 
+    /* Was a hand-rolled channel loop that converted each line's encoding itself. The
+       engine-side writer does exactly this and is the one the byte-exact encoding tests
+       pin, so there is no reason for a second implementation here. */
     Function WriteStringArrayToDisk String[] asCode Returns Boolean
         Boolean bIsUtf8
-        String sFileName sLine
-        Integer iSize iCount iCh
-
-        Get Seq_New_Channel to iCh
-        If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
-            Error DFERR_PROGRAM "No Channel Available for saving file"
-            Function_Return False
-        End
-
+        String sFileName
         Get psCodeFile to sFileName
-        Move (SizeOfArray(asCode)) to iSize
-        Decrement iSize
-        
-        Direct_Output channel iCh sFileName
-        
-        For iCount from 0 to iSize
-            Move asCode[iCount] to sLine
-                Get pbUtf8Mode to bIsUtf8
-                If (bIsUtf8 = False) Begin
-                   Get Utf8ToEditorFormat sLine to sLine
-                End    
-            If (iCount < iSize) Begin
-                Writeln channel iCh sLine
-            End
-            Else Begin
-                Write channel iCh sLine
-            End
-        Loop                
-        Close_Output channel iCh
-        Send Seq_Release_Channel iCh
-
-        Function_Return (Err = False)
+        Get pbUtf8Mode to bIsUtf8
+        Function_Return (rfWriteEncodedFileFromStringArray(&asCode, sFileName, C_NewLine, bIsUtf8))
     End_Function
 
+    /* Reports FAILURE when the control has no window (Nils 2026-08-03). It used to end in an
+       unconditional Function_Return True, so the engine's "could not write to the editor" check
+       could never fire - and every AppendText below goes through EditorMessage, which SILENTLY
+       returns 0 when Window_Handle is 0. In a headless run the editor view has never been paged,
+       so the whole editor pass wrote nothing, changed nothing and said nothing: EditorReIndent
+       reported 0 lines while ten deliberately un-indented lines sat untouched. */
     Function WriteDataToEditor String[] asCode Returns Boolean
         Integer iCount iSize iVoid
         String sLine
+
+        If (Window_Handle(Self) = 0) ;
+            Function_Return False
         
         Send Delete_Data
-        Get CM_EnableCRLF True to iVoid
+        Send SetLineEndings True
 
         Move (SizeOfArray(asCode)) to iSize
         Decrement iSize
@@ -355,7 +865,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         For iCount from 0 to iSize
             Move asCode[iCount] To sLine
             If (iCount < iSize) Begin
-                Move (sLine + String(CS_CRLF)) to sLine
+                Move (sLine + String(C_NewLine)) to sLine
             End
             // We should not do any UTF8/OEM conversion here as it is done by the AppendText function
             Send AppendText sLine
@@ -385,7 +895,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
 
     Procedure JumpToSourceLine Integer iLine
         Handle hoEdit
-        Get phoCodeMaxEditor to hoEdit    
+        Get phoEditorControl to hoEdit    
         If (hoEdit <> 0) Begin
             Send Activate of hoEdit
             Send EditorMessage of hoEdit SCI_GOTOLINE iLine
@@ -405,8 +915,8 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         If (sFileName <> "") Begin
             Set psCodeFile to sFileName
             Send Delete_Data
-            Get CM_OpenFile sFileName to eStatus
-            Get TextEncoding to iEncoding
+            Get OpenFile sFileName to eStatus
+            Get EncodingMode to iEncoding
             Send ShowTextEncoding iEncoding
             Send FillFileTimeStamp sFileName // Update the filetime.
             // Activate the Editor object(!) and view.
@@ -467,22 +977,510 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         Set psCodeFile to ""
         Set Changed_State to False
         Send UpdateMainPanelCaption ""
-        Set UTF8Text of (StatusBar_Id(ghoCommandBars)) to ""
+        Set UTF8Text of (Statusbar_Id(ghoCommandBars)) to ""
     End_Procedure
     
+    /* ---- QUICK MARKS ----------------------------------------------------------------------
+
+       A STACK of places (Nils 2026-09-10): Ctrl+Q pushes where the caret is, Ctrl+Shift+Q pops
+       the newest place and returns to it - in another file when that is where it was pushed.
+       Both on the right-click menu as Push / Pop Quick Mark. The stack itself is oQuickMarks
+       (cQuickMarkStack, pure and tested); everything Scintilla is here.
+
+       A MARK TRACKS ITS LINE. Each push adds marker CI_QuickMarkMarker to the line, and
+       Scintilla moves markers with the text, so a mark pushed on line 200 still points at the
+       right line after thirty lines are inserted above it; SCI_MARKERLINEFROMHANDLE reads where
+       it is now. A handle belongs to ONE buffer, though, and Scintilla does not invalidate it
+       when the buffer is replaced - it merges the markers of every deleted line into the line
+       before, so after a load the old handles would all answer "line 0" of the NEW file. Hence
+       the generation: every buffer replacement below bumps piQuickMarkDocGen, and a handle from
+       another generation is never asked. Before each replacement the live handles are read one
+       last time (RefreshQuickMarkLines), so iLine is the freshest line the mark had; after a
+       load, the marks of the file now in the buffer get glyphs and handles again
+       (ResyncQuickMarkGlyphs). */
+
+    // The three ways this editor replaces its buffer. LoadFile is ClearDocument + OpenFile; the
+    // Refresh File menu item calls OpenFile alone; WriteDataToEditor and the colour-scheme
+    // preview go through SetDocumentText.
+    Function OpenFile String sFilePath Returns Boolean
+        Boolean bOk
+        Send RefreshQuickMarkLines
+        Forward Get OpenFile sFilePath to bOk
+        Send ResyncQuickMarkGlyphs
+        Function_Return bOk
+    End_Function
+
+    Procedure ClearDocument
+        Send RefreshQuickMarkLines
+        Forward Send ClearDocument
+        // An empty buffer holds no place, so no glyphs are re-added here - the generation moves
+        // on and the marks keep their last lines for the file's return.
+        Set piQuickMarkDocGen to (piQuickMarkDocGen(Self) + 1)
+        Send EditorMessage SCI_MARKERDELETEALL CI_QuickMarkMarker
+    End_Procedure
+
+    Procedure SetDocumentText String sText
+        Send RefreshQuickMarkLines
+        Forward Send SetDocumentText sText
+        Send ResyncQuickMarkGlyphs
+    End_Procedure
+
+    // Live handles reread: a mark whose handle is of the current generation takes the line its
+    // marker is on now. Run before every buffer replacement, while the handles still answer.
+    Procedure RefreshQuickMarkLines
+        Handle hoStack
+        Integer i iMax iGen iLine iHandle
+        tQuickMark QM
+
+        Move (oQuickMarks(Self)) to hoStack
+        Get piQuickMarkDocGen to iGen
+        Get Count of hoStack to iMax
+        Decrement iMax
+        For i from 0 to iMax
+            Get MarkAt of hoStack i to QM
+            Move QM.iHandle to iHandle
+            If (iHandle > 0 and QM.iGen = iGen) Begin
+                Get EditorMessage SCI_MARKERLINEFROMHANDLE iHandle to iLine
+                If (iLine >= 0) ;
+                    Send SetLine of hoStack i iLine
+            End
+        Loop
+    End_Procedure
+
+    // After a load: a new generation, the stale glyphs gone, and every mark of the file now in
+    // the buffer gets a glyph and a handle again at its last known line - clamped, since the
+    // file may have shrunk on disk since it was pushed.
+    Procedure ResyncQuickMarkGlyphs
+        Handle hoStack
+        Integer i iMax iGen iLine iLines iHandle
+        String sFile
+        tQuickMark QM
+
+        Set piQuickMarkDocGen to (piQuickMarkDocGen(Self) + 1)
+        Get piQuickMarkDocGen to iGen
+        Send EditorMessage SCI_MARKERDELETEALL CI_QuickMarkMarker
+        Get psCodeFile to sFile
+        If (sFile = "") ;
+            Procedure_Return
+        Move (Lowercase(sFile)) to sFile
+        Move (oQuickMarks(Self)) to hoStack
+        Get Count of hoStack to iMax
+        Decrement iMax
+        If (iMax < 0) ;
+            Procedure_Return
+        Send EnsureQuickMarkGlyph
+        Get DocumentLineCount to iLines
+        For i from 0 to iMax
+            Get MarkAt of hoStack i to QM
+            If (Lowercase(QM.sFile) = sFile) Begin
+                Move QM.iLine to iLine
+                If (iLine >= iLines) ;
+                    Move (iLines - 1) to iLine
+                If (iLine < 0) ;
+                    Move 0 to iLine
+                Get EditorMessage SCI_MARKERADD iLine CI_QuickMarkMarker to iHandle
+                Send SetHandle of hoStack i iHandle iGen
+            End
+        Loop
+    End_Procedure
+
+    // The glyph, defined once per control: an arrow (SC_MARK_ARROW), not the bookmark's ribbon -
+    // a difference of SHAPE reads for everyone; a difference of colour does not.
+    Procedure EnsureQuickMarkGlyph
+        If (pbQuickMarkGlyphReady(Self) = False) Begin
+            Send EditorMessage SCI_MARKERDEFINE CI_QuickMarkMarker SC_MARK_ARROW
+            Set pbQuickMarkGlyphReady to True
+        End
+    End_Procedure
+
+    Function QuickMarkCount Returns Integer
+        Function_Return (Count(oQuickMarks(Self)))
+    End_Function
+
+    // Where a mark is NOW: its marker's line when the handle is of the current generation, else
+    // the last line it was known on - clamped into the document either way.
+    Function QuickMarkCurrentLine tQuickMark QM Returns Integer
+        Integer iLine iLines iGen iHandle iFromHandle
+
+        Move QM.iLine to iLine
+        Get piQuickMarkDocGen to iGen
+        Move QM.iHandle to iHandle
+        If (iHandle > 0 and QM.iGen = iGen) Begin
+            Get EditorMessage SCI_MARKERLINEFROMHANDLE iHandle to iFromHandle
+            If (iFromHandle >= 0) ;
+                Move iFromHandle to iLine
+        End
+        Get DocumentLineCount to iLines
+        If (iLine >= iLines) ;
+            Move (iLines - 1) to iLine
+        If (iLine < 0) ;
+            Move 0 to iLine
+        Function_Return iLine
+    End_Function
+
+    Procedure PushQuickMark
+        Handle hoStack
+        Boolean bPushed
+        Integer iLine iCol iHandle iTop iGen iCount
+        String sFile
+        tQuickMark QM Top
+
+        Get psCodeFile to sFile
+        If (sFile = "") Begin
+            Send UpdateStatusBar "Quick Mark: no file is loaded" False
+            Procedure_Return
+        End
+        Move (oQuickMarks(Self)) to hoStack
+        Get CurrentLine to iLine
+        Get CaretColumn to iCol
+        // The top's line is refreshed first, so "already on top" compares the place its marker
+        // is on NOW, not the line it was pushed on.
+        Get Count of hoStack to iTop
+        Decrement iTop
+        If (iTop >= 0) Begin
+            Get MarkAt of hoStack iTop to Top
+            If (Lowercase(Top.sFile) = Lowercase(sFile)) ;
+                Send SetLine of hoStack iTop (QuickMarkCurrentLine(Self, Top))
+        End
+        Send EnsureQuickMarkGlyph
+        Get EditorMessage SCI_MARKERADD iLine CI_QuickMarkMarker to iHandle
+        Get piQuickMarkDocGen to iGen
+        Move sFile   to QM.sFile
+        Move iLine   to QM.iLine
+        Move iCol    to QM.iCol
+        Move iHandle to QM.iHandle
+        Move iGen    to QM.iGen
+        Get PushMark of hoStack QM to bPushed
+        If (bPushed = False) Begin
+            // The same place is on top already - one glyph is enough, and one pop.
+            Send EditorMessage SCI_MARKERDELETEHANDLE iHandle
+            Send UpdateStatusBar ("Quick Mark: line" * String(iLine + 1) * "is already on top of the stack") False
+            Procedure_Return
+        End
+        Get Count of hoStack to iCount
+        Send UpdateStatusBar ("Quick Mark pushed: line" * String(iLine + 1) * "(" + String(iCount) * "on the stack)") False
+    End_Procedure
+
+    Procedure PopQuickMark
+        Handle hoStack
+        Boolean bOk bExists
+        Integer iLine iCol iHandle iGen iCount
+        String sFile sHere
+        tQuickMark QM
+
+        Move (oQuickMarks(Self)) to hoStack
+        Get TopMark of hoStack (&QM) to bOk
+        If (bOk = False) Begin
+            Send UpdateStatusBar "Quick Mark: the stack is empty" False
+            Procedure_Return
+        End
+        Get psCodeFile to sHere
+        Move QM.sFile to sFile
+        If (Lowercase(sFile) <> Lowercase(sHere)) Begin
+            /* Pushed in another file: go there first. The mark stays on the stack through the
+               load, so ResyncQuickMarkGlyphs gives it a live handle again and the same-file path
+               below finishes the job. Unsaved work in the file being left is asked about, with a
+               Cancel that leaves everything - stack included - as it was; LoadFile itself would
+               have discarded it without a word. */
+            Get vFilePathExists sFile to bExists
+            If (bExists = False) Begin
+                // Gone for good: drop the mark rather than leave a dead top on the stack.
+                Get PopMark of hoStack (&QM) to bOk
+                Send UpdateStatusBar ("Quick Mark dropped - the file no longer exists:" * sFile) False
+                Procedure_Return
+            End
+            Get MayLeaveFileFor sFile to bOk
+            If (bOk = False) ;
+                Procedure_Return
+            Send LoadFileForJump sFile
+        End
+        Get PopMark of hoStack (&QM) to bOk
+        Get QuickMarkCurrentLine QM to iLine
+        Get piQuickMarkDocGen to iGen
+        Move QM.iHandle to iHandle
+        If (iHandle > 0 and QM.iGen = iGen) ;
+            Send EditorMessage SCI_MARKERDELETEHANDLE iHandle
+        Move QM.iCol to iCol
+        Send Activate
+        Send SetCaretPosition iLine iCol
+        Get Count of hoStack to iCount
+        Send UpdateStatusBar ("Quick Mark popped: line" * String(iLine + 1) * "(" + String(iCount) * "left)") False
+    End_Procedure
+
+    /* ---- GO TO DEFINITION -----------------------------------------------------------------
+
+       Ctrl+Shift+G, or the first item of the right-click menu (Nils 2026-09-10, after the
+       Studio's): jumps to where the word under the caret is DEFINED. Three sources, in order of
+       trust: the live buffer of the file being edited (never stale), the definition index over
+       the workspace and its libraries, and the same index's view of the DataFlex Pkg folder.
+       Several definitions - a Construct_Object has 573 in Pkg alone - go through
+       GotoDefinitionPicker.dg, nearest first; none at all gets the Studio's own sentence.
+
+       THE INDEX IS BUILT ON FIRST USE, once per workspace per session. Measured: 1.8 s for the
+       DF26 Pkg folder, 9.5 s for a 1,240-file workspace, 11.6 s for both plus the web source
+       (126,040 definitions) - too slow for a keypress or for the paint after opening a
+       workspace, quick enough to pay once while the status bar says so. A save refreshes that
+       file's entries (a quarter of a second at that size). Files the ENGINE rewrites are not
+       refreshed until the next session; the jump then lands where the definition WAS, which
+       after a refactoring pass is rarely far from where it is.
+
+       A JUMP PUSHES A QUICK MARK FIRST, so Ctrl+Shift+Q is the way back - the pairing that makes
+       either half useful. */
+
+    /* The index for the open workspace, built here on first use; keyed on the workspace file and
+       the target Pkg folder, so opening another workspace gets another index. Its SCOPE, in the
+       order the folders are added (each once, case-blind):
+
+         1. the target DataFlex's Pkg folder, walked;
+         2. the refactoring scope's own list - every root and its subfolders already, minus the
+            backup and non-source folders a blind walk would find - taken flat;
+         3. the git packages the workspace is PINNED to: the .sws.lock's full transitive set, each
+            found under DfPkg by its commit and walked. The scope leaves DfPkg out on purpose (a
+            checkout is not a place to refactor), and a definition lookup must have it: on the
+            first run a class two package hops away - a library's own library, which the .sws
+            never names - was "not found" with its Use line in plain sight (Nils 2026-09-10);
+         4. and, for a workspace without a lock, the folders its newest compiler listing actually
+            read, packages and all - a DF25 workspace's declared libraries come in under 2, so this
+            is the fallback for what a build resolved that nothing declares. */
+    Function EnsureSymbolIndex Returns Handle
+        Handle hoIdx hoShadow
+        String sKey sSws sPkg sHome sLock sListing sLeaf sPath
+        String[] asRecursive asFlat asSeen asWs asRefs asPkgs asLines
+        Integer i iMax iStart iCount iPos
+
+        Get psSWSFile of ghoApplication to sSws
+        Get psTargetPkgFolder of ghoApplication to sPkg
+        If (sSws = "" and sPkg = "") ;
+            Function_Return 0
+        Move (Lowercase(sSws) + "|" + Lowercase(sPkg)) to sKey
+        Get phoSymbolIndex to hoIdx
+        If (hoIdx <> 0 and psSymbolIndexKey(Self) = sKey) ;
+            Function_Return hoIdx
+        // A build already running (the key that started it auto-repeated into the pump) is not
+        // started again underneath itself.
+        If (pbSymbolIndexBuilding(Self) = True) ;
+            Function_Return 0
+        Set pbSymbolIndexBuilding to True
+        If (hoIdx <> 0) ;
+            Send Destroy of hoIdx
+        Get Create (RefClass(cSymbolIndex)) to hoIdx
+        Send Cursor_Wait of Cursor_Control
+
+        If (sPkg <> "") ;
+            Send AddDefinitionScopeFolder sPkg (&asRecursive) (&asSeen)
+        If (sSws <> "") Begin
+            Get WholeWorkspaceSourceFolders of ghoApplication to asWs
+            Move (SizeOfArray(asWs) - 1) to iMax
+            For i from 0 to iMax
+                Send AddDefinitionScopeFolder asWs[i] (&asFlat) (&asSeen)
+            Loop
+            Get psHomeTarget of ghoApplication to sHome
+            Move (rfReadEncodedFileAsString(sSws + ".lock")) to sLock
+            Get LockPinnedRefs of hoIdx sLock to asRefs
+            Get DfPkgCheckoutsFor of hoIdx sHome asRefs to asPkgs
+            Move (SizeOfArray(asPkgs) - 1) to iMax
+            For i from 0 to iMax
+                Send AddDefinitionScopeFolder asPkgs[i] (&asRecursive) (&asSeen)
+            Loop
+            If (SizeOfArray(asRefs) = 0) Begin
+                Get Create (RefClass(cShadowedPackageFiles)) to hoShadow
+                Get NewestListingFile of hoShadow sHome to sListing
+                If (sListing <> "") Begin
+                    Move (rfReadEncodedFileAsStringArray(sListing)) to asLines
+                    Move (SizeOfArray(asLines) - 1) to iMax
+                    For i from 0 to iMax
+                        Get IncludedFileFromPrnLine of hoShadow asLines[i] (&sPath) to sLeaf
+                        If (sLeaf <> "") Begin
+                            Move (RightPos("\", sPath)) to iPos
+                            If (iPos > 1) ;
+                                Send AddDefinitionScopeFolder (Left(sPath, (iPos - 1))) (&asFlat) (&asSeen)
+                        End
+                    Loop
+                End
+                Send Destroy of hoShadow
+            End
+        End
+
+        Send UpdateStatusBar ("Go to definition: indexing" * String(SizeOfArray(asRecursive) + SizeOfArray(asFlat)) * "source folders...") False
+        Move (GetTickCount()) to iStart
+        Get BuildIndexEx of hoIdx (&asRecursive) (&asFlat) to iCount
+        Set phoSymbolIndex   to hoIdx
+        Set psSymbolIndexKey to sKey
+        // Keys pressed while that ran - the chord that started it, still held and repeating, for
+        // one - would be typed into the text the moment the status bar pumps. Dropped instead.
+        Send FlushKeyboardInput
+        Send Cursor_Ready of Cursor_Control
+        Set pbSymbolIndexBuilding to False
+        Send UpdateStatusBar ("Definition index:" * String(iCount) * "definitions in" * String(piFilesIndexed(hoIdx)) * "files (" + String(GetTickCount() - iStart) * "ms)") False
+        Function_Return hoIdx
+    End_Function
+
+    // One folder into a scope list, once: compared without case and without a trailing backslash,
+    // added as spelt.
+    Procedure AddDefinitionScopeFolder String sFolder String[] ByRef asList String[] ByRef asSeen
+        String sNorm
+
+        Move (Lowercase(Trim(sFolder))) to sNorm
+        If (sNorm = "") ;
+            Procedure_Return
+        If (Right(sNorm, 1) = "\") ;
+            Move (Left(sNorm, (Length(sNorm) - 1))) to sNorm
+        If (SearchArray(sNorm, asSeen) <> -1) ;
+            Procedure_Return
+        Move sNorm to asSeen[SizeOfArray(asSeen)]
+        Move (Trim(sFolder)) to asList[SizeOfArray(asList)]
+    End_Procedure
+
+    // After a save, the index's entries for this file follow the buffer just written. Nothing to
+    // do until an index exists - the first Go to definition reads the saved file from disk anyway.
+    Procedure RefreshSymbolIndexForCurrentFile
+        Handle hoIdx
+        String sFile
+        String[] asLines
+
+        Get phoSymbolIndex to hoIdx
+        If (hoIdx = 0) ;
+            Procedure_Return
+        Get psCodeFile to sFile
+        If (sFile = "") ;
+            Procedure_Return
+        Get EditorDataAsStringArray to asLines
+        Send ReplaceFileDefinitions of hoIdx sFile (&asLines)
+    End_Procedure
+
+    /* Leaving the current file for sFile - the decision only, not the load: False when sFile is
+       gone, or when the user answers Cancel to saving unsaved work here (Yes saves first). Kept
+       apart from LoadFileForJump so that what happens between the decision and the load - the
+       Quick Mark of where we were - still sees the old buffer. */
+    Function MayLeaveFileFor String sFile Returns Boolean
+        Boolean bExists bChanged
+        Integer iAnswer
+        String sHere
+
+        Get vFilePathExists sFile to bExists
+        If (bExists = False) Begin
+            Send UpdateStatusBar ("The file no longer exists:" * sFile) False
+            Function_Return False
+        End
+        Get psCodeFile to sHere
+        If (sHere <> "") Begin
+            Get Changed_State to bChanged
+            If (bChanged = True) Begin
+                Get YesNoCancel_Box ("Save the changes to" * sHere * "before leaving it?") to iAnswer
+                If (iAnswer = MBR_Cancel) ;
+                    Function_Return False
+                If (iAnswer = MBR_Yes) ;
+                    Send Request_Save
+            End
+        End
+        Function_Return True
+    End_Function
+
+    Procedure LoadFileForJump String sFile
+        Send OnFileNameUpdate of ghoApplication sFile
+        Send LoadFile sFile
+    End_Procedure
+
+    Procedure GotoDefinition
+        Handle hoIdx hoScan
+        String sWord sFile sPkg
+        String[] asLines
+        tSymbolDef[] aIdx aAll
+        tSymbolDef Def
+        Integer i iMax iPick
+
+        Get WordAtCaret to sWord
+        Move (Trim(sWord)) to sWord
+        If (sWord = "") Begin
+            Send UpdateStatusBar "Go to definition: no word under the cursor" False
+            Procedure_Return
+        End
+        If (pbSymbolIndexBuilding(Self) = True) ;
+            Procedure_Return
+        Get psCodeFile to sFile
+        Get EnsureSymbolIndex to hoIdx
+        If (hoIdx = 0 and sFile = "") Begin
+            Send UpdateStatusBar "Go to definition: no file and no workspace to search" False
+            Procedure_Return
+        End
+        // The scanner for the live buffer is the index when there is one; a file loaded with no
+        // workspace open still gets its own buffer searched.
+        Move hoIdx to hoScan
+        If (hoScan = 0) ;
+            Get Create (RefClass(cSymbolIndex)) to hoScan
+        If (sFile <> "") Begin
+            Get EditorDataAsStringArray to asLines
+            Get DefinitionsInLines of hoScan (&asLines) sFile sWord to aAll
+        End
+        If (hoIdx <> 0) Begin
+            Get DefinitionsOf of hoIdx sWord to aIdx
+            Move (SizeOfArray(aIdx) - 1) to iMax
+            For i from 0 to iMax
+                // The file being edited answered from its buffer; the index's copy of it is stale by definition.
+                If (Lowercase(aIdx[i].sFile) <> Lowercase(sFile)) ;
+                    Move aIdx[i] to aAll[SizeOfArray(aAll)]
+            Loop
+        End
+        Get psTargetPkgFolder of ghoApplication to sPkg
+        Get RankDefinitions of hoScan aAll sFile sPkg to aAll
+        If (hoScan <> hoIdx) ;
+            Send Destroy of hoScan
+        If (SizeOfArray(aAll) = 0) Begin
+            Send Info_Box ("The definition for '" + sWord + "' cannot be found.") "Go to definition"
+            Procedure_Return
+        End
+        If (SizeOfArray(aAll) = 1) ;
+            Move 0 to iPick
+        Else ;
+            Get ChooseDefinition of oGotoDefinitionPicker aAll to iPick
+        If (iPick < 0) ;
+            Procedure_Return
+        Move aAll[iPick] to Def
+        Send JumpToDefinition Def
+    End_Procedure
+
+    Procedure JumpToDefinition tSymbolDef Def
+        Boolean bOk bOtherFile
+        Integer iLine iHere
+        String sHere sTarget
+
+        Get psCodeFile to sHere
+        Move Def.sFile to sTarget
+        Move (Def.iLine - 1) to iLine
+        Get CurrentLine to iHere
+        Move (Lowercase(sTarget) <> Lowercase(sHere)) to bOtherFile
+        If (bOtherFile = False and iLine = iHere) Begin
+            Send UpdateStatusBar ("Go to definition: already at the definition of" * Def.sName) False
+            Procedure_Return
+        End
+        If (bOtherFile = True) Begin
+            Get MayLeaveFileFor sTarget to bOk
+            If (bOk = False) ;
+                Procedure_Return
+        End
+        // The way back first - Ctrl+Shift+Q returns here.
+        If (sHere <> "") ;
+            Send PushQuickMark
+        If (bOtherFile = True) ;
+            Send LoadFileForJump sTarget
+        Send Activate
+        Send SetCaretPosition iLine 0
+        Send UpdateStatusBar ("Go to definition:" * Def.sKind * Def.sName * "-" * sTarget * "(" + String(Def.iLine) + ")") False
+    End_Procedure
+
     Procedure ShowTextEncoding Integer iEncoding
         Case Begin
             Case (iEncoding = eTE_UTF8) //1
-                Set UTF8Text of (StatusBar_Id(ghoCommandBars)) to "UTF-8-BOM"
+                Set UTF8Text of (Statusbar_Id(ghoCommandBars)) to "UTF-8-BOM"
                 Case Break
             Case (iEncoding = eTE_OEM)  //2
-                Set UTF8Text of (StatusBar_Id(ghoCommandBars)) to "OEM"
+                Set UTF8Text of (Statusbar_Id(ghoCommandBars)) to "OEM"
                 Case Break
             Case (iEncoding = eTE_ANSI) //3
-                Set UTF8Text of (StatusBar_Id(ghoCommandBars)) to "ANSI"
+                Set UTF8Text of (Statusbar_Id(ghoCommandBars)) to "ANSI"
                 Case Break
             Case Else  
-                Set UTF8Text of (StatusBar_Id(ghoCommandBars)) to "???"
+                Set UTF8Text of (Statusbar_Id(ghoCommandBars)) to "???"
         Case End  
     End_Procedure
 
@@ -520,6 +1518,9 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
 
         Move (NullDateTime()) to dtFileDateTime
         Get vFilePathExists sFileName to bExists
+        // Not for a folder: it "exists" too, and Get_File_Mod_Time on one is error 4358 (2026-10-05).
+        If (bExists = True and rfDirectoryExists(sFileName) = True) ;
+            Move False to bExists
         If (bExists = True) Begin
             Get_File_Mod_Time sFileName to dDate iHH iMM iSS
             Move dDate            to dtFileDateTime
@@ -566,7 +1567,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         Handle hoStatusBar
         Integer iLines iCharacters
 
-        Move (StatusBar_Id(Self)) to hoStatusBar   
+        Move (Statusbar_Id(Self)) to hoStatusBar   
         If (num_arguments > 2) Begin
             Move iChrs to iCharacters
             If (iCharacters = 0) Begin
@@ -590,21 +1591,32 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         Send PumpMsgQueue of Desktop
     End_Procedure
     
+    /* SCI_SETSAVEPOINT, not SCI_GETMODIFY. This sent the GETTER - a query, with the new value
+       passed as its wParam - so "Set Changed_State to False" cleared nothing and had never
+       cleared anything. Every caller that establishes a baseline before doing work
+       (EditorReIndent, EditorNormalizeCase) was therefore reading the flag as it stood, and the
+       engine's "so no data-loss prompt on exit" line did not do that either.
+
+       Setting it True is a no-op ON PURPOSE: Scintilla derives "modified" from the document's
+       distance to the last save point, and there is no message that forces the flag on. Marking
+       a document dirty without editing it is not a thing the control can express, so this says
+       so rather than pretending. */
     Procedure Set Changed_State Boolean bChanged
-        Send EditorMessage SCI_GETMODIFY bChanged
+        If (bChanged = False) ;
+            Send MarkSaved
     End_Procedure
     
     Function Changed_State Returns Boolean
         Boolean bChanged
-        Get CM_IsModified to bChanged
+        Get IsModified to bChanged
         Function_Return bChanged        
     End_Function
     
     Procedure OnChange
         Boolean bChanged
-        Get CM_IsModified to bChanged
+        Get IsModified to bChanged
         If (bChanged = True) Begin
-            Set ActionText of (StatusBar_Id(Self))  to ""
+            Set ActionText of (Statusbar_Id(Self))  to ""
         End
     End_Procedure
 
@@ -637,7 +1649,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
             End
             
             Get IsFileTimeNewer sFileName to bHasChangedExternal
-            Get CM_IsModified to bUserModified
+            Get IsModified to bUserModified
             If (bHasChangedExternal and bUserModified) Begin
                 If (bUserModified) Begin
                     Append sMsg "The file has been changed by another program.\n\n"
@@ -658,7 +1670,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
 
             // If file has changed externally, but we didn't edit, then do not ask, just refresh
             If (bHasChangedExternal and bUserModified = False) Begin
-                Get SC_LineCount to iRet
+                Get DocumentLineCount to iRet
                 If (iRet > 1) Begin
                     Move True to bDoReloadFile
                 End
@@ -669,7 +1681,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
                 Get YesNo_Box sMsg (Label(hoMain)) to iRet
                 If (iRet = MBR_Yes) Begin
                     Get CurrentLine to iCurrentLine
-                    Get CM_OpenFile sFileName to iRet
+                    Get OpenFile sFileName to iRet
                     Send EditorMessage SCI_SETSAVEPOINT
                     If (iCurrentLine <> 0) Begin
                         Send EditorMessage SCI_GOTOLINE iCurrentLine
@@ -689,6 +1701,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
     Procedure OnFileDropped String sFilename
         String sSWSFile    
         Handle hoEditor
+
         Get phoEditor of ghoApplication to hoEditor
         If (Self <> hoEditor) Begin
             Get psSWSFile of ghoApplication to sSWSFile
@@ -704,7 +1717,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
 
     Procedure CME_Find
         Handle hoEdit
-        Get phoCodeMaxEditor to hoEdit
+        Get phoEditorControl to hoEdit
         If (hoEdit) Begin
             Send Activate of hoEdit
             Send Find of hoEdit
@@ -713,7 +1726,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
 
     Procedure CME_FindNext
         Handle hoEdit
-        Get phoCodeMaxEditor to hoEdit
+        Get phoEditorControl to hoEdit
         If (hoEdit) Begin
             Send Activate of hoEdit
             Send FindNext of hoEdit
@@ -722,7 +1735,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
 
     Procedure CME_FindPrevious
         Handle hoEdit
-        Get phoCodeMaxEditor to hoEdit
+        Get phoEditorControl to hoEdit
         If (hoEdit) Begin
             Send Activate of hoEdit
             Send FindPrevious of hoEdit
@@ -731,7 +1744,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
 
     Procedure CME_FindReplace
         Handle hoEdit
-        Get phoCodeMaxEditor to hoEdit
+        Get phoEditorControl to hoEdit
         If (hoEdit) Begin
             Send Activate of hoEdit
             Send Replace of hoEdit
@@ -740,7 +1753,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
 
     Procedure CME_GotoLine
         Handle hoEdit
-        Get phoCodeMaxEditor to hoEdit
+        Get phoEditorControl to hoEdit
         If (hoEdit) Begin
             Send Activate of hoEdit
             Send GotoLine of hoEdit
@@ -749,20 +1762,20 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
 
     Procedure CME_SelectAll
         Handle hoEdit
-        Get phoCodeMaxEditor to hoEdit
+        Get phoEditorControl to hoEdit
         If (hoEdit) Begin
             Send Activate of hoEdit
-            Send SelectAll of hoEdit
+            Send SelectAllText of hoEdit
         End
     End_Procedure
 
     Procedure CME_UndoAction
         Handle hoEdit
         Integer iRet
-        Get phoCodeMaxEditor to hoEdit
+        Get phoEditorControl to hoEdit
         If (hoEdit) Begin   
             Send Activate of hoEdit
-            Get CM_Undo to iRet
+            Get Undo to iRet
         End
     End_Procedure
 
@@ -770,20 +1783,19 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         Handle hoEdit 
         Integer iRet
         Move 0 to iRet
-        Get phoCodeMaxEditor to hoEdit
+        Get phoEditorControl to hoEdit
         If (hoEdit) Begin
-            Get CM_CanUndo to iRet
+            Get CanUndo to iRet
         End
         Function_Return (iRet = 1)
     End_Function
 
     Procedure CME_RedoAction
         Handle hoEdit
-        Integer iRet
-        Get phoCodeMaxEditor to hoEdit
+        Get phoEditorControl to hoEdit
         If (hoEdit) Begin
             Send Activate of hoEdit
-            Get CM_Redo to iRet
+            Send Redo
         End
     End_Procedure
 
@@ -791,9 +1803,9 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         Handle hoEdit
         Integer iRet
         Move 0 to iRet
-        Get phoCodeMaxEditor to hoEdit
+        Get phoEditorControl to hoEdit
         If (hoEdit) Begin
-            Get CM_CanRedo to iRet
+            Get CanRedo to iRet
         End
         Function_Return (iRet = 1)
     End_Function
@@ -864,12 +1876,12 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
      // if there is not, then it will insert comments -in the first two positions- for
      // all selected lines.
     Procedure ToggleComment
-        Boolean bAddComments
+        Boolean bAddComments bHasSelection
         Integer iStart iEnd iLine iRet iEndCol iStartCol iCurrLine
         String sVal sChk
         
         Append sChk "//"
-        Get CM_GetSel False to iRet
+        Get RefreshSelectionState to bHasSelection
         Get piSelEndCol    to iEndCol
         Get piSelStartCol  to iStartCol
         Get piSelStartLine to iStart
@@ -883,27 +1895,27 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         //
         // Check the first line to see if we are going to add or remove comments
         Move False to bAddComments
-        Get Value Item iStart to sVal
+        Get LineText iStart to sVal
         If (Left(sVal,2) <> sChk) Begin
           Move True to bAddComments
         End
-         
+
             // Run all lines and toggle the comment mark.
-        Send EditorMessage SCI_BEGINUNDOACTION
+        Send BeginUndoGroup
         For iLine from iStart to iEnd
-            Get value Item iLine to sVal
+            Get LineText iLine to sVal
             If (bAddComments) Begin
               Move (Append(sChk,sVal)) to sVal
             End
             Else Begin
               If (Left(sVal,2) = sChk) Move (Replace(sChk,sVal,"")) to sVal
             End
-            Set Value Item iLine to sVal
-        Loop                                 
-        Send EditorMessage SCI_ENDUNDOACTION
+            Send SetLineText iLine sVal
+        Loop
+        Send EndUndoGroup
         // Keep the selection
-        Move (CM_SetSel(Self,iStart,iStartCol,iCurrLine,iEndCol,False)) to iRet
-        // This must be after the "CM_SetSel" line
+        Send SelectRange iStart iStartCol iCurrLine iEndCol
+        // This must be after the SelectRange line
         Send EditorMessage SCI_GOTOLINE iLine 
     End_Procedure
 
@@ -913,7 +1925,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
       Integer  iCharSet
       Boolean  bConvertText
 
-      Get TextEncoding to iEncoding
+      Get EncodingMode to iEncoding
         Case Begin
             Case (iEncoding = eTE_UTF8) // 1
             Send EditorMessage SCI_SETCODEPAGE SC_CP_UTF8
@@ -947,18 +1959,18 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         String  sFontFace
         Integer iFontSize
         Integer iCharSet
+
         //
 
-        Move (CM_ENABLEGLOBALPROPS(Self,False))    to iRet
-
         Move ghoEditorProperties  to hoIni
-        Move (CM_SetLineNumbering(Self,Low(piLineNumbering(hoIni)),Hi(piLineNumbering(hoIni)),Low(piLineNumbering(hoIni)))) to iRet
-        Move (CM_EnableLeftMargin(Self,pbLeftMargin(hoIni)))            to iRet
+        Send ShowLineNumbers (Low(piLineNumbering(hoIni)))
+        Send EnableFolding   (pbLeftMargin(hoIni))    // the "left margin" setting has
+                                                      // always been the fold margin
         Get psLanguage of hoIni to sLanguage
 
-        Move (CM_SetLanguage(Self,sLanguage))                           to iRet
-        Move (CM_ShowScrollBar(Self,True,pbScrollBarH(hoIni)))          to iRet
-        Move (CM_ShowScrollBar(Self,False,pbScrollBarV(hoIni)))         to iRet
+        Send ApplyEditorLanguage sLanguage
+        Send ShowHorizontalScrollBar (pbScrollBarH(hoIni))
+        Send ShowVerticalScrollBar   (pbScrollBarV(hoIni))
         // Editor font face?
         Move (psFontFace(ghoEditorProperties))                          to sFontData
         If (sFontData="") Begin
@@ -1010,65 +2022,57 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         Send EditorMessage SCI_STYLESETCHARACTERSET STYLE_DEFAULT iCharSet
         Send EditorMessage SCI_STYLESETSIZE STYLE_LINENUMBER (iFontSize-1) // Set font size
         //
-        Set  pbShowMatchingBraces to (pbShowMatchingBraces(hoIni))
-        If  (pbShowIndentGuides(hoIni)) Begin
-            Send ShowIndentationGuides
-        End
-        Send SelectTillEndOfLine (pbSelectWholeLine(hoIni))
-
-        Move (CM_EnableDragDrop(Self,pbDragDrop(hoIni)))                to iRet
-        Move (CM_EnableColumnSel(Self,pbColumnSel(hoIni)))              to iRet
-        Move (CM_SetAutoIndentMode(Self,piAutoIndentMode(hoIni)))       to iRet
-        Move (CM_SetTabSize(Self,piTabSize(hoIni)))                     to iRet
-        Move (CM_EnableTabExpand(Self,pbTabExpand(hoIni)))              to iRet
-        Move (CM_EnableNormalizeCase(Self,pbNormalizeCase(hoIni)))      to iRet
-        Move (CM_EnableSelBounds(Self,pbSelBounds(hoIni)))              to iRet
-        Move (CM_EnableCaseSensitive(Self,pbCaseSensitive(hoIni)))      to iRet
-        Move (CM_EnableWholeWord(Self,pbWholeWord(hoIni)))              to iRet
+        Set pbShowMatchingBraces to (pbShowMatchingBraces(hoIni))
+        Send SetIndentationGuides      (pbShowIndentGuides(hoIni))
+        Send SetSelectionFillsLineEnd  (pbSelectWholeLine(hoIni))
+        Send SetAutoIndentMode         (piAutoIndentMode(hoIni))
+        Send SetTabWidth               (piTabSize(hoIni))
+        // "Tab expand" means tabs become spaces, so it is the inverse of use-tabs.
+        Send SetUseTabs                (not(pbTabExpand(hoIni)))
+        Set pbNormalizeCase to (pbNormalizeCase(hoIni))
+        Get ApplySearchOptions (pbWholeWord(hoIni)) (pbCaseSensitive(hoIni)) False ;
+                             (pbFindDocumentStart(Self)) to iRet
+        /* Four settings are deliberately gone: Drag and Drop, Column Select, Selection
+           Bounds and Global Properties. Each sent a CodeMax window message that a
+           Scintilla control does not implement, so all four have been doing nothing
+           since the day the facade was written - the switches for the first three are
+           still on the Options page and still have no effect. Wiring them up for real
+           is its own change; pretending they work is not. */
     End_Procedure
         
-    Procedure LoadElementString String sElement String sSeparator String[] ByRef saElements
-        Integer iC iItem
-        Handle hoParser
-
-        Get Create (RefClass(cLineParser)) to hoParser
-        Set psSepCharacter of hoParser to sSeparator
-        Send ParseLine     to hoParser sElement
-        For iC from 0 to (Item_Count(hoParser) -1)
-            Move (SizeOfArray(saElements)) to iItem
-            Get Value of hoParser Item iC to saElements[iItem]
-        Loop
-        Send Destroy_Object to hoParser
-    End_Procedure
 
     Procedure LoadEntries
         String sLanguage
         Integer iC    
         tSCLanguage SCLanguage
-        Move "VDF" to sLanguage
+
+        Move CS_EditorLanguage to sLanguage
         Get FindLanguage of ghoEditorProperties sLanguage to iC
         If (iC < 0) Begin
             Error DFERR_PROGRAM "Scintilla Language settings could not be loaded (LoadEntries - cRefactorScintillaEditor)"
         End
         
-        Get psLanguages.dwStyle                 of ghoEditorProperties iC to SCLanguage.iProcedural
-        Get psLanguages.bIsCaseSensitive        of ghoEditorProperties iC to SCLanguage.iCaseSensitive
-        Get psLanguages.szStringDelims          of ghoEditorProperties iC to SCLanguage.sStringDelimiter
-        Get psLanguages.chEscape                of ghoEditorProperties iC to SCLanguage.sEscapeChar
-        Get psLanguages.chTerminator            of ghoEditorProperties iC to SCLanguage.sLineTerminationChar
-        Get psLanguages.szSingleLineComments    of ghoEditorProperties iC to SCLanguage.sLineComments
-        Get psLanguages.szMultiLineComments1    of ghoEditorProperties iC to SCLanguage.sMultiLineCommentStart
-        Get psLanguages.szMultiLineComments2    of ghoEditorProperties iC to SCLanguage.sMultiLineCommentStop
-
-        Send LoadElementString (psLanguages.szScopeKeywords1(ghoEditorProperties,iC))       "\n" (&SCLanguage.saScopeStart)
-        Send LoadElementString (psLanguages.szScopeKeywords2(ghoEditorProperties,iC))       "\n" (&SCLanguage.saScopeStop)
-        Send LoadElementString (psLanguages.szKeywords(ghoEditorProperties,iC))             "\n" (&SCLanguage.saKeywords)
-        Send LoadElementString (psLanguages.szOperators(ghoEditorProperties,iC))            "\n" (&SCLanguage.saOperators)
-
-        Send LoadElementString (psLanguages.pszTagElementNames(ghoEditorProperties,iC))     "\n" (&SCLanguage.saTags)
-        Send LoadElementString (psLanguages.pszTagAttributeNames(ghoEditorProperties,iC))   "\n" (&SCLanguage.saAttributes)
-        Send LoadElementString (psLanguages.pszTagEntities(ghoEditorProperties,iC))         "\n" (&SCLanguage.saEntities)
+        /* Eleven more sub-values used to be read into SCLanguage here - dwStyle,
+           bIsCaseSensitive, the string delimiters, the escape and terminator characters,
+           the three comment markers and the three HTML/XML tag lists. Every one of them
+           was WRITE-ONLY: measured across all of AppSrc, nothing ever read those struct
+           members back. They are Hammer-era leftovers from when this dialog was built
+           (Nils, 2026-07-28).
         
+           Only the four the engine consumes are filled now. _AddAllKeyWords in
+           cBaseFuncLib reads saScopeStart, saScopeStop, saKeywords and saOperators, and
+           those are what seed ghoFuncLib's keyword arrays.
+        
+           The SETTINGS themselves are untouched - psLanguages still stores all fifteen
+           sub-values at their original indices, because those indices are the on-disk
+           format and renumbering them would misread every saved language definition.
+           This drops the reads, not the data. */
+
+        Send RefactorAppendSplitLine (psLanguages.szScopeKeywords1(ghoEditorProperties,iC))       "\n" (&SCLanguage.saScopeStart)
+        Send RefactorAppendSplitLine (psLanguages.szScopeKeywords2(ghoEditorProperties,iC))       "\n" (&SCLanguage.saScopeStop)
+        Send RefactorAppendSplitLine (psLanguages.szKeywords(ghoEditorProperties,iC))             "\n" (&SCLanguage.saKeywords)
+        Send RefactorAppendSplitLine (psLanguages.szOperators(ghoEditorProperties,iC))            "\n" (&SCLanguage.saOperators)
+
         Set pSCLanguage of ghoApplication to SCLanguage 
         Send _AddAllKeyWords of ghoFuncLib
     End_Procedure
@@ -1078,49 +2082,16 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
     // and its AddAllKeyWords message relies on that the ghoApplication's pSCLanguage was set.
     // But it wasn't (too early), so we load the Scintilla editor language properties here, sets the pSCLanguage
     // property and call AddAllKeyWords.
+    // The editor's own post-page setup. The LANGUAGE half - lexer, keyword lists,
+    // normalize-case dictionary - is ApplyLanguage in cScintillaSchemeView, shared with
+    // the settings preview so both lex DataFlex identically. Everything below it is the
+    // editor's alone: its command table, its hotkeys, and the engine wiring LoadEntries
+    // does.
     Procedure SetLexer
-        Boolean bInit
         Integer iRet
-        Integer iLanguage
-        Integer iLexer
-        String  sKeywords sScopeKeywords1 sScopeKeywords2 sOperators
-        String  sLanguage sLexerLang
         String  sHotKeys
 
-        Get psLanguage of ghoEditorProperties  to sLanguage 
-        Move (CM_SetLanguage(Self,sLanguage))  to iRet
-        Get EditorMessage SCI_GETLEXER 0 0     to iLexer
-        Move (ZeroString(255)) to sLexerLang
-        Get EditorMessage SCI_GETLEXERLANGUAGE 0 (AddressOf(sLexerLang)) to iRet
-        Get FindLanguage    of ghoEditorProperties sLanguage    to iLanguage
-
-        If (iLexer = SCLEX_DATAFLEX) Begin
-            Get SCKeywords (psLanguages.szKeywords(ghoEditorProperties, iLanguage))         to sKeywords
-            Get SCKeywords (psLanguages.szScopeKeywords1(ghoEditorProperties, iLanguage))   to sScopeKeywords1
-            Get SCKeywords (psLanguages.szScopeKeywords2(ghoEditorProperties, iLanguage))   to sScopeKeywords2
-            Get SCKeywords (psLanguages.szOperators(ghoEditorProperties,iLanguage))         to sOperators
-            Move (Replaces(CS_U,sOperators,"")) to sOperators // The ^ char is a wildcard match in scintilla, the result is EVERYTHING is an operator, so remove it before passing it, it is a hardcoded operator in scintilla.
-            // Fill the arrays for normalizing case feature when typing
-            Get InitializedLanguage of oNormalizeCase SCLEX_DATAFLEX to bInit
-            If (bInit=False) Begin
-                Send AddKeywords   of oNormalizeCase SCLEX_DATAFLEX sKeywords
-                Send AddScopewords of oNormalizeCase SCLEX_DATAFLEX sScopeKeywords1
-                Send AddScopewords of oNormalizeCase SCLEX_DATAFLEX sScopeKeywords2
-            End
-            // Supply the keywords/scope keywords in lower case as the lexer matches on lowercase characters
-            Move (Lowercase(sKeywords)) to sKeywords
-            Move (sKeywords + Character(0)) to sKeywords
-            Move (Lowercase(sScopeKeywords1)) to sScopeKeywords1
-            Move (Lowercase(sScopeKeywords2)) to sScopeKeywords2
-            Move (Lowercase(sOperators))      to sOperators
-            Send EditorMessage SCI_SETKEYWORDS 0 (AddressOf(sKeywords))         // language keywords
-            If (sScopeKeywords1 <> "" and sScopeKeywords2 <> "") Begin
-                Send EditorMessage SCI_SETKEYWORDS 1 (AddressOf(sScopeKeywords1)) // scope open
-                Send EditorMessage SCI_SETKEYWORDS 2 (AddressOf(sScopeKeywords2)) // scope close
-                Send EditorMessage SCI_SETKEYWORDS 3 (AddressOf(sOperators))      // operators
-            End
-            //
-        End
+        Send ApplyLanguage
         // Use shortcut keys as defined in hammer config codemaxedit.ini file.
         Send RegisterAllInternalCommands
         Send RegisterExtraCommands 
@@ -1130,22 +2101,25 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
         Send LoadEntries
 
         Get psEditorHotKeys of ghoEditorProperties to sHotKeys
-        Get CMSetHotkeys sHotKeys  to iRet
+        Get SetEditorHotKeys sHotKeys  to iRet
+        // The bindings are live now, so the context menu can advertise the real keys.
+        // Reached again after a settings save, which broadcasts ApplyEditorOptions.
+        Send RefreshShortcutCaptions of oSciContextMenu
     End_Procedure
 
     Function Line_Count Returns Integer
         Integer iCount
-        Get SC_LineCount to iCount
+        Get DocumentLineCount to iCount
         Function_Return iCount
     End_Function
 
     Function Line Integer iLine Returns String
         String sLine
-        Get CM_GetLine iLine to sLine
+        Get LineText iLine to sLine
         Function_Return sLine
     End_Function
 
-    // Like the CM_GetLine of cScilexer but does *not* call "Get EditorFormatToUtf8 sBuffer to sBuffer"
+    // Like LineText but deliberately does NOT convert the encoding - raw buffer bytes.
     Function EditorLine Integer iLine Returns String
         Integer iEOLPos iStartPos iLineLength iRet
         String  sBuffer
@@ -1169,8 +2143,7 @@ Class cRefactorScintillaEditor is a cSciLexerRefactor
     End_Function
 
     Procedure AppendText String sText
-        Integer eSuccess
-        Get CM_AddText sText to eSuccess
+        Send AddTextAtCaret sText
     End_Procedure
 
     Procedure Page_Object Integer bState

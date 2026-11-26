@@ -24,12 +24,16 @@
 */
 Use BatchDD.pkg
 Use RefactorStatusPanel.pkg
+Use RDCTimeSpan.pkg              // RDCTimeSpanToString - the end-of-run summary's elapsed time (RDCToolsLib)
 Use vWin32fh.pkg
-Use cEncodingHelpers.pkg   // RFReadEncodedFileAsStringArray / RFWriteEncodedFileFromStringArray / RFFileHasBOM
+Use cEncodingHelpers.pkg   // rfReadEncodedFileAsStringArray / rfWriteEncodedFileFromStringArray / rfFileHasBOM
+Use cLibraryInventory.pkg  // LibrariesInFolders - the pre-run library-folder warning
 
-Use cSciLexer.h
+Use ScintillaLexerApi.h.pkg
 Use cRefactorStatusLog.pkg
 Use cFunctionsDataDictionary.dd
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cPlanNoOps.pkg               // the files a plan run left as they were, recorded for the next plan
 
 Declare_Datafile SysFile
 Declare_Datafile Functions
@@ -37,6 +41,12 @@ Declare_Datafile FunctionsA
 
 Register_Object oEngineErrorLog_dg
 Register_Function phoEditorView Returns Handle
+/* The registered activation message for the editor view (DFRefactor.src / DFRefactorFT.src both
+   declare it with Activate_View). Registered here for the same reason cRefactorScintillaEditor
+   registers its application actions: UnitTests has no editor view at all, and without
+   this the engine fails that build with "4306 Forward reference not resolved". Where the view
+   exists the Send resolves to it; where it does not, it is an inert no-op. */
+Register_Procedure Activate_oEditorView_vw
 Register_Function phoRefactorView Returns Handle
 Register_Function A_InsertSpaceAfterParenthesis String ByRef sLine String sParameter Returns Boolean
 Register_Function pbIgnoreErrorState Returns Boolean
@@ -47,20 +57,19 @@ Register_Function pbIgnoreErrorState Returns Boolean
 // lives in DashboardFT.vw (FT only), so it is a harmless no-op in the non-FT build (no view handles it).
 Register_Procedure RefreshAfterRun
 
-// Human-readable label for a run's origin (the engine's peRunOrigin), shown as "Run source:" in
-// the summary log so a saved summary says WHAT triggered the run. Global + pure so it is
-// unit-testable without an engine instance. A batch (/bm) run reaches the engine through the
-// normal path with pbBatchMode set, so StartEngine stamps peRunOrigin = eRunBatch before the
-// summary is built (Nils 2026-06-13).
-Function RunOriginText Global Integer eOrigin Returns String
-    If (eOrigin = eRunPlan) ;
-        Function_Return "Refactor Plan (from Analyze)"
-    If (eOrigin = eRunBatch) ;
-        Function_Return "Batch mode (command-line)"
-    If (eOrigin = eRunTestBench) ;
-        Function_Return "Test Bench"
-    Function_Return "Manual selection (Start Refactoring)"
-End_Function
+// One PRE-RESOLVED dispatch entry for a selected refactoring function. The engine used to run a
+// Constrained_Find over FunctionsA + an Eval("get_<name>") + buffer Trims for EVERY line x function
+// (14.3 MILLION times on a 530k-line workspace = 8.9 of 45 measured run-minutes, 2026-07-04) - and
+// the by-value tRefactorSettings that rode along deep-copied the run's whole file list per line.
+// BuildDispatchList resolves each selected function ONCE per run; the line loop just walks this
+// array. iRecnum lets the per-hit FunctionsA counter write stay LIVE (Recnum-find + Reread - it
+// measured 0.5s per run).
+Struct tEngineDispatchFn
+    Integer iFunctionID
+    Integer iRecnum
+    String  sName
+    String  sParameter
+End_Struct
 
 {ClassLibrary = Windows}
 Class cRefactorEngine is a BusinessProcess
@@ -80,18 +89,104 @@ Class cRefactorEngine is a BusinessProcess
         Property Boolean private.pbBatchMode False
         Property Handle phoDD
         Property Handle phoEditor          
-        Property Handle StatusBar_Id
+        Property Handle Statusbar_Id
         Property String psCurrentSourceFileName   
         Property String psTotalTime
         Property tRefactorSettings pRefactorSettings
+        // The PRE-conversion source of the file currently being processed - stashed in the per-file loop
+        // BEFORE the line-by-line pass, so a whole-file eOtherFunction (DeclareRefactoredIndicators) can read
+        // the original Indicate/[X] indicator usage that the conversion then rewrites away.
+        Property String[] pasOriginalSource
         // Which UI action triggered this run - shown as "Run source:" in the summary log. Each
         // entry point Sets it before StartEngine; StartEngine stamps eRunBatch for a /bm run.
         Property Integer peRunOrigin eRunManual
+        // SILENT (report-style) run: no "you have selected N refactoring functions... Continue?" question
+        // up front, and no summary-log dialog afterwards - because the CALLER shows the real output itself
+        // (the guided Check Workspace view's "Check declarations" row runs the report this way, then opens
+        // the report). Suppresses exactly what pbBatchMode suppresses in CollectSettings; error paths are
+        // deliberately left alone, so a failed run still reports honestly. ONE-SHOT: RunRefactoringEngine
+        // clears it at the end of the run, so it can never leak into the next (interactive) run.
+        Property Boolean pbSilentRun False
+        // The run's main program is a character-mode program (set with the run settings, from
+        // MainProgramIsCharacterMode): the converters that rewrite Windows UI objects are skipped
+        // at both dispatch points - see _SkipForCharacterMode. (Nils 2026-09-20.)
+        Property Boolean pbCharacterModeRun False
+        // The user's never-pick list for this run (set with the run settings, from NeverPickFunctions
+        // of the application): a function on it is skipped at both dispatch points, ticked or not -
+        // see _SkipForNeverPick. (Nils 2026-10-06.)
+        Property String[] pasNeverPickRun
+        // Monotonic run counter, bumped at the START of every RunRefactoringEngine (attempted runs
+        // count too - a cancelled run may already have written files). Lets a caller that launched
+        // a MODAL flow (the guided view's Run-the-plan -> plan dialog -> run -> summary) find out
+        // afterwards whether an engine run actually happened, without threading a result through
+        // the dialogs: capture before, compare after.
+        Property Integer piEngineRunSeq 0
+        // The CALLER already asked its own, TARGETED question - so skip the engine's generic one, but keep
+        // everything else (notably the summary, which is the record of what a source-writing run changed).
+        // The generic warning counts "1 refactoring functions ... 2054 Files in 12 selected Folders", which
+        // says nothing about WHICH function, WHICH folders or - for a version-guard run - which DataFlex
+        // version, and reads as a mystery when the user pressed a specific row action (Nils 2026-07-20).
+        // ONE-SHOT, cleared with pbSilentRun at the end of the run.
+        Property Boolean pbStartQuestionAsked False
+        /* RE-ENTRANCY LATCH (2026-08-16). The engine pumps the message queue while it initialises
+           (_CollectIndicatorNames' progress beat, the status-panel paints) - and a pump lets an
+           ACCELERATOR through: Nils's key press reached ActivateProcess -> StartRefactoreCode ->
+           StartEngine again, three levels deep, from inside CollectSettings. Each nested start
+           created a new Functions DD and overwrote phoDD; the inner run then destroyed it on its
+           way out, and the outer CollectSettings sent SelectDefineSelectMacro to a dead handle -
+           err 98 "Invalid message". True from StartEngine's entry to its exit; a second start
+           while it is set is dropped, whatever surface it came from. */
+        Property Boolean pbEngineBusy False
+        /* FILES THIS RUN COULD NOT WRITE (2026-08-18). One entry per file - "<path> - <reason>" - filled
+           by ReportUnwritableFile from WriteStringArrayToFile, cleared at the start of each run
+           (RunRefactoringEngine), listed by CollectSummary. It exists because a failed write used to
+           leave no trace at all: Direct_Output does not raise on a read-only target (see the note above
+           rfIsFileReadOnly in RefactorFileIO.pkg), the writer returned False, the caller dropped it, and
+           the file had already been counted as changed. Nils's WinServ plan run over a DfPkg file:
+           "7 lines renamed, 1 of 1 files changed, Process completed OK" - three times - and the file on
+           disk never moved; the truth only surfaced when the editor's Ctrl+S hit error 32. */
+        Property String[] pasUnwritableFiles
+        // The file ReportUnwritableFile last recorded: the per-file loop writes a line-by-line change
+        // twice (once so the editor functions see it on disk, once at the end), so the same failure
+        // arrives twice per file - it is reported once.
+        Property String psLastUnwritableFile
+        /* WRITE-PROTECTED FILES ARE SYSTEM FILES (Nils 2026-08-18: "if the files are write protected, I
+           think they should be handled just like the other DataFlex system files under Program Files").
+           The files DropWriteProtectedFiles took OUT of this run at InitializeEngine - the one gate every
+           run passes, whatever built its file list (a folder collection, a plan, a file-precise row
+           action, a batch INI). Named by StartWarning before the run and by CollectSummary after it,
+           never dropped in silence. See DropWriteProtectedFiles. */
+        Property String[] pasReadOnlySkipped
+        /* FILES THAT NO LONGER EXIST leave the run at the same gate (2026-09-05, LegacyApp): a plan names
+           files as they stood at the Check, and the board's own [Rename them] retired two FlexCOM
+           proxies forty minutes before the run reached them - the COM-proxy gate then raised "The file
+           doesn't exist" once per file and per pass, four dialogs for two files the tool itself had
+           renamed. Dropped here whatever the run does (a report cannot read them either), named by
+           StartWarning before the run and CollectSummary after it. See DropMissingFiles. */
+        Property String[] pasMissingSkipped
+        /* FILES CARRYING A NUL BYTE leave a WRITING run (2026-09-07): junk bytes, or a binary file under a
+           source name. The reader now round-trips them, but a source file should not contain one and the
+           user is the one to remove it; named with the line, like the other two lists. See DropBinaryFiles. */
+        Property String[] pasBinarySkipped
+        // The FIRST file the NUL-byte gate dropped and the line its byte is on - what the start
+        // question offers to open in the editor (2026-09-23). "" / 0 when the gate dropped nothing.
+        Property String  psFirstNulFile ""
+        Property Integer piFirstNulLine 0
+        /* THE RULE: MACRO CODE IS NEVER REFACTORED (Nils, 2026-09-07) - what the run walked past, for the
+           summary line: #COMMAND bodies, #DATA blocks and '!' directive lines, counted once per file
+           (psMacroCountedFile remembers the last file counted). See the library's macro-code guard (cRefactorFuncLib). */
+        Property Integer piMacroLinesKept 0
+        Property Integer piMacroFilesKept 0
+        // The local includes this run converted WITH their programs (the include lift, see
+        // cRefactorFuncLib _LiftIncludeVerdict), as "<leaf> (used by <program>)" - one summary line.
+        Property String[] pasLiftedIncludeNotes
+        Property String  psMacroCountedFile ""
 
-        Property String psLineBreak CS_CRLF
+        Property String psLineBreak C_NewLine
         Property Boolean pbLastLineBreak
 
         Get Create (RefClass(cRefactorStatusLog)) to ghoStatusLog
+
     End_Procedure
 
     Procedure End_Construct_Object
@@ -100,6 +195,23 @@ Class cRefactorEngine is a BusinessProcess
         Set Status_Panel_Id to ghoStatusPanel
     End_Procedure
     
+    // Human-readable label for a run's origin (the engine's peRunOrigin), shown as "Run source:" in
+    // the summary log so a saved summary says WHAT triggered the run. Global + pure so it is
+    // unit-testable without an engine instance. A batch (/bm) run reaches the engine through the
+    // normal path with pbBatchMode set, so StartEngine stamps peRunOrigin = eRunBatch before the
+    // summary is built (Nils 2026-06-13).
+    Function RunOriginText Integer eOrigin Returns String
+        If (eOrigin = eRunPlan) ;
+            Function_Return "Refactor Plan (from Analyze)"
+        If (eOrigin = eRunDeepScan) ;
+            Function_Return "Refactor Plan (from Analyze Source)"
+        If (eOrigin = eRunBatch) ;
+            Function_Return "Batch mode (command-line)"
+        If (eOrigin = eRunTestBench) ;
+            Function_Return "Test Bench"
+        Function_Return "Manual selection (Start Refactoring)"
+    End_Function
+
     { Visibility = Public MethodType = Property }
     Procedure Set pbBatchMode Boolean bState
         Set private.pbBatchMode to bState
@@ -115,10 +227,46 @@ Class cRefactorEngine is a BusinessProcess
 
     // Collect all settings to one common struct to be passed amongst the main operating procedures.
     Function CollectSettings tRefactorFiles RefactorFiles Returns tRefactorSettings
-        tRefactorSettings RefactorSettings     
-        
+        Boolean bHasSelectIndicator bModernizeSelect
+        tRefactorSettings RefactorSettings
+        String[] asNeverPick
+
         Move RefactorFiles                       to RefactorSettings.FileData
-        Set psCurrentSourceFileName              to RefactorSettings.FileData.asFullFileNames[0] 
+        // A zero-length list has no [0] to read (error 4509); a batch INI or a row action can hand one in.
+        If (SizeOfArray(RefactorSettings.FileData.asFullFileNames) > 0) ;
+            Set psCurrentSourceFileName to RefactorSettings.FileData.asFullFileNames[0]
+        Else ;
+            Set psCurrentSourceFileName to ""
+        // Companion functions, decided BEFORE the selection counts are read.
+        //  - DefineSelectMacro: needed ONLY when a selected converter runs under eModernizeSelect AND the
+        //    source has a [Select] / Indicate Select. The eModernizeSelect check is a cheap DD field read, so
+        //    do it FIRST - the whole-file SELECT scan (which reads EVERY run file) then runs ONLY on the rare
+        //    eModernizeSelect run, never on the default eLeaveSelect. (That unconditional scan over the full
+        //    run file set was the post-Proceed lag on a large workspace; Nils 2026-07-06.)
+        //  - DeclareRefactoredIndicators: SOURCE-driven; the Modernization plan already decided it precisely
+        //    (cModAnalyzer.AddNeededIndicatorCompanions), so only the MANUAL grid / batch paths need the
+        //    run-time net - skip it for a plan run, which would otherwise re-add it unconditionally.
+        If (phoDD(Self) <> 0) Begin
+            Get HasModernizeSelectConverterSelected of (phoDD(Self)) to bModernizeSelect
+            If (bModernizeSelect = True) Begin
+                Move False to bHasSelectIndicator
+                If (ghoFuncLib <> 0) ;
+                    Get _ScopeHasSelectIndicator of ghoFuncLib RefactorFiles.asFullFileNames to bHasSelectIndicator
+                If (bHasSelectIndicator = True) ;
+                    Send SelectDefineSelectMacro of (phoDD(Self))
+            End
+            If (peRunOrigin(Self) <> eRunPlan) ;
+                Send EnsureCompanionsSelected of (phoDD(Self))
+        End
+
+        // RECOUNT the per-type selection counters from the live FunctionsA scan before reading them below
+        // (Nils 2026-07-13). The incremental SysFile.Selectede* counters DRIFT upward over a session
+        // (cFunctionsDataDictionary.AdjustSelected adds on every per-row save and the per-type counters are
+        // uncapped, unlike SelectedFunctionTotal) - a stale editor count made the engine run a spurious
+        // eEditorFunctions pass that ACTIVATED the editor with no editor functions actually selected. Done AFTER
+        // EnsureCompanionsSelected so the counts include any auto-selected companions.
+        Send ResetAllSysFileSelectionCounters of (phoDD(Self))
+
         Move SysFile.FileExtensionFilter         to RefactorSettings.sFileFilter
         Move SysFile.SelectedFunctionTotal       to RefactorSettings.iSelectedFunctionTotal
         Move SysFile.SelectedeStandardFunction   to RefactorSettings.iSelectedStandardFunctions
@@ -145,8 +293,18 @@ Class cRefactorEngine is a BusinessProcess
         Move SysFile.bCountSourceLines          to RefactorSettings.bCountSourceLines
         Move SysFile.bReadOnly                  to RefactorSettings.bReadOnly
         Get pbWorkspaceMode of ghoApplication   to RefactorSettings.bWorkspaceMode
+        // A character-mode main program (Use UI, no Windows base): the converters that rewrite
+        // Windows user-interface objects are skipped for it - see _SkipForCharacterMode.
+        Get MainProgramIsCharacterMode of ghoApplication to RefactorSettings.bCharacterMode
+        Set pbCharacterModeRun to RefactorSettings.bCharacterMode
+        // The user's never-pick list, read once per run - see _SkipForNeverPick.
+        Get NeverPickFunctions of ghoApplication to asNeverPick
+        Set pasNeverPickRun to asNeverPick
         
-        If (pbBatchMode(Self) = False) Begin
+        // A SILENT report run is suppressed exactly like a headless one: the start question would ask about
+        // "refactoring functions" for something that changes nothing, and the summary dialog would bury the
+        // report the caller is about to open. See pbSilentRun.
+        If (pbBatchMode(Self) = False and pbSilentRun(Self) = False) Begin
             Get ReadInteger of ghoApplication CS_Settings CS_ShowQuestion True to RefactorSettings.bShowStartQuestion
             Get ReadInteger of ghoApplication CS_Settings CS_ShowSummary  True to RefactorSettings.bShowSummary
         End
@@ -154,17 +312,159 @@ Class cRefactorEngine is a BusinessProcess
             Move False to RefactorSettings.bShowStartQuestion
             Move False to RefactorSettings.bShowSummary
         End
+        // A caller that already put its own targeted question on screen suppresses ONLY the generic one.
+        If (pbStartQuestionAsked(Self) = True) ;
+            Move False to RefactorSettings.bShowStartQuestion
 
         Set pRefactorSettings               to RefactorSettings
         Set pRefactorSettings of ghoFuncLib to RefactorSettings
         Function_Return RefactorSettings
     End_Function
 
+    /* THE WRITE-PROTECTED GATE (2026-08-18). The DataFlex install's Pkg tree is never collected
+       (AllSourceFiles' hard guard on psTargetPkgFolder - "the only place off limits is the DataFlex
+       install"). Nils's rule of the same day extends that status to any file that carries the
+       READ-ONLY attribute: "handled just like the other DataFlex system files under Program Files".
+       What that catches in practice: DataFlex 26's DfPkg package checkouts under the workspace
+       (every file read-only, pinned to a commit), the DataFlex system package cache, and a VCS working
+       copy that marks non-checked-out files read-only - for the last, checking the file out is the
+       user's move; DFRefactor never clears the attribute on a source (see rfClearFileReadOnly).
+
+       HERE, not only at collection: the file list can arrive from a plan, a file-precise row action
+       or a batch INI, none of which pass AllSourceFiles. One GetFileAttributesW per file - cheap.
+       Dropped files go to pasReadOnlySkipped so StartWarning can say it BEFORE the run and
+       CollectSummary AFTER it; a skip nobody can see reads as coverage. The engine's own
+       NOT WRITTEN report (ReportUnwritableFile) stays as the safety net for what an attribute
+       cannot show - a lock, an ACL, a folder gone between now and the write. */
+    Function DropWriteProtectedFiles tRefactorFiles ByRef RefactorFiles Returns Integer
+        String[] asKeep asSkipped
+        Integer i iMax iKeep
+
+        Move (SizeOfArray(RefactorFiles.asFullFileNames) - 1) to iMax
+        Move 0 to iKeep
+        For i from 0 to iMax
+            If (RefactorFiles.asFullFileNames[i] <> "" and rfIsFileReadOnly(RefactorFiles.asFullFileNames[i]) = True) Begin
+                Move RefactorFiles.asFullFileNames[i] to asSkipped[SizeOfArray(asSkipped)]
+            End
+            Else Begin
+                Move RefactorFiles.asFullFileNames[i] to asKeep[iKeep]
+                Increment iKeep
+            End
+        Loop
+        Set pasReadOnlySkipped to asSkipped
+        If (SizeOfArray(asSkipped) > 0) ;
+            Move asKeep to RefactorFiles.asFullFileNames
+        Function_Return (SizeOfArray(asSkipped))
+    End_Function
+
+    /* THE MISSING-FILE GATE (2026-09-05). A file list can be older than the disk: a saved plan, a
+       row action or a batch INI names files as they stood when the list was made, and the board's
+       own [Rename them] (FlexCOM20.pkg -> FlexCOM20.pkg.shadowed) or a delete in between leaves a
+       name with nothing behind it. Reading such a name is an error in EVERY mode - a report cannot
+       read it either - so unlike the write-protected gate this one is not tied to RunWritesSource.
+       Dropped names go to pasMissingSkipped; the two summaries name them. Order is kept. */
+    Function DropMissingFiles tRefactorFiles ByRef RefactorFiles Returns Integer
+        String[] asKeep asSkipped
+        Integer i iMax iKeep
+        Boolean bExists
+
+        Move (SizeOfArray(RefactorFiles.asFullFileNames) - 1) to iMax
+        Move 0 to iKeep
+        For i from 0 to iMax
+            Move True to bExists
+            If (RefactorFiles.asFullFileNames[i] <> "") Begin
+                Move (vFilePathExists(RefactorFiles.asFullFileNames[i])) to bExists
+                /* A FOLDER IS NOT A FILE (2026-10-05). vFilePathExists answers True for one, and a folder
+                   reached this list as the "file" of a compiler message cut off mid-line by a compiler
+                   crash (see IsCompilerMessageFile). The run then read it as a file, and the editor's
+                   file-time check at its end raised error 4358. It leaves with the missing names. */
+                If (bExists = True and rfDirectoryExists(RefactorFiles.asFullFileNames[i]) = True) ;
+                    Move False to bExists
+            End
+            If (bExists = False) Begin
+                Move RefactorFiles.asFullFileNames[i] to asSkipped[SizeOfArray(asSkipped)]
+            End
+            Else Begin
+                Move RefactorFiles.asFullFileNames[i] to asKeep[iKeep]
+                Increment iKeep
+            End
+        Loop
+        Set pasMissingSkipped to asSkipped
+        If (SizeOfArray(asSkipped) > 0) ;
+            Move asKeep to RefactorFiles.asFullFileNames
+        Function_Return (SizeOfArray(asSkipped))
+    End_Function
+
+    /* THE BINARY-BYTE GATE (2026-09-07). A source file with a NUL byte in it - a junk line of the bytes
+       00 02, in the case that taught this - used to lose every line from the NUL to the end of the
+       reader's 8 KB decode window, silently; the reader now carries the NUL through, but a file like
+       that is either damaged or not source at all, and the person who owns it should hear so instead
+       of having the tool write it back. Applied only to a run that WRITES (like the write-protected
+       gate): a report may still read the file. Names go to pasBinarySkipped with the line, for the two
+       summaries. Order is kept. */
+    Function DropBinaryFiles tRefactorFiles ByRef RefactorFiles Returns Integer
+        String[] asKeep asSkipped
+        Integer i iMax iKeep iNulLine
+
+        Set psFirstNulFile to ""
+        Set piFirstNulLine to 0
+        Move (SizeOfArray(RefactorFiles.asFullFileNames) - 1) to iMax
+        Move 0 to iKeep
+        For i from 0 to iMax
+            Move 0 to iNulLine
+            If (RefactorFiles.asFullFileNames[i] <> "") ;
+                Move (rfFirstNulLine(RefactorFiles.asFullFileNames[i])) to iNulLine
+            If (iNulLine > 0) Begin
+                Move (RefactorFiles.asFullFileNames[i] + "  (NUL byte at line " + String(iNulLine) + ")") to asSkipped[SizeOfArray(asSkipped)]
+                If (psFirstNulFile(Self) = "") Begin
+                    Set psFirstNulFile to RefactorFiles.asFullFileNames[i]
+                    Set piFirstNulLine to iNulLine
+                End
+            End
+            Else Begin
+                Move RefactorFiles.asFullFileNames[i] to asKeep[iKeep]
+                Increment iKeep
+            End
+        Loop
+        Set pasBinarySkipped to asSkipped
+        If (SizeOfArray(asSkipped) > 0) ;
+            Move asKeep to RefactorFiles.asFullFileNames
+        Function_Return (SizeOfArray(asSkipped))
+    End_Function
+
+    /* Does this run CHANGE source? The write-protected gate below applies only when it does - reading a
+       file is not refactoring it (Nils 2026-08-19).
+
+       Why it matters: FunctionReturnMismatchReport's whole job is to NAME the declarations behind a 4544,
+       and the decisive ones often live in exactly the read-only third-party library the gate removes. Drop
+       those files from a REPORT and the report answers "no declaration of this name was found" about a
+       library it was told not to open - the same class of dishonesty the gate was built to end. The
+       analyzer makes the same distinction: a write-protected file's rows stay visible, badged
+       System (read-only), and only the PLAN leaves them alone.
+
+       A run writes unless it is a dry run (bReadOnly), the count-source-lines run (which is one pass over
+       the text and changes nothing), or made up entirely of report-type functions. An eEditorFunction is
+       NOT a report - it writes through the editor - so it is counted on the writing side by omission. */
+    Function RunWritesSource tRefactorSettings RefactorSettings Returns Boolean
+        Integer iReportOnly
+
+        If (RefactorSettings.bReadOnly = True) ;
+            Function_Return False
+        If (RefactorSettings.bCountSourceLines = True) ;
+            Function_Return False
+        Move (RefactorSettings.iSelectedReportFunctions + RefactorSettings.iSelectedReportAllFunctions) to iReportOnly
+        Function_Return (RefactorSettings.iSelectedFunctionTotal > iReportOnly)
+    End_Function
+
     // Initializes the refactoring engine and make validations of the setup.
     Function InitializeEngine tRefactorFiles RefactorFiles Returns Boolean
         Boolean bOK bExists
-        String sFolderName             
-        tRefactorSettings RefactorSettings 
+        String sFolderName sFileName sBlockMsg sBuiltBy
+        String[] asNoFiles asBlockScan asDroppedProxies asBuiltBy
+        Integer iSize iFile iBlockLine iVerFold iBuilt iBuiltMax
+        Boolean bInRunFolders bBlockExists
+        tRefactorSettings RefactorSettings
+        Integer iDropped iMissing iBinary
 
         // Defensive re-baseline: if a previous run leaked a target-workspace
         // filelist redirect (e.g. a hard error skipped the post-run restore),
@@ -175,14 +475,144 @@ Class cRefactorEngine is a BusinessProcess
         // bWorkspaceMode = "All files in selected folders", else only a single file will be processed.
         Send _InitializeFuncLib of ghoFuncLib
         Send ResetFunctionsCounters of (phoDD(Self))
-        
+        Set piMacroLinesKept   to 0
+        Set piMacroFilesKept   to 0
+        Set psMacroCountedFile to ""
+
         // The CollectSettings message also sets the class property pRefactorSettings
         Get CollectSettings RefactorFiles to RefactorSettings
+
+        /* Write-protected files leave the run HERE - system files, like the DataFlex install (see
+           DropWriteProtectedFiles) - but only for a run that would change them (RunWritesSource). The
+           settings carry their own copy of the file list, so it is re-synced from the trimmed one; a
+           run that keeps every file must still CLEAR the skip list, or the previous run's names would
+           be reported as this one's. */
+        // Names with nothing on disk behind them leave first, in every mode (see DropMissingFiles).
+        Get DropMissingFiles (&RefactorFiles) to iMissing
+        If (RunWritesSource(Self, RefactorSettings) = True) Begin
+            Get DropWriteProtectedFiles (&RefactorFiles) to iDropped
+            // A file carrying a NUL byte leaves a writing run as well (see DropBinaryFiles).
+            Get DropBinaryFiles (&RefactorFiles) to iBinary
+            If (iDropped + iBinary > 0) Begin
+                Move RefactorFiles to RefactorSettings.FileData
+                If (SizeOfArray(RefactorSettings.FileData.asFullFileNames) > 0) ;
+                    Set psCurrentSourceFileName to RefactorSettings.FileData.asFullFileNames[0]
+                Set pRefactorSettings               to RefactorSettings
+                Set pRefactorSettings of ghoFuncLib to RefactorSettings
+            End
+        End
+        Else Begin
+            Set pasReadOnlySkipped to asNoFiles
+            Set pasBinarySkipped   to asNoFiles
+            Set psFirstNulFile     to ""
+            Set piFirstNulLine     to 0
+        End
+        // The missing-file gate trimmed the list but the write-protected block did not re-sync it.
+        If (iMissing > 0 and iDropped = 0) Begin
+            Move RefactorFiles to RefactorSettings.FileData
+            If (SizeOfArray(RefactorSettings.FileData.asFullFileNames) > 0) ;
+                Set psCurrentSourceFileName to RefactorSettings.FileData.asFullFileNames[0]
+            Set pRefactorSettings               to RefactorSettings
+            Set pRefactorSettings of ghoFuncLib to RefactorSettings
+        End
         Get IsValidActions RefactorSettings to bOk
         If (bOk = False) Begin
             Function_Return False
         End    
         
+        /* THE FLEXCOM HALT (Nils, 2026-08-27). A file built on the retired FlexCOM.pkg cannot be
+           made to compile by any refactoring - DataFlex 26 does not ship the helper - so a run
+           over such a workspace is work spent burying the real task. HALTED, not skipped: the
+           user asked for a hard stop with a clear message, and it fires HERE, before one file is
+           modified, because a run stopped halfway leaves the half-refactored state this tool
+           spends the rest of its time untangling.
+
+           Write-runs only. A REPORT run must still work - it is how the user sees the problem -
+           and the Deep Scan row (DS 9220) is what explains it on the board. */
+        If (RunWritesSource(Self, RefactorSettings) = True) Begin
+            /* ...INCLUDING THE FILES COLLECTION LEFT OUT. AllSourceFiles drops Studio-generated
+               COM proxies, and a FlexCOM-era proxy is exactly where the blocker lives - scanning
+               only the collected list made this halt blind on the workspace that motivated it
+               (rcmail.pkg, 2026-08-27). pasProxySkipped is the collection's own record of what
+               it dropped; entries are filtered to the run's folders as a guard against a stale
+               list from an earlier collection elsewhere. */
+            Get pasProxySkipped of ghoApplication to asDroppedProxies
+            Move (SizeOfArray(asDroppedProxies) - 1) to iSize
+            For iFile from 0 to iSize
+                Move (Lowercase(asDroppedProxies[iFile])) to sFileName
+                Move False to bInRunFolders
+                Move (SizeOfArray(RefactorSettings.FileData.asFolders) - 1) to iBlockLine
+                For iVerFold from 0 to iBlockLine
+                    If (Left(sFileName, Length(RefactorSettings.FileData.asFolders[iVerFold])) = Lowercase(RefactorSettings.FileData.asFolders[iVerFold])) ;
+                        Move True to bInRunFolders
+                Loop
+                If (bInRunFolders = True) ;
+                    Move asDroppedProxies[iFile] to RefactorSettings.FileData.asFullFileNames[SizeOfArray(RefactorSettings.FileData.asFullFileNames)]
+            Loop
+            /* The extended list is LOCAL to this gate: RefactorSettings is a by-value copy here,
+               so the appended proxies never reach the run's own file list - they are read once,
+               below, and only for the halt check. */
+            Move (SizeOfArray(RefactorSettings.FileData.asFullFileNames)) to iSize
+            If (ghoStatusPanel <> 0 and Active_State(ghoStatusPanel) = True) ;
+                Set Caption_Text of ghoStatusPanel to "Checking for legacy COM packages that block refactoring..."
+            Decrement iSize
+            For iFile from 0 to iSize
+                Move RefactorSettings.FileData.asFullFileNames[iFile] to sFileName
+                /* A NAME IN THIS LIST IS NOT A PROMISE THE FILE IS STILL THERE. pasProxySkipped is
+                   the collection s record from whenever the collection last ran, and it is filtered
+                   to the run s folders by PATH TEXT alone - so a proxy moved, renamed or deleted
+                   since then is still in it, and the halt would name a file the user can no longer
+                   find. Asked of the disk rather than of the list (2026-08-30, on a workspace where
+                   the offending file had been moved out of the scanned folder and the halt still
+                   named its old path). */
+                Move False to bBlockExists
+                If (sFileName <> "") ;
+                    File_Exist sFileName bBlockExists
+                If (bBlockExists = True) Begin
+                    Move (rfReadEncodedFileAsStringArray(sFileName)) to asBlockScan
+                    Get LineUsingRetiredFlexCom of ghoFuncLib (&asBlockScan) to iBlockLine
+                    /* ONLY A PROXY SOME PROGRAM COMPILES HALTS THE RUN (Nils 2026-09-03, LegacyApp).
+                       CleanCash_1_0.pkg - a 2009 FlexCOM proxy in no compile listing, its wrapper
+                       named by no .src - halted the whole workspace. The listings are the record of
+                       what a build actually read (ProgramsCompilingFile); a proxy in none of them
+                       is dead code to retire, and the board's DS 9220 row says so. Logged, not
+                       silenced. A program never built here has no listing and cannot vouch either
+                       way - accepted. */
+                    If (iBlockLine > 0) Begin
+                        Get ProgramsCompilingFile of ghoApplication sFileName to asBuiltBy
+                        If (SizeOfArray(asBuiltBy) = 0) Begin
+                            Send Log_Status of ghoStatusLog (String(sFileName) + " (line " + String(iBlockLine) + ") is built on FlexCOM.pkg, but no program in this workspace compiles it - not halting. Retire the file.")
+                            Move 0 to iBlockLine
+                        End
+                    End
+                    If (iBlockLine > 0) Begin
+                        Move "" to sBuiltBy
+                        Move (SizeOfArray(asBuiltBy) - 1) to iBuiltMax
+                        For iBuilt from 0 to iBuiltMax
+                            If (sBuiltBy <> "") ;
+                                Move (sBuiltBy + ", ") to sBuiltBy
+                            Move (sBuiltBy + asBuiltBy[iBuilt]) to sBuiltBy
+                        Loop
+                        Move ("REFACTORING IS HALTED for this workspace." + C_NewLine + C_NewLine ;
+                            + String(sFileName) + " (line " + String(iBlockLine) + ") is built on FlexCOM.pkg - " ;
+                            + "the FlexCOM-era COM helper that DataFlex 26 no longer ships. No refactoring can " ;
+                            + "make that code compile, so nothing will be changed until it is resolved. " ;
+                            + "Compiled by: " + sBuiltBy + "." + C_NewLine + C_NewLine ;
+                            + "Re-generate the COM proxy with the Studio's Import COM Object Library wizard " ;
+                            + "(the COM component itself must be installed and registered), adapt the call " ;
+                            + "sites to the regenerated classes, and retire the old file. Then run again." + C_NewLine + C_NewLine ;
+                            + "Note: changing 'Use FlexCOM.pkg' to 'Use FlexCOM20.pkg' cannot work - the " ;
+                            + "generated code is written against the old helper.") to sBlockMsg
+                        If (pbBatchMode(Self) = False) ;
+                            Send Info_Box sBlockMsg "Refactoring halted"
+                        Else ;
+                            Send UserError sBlockMsg
+                        Function_Return False
+                    End
+                End
+            Loop
+        End
+
         Set psTotalTime to ""
         // This is the base back-up folder. Subfolders will be created automatically
         // when needed.
@@ -217,13 +647,31 @@ Class cRefactorEngine is a BusinessProcess
         tRefactorSettings RefactorSettings 
         Handle hoDD
         
+        // One run at a time - see pbEngineBusy. A start that arrives while a run is initialising or
+        // executing (a queued accelerator, a double click, a timer) is dropped, not queued.
+        /* DROPPED, BUT SAID (2026-09-03). On WinServ every board action between 13:21 and 13:26 -
+           a converter, the globals guard, a Check, the External_Function guard - came back with a
+           dialog and wrote nothing: no log entry, no backup, no compile. Each dialog was reading
+           the counters the LAST real run had left, because this exit refused the start in silence
+           and every caller took a silent return for a run. A restart cleared it; what set the
+           latch is not known. A refusal nobody can see is indistinguishable from success, so it
+           speaks now (never in batch mode, where there is nobody to read it and nothing to
+           double-click). The callers' half of the fix is RunScopedFunction, which now reads
+           piEngineRunSeq to tell a run that happened from one that did not. */
+        If (pbEngineBusy(Self) = True) Begin
+            If (pbBatchMode(Self) = False) ;
+                Send Info_Box ("A refactoring run is already in progress, so this one was not started." + Character(10) + Character(10) ;
+                    + "If no run is visibly in progress, the previous one did not end normally - restart DFRefactor before the next run.") "Engine busy"
+            Procedure_Return
+        End
+        Set pbEngineBusy to True
         Get Create (RefClass(cFunctionsDataDictionary)) to hoDD
         Set phoDD to hoDD
         // Record the execution context for the error logger (a dedicated property
         // now, instead of scribbling on the shared FunctionsA.Function_Name buffer).
         Set psExecutionContext of ghoFuncLib to "StartEngine"   
-        Get StatusBar_Id of (phoMainPanel(ghoApplication)) to hoStatusBarID
-        Set StatusBar_Id  to hoStatusBarID
+        Get Statusbar_Id of (phoMainPanel(ghoApplication)) to hoStatusBarID
+        Set Statusbar_Id  to hoStatusBarID
         Set phoEditor  to hoEditor
         // A headless /bm run reaches StartEngine through the normal path with pbBatchMode set;
         // stamp the true origin so the summary says "Batch mode", not whatever the caller set.
@@ -234,6 +682,11 @@ Class cRefactorEngine is a BusinessProcess
         Get InitializeEngine RefactorFiles to bOK
         If (bOK = False) Begin
             Send Destroy of (phoDD(Self))
+            Set pbEngineBusy to False
+            // A headless run that fails to initialise still has to report + exit, or the build would hang.
+            If (pbBatchMode(Self) = True) Begin
+                Send ExitBatchWithCode of ghoApplication eEngineError "Engine initialization failed (check the workspace / selections in the CmdLine INI)."
+            End
             Procedure_Return
         End
 
@@ -241,11 +694,13 @@ Class cRefactorEngine is a BusinessProcess
         Get StartWarning RefactorSettings (psCurrentSourceFileName(Self)) to eResponse
         If (eResponse <> MBR_Yes) Begin
             Send Destroy of (phoDD(Self))
+            Set pbEngineBusy to False
             Procedure_Return
         End
         
-        // This will call the RunRefactoringEngine message:
+        // This will call the RunRefactoringEngine message (synchronous - DoProcess -> OnProcess):
         Send DoProcess
+        Set pbEngineBusy to False
     End_Procedure
     
     // Do *not* call this message! Instead call StartEngine. 
@@ -253,24 +708,50 @@ Class cRefactorEngine is a BusinessProcess
     // This is called by OnProcess.
     {Visibility = Private}
     Procedure RunRefactoringEngine
-        tRefactorSettings RefactorSettings  
+        tRefactorSettings RefactorSettings
         String sText
+        String[] asNoFiles
         Handle hoEditor
         DateTime dtExecStart
-        Integer eResponse 
+        Integer eResponse
         Boolean bHasChangedExternal
-    
+        Handle hoNoOps
+        String[] asNoOpBefore asNoOpFns
+
+        Set piEngineRunSeq to (piEngineRunSeq(Self) + 1)
         // Record the execution context for the error logger (a dedicated property
         // now, instead of scribbling on the shared FunctionsA.Function_Name buffer).
         Set psExecutionContext of ghoFuncLib to "RunRefactoringEngine"
         Move False to Err
-        Move 0 to LastErr     
-        
+        Move 0 to LastErr
+        // Per-run: the files this run fails to write (see the property).
+        Set pasUnwritableFiles to asNoFiles
+        Set psLastUnwritableFile to ""
+
         Get phoEditor to hoEditor
         Move (CurrentDateTime()) to dtExecStart
         Get pRefactorSettings to RefactorSettings   
         
+        /* THE PLAN'S NO-OPS (2026-11-12): every file of a plan run is stamped before it, so the files the run
+           leaves as they were can be recorded with its functions afterwards (cPlanNoOps), and the next plan
+           does not offer those functions for those files again. Only a plan run that writes, and only when
+           it finishes OK - a cancelled run may have skipped files. */
+        Move 0 to hoNoOps
+        If ((peRunOrigin(Self) = eRunPlan or peRunOrigin(Self) = eRunDeepScan) and RefactorSettings.bReadOnly = False) Begin
+            Get Create (RefClass(cPlanNoOps)) to hoNoOps
+            If (hoNoOps <> 0) Begin
+                Get StampsOf of hoNoOps RefactorSettings.FileData.asFullFileNames to asNoOpBefore
+                Get _SelectedFunctionNames to asNoOpFns
+            End
+        End
+
         Get GetTheWorkDone RefactorSettings hoEditor to eResponse
+
+        If (hoNoOps <> 0) Begin
+            If (eResponse = eEngineOK) ;
+                Send RecordRun of hoNoOps RefactorSettings.FileData.asFullFileNames asNoOpBefore asNoOpFns
+            Send Destroy of hoNoOps
+        End
 
         // Safety net: RestyleDDOs (eOtherFunctionAll) may have redirected the
         // active filelist to the target workspace. Restore DFRefactor's own
@@ -288,13 +769,22 @@ Class cRefactorEngine is a BusinessProcess
         Send Stop_StatusPanel of ghoStatusPanel
         Send Destroy of (phoDD(Self))
 
+        // Guided-loop bookkeeping: stamp a finished PLAN run per workspace (any outcome - even a
+        // partial/cancelled run may have applied fixes), so the dashboard's cycle strip can relight
+        // Compile ("plan applied - recompile to verify") until the next analyze supersedes the stamp.
+        // Stamped BEFORE the broadcast below, so the dashboard's own refresh already sees it.
+        If (peRunOrigin(Self) = eRunPlan) ;
+            Send WritePlanRunStamp of ghoApplication
+
         // FT dashboard: announce run completion so the dashboard re-reads its live gates (the Revert chip
         // lights once a backup exists). Fired on ALL outcomes (a partial/cancelled run can still create a
         // backup) and before the batch-exit. No-op in non-FT builds (no view handles RefreshAfterRun).
         Broadcast Send RefreshAfterRun of (Client_Id(phoMainPanel(ghoApplication)))
-        
+
         If (pbBatchMode(Self) = True) Begin
-            Send Exit_Application
+            // Record the outcome AND force-exit with a code (0 ok / 1 fail), so a build can check both the
+            // result file and %ERRORLEVEL%. (A DataFlex GUI app can't return a code from a graceful close.)
+            Send ExitBatchWithCode of ghoApplication eResponse sText
         End
         If (eResponse = eEngineOK) Begin
             If (RefactorSettings.bShowSummary = True or RefactorSettings.bCountSourceLines = True) Begin
@@ -307,18 +797,93 @@ Class cRefactorEngine is a BusinessProcess
                 Send Popup of (oEngineErrorLog_dg(Client_Id(phoMainPanel(ghoApplication))))
             End
         End
+        // Consume the one-shot flags: the NEXT run must ask + summarise normally, whatever this one was.
+        Set pbSilentRun to False
+        Set pbStartQuestionAsked to False
     End_Procedure
+
+    /* THE CHARACTER-MODE GATE (Nils 2026-09-20). True - and the reason noted once for the summary -
+       when the run's main program is a character-mode program and this function rewrites Windows
+       user-interface objects (FunctionNeedsWindowsProgram has the list and the criterion). Asked
+       at the two places a selected function becomes a call: BuildDispatchList for the per-line and
+       per-file types, eOtherFunctionsAll for the whole-list type. The start question names the
+       same functions beforehand (WindowsOnlySelectedFunctions). Reports are never gated. */
+    Function _SkipForCharacterMode String sFunctionName Returns Boolean
+        Boolean bNeedsWindows
+
+        If (pbCharacterModeRun(Self) = False) ;
+            Function_Return False
+        Get FunctionNeedsWindowsProgram of ghoFuncLib sFunctionName to bNeedsWindows
+        If (bNeedsWindows = False) ;
+            Function_Return False
+        Send AddRunNote of ghoFuncLib sFunctionName ("SKIPPED - it rewrites Windows user-interface objects, and this program is a character-mode program that has no Windows user interface yet. Its screens have to be rewritten by hand first - see the character-mode inventory on the Guided Dashboard.")
+        Function_Return True
+    End_Function
+
+    /* THE NEVER-PICK GATE (Nils 2026-10-06). True - and the reason noted once for the summary - when the
+       function is on the user's never-pick list (pasNeverPickRun, the Never pick column of Select
+       Functions). Until today the list only kept the tool from TICKING such a function - a plan listed
+       it unticked, Select All left it - and a tick from anywhere else still ran it: a tester with a
+       DataFlex 3.2 program set RemoveLocalKeyWord aside, exactly as the board told them to, and a run
+       removed every Local anyway (GitHub, 2026-10-06). The list is a block now: asked at the same two
+       dispatch points as the character-mode gate, so no route to the engine can run a listed function,
+       and the start question names them beforehand (NeverPickSelectedFunctions). Case-blind, as every
+       function name is. */
+    Function _SkipForNeverPick String sFunctionName Returns Boolean
+        String[] asList
+
+        Get pasNeverPickRun to asList
+        If (SizeOfArray(asList) = 0) ;
+            Function_Return False
+        If (SearchArray(Trim(sFunctionName), asList, Desktop, RefFunc(DFSTRICMP)) = -1) ;
+            Function_Return False
+        Send AddRunNote of ghoFuncLib sFunctionName ("SKIPPED - it is on your never-pick list (the Never pick column of Select Functions), so it does not run. Untick it there to run it.")
+        Function_Return True
+    End_Function
+
+    // Resolve the SELECTED functions of one type ONCE per run (see tEngineDispatchFn): the
+    // Constrained_Find + Eval + Trims happen N times here instead of once per LINE x FUNCTION.
+    Function BuildDispatchList Integer eType Returns tEngineDispatchFn[]
+        tEngineDispatchFn[] aDisp
+        Integer iCount
+        Boolean bSkip
+
+        Move 0 to iCount
+        Constraint_Set (Self + eType) Clear
+        Constrained_Clear eq FunctionsA by Index.4
+        Constrain FunctionsA.Type eq eType
+        Constrain FunctionsA.Selected eq True
+        Constrain FunctionsA.bPublished eq True
+        Constrained_Find First FunctionsA by Index.4
+        While (Found = True)
+            Get _SkipForCharacterMode (Trim(FunctionsA.Function_Name)) to bSkip
+            If (bSkip = False) ;
+                Get _SkipForNeverPick (Trim(FunctionsA.Function_Name)) to bSkip
+            If (bSkip = False) Begin
+                Move (Trim(FunctionsA.Function_Name)) to aDisp[iCount].sName
+                Move (Trim(FunctionsA.Parameter))     to aDisp[iCount].sParameter
+                Move (Eval("get_" - aDisp[iCount].sName)) to aDisp[iCount].iFunctionID
+                Move FunctionsA.Recnum to aDisp[iCount].iRecnum
+                Increment iCount
+            End
+            Constrained_Find Next
+        Loop
+        Function_Return aDisp
+    End_Function
 
     // This is were the actual refactoring takes place (in a business process).
     Function GetTheWorkDone tRefactorSettings RefactorSettings Handle hoEditor Returns Integer
-        String[] asFiles asFilesOrg asCode asCodeOrg
-        Boolean bOK bEditorFunctions bExists bWriteLine bChanged bIsStudioGenerated bStop bHasChangedExternal
-        String sFileName sPath sText sFolderName sFileShort sLine sMessage
-        Integer eResponse iRetval iErrors iFile iSize iFolders
+        String[] asFiles asFilesOrg asCode asCodeOrg asPinned asAllNoProxy asLifted
+        Boolean bOK bEditorFunctions bExists bWriteLine bChanged bIsStudioGenerated bStop bHasChangedExternal bInList
+        String sFileName sPath sText sFolderName sFileShort sLine sMessage sLifted
+        Integer eResponse iRetval iErrors iFile iSize iFolders iLiftedSeen iLift
         Handle hoView
         DateTime dtEditorLoaded dtFileNow
-        
-        Move 0 to iRetval  
+        Boolean bDiff bPaint bNeedPinned bCountFile bWritten bNeedLookAhead
+        String[] asNoPinned
+        tEngineDispatchFn[] aStdDisp aRemDisp aOtherDisp
+
+        Move 0 to iRetval
         Set piPosition  of ghoProgressBarOverall to 0
         Set piAdvanceBy of ghoProgressBarOverall to 1
         Set piMaximum   of ghoProgressBarOverall to (SizeOfArray(RefactorSettings.FileData.asFullFileNames))
@@ -331,6 +896,52 @@ Class cRefactorEngine is a BusinessProcess
         // types (line-by-line, eOtherFunction, eReportFunction) are also selected.
         Move RefactorSettings.FileData.asFullFileNames to asFiles
         Move asFiles to asFilesOrg
+
+        // Resolve the selected functions ONCE for the whole run (see tEngineDispatchFn): the line
+        // loop and the per-file whole-file pass walk these arrays instead of re-finding + Eval'ing
+        // the FunctionsA rows per line/file.
+        If (RefactorSettings.iSelectedStandardFunctions > 0) Begin
+            Get BuildDispatchList eStandardFunction to aStdDisp
+        End
+        If (RefactorSettings.iSelectedRemoveFunctions > 0) Begin
+            Get BuildDispatchList eRemoveFunction to aRemDisp
+        End
+        If (RefactorSettings.iSelectedOtherFunctions <> 0) Begin
+            Get BuildDispatchList eOtherFunction to aOtherDisp
+        End
+
+        /* IS THE PINNED-INDICATOR SET NEEDED AT ALL THIS RUN? (Nils 2026-07-29: a Tidy Up over 1,796
+           files with ONE unrelated function selected - ChangeTypeface, already run, so no hits - was
+           still grinding past ten minutes.)
+
+           _ComputePinnedIndicators walks every file TWICE and stats the disk once per 'use' line, and
+           it ran for EVERY file of EVERY run. Only the four indicator converters ever read what it
+           produces, so on a run that selected none of them the whole thing is pure cost - roughly a
+           threefold multiplier on the per-file scan, spent to fill a property nothing will read.
+
+           Resolved ONCE here from the already-built dispatch lists (which name the selected
+           functions), not per file. When it is not needed the property is CLEARED rather than left
+           alone, so a set computed by an earlier run in the same session cannot leak into this one. */
+        Move False to bNeedPinned
+        Send _NoteIfPinnedNeeded (&aStdDisp) (&bNeedPinned)
+        Send _NoteIfPinnedNeeded (&aRemDisp) (&bNeedPinned)
+        Send _NoteIfPinnedNeeded (&aOtherDisp) (&bNeedPinned)
+
+        // The side-product look-ahead, resolved the same way. Line-by-line only: no whole-file
+        // function asks for it.
+        Move False to bNeedLookAhead
+        Send _NoteIfLookAheadNeeded (&aStdDisp) (&bNeedLookAhead)
+
+        /* THE RUN'S FILE SET, for the include lift (2026-09-14; the contract is the block above
+           _LiftIncludeVerdict in cRefactorFuncLib). A local include that reads an indicator this run
+           converts CONVERTS WITH IT when every file that 'use's it is in this list: the pin walk
+           records such an include (pasRunIncludes) and the loop below appends it to asFiles, so it
+           takes the same road as every other file - backup, the line pass, the whole-file pass, the
+           write. Only when the pinned set is needed at all: otherwise no walk runs and nothing lifts. */
+        Move 0 to iLiftedSeen
+        Set pasLiftedIncludeNotes to asNoPinned
+        If (bNeedPinned = True) ;
+            Send _SetRunFiles of ghoFuncLib asFiles RefactorSettings.FileData.asFolders
 
         If (RefactorSettings.bCountSourceLines or RefactorSettings.iSelectedLineByLineFunctions or RefactorSettings.iSelectedFullFileFunctions) Begin
             Move (SizeOfArray(RefactorSettings.FileData.asFolders)) to iFolders
@@ -355,26 +966,89 @@ Class cRefactorEngine is a BusinessProcess
                 // Per-file execution context for the error logger; the type-loops
                 // below refine it to the specific function name.
                 Set psExecutionContext of ghoFuncLib to ("File: " + sFileName)
-                Get ReadFileToStringArray sFileName to asCode 
+                Get ReadFileToStringArray sFileName to asCode
                 Move asCode to asCodeOrg
+                Move False to bDiff
+                Move False to bCountFile   // True only on the path that used to call IncrementFileCount
+                /* pasOriginalSource is read by exactly ONE function - DeclareRefactoredIndicators,
+                   an eOtherFunction - but a property Set of a String[] COPIES the whole array, so
+                   an unconditional stash pays a full file copy on every file of every run. Gated
+                   on the only condition under which a reader can exist. (Nils 2026-07-28: the
+                   status panel froze on a 20,000-line file.) */
+                If (RefactorSettings.iSelectedOtherFunctions <> 0) ;
+                    Set pasOriginalSource to asCodeOrg
                 Set piPosition  of ghoProgressBar to 0
                 Set piAdvanceBy of ghoProgressBar to 1
                 Set piMaximum   of ghoProgressBar to (SizeOfArray(asCodeOrg))
                 Send ClearFuncLibProperties of ghoFuncLib
+                // PINNED indicators for THIS file (GROUP/ALL participants + names read by a 'use'd local
+                // include): the four indicator converters leave these entirely legacy so they can't decouple
+                // from an unconvertible reference. Set AFTER ClearFuncLibProperties (which does not touch it)
+                // so it stands for the whole per-file line pass + the eOtherFunction (DeclareRefactoredIndicators)
+                // that follows. Empty for the overwhelmingly common file, so a no-op there. (Nils 2026-07-09.)
+                /* (&asCodeOrg), not asCodeOrg. The parameter is declared ByRef and the function only
+                   READS it, but passing the array by value copies every line - and this is the ONE
+                   call site of eight that did (cModAnalyzer, ModAnalyzerFT, the tests and the
+                   funclib's own caller all pass the address). It sat on the hottest path there is:
+                   once per file, every run. It also does the file's include scan, so it is slow AND
+                   silent - hence the Update_StatusPanel below, which pumps the message queue. */
+                Get PanelPaintDue of ghoStatusPanel to bPaint
+                If (bPaint = True) ;
+                    Send Update_StatusPanel of ghoStatusPanel ("Scanning:" * String(sFileShort))
+                If (bNeedPinned = True) Begin
+                    // The panel's function line still named the PREVIOUS file's last function through
+                    // this whole pre-scan (Nils 2026-09-21: "GuardAnsi... is extremely slow" - it had
+                    // finished; the include lift was reading 1,414 files under its name).
+                    Set Message_Text of ghoStatusPanel to "Pre-scan: which indicators must stay legacy"
+                    Get _ComputePinnedIndicators of ghoFuncLib (&asCodeOrg) sFileName to asPinned
+                    Set pasPinnedIndicators of ghoFuncLib to asPinned
+                    // A LOCAL INCLUDE THAT CONVERTS WITH THE RUN joins the list (the block above the
+                    // loop): appended at the tail, once, so the For walks it after the selection - a
+                    // DataFlex For re-reads its bound every pass (measured 2026-09-14). Its own pin
+                    // walk, its own backup, its own write, like any file. The summary names it.
+                    Get pasRunIncludes of ghoFuncLib to asLifted
+                    While (iLiftedSeen < SizeOfArray(asLifted))
+                        Move asLifted[iLiftedSeen] to sLifted
+                        Move False to bInList
+                        For iLift from 0 to iSize
+                            If (Lowercase(asFiles[iLift]) = Lowercase(sLifted)) ;
+                                Move True to bInList
+                        Loop
+                        If (bInList = False) Begin
+                            Move sLifted to asFiles[SizeOfArray(asFiles)]
+                            Increment iSize
+                            Set piMaximum of ghoProgressBarOverall to (SizeOfArray(asFiles))
+                            Send _NoteLiftedInclude sLifted sFileShort
+                        End
+                        Increment iLiftedSeen
+                    Loop
+                End
+                Else Begin
+                    Set pasPinnedIndicators of ghoFuncLib to asNoPinned
+                    // Reasons go with the names (see cBaseFuncLib pasPinnedReasons).
+                    Set pasPinnedReasons of ghoFuncLib to asNoPinned
+                End
                 
                 If (RefactorSettings.bCountSourceLines = False) Begin
                     Move ("Refactoring File No:" * String(iFile + 1) * "of:" * String(iSize + 1)) to sMessage
+                    // A batch run says so on the panel too, in the run summary's words (Nils 2026-10-24).
+                    If (pbBatchMode(Self) = True) ;
+                        Move (sMessage * "-" * RunOriginText(Self, eRunBatch)) to sMessage
                 End
                 Else Begin
                     Move "Counting source lines" to sMessage    
                 End
-                Set Caption_text of ghoStatusPanel to sMessage
+                Set Caption_Text of ghoStatusPanel to sMessage
                 Set Title_Text of ghoStatusPanel to ("Folder:" * String(sFolderName))
                 
                 // We do _not_ refactor files generated by the Studio for COM components (.ocx files et al)
                 Get _IsDataFlexCOMProxyClassesFile of ghoFuncLib sFileName to bIsStudioGenerated
                 If (bIsStudioGenerated = False) Begin
                     Set TableName_Text of ghoStatusPanel to ("File:" * String(sFileShort))
+                    // Keep psCurrentSourceFileName honest: it was set ONCE, to FileData[0], so for
+                    // every file after the first it named the wrong one. A refactor function that
+                    // wants to report WHERE it declined something needs the real current file.
+                    Set psCurrentSourceFileName to sFileName
 
                     // *** Count source lines: (Only) ***
                     If (RefactorSettings.bCountSourceLines = True) Begin
@@ -383,6 +1057,9 @@ Class cRefactorEngine is a BusinessProcess
                     
                     Else Begin  
                         If (RefactorSettings.bReadOnly = False) Begin
+                            Get PanelPaintDue of ghoStatusPanel to bPaint
+                            If (bPaint = True) ;
+                                Send Update_StatusPanel of ghoStatusPanel ("Backing up:" * String(sFileShort))
                             Get SaveBackupFile of ghoApplication sFileName to bOK
                             If (bOK = False) Begin
                                 Error DFErr_Program ("The file could not be copied to the backup area and no attempt was made to change it.\n" * String(sFileName))
@@ -392,23 +1069,23 @@ Class cRefactorEngine is a BusinessProcess
 
                         // *** Line-by-line functions: ***
                         If (RefactorSettings.iSelectedLineByLineFunctions) Begin
-                            Get LineByLineFunctions (&asCode) RefactorSettings to bChanged
+                            Get LineByLineFunctions (&asCode) RefactorSettings (&aStdDisp) (&aRemDisp) bNeedLookAhead to bChanged
                             If (bChanged = True) Begin
-                                Get WriteStringArrayToFile asCode sFileName to bOK
+                                Get WriteStringArrayToFile (&asCode) sFileName to bOK
                             End
                         End
         
                         // *** Editor Functions ***
                         If (RefactorSettings.iSelectedEditorFunctions <> 0) Begin
                             // This will display the file in the toolbar.
-                            Get eEditorFunctions sFileName (&asCode) RefactorSettings to bChanged 
-                        End     
+                            Get eEditorFunctions sFileName (&asCode) RefactorSettings to bChanged
+                        End
                         
                         If (RefactorSettings.iSelectedFullFileFunctions) Begin
                             // *** Type: eOtherFunction ***
                             //           One file as a string array is passed.
                             If (RefactorSettings.iSelectedOtherFunctions <> 0) Begin
-                                Get eOtherFunctions sFileName (&asCode) RefactorSettings to bOK
+                                Get eOtherFunctions sFileName (&asCode) RefactorSettings (&aOtherDisp) to bOK
                             End
                 
                             // *** Type: eReportFunction ***
@@ -420,7 +1097,26 @@ Class cRefactorEngine is a BusinessProcess
                                 Get eReportFunctions (&asCode) RefactorSettings to bOK
                             End
                         End
-                        Send IncrementFileCount bOK
+                        // Count "changed" by the ACTUAL change to the file, not the shared bOK - which the
+                        // blocks above clobber (SaveBackupFile / the line-by-line write / eOtherFunctions /
+                        // eReportFunctions all reuse it), so a file whose line-by-line functions DID change it
+                        // but whose selected whole-file function found nothing was reported as unchanged. This
+                        // is the SAME predicate the write below (line ~457) uses, so the count + the write can
+                        // never disagree. (Nils, LegacyApp: 18 Uppercase lines changed yet "0 of 7 files".)
+                        /* Computed ONCE into bDiff and reused by the write below, which used to run
+                           the identical whole-array compare a second time - two full sweeps of a
+                           20,000-line file per file, both of them silent. Nothing between here and
+                           the write touches asCode (only Cancel_Check), so the answer cannot change.
+                           bDiff is initialised False per file, which is also the right answer for
+                           the paths that skip this block (a COM proxy, or count-source-lines mode):
+                           neither alters asCode. */
+                        Get PanelPaintDue of ghoStatusPanel to bPaint
+                        If (bPaint = True) ;
+                            Send Update_StatusPanel of ghoStatusPanel ("Checking for changes:" * String(sFileShort))
+                        Move (IsSameArray(asCode, asCodeOrg) = False) to bDiff
+                        // Counted AFTER the write below (bCountFile), not here: a file whose write fails
+                        // is not a changed file, however different the array is (2026-08-18).
+                        Move True to bCountFile
                     End
                 End
 
@@ -437,10 +1133,23 @@ Class cRefactorEngine is a BusinessProcess
                     Function_Return eEngineUserCancel
                 End
 
-                If (RefactorSettings.bReadOnly = False and (IsSameArray(asCode, asCodeOrg) = False))  Begin
+                // bDiff was computed above - see the comment there for why recomputing it here was
+                // a second full sweep of the same two arrays.
+                Move True to bWritten
+                If (RefactorSettings.bReadOnly = False and bDiff = True)  Begin
                     Set psExecutionContext of ghoFuncLib to ("Writing file: " + sFileName)
-                    Get WriteStringArrayToFile asCode sFileName to bOK
+                    Get PanelPaintDue of ghoStatusPanel to bPaint
+                    If (bPaint = True) ;
+                        Send Update_StatusPanel of ghoStatusPanel ("Writing:" * String(sFileShort))
+                    Get WriteStringArrayToFile (&asCode) sFileName to bWritten
                 End
+                /* The changed-files total counts what reached the DISK. A dry run (bReadOnly) counts the
+                   would-be changes as before; a real run counts a differing file only when its write
+                   succeeded - the failure itself is recorded by ReportUnwritableFile and listed in the
+                   summary. (Until 2026-08-18 the count was taken from the array diff before the write,
+                   so a read-only file was "changed" in the total while unchanged on disk.) */
+                If (bCountFile = True) ;
+                    Send IncrementFileCount (bDiff = True and (RefactorSettings.bReadOnly = True or bWritten = True))
                 If (RefactorSettings.bWorkspaceMode = False and RefactorSettings.iSelectedEditorFunctions = 0) Begin
                     Send LoadFile of hoEditor sFileName
                 End
@@ -474,7 +1183,34 @@ Class cRefactorEngine is a BusinessProcess
                     End
                 Loop
             End
-            Get eOtherFunctionsAll (&asFiles) RefactorSettings to bOK
+            /* STUDIO-GENERATED COM PROXIES ARE NOT OURS TO WRITE, and this path had no such guard.
+
+               The per-file loop above skips them (_IsDataFlexCOMProxyClassesFile), but an
+               eOtherFunctionAll is handed the WHOLE list and iterates it itself, so that skip never
+               reached it. ChangeCollidingMethodName therefore renamed ComItem inside MSWORD.pkg,
+               Excel9.pkg, msoutl.pkg and six other generated wrappers - 214 declarations - which
+               unresolved every "Set ComItem" left in the workspace (E 4306) and cost nine files
+               restored from backup (WinServ, 2026-08-26).
+
+               A FILTERED COPY, not asFiles itself: the report path below still gets the full list,
+               where reading a proxy is harmless because nothing is written. The cost is that an
+               eOtherFunctionAll which REWRITES the array (the ReadOnly restore below implies some
+               do) no longer hands that back. The list is input to these functions, and not
+               corrupting a vendor package is worth more than propagating an edit to one. The files
+               are still backed up above - a backup of a file we then decline to touch is harmless,
+               and cheaper than a second reason to get this list wrong. */
+            Move (ResizeArray(asAllNoProxy, 0)) to asAllNoProxy
+            Move (SizeOfArray(asFiles)) to iSize
+            Decrement iSize
+            For iFile from 0 to iSize
+                Move asFiles[iFile] to sFileName
+                If (sFileName <> "") Begin
+                    Get _IsDataFlexCOMProxyClassesFile of ghoFuncLib sFileName to bIsStudioGenerated
+                    If (bIsStudioGenerated = False) ;
+                        Move sFileName to asAllNoProxy[SizeOfArray(asAllNoProxy)]
+                End
+            Loop
+            Get eOtherFunctionsAll (&asAllNoProxy) RefactorSettings to bOK
             If (RefactorSettings.bReadOnly = True) Begin
                 Move asFilesOrg to asFiles
             End
@@ -483,13 +1219,12 @@ Class cRefactorEngine is a BusinessProcess
         // *** Type: eReportFunctionAll ***
         //      All source files with full pathing is passed as a string array.
         //      Makes no code changes!
-        If (RefactorSettings.iSelectedReportAllFunctions > 0) Begin                
+        If (RefactorSettings.iSelectedReportAllFunctions > 0) Begin
             Get eReportFunctionsAll (&asFiles) RefactorSettings to bOK
             If (RefactorSettings.bReadOnly = True) Begin
                 Move asFilesOrg to asFiles
             End
         End
-        
         Get IsFileTimeNewer of hoEditor sFileName to bHasChangedExternal
         // FileModTime has seconds-only precision (DateSetMillisecond zeroes the ms
         // field in cRefactorScintillaEditor.pkg's FileModTime). When eOtherFunctionAll
@@ -530,43 +1265,104 @@ Class cRefactorEngine is a BusinessProcess
         Function_Return iRetval
     End_Function
 
-    Function LineByLineFunctions String[] ByRef asCode tRefactorSettings RefactorSettings Returns Boolean
-        Integer iLine iSize iItem iCRLFPos
-        Boolean bOK bChange bWriteLine
+    Function LineByLineFunctions String[] ByRef asCode tRefactorSettings RefactorSettings tEngineDispatchFn[] ByRef aStdDisp tEngineDispatchFn[] ByRef aRemDisp Boolean bNeedLookAhead Returns Boolean
+        Integer iLine iSize iItem iCRLFPos iLastUiTick iMacro
+        Boolean bOK bChange bWriteLine bMacro bHasSideProducts bKeep
         String sLine
-        String[] asCodeNew asCodeOrg
+        String[] asCodeNew asCodeOrg asNeedles asNoLookAhead
+        Boolean[] abMacro
 
+        Move 0 to iLastUiTick
         Move asCode to asCodeOrg
         Send ClearFuncLibProperties of ghoFuncLib
+        /* THE LINE PASS'S LOOK-AHEAD (pasLinePassSource / piLinePassIndex, 2026-09-08). A command
+           converter that drops a side product of the legacy string commands - Found, strmark,
+           strlen - must see the lines BELOW its own to know whether anything reads what it is
+           about to drop. asCode is the file AS READ for the whole loop below (each line function's
+           output accumulates in asCodeNew), so an index into it is exact for everything ahead.
+
+           Two gates, because a String[] property Set copies the array: bNeedLookAhead says a
+           converter that asks for it is selected at all, and _FileContainsAnyText says this file
+           even mentions one of the three names. Nearly every file fails the second one and never
+           pays for the copy. Cleared again on the way out, so no later pass - and no next run in
+           the same session - can read a stale file. */
+        Move False to bHasSideProducts
+        If (bNeedLookAhead = True) Begin
+            Move (StrSplitToArray("found|strmark|strlen", "|")) to asNeedles
+            Get _FileContainsAnyText of ghoFuncLib (&asCode) (&asNeedles) to bHasSideProducts
+        End
+        If (bHasSideProducts = True) ;
+            Set pasLinePassSource of ghoFuncLib to asCode
+        Set pbLinePassSideProducts of ghoFuncLib to bHasSideProducts
+        Set piLinePassIndex of ghoFuncLib to -1
         Move (SizeOfArray(asCode)) to iSize
         Decrement iSize
         Move 0 to iItem
         Move False to bChange
+        /* THE RULE: MACRO CODE IS NEVER REFACTORED (Nils, 2026-09-07). A #COMMAND body, a #DATA block and a
+           '!' directive line are still tokenized below - the lexer's state must advance past them - but no line
+           function ever receives one, and they are written back exactly as read (see cRefactorFuncLib's macro-code guard). The
+           converters' own guards stay; the rule no longer depends on each of them remembering it. */
+        Get MacroCodeFlags of ghoFuncLib (&asCode) to abMacro
+        Move 0 to iMacro
+        For iLine from 0 to iSize
+            If (abMacro[iLine] = True) ;
+                Increment iMacro
+        Loop
+        Send _CountMacroCodeKept (psCurrentSourceFileName(Self)) iMacro
+        // Panel "Function Type" set ONCE per file - it used to be set per LINE at the top of
+        // eStandardFunctions/eRemoveFunctions: a window text op x 530k lines (2026-07-04 hunt).
+        If (RefactorSettings.iSelectedStandardFunctions > 0) Begin
+            Set Message_Text of ghoStatusPanel to ("Function Type:" * "eStandardFunction")
+        End
+        If (RefactorSettings.iSelectedRemoveFunctions > 0) Begin
+            Set Message_Text of ghoStatusPanel to ("Function Type:" * "eRemoveFunction")
+        End
 
         For iLine from 0 to iSize
-            Send DoAdvance of ghoProgressBar
-            Send UpdateStatusBar ("Refactoring line:" * String(iLine) * "of:" * String(iSize + 1)) True
-            Set Action_Text of ghoStatusPanel  to ("Refactoring line:" * String(iLine) * "of:" * String(iSize + 1))
+            // UI THROTTLE (2026-07-04 hunt): the per-line bar advance + THREE status text sets measured
+            // 5.9 of 45 run-minutes (0.67 ms x 530k lines - the string building rode along). ~20
+            // updates/s is visually identical; the absolute piPosition set lands the bar in one op.
+            If ((GetTickCount() - iLastUiTick) >= 50) Begin
+                Move (GetTickCount()) to iLastUiTick
+                Set piPosition of ghoProgressBar to (iLine + 1)
+                Send UpdateStatusBar ("Refactoring line:" * String(iLine) * "of:" * String(iSize + 1)) True
+                Set Action_Text of ghoStatusPanel  to ("Refactoring line:" * String(iLine) * "of:" * String(iSize + 1))
+            End
 
             // Read a line from the source file's string array.
             // This is the same string that potentially gets changed by several
             // refactoring functions, as the value will be passed as ByRef.
             Move asCode[iLine] to sLine
             Send InitializeTokenizer of ghoFuncLib sLine
+            // Macro code: tokenized (above), never handed to a function (below) - the rule.
+            Move abMacro[iLine] to bMacro
+            /* ...AND THE SAME FOR A MULTI-LINE STRING'S TEXT AND A #HEADER REGION (2026-10-29): the tokenizer marks
+               those lines, and no function gets one. A string's text is its value, and a header is not ours to
+               refactor - yet four line functions changed both, because they read the raw line and test nothing:
+               RemovePropertyPublic, NormalizeArrayNotation, RemoveOldStudioMarkers, RemoveResidentImageOption.
+               One gate here keeps every function, and every function still to come, off those lines. A line wholly
+               inside a block comment and a report image's text are marked too (2026-10-30). */
+            Get pbKeepLineAsWritten of ghoFuncLib to bKeep
 
             // Only re-tokenize if A_InsertSpaceAfterParenthesis actually modified the line.
             // Re-tokenizing an unmodified line corrupts state when the line is an image end
             // marker (/*): the first call correctly clears pbIsInPage, but the second call
             // sees pbIsInPage=False and misidentifies /* as a DF23 comment start.
-            Get A_InsertSpaceAfterParenthesis of ghoFuncLib (&sLine) "" to bOK
-            If (bOK = True) Begin
-                Send InitializeTokenizer of ghoFuncLib sLine
+            If (bMacro = False and bKeep = False) Begin
+                Get A_InsertSpaceAfterParenthesis of ghoFuncLib (&sLine) "" to bOK
+                If (bOK = True) Begin
+                    Send InitializeTokenizer of ghoFuncLib sLine
+                End
             End
 
             Move True to bWriteLine
+            // The line the converters are holding, for the side-product look-ahead above.
+            If (bHasSideProducts = True) ;
+                Set piLinePassIndex of ghoFuncLib to iLine
             // *** eStandardFunctions ***
-            If (RefactorSettings.iSelectedStandardFunctions > 0 and bWriteLine = True) Begin
-                Get eStandardFunctions (&sLine) RefactorSettings to bOK
+            If (RefactorSettings.iSelectedStandardFunctions > 0 and bWriteLine = True and bMacro = False and bKeep = False) Begin
+                Get eStandardFunctions (&sLine) (&aStdDisp) to bOK
                 If (bChange = False and bOK = True) Begin
                     Move True to bChange
                 End
@@ -575,8 +1371,8 @@ Class cRefactorEngine is a BusinessProcess
             // *** eRemoveFunctions ***
             // If at least one of these functions sets bWriteLine to false,
             // the read source line will _not_ be written back to disk.
-            If (RefactorSettings.iSelectedRemoveFunctions > 0) Begin
-                Get eRemoveFunctions (&sLine) RefactorSettings (&bWriteLine) to bOK
+            If (RefactorSettings.iSelectedRemoveFunctions > 0 and bMacro = False and bKeep = False) Begin
+                Get eRemoveFunctions (&sLine) (&aRemDisp) (&bWriteLine) to bOK
                 If (bChange = False and bOK = True) Begin
                     Move True to bChange
                 End
@@ -588,17 +1384,22 @@ Class cRefactorEngine is a BusinessProcess
                 // Split it back into separate array elements so the file (and the whole-file pass) see proper
                 // lines. No current single-line function emits CRLF, so this is a plain one-element store in
                 // every other case (the While loop simply does not run).
-                Move (Pos(CS_CRLF, sLine)) to iCRLFPos
+                Move (Pos(C_NewLine, sLine)) to iCRLFPos
                 While (iCRLFPos > 0)
                     Move (Left(sLine, (iCRLFPos - 1))) to asCodeNew[iItem]
                     Increment iItem
                     Move (Mid(sLine, (Length(sLine) - iCRLFPos - 1), (iCRLFPos + 2))) to sLine
-                    Move (Pos(CS_CRLF, sLine)) to iCRLFPos
+                    Move (Pos(C_NewLine, sLine)) to iCRLFPos
                 Loop
                 Move sLine to asCodeNew[iItem]
                 Increment iItem
             End
         Loop
+
+        // Never leave a file behind in the funclib (see the look-ahead note above).
+        Set pasLinePassSource of ghoFuncLib to asNoLookAhead
+        Set pbLinePassSideProducts of ghoFuncLib to False
+        Set piLinePassIndex of ghoFuncLib to -1
 
         If (RefactorSettings.bReadOnly = True) Begin
             Move asCodeOrg to asCode
@@ -616,26 +1417,18 @@ Class cRefactorEngine is a BusinessProcess
     //    
     // *** Type: eRemoveFunction ***
     //           Line-by-line functions
-    Function eRemoveFunctions String ByRef sLine tRefactorSettings RefactorSettings Boolean ByRef bWriteLine Returns Boolean
+    Function eRemoveFunctions String ByRef sLine tEngineDispatchFn[] ByRef aDisp Boolean ByRef bWriteLine Returns Boolean
         Boolean bChanged bChangesMade
-        String sFunctionName sParameter sLineBefore
-        Integer iFunctionID
-        
+        String sLineBefore
+        Integer iFunctionID j iMax
+
         Move False to bChangesMade
-        Set Message_Text of ghoStatusPanel to ("Function Type:" * "eRemoveFunction")
-        Constraint_Set (Self + eRemoveFunction) Clear
-        Constrained_Clear eq FunctionsA by Index.4
-        Constrain FunctionsA.Type eq eRemoveFunction
-        Constrain FunctionsA.Selected eq True
-        Constrain FunctionsA.bPublished eq True
-        Constrained_Find First FunctionsA by Index.4
-        While (Found = True)    
-            Move (Trim(FunctionsA.Parameter)) to sParameter
-            Move (Trim(FunctionsA.Function_Name)) to sFunctionName
-            Set psExecutionContext of ghoFuncLib to sFunctionName
-            Move (Eval("get_" - (sFunctionName))) to iFunctionID
+        Move (SizeOfArray(aDisp) - 1) to iMax
+        For j from 0 to iMax
+            Set psExecutionContext of ghoFuncLib to aDisp[j].sName
+            Move aDisp[j].iFunctionID to iFunctionID
             Move sLine to sLineBefore
-            Get iFunctionID of ghoFuncLib (&sLine) sParameter to bChanged
+            Get iFunctionID of ghoFuncLib (&sLine) aDisp[j].sParameter to bChanged
             If (bChanged = True) Begin
                 Move False to bWriteLine
                 // Same re-tokenize as eStandardFunctions, so a following remove-function sees the masked
@@ -644,40 +1437,37 @@ Class cRefactorEngine is a BusinessProcess
                 // corrupt lexer state on an image /* marker (see the LineByLineFunctions note).
                 If (sLine <> sLineBefore) ;
                     Send InitializeTokenizer of ghoFuncLib sLine
+                Move aDisp[j].iRecnum to FunctionsA.Recnum
+                Find eq FunctionsA by Recnum
                 Reread FunctionsA
                     Add 1 to FunctionsA.Counter
                     SaveRecord FunctionsA
                     Move True to bChangesMade
                 Unlock
             End
-            Constrained_Find Next            
         Loop
-    
+
         Function_Return bChangesMade
-    End_Function              
+    End_Function
     
-    // *** Type: eStandardFunction ***
-    //           Line-by-line functions
-    Function eStandardFunctions String ByRef sLine tRefactorSettings RefactorSettings Returns Boolean
+    // *** Type: eStandardFunction *** - line-by-line, dispatched from the PRE-RESOLVED list
+    // (BuildDispatchList; see tEngineDispatchFn): no per-line Constrained_Find / Eval / Trims,
+    // no by-value tRefactorSettings (its FileData deep-copied the run's whole file list per LINE),
+    // and the panel's "Function Type" text is set once per file by the caller - together 8.9 of 45
+    // measured run-minutes (2026-07-04). The per-hit counter write stays LIVE via the stored
+    // Recnum (it measured 0.5s per run).
+    Function eStandardFunctions String ByRef sLine tEngineDispatchFn[] ByRef aDisp Returns Boolean
         Boolean bChanged bChangesMade
-        String sFunctionName sParameter sLineBefore
-        Integer iFunctionID
-        
+        String sLineBefore
+        Integer iFunctionID j iMax
+
         Move False to bChangesMade
-        Set Message_Text of ghoStatusPanel to ("Function Type:" * "eStandardFunction")
-        Constraint_Set (Self + eStandardFunction) Clear
-        Constrained_Clear eq FunctionsA by Index.4
-        Constrain FunctionsA.Type eq eStandardFunction        
-        Constrain FunctionsA.Selected eq True
-        Constrain FunctionsA.bPublished eq True
-        Constrained_Find First FunctionsA by Index.4
-        While (Found = True)    
-            Move (Trim(FunctionsA.Parameter))     to sParameter
-            Move (Trim(FunctionsA.Function_Name)) to sFunctionName
-            Set psExecutionContext of ghoFuncLib to sFunctionName
-            Move (Eval("get_" - (sFunctionName))) to iFunctionID
+        Move (SizeOfArray(aDisp) - 1) to iMax
+        For j from 0 to iMax
+            Set psExecutionContext of ghoFuncLib to aDisp[j].sName
+            Move aDisp[j].iFunctionID to iFunctionID
             Move sLine to sLineBefore
-            Get iFunctionID of ghoFuncLib (&sLine) sParameter to bChanged
+            Get iFunctionID of ghoFuncLib (&sLine) aDisp[j].sParameter to bChanged
             If (bChanged = True) Begin
                 // The function rewrote sLine, so the shared tokenizer's masked line (sOverstrikeLine)
                 // now holds stale positions. Re-tokenize so the NEXT line-by-line function sees offsets
@@ -688,41 +1478,132 @@ Class cRefactorEngine is a BusinessProcess
                 // re-tokenize, and never re-tokenizes an unchanged line (which would corrupt an image /* marker).
                 If (sLine <> sLineBefore) ;
                     Send InitializeTokenizer of ghoFuncLib sLine
+                Move aDisp[j].iRecnum to FunctionsA.Recnum
+                Find eq FunctionsA by Recnum
                 Reread FunctionsA
                     Add 1 to FunctionsA.Counter
                     SaveRecord FunctionsA
                     Move True to bChangesMade
                 Unlock
             End
-            Constrained_Find Next
         Loop
-        
+
         Function_Return bChangesMade
     End_Function
     
+    /* Give the Scintilla control a real window, and say whether it now has one.
+
+       THE VIEW IS PAGED THE WAY THE APP PAGES IT - the registered Activate_<view> message, sent to
+       the CLIENT AREA. That is the idiom everywhere else in both builds:
+           Send Activate_oEditorView_vw of (Client_Id(phoMainPanel(Self)))      DFRefactor.src
+           Send Activate_oEditorView_vw of (Client_Id(ghoCommandBars))          DFRefactorFT.src
+       "Send Activate of <the view object>" is NOT how views are paged here, and "Send Activate of
+       <the control>" only moves focus - a control cannot page itself. Both leave Window_Handle 0.
+
+       That matters because every call into the control goes through EditorMessage, which returns 0
+       without doing anything while Window_Handle is 0. With no window the editor pass loads
+       nothing and changes nothing, silently - Nils, 2026-08-03: "still no change to the
+       indentation - aka it was not run."
+
+       A /bm run executes inside OnStartup, BEFORE Start_UI, so the main panel has no window either
+       and there would be nothing for the view to attach to - hence the panel step first. Safe this
+       early: the interactive path already pops oSelectWorkspace_dg before Start_UI in this same
+       program.
+
+       On failure sWhy carries the ACTUAL handles rather than a guess, so the run says which link
+       in the chain was missing instead of costing another full run to find out. */
+    Function _EnsureEditorRealized Handle hoEditor String ByRef sWhy Returns Boolean
+        Handle hoView hoPanel hoClient hwEditor hwView hwPanel
+
+        Move "" to sWhy
+        If (hoEditor = 0) Begin
+            Move "phoEditor of ghoApplication is 0 - this build has no editor control." to sWhy
+            Function_Return False
+        End
+        If (Window_Handle(hoEditor) <> 0) ;
+            Function_Return True
+
+        Get phoEditorView of ghoApplication to hoView
+        Get phoMainPanel  of ghoApplication to hoPanel
+        Move 0 to hoClient
+        If (hoPanel <> 0) Begin
+            If (Window_Handle(hoPanel) = 0) ;
+                Send Activate of hoPanel
+            Move (Client_Id(hoPanel)) to hoClient
+        End
+
+        If (hoClient <> 0) Begin
+            Send Activate_oEditorView_vw of hoClient
+            Send PumpMsgQueue of Desktop
+        End
+        // Fallback: page the view object directly. Kept because it costs nothing and covers a
+        // build where the client area is not the one holding the view.
+        If (hoView <> 0 and Window_Handle(hoEditor) = 0) Begin
+            Send Activate of hoView
+            Send PumpMsgQueue of Desktop
+        End
+
+        If (Window_Handle(hoEditor) <> 0) ;
+            Function_Return True
+
+        Move 0 to hwView
+        Move 0 to hwPanel
+        If (hoView <> 0) ;
+            Move (Window_Handle(hoView)) to hwView
+        If (hoPanel <> 0) ;
+            Move (Window_Handle(hoPanel)) to hwPanel
+        Move (Window_Handle(hoEditor)) to hwEditor
+        Move ("control obj" * String(hoEditor) * "hWnd" * String(hwEditor) ;
+            + "; view obj" * String(hoView) * "hWnd" * String(hwView) ;
+            + "; panel obj" * String(hoPanel) * "hWnd" * String(hwPanel) ;
+            + "; client obj" * String(hoClient)) to sWhy
+        Function_Return False
+    End_Function
+
     // *** eEditorFunctions ***
     //     One file as a string array is passed.
     Function eEditorFunctions String sFileName String[] ByRef asCode tRefactorSettings RefactorSettings Returns Boolean
         Handle hoEditor
         Integer iFunctionID
-        Boolean bChanged bOK
-        String sFunctionName sParameter 
+        Boolean bChanged bOK bEditorReady
+        Integer iLines iMasked iBack iLost iText iVoid
+        String sFunctionName sParameter sWhyNoEditor
+        String[] asPrev asNow asSaved asTextSaved
+        Integer[] aiMacro aiText
         String[] asCodeOrg 
         
         Move asCode to asCodeOrg
-        Move False to bChanged   
+        /* THE RULE: macro code is never refactored, and neither is a DF 23 multi-line string's text or a #HEADER
+           region - masked before the buffer goes to the editor control, put back on the way out (see
+           the library's macro-code guard). Here a string's closing line is kept as written too (KeptTextFlags), so re-indent
+           cannot move it. The per-function diff below moves each re-indented sentinel back to column 0 first, so
+           it counts real changes only; the masked lines come back exactly as read. */
+        Get MaskKeptText of ghoFuncLib (&asCode) True (&asTextSaved) (&aiText) to iText
+        Get MaskMacroCode of ghoFuncLib (&asCode) (&asSaved) (&aiMacro) to iMasked
+        Send _CountMacroCodeKept sFileName iMasked
+        Move False to bChanged
         Get phoEditor of ghoApplication to hoEditor
         Send ClearFuncLibProperties of ghoFuncLib
         Send SaveErrorState of ghoFuncLib
         
         // This will display the file name in the toolbar.
         Send UpdateStatusBar "Editor Refactoring Functions..." False  
-        Get WriteDataToEditor of hoEditor asCode to bOK
-        If (bOK = False) Begin
-            Error "Could not write asCode string array correctly to editor object."
-            Function_Return False
+        /* ACTIVATE BEFORE WRITING - the editor is a COM control, and every call into it goes
+           through EditorMessage, which returns 0 without doing anything while Window_Handle is 0.
+           Until the view has been paged there IS no window, so the old order (write, THEN activate)
+           fed the whole file into a control that silently dropped it, and WriteDataToEditor's
+           unconditional Function_Return True made that look like success. Nils, 2026-08-03:
+           "I had 10 lines unindented to col 0, before running, and those lines are still at col 0"
+           - while the run reported the pass as run, with 0 lines changed. */
+        Get _EnsureEditorRealized hoEditor (&sWhyNoEditor) to bEditorReady
+        If (bEditorReady = True) Begin
+            Get WriteDataToEditor of hoEditor asCode to bOK
+            Move (bOK) to bEditorReady
+            Send Activate of hoEditor
         End
-        Send Activate of hoEditor
+        // The baseline every per-function diff below measures against: the file AS LOADED, which
+        // is not the same as asCodeOrg once the first editor function has run.
+        Move asCode to asPrev
 
         Set Message_Text of ghoStatusPanel to ("Function Type:" * "eEditorFunction")
         Constraint_Set (Self + eEditorFunction) Clear
@@ -735,14 +1616,41 @@ Class cRefactorEngine is a BusinessProcess
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Lowercase(Trim(FunctionsA.Function_Name))) to sFunctionName
             Set psExecutionContext of ghoFuncLib to sFunctionName
-            Move (Eval("get_" - (sFunctionName))) to iFunctionID             
-            Get iFunctionID of ghoFuncLib asCode sParameter to bOK
-            If (bOK = True) Begin
-                Reread FunctionsA
-                    Add 1 to FunctionsA.Counter
-                    SaveRecord FunctionsA
-                Unlock
-                Move True to bChanged
+            /* An editor function with no live editor can only report "0 changes", which reads as
+               "there was nothing to do". Say what actually happened instead - once per function,
+               in the run summary, next to the rest of that function's result. */
+            If (bEditorReady = False) Begin
+                Send AddRunNote of ghoFuncLib (Trim(FunctionsA.Function_Name)) ;
+                    ("SKIPPED - the source editor could not be given a window, so the file was never" ;
+                     * "loaded into it. Editor functions drive the editor control itself." ;
+                     * "[" + sWhyNoEditor + "]")
+            End
+            Else Begin
+                Move (Eval("get_" - (sFunctionName))) to iFunctionID             
+                Get iFunctionID of ghoFuncLib asCode sParameter to bOK
+                /* COUNT WHAT ACTUALLY CHANGED, by reading the buffer back and diffing it.
+
+                   The old test was the function's own return value - Changed_State, i.e. "is the
+                   document different from its last save point" - which after WriteDataToEditor
+                   loads the file is true no matter what the function did. So this added 1 per
+                   FILE and the summary printed it as "lines". Nils, 2026-08-03, ran the same
+                   workspace twice with ten lines un-indented in between and got "25 lines
+                   Reindented code" both times; 25 was the number of files.
+
+                   One readback per editor function per file. That is one more than the single
+                   readback this loop used to do after it finished, and it is what makes the
+                   number mean what the summary says it means. */
+                Get EditorDataAsStringArray of hoEditor to asNow
+                Get UnindentSentinels of ghoFuncLib (&asNow) to iVoid
+                Get ChangedLineCount of ghoFuncLib asPrev asNow to iLines
+                If (iLines > 0) Begin
+                    Reread FunctionsA
+                        Add iLines to FunctionsA.Counter
+                        SaveRecord FunctionsA
+                    Unlock
+                    Move True to bChanged
+                End
+                Move asNow to asPrev
             End
             Constrained_Find Next
         Loop
@@ -753,48 +1661,131 @@ Class cRefactorEngine is a BusinessProcess
         Else If (bChanged = True) Begin  
             // To not get an "Editor change" data loss message when exiting program.
             Set Changed_State of hoEditor to False
-            Get EditorDataAsStringArray of hoEditor to asCode
+            // asPrev already holds the final buffer - the counting loop above read it back after
+            // the last function ran, so a further round trip would only re-fetch the same lines.
+            Move asPrev to asCode
+        End
+        // The macro lines go back whether or not an editor function changed anything (the read-only path
+        // restored the unmasked original above and needs nothing).
+        If (iMasked > 0 and RefactorSettings.bReadOnly = False) Begin
+            Get UnmaskMacroCode of ghoFuncLib (&asCode) (&asSaved) (&aiMacro) (&iLost) to iBack
+            If (iLost > 0) ;
+                Send AddRunNote of ghoFuncLib sFunctionName (sFileName + ":" * String(iLost) * "macro line(s) an editor function had removed were put back at their original place - macro code is never refactored; check the file.")
+        End
+        If (iText > 0 and RefactorSettings.bReadOnly = False) Begin
+            Get UnmaskKeptText of ghoFuncLib (&asCode) (&asTextSaved) (&aiText) (&iLost) to iBack
+            If (iLost > 0) ;
+                Send AddRunNote of ghoFuncLib sFunctionName (sFileName + ":" * String(iLost) * "line(s) of a multi-line string or a #HEADER region an editor function had removed were put back at their original place - they are never refactored; check the file.")
         End
         Send RestoreErrorState of ghoFuncLib
 
         Function_Return bChanged
     End_Function  
     
+    /* IS THE LINE PASS'S LOOK-AHEAD NEEDED THIS RUN? The same shape, and the same reason, as
+       _NoteIfPinnedNeeded below: only the command converters that drop a side product of the
+       legacy string commands ever read pasLinePassSource, and stashing a file's lines in a
+       property copies the whole array. Resolved ONCE from the already-built dispatch list. The
+       family list itself lives with the converters (_SideProductCommandOfFunction), so this
+       gate cannot drift from the guard it is gating. (Nils 2026-09-08.) */
+    Procedure _NoteIfLookAheadNeeded tEngineDispatchFn[] ByRef aDisp Boolean ByRef bNeeded
+        Integer i iLast
+        String sCmd
+
+        If (bNeeded = True) ;
+            Procedure_Return
+        Move (SizeOfArray(aDisp) - 1) to iLast
+        For i from 0 to iLast
+            Get _SideProductCommandOfFunction of ghoFuncLib (aDisp[i].sName) to sCmd
+            If (sCmd <> "") Begin
+                Move True to bNeeded
+                Procedure_Return
+            End
+        Loop
+    End_Procedure
+
+    /* Does this dispatch list contain any of the FOUR indicator converters - the only readers of
+       pasPinnedIndicators? OR-ed into the flag, so the caller can ask of each list in turn.
+
+       Named explicitly rather than inferred: an indicator converter is recognised by BEING one of
+       these, and a new one added later must be added here too. The alternative (a marker on the
+       function record) is a bigger change for a four-entry list that has been stable all year. */
+    Procedure _NoteIfPinnedNeeded tEngineDispatchFn[] ByRef aDisp Boolean ByRef bNeeded
+        Integer i iLast
+        String sName
+
+        If (bNeeded = True) ;
+            Procedure_Return
+        Move (SizeOfArray(aDisp) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(Trim(aDisp[i].sName))) to sName
+            If (sName = "changelegacyindicators" or sName = "changesquarebracketsindicators" ;
+                or sName = "changeindicatortoboolean" or sName = "declarerefactoredindicators") Begin
+                Move True to bNeeded
+                Procedure_Return
+            End
+        Loop
+    End_Procedure
+
+    /* Announce the function that is about to run, and CLEAR the file-scoped fields with it.
+
+       Nils, 2026-07-29, on starting AlignCollidingDeclarationType: "WinUuid.pkg system package was
+       shown ... at least that is what the status_panel first showed when starting the process". It
+       was never touched - that path came from the DECLARATION LOOKUP one phase earlier
+       (InstallNameDeclsForNames walks the target install's Pkg folder read-only, to find out whether
+       DataFlex itself declares the contested name). But its Title_Text was cleared on the way out
+       and TableName_Text was not, so the install path stayed on the panel until the next function's
+       first file landed on it - long enough to read as "DFRefactor is rewriting a system package".
+
+       A status panel that outlives its phase makes the tool look like it is doing something it must
+       never do, which is worth more than a cosmetic fix. Cleared HERE rather than in each refactor
+       function: the engine is the one place that knows a new function is starting, so no future
+       function can inherit the last one's filename by forgetting to. */
+    Procedure AnnounceFunction String sFunctionName
+        Set Message_Text   of ghoStatusPanel to ("Function:" * sFunctionName)
+        Set TableName_Text of ghoStatusPanel to ""
+        Set Title_Text     of ghoStatusPanel to ""
+    End_Procedure
+
     // *** Type: eOtherFunction ***
-    //           One file as a string array is passed.  
+    //           One file as a string array is passed.
     //           These function should return the changes in the ByRef asCode string array.
-    Function eOtherFunctions String sFileName String[] ByRef asCode tRefactorSettings RefactorSettings Returns Boolean
-        Boolean bChanged bOK
-        String sParameter sFunctionName
-        Integer iFunctionID iRetval
+    Function eOtherFunctions String sFileName String[] ByRef asCode tRefactorSettings RefactorSettings tEngineDispatchFn[] ByRef aDisp Returns Boolean
+        Boolean bChanged
+        Integer iFunctionID iRetval j iMax iMasked iLost
         String[] asCodeOrg
-        
+
         Move False to bChanged
-        Move asCode to asCodeOrg
-        
+        // The snapshot exists ONLY to restore asCode when the run is read-only, so a normal run was
+        // paying a full copy of every file's lines for a branch it never takes.
+        If (RefactorSettings.bReadOnly = True) ;
+            Move asCode to asCodeOrg
+
         Set Message_Text of ghoStatusPanel to ("Function type:" * "eOtherFunction")
-        Constraint_Set (Self + eOtherFunction) Clear
-        Constrained_Clear eq FunctionsA by Index.4
-        Constrain FunctionsA.Type eq eOtherFunction
-        Constrain FunctionsA.Selected eq True
-        Constrain FunctionsA.bPublished eq True
-        Constrained_Find First FunctionsA by Index.4
-        While (Found = True)    
+        // Dispatched from the PRE-RESOLVED list (BuildDispatchList; see tEngineDispatchFn).
+        Move (SizeOfArray(aDisp) - 1) to iMax
+        For j from 0 to iMax
             Send ClearFuncLibProperties of ghoFuncLib
-            Move (Trim(FunctionsA.Parameter)) to sParameter
-            Move (Trim(FunctionsA.Function_Name)) to sFunctionName
-            Set psExecutionContext of ghoFuncLib to sFunctionName
-            Set Message_Text of ghoStatusPanel to ("Function:" * sFunctionName)
-            Move (Eval("get_" - (sFunctionName))) to iFunctionID
-            Get iFunctionID of ghoFuncLib (&asCode) sParameter to iRetval
+            Set psExecutionContext of ghoFuncLib to aDisp[j].sName
+            Send AnnounceFunction aDisp[j].sName
+            Move aDisp[j].iFunctionID to iFunctionID
+            // THE RULE: macro code is never refactored, and neither is a DF 23 multi-line string's text, a
+            // #HEADER region, a block comment's text or a report image's text - masked away from the function, put
+            // back after it (RunWholeFileFunction; see the library's macro-code guard). A masked line the function
+            // deleted is re-inserted where it was, and that is named in the function's run notes.
+            Get RunWholeFileFunction of ghoFuncLib iFunctionID (&asCode) aDisp[j].sParameter (&iMasked) (&iLost) to iRetval
+            Send _CountMacroCodeKept sFileName iMasked
+            If (iLost > 0) ;
+                Send AddRunNote of ghoFuncLib aDisp[j].sName (sFileName + ":" * String(iLost) * "line(s) the function had removed were put back at their original place - macro code, #HEADER lines and the text of a multi-line string, a block comment or a report image are never refactored; check the file.")
             If (iRetval <> 0) Begin
+                Move aDisp[j].iRecnum to FunctionsA.Recnum
+                Find eq FunctionsA by Recnum
                 Reread FunctionsA
                     Add iRetval to FunctionsA.Counter
                     SaveRecord FunctionsA
                     Move True to bChanged
                 Unlock
             End
-            Constrained_Find Next
         Loop
 
         If (RefactorSettings.bReadOnly = True) Begin
@@ -825,7 +1816,7 @@ Class cRefactorEngine is a BusinessProcess
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName
             Set psExecutionContext of ghoFuncLib to sFunctionName
-            Set Message_Text of ghoStatusPanel to ("Function:" * sFunctionName)
+            Send AnnounceFunction sFunctionName
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
             // Data send as ByRef to have a consistent calling convention for all refactoring functions:
             Get iFunctionID of ghoFuncLib (&asCode) sParameter to iRetval
@@ -864,7 +1855,7 @@ Class cRefactorEngine is a BusinessProcess
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName
             Set psExecutionContext of ghoFuncLib to sFunctionName
-            Set Message_Text of ghoStatusPanel to ("Function:" * sFunctionName)
+            Send AnnounceFunction sFunctionName
             Move (Eval("get_" - (sFunctionName))) to iFunctionID
             Get iFunctionID of ghoFuncLib (&RefactorSettings.FileData.asFullFileNames) sParameter to iRetval
             If (iRetval <> 0) Begin
@@ -893,7 +1884,7 @@ Class cRefactorEngine is a BusinessProcess
     //      These functions are responisble for writing changes to disk.
     //      Note: These must be called _after_ files has been changed by the Scintilla editor (if selected). 
     Function eOtherFunctionsAll String[] ByRef asFiles tRefactorSettings RefactorSettings Returns Integer
-        Boolean bStop
+        Boolean bStop bSkip
         Integer bOK
         String sParameter sFunctionName
         Integer iFunctionID iRetval
@@ -911,15 +1902,21 @@ Class cRefactorEngine is a BusinessProcess
             Send ClearFuncLibProperties of ghoFuncLib
             Move (Trim(FunctionsA.Parameter)) to sParameter
             Move (Trim(FunctionsA.Function_Name)) to sFunctionName
-            Set psExecutionContext of ghoFuncLib to sFunctionName
-            Set Message_Text of ghoStatusPanel to ("Function:" * sFunctionName)
-            Move (Eval("get_" - (sFunctionName))) to iFunctionID
-            Get iFunctionID of ghoFuncLib (&RefactorSettings.FileData.asFullFileNames) sParameter to iRetval
-            If (iRetval <> 0) Begin
-                Reread FunctionsA
-                    Add iRetval to FunctionsA.Counter
-                    SaveRecord FunctionsA
-                Unlock
+            // The character-mode gate and the never-pick gate - the whole-list type's own dispatch point.
+            Get _SkipForCharacterMode sFunctionName to bSkip
+            If (bSkip = False) ;
+                Get _SkipForNeverPick sFunctionName to bSkip
+            If (bSkip = False) Begin
+                Set psExecutionContext of ghoFuncLib to sFunctionName
+                Send AnnounceFunction sFunctionName
+                Move (Eval("get_" - (sFunctionName))) to iFunctionID
+                Get iFunctionID of ghoFuncLib (&RefactorSettings.FileData.asFullFileNames) sParameter to iRetval
+                If (iRetval <> 0) Begin
+                    Reread FunctionsA
+                        Add iRetval to FunctionsA.Counter
+                        SaveRecord FunctionsA
+                    Unlock
+                End
             End
 
             // We only check for "Cancel" once every new file.
@@ -1031,9 +2028,10 @@ Class cRefactorEngine is a BusinessProcess
     Function SummaryText Integer eResponse tRefactorSettings RefactorSettings DateTime dtExecStart Handle hoEditor Returns String
         Integer iErrors iCh
         DateTime dtExecEnd
+
         TimeSpan tsTotalTime
         String sTotalTime sText sPath sLogFile
-        String[] asOtherLogFiles
+        String[] asOtherLogFiles asUnwritable
         
         // Record the execution context for the error logger (a dedicated property
         // now, instead of scribbling on the shared FunctionsA.Function_Name buffer).
@@ -1041,9 +2039,9 @@ Class cRefactorEngine is a BusinessProcess
 
         Move (CurrentDateTime()) to dtExecEnd
         Move (dtExecEnd - dtExecStart) to tsTotalTime
-        Get TimeSpanToString tsTotalTime to sTotalTime
+        Get RDCTimeSpanToString tsTotalTime to sTotalTime
         Set psTotalTime to sTotalTime
-        Send UpdateStatusBar (CS_CRLF + "Process completed. Elapsed Time:" * sTotalTime) True
+        Send UpdateStatusBar (C_NewLine + "Process completed. Elapsed Time:" * sTotalTime) True
         Get CollectSummary RefactorSettings True to sText
         
         If (eResponse = eEngineOK) Begin
@@ -1063,7 +2061,15 @@ Class cRefactorEngine is a BusinessProcess
         End
         Else If (eResponse = eEngineError) Begin
             Move "The process ended but with errors. The Refactoring Engine Error dialog will now be displayed." to sText
-        End     
+            // The most likely error a user meets is a file that could not be written - say it in the
+            // FIRST box, with the count, not only in the error log's rows (2026-08-18).
+            Get pasUnwritableFiles to asUnwritable
+            If (SizeOfArray(asUnwritable) > 0) Begin
+                Append sText "\n\n" (String(SizeOfArray(asUnwritable)) * "file(s) could NOT be written and are unchanged on disk (read-only / locked / missing folder) - the summary log names each one with its reason.")
+                If (SizeOfArray(asUnwritable) = 1) ;
+                    Append sText "\n" asUnwritable[0]
+            End
+        End
         Else If (eResponse = eEngineSelError) Begin
             Move "Name in File array is blank, cannot continue. (GetTheWorkDone)\nProcess interrupted." to sText
         End  
@@ -1074,22 +2080,389 @@ Class cRefactorEngine is a BusinessProcess
         Function_Return sText
     End_Function
     
+    /* Appends the library-folder paragraph to the pre-run message, or nothing when the selection
+       touches no library. Kept out of StartWarning's body so that already-long message builder
+       stays readable. */
+    { Visibility=Private }
+    Procedure AppendLibraryFolderWarning String ByRef sMessage String[] ByRef asFolders
+        String[] asLibs
+        String sWS sNames
+        Handle ho
+        Integer i iMax
+
+        Get psSWSFile of ghoApplication to sWS
+        If (sWS = "") ;
+            Procedure_Return
+        // giLibraryInventoryClass (2026-10-05): the plain class reads no libraries from a JSON workspace
+        // file, so this note never showed on a DataFlex 26 workspace.
+        Get Create giLibraryInventoryClass to ho
+        Get LibrariesInFolders of ho sWS (&asFolders) to asLibs
+        Send Destroy of ho
+        Move (SizeOfArray(asLibs) - 1) to iMax
+        If (iMax < 0) ;
+            Procedure_Return
+        Move "" to sNames
+        For i from 0 to iMax
+            If (sNames <> "") ;
+                Move (sNames + ", ") to sNames
+            Move (sNames + asLibs[i]) to sNames
+        Loop
+        Append sMessage "\n\nNOTE: " (iMax + 1) " of the selected folders belong to libraries: " sNames "."
+        Append sMessage "\nThese are maintained elsewhere. Changes made here are not lost - but the next update "
+        Append sMessage "to the library will overwrite or conflict with them, with nothing to show it happened."
+    End_Procedure
+
+    /* The selected functions that require a Parameter and have none, one per line, or "" when
+       there are none. Reads the Functions table directly through the DD's own alias-free walk -
+       the same Selected + bPublished set the run itself collects - and asks ghoFuncLib which names
+       are parameter-required (FunctionRequiresParameter, where the criterion is documented).
+
+       Blank when the funclib is absent: the DFUnit runner builds a plain cApplication with no
+       ghoFuncLib, and a pre-run warning is not what a test harness is for. */
+    /* The selected functions the character-mode gate will skip, as a list for the start question -
+       "" when the main program is not a character-mode program or none is selected. Same shape as
+       UnparameterisedSelectedFunctions below; the skip itself happens in _SkipForCharacterMode. */
+    Function WindowsOnlySelectedFunctions tRefactorSettings RefactorSettings Returns String
+        String sOut sName
+        Boolean bNeeds
+
+        If (ghoFuncLib = 0 or RefactorSettings.bCharacterMode = False) ;
+            Function_Return ""
+        Move "" to sOut
+        Clear Functions
+        Find gt Functions by Index.1
+        While (Found)
+            If (Functions.Selected = 1 and Functions.bPublished = 1) Begin
+                Move (Trim(Functions.Function_Name)) to sName
+                Get FunctionNeedsWindowsProgram of ghoFuncLib sName to bNeeds
+                If (bNeeds = True) ;
+                    Move (sOut + C_NewLine + "   " + sName) to sOut
+            End
+            Find gt Functions by Index.1
+        Loop
+        Function_Return sOut
+    End_Function
+
+    // The selected functions the never-pick gate will skip, as a list for the start question - "" when
+    // none is selected. Same shape as the two beside it; the skip itself happens in _SkipForNeverPick.
+    Function NeverPickSelectedFunctions tRefactorSettings RefactorSettings Returns String
+        String[] asList
+        String sOut sName
+
+        Get pasNeverPickRun to asList
+        If (ghoFuncLib = 0 or SizeOfArray(asList) = 0) ;
+            Function_Return ""
+        Move "" to sOut
+        Clear Functions
+        Find gt Functions by Index.1
+        While (Found)
+            If (Functions.Selected = 1 and Functions.bPublished = 1) Begin
+                Move (Trim(Functions.Function_Name)) to sName
+                If (SearchArray(sName, asList, Desktop, RefFunc(DFSTRICMP)) <> -1) ;
+                    Move (sOut + C_NewLine + "   " + sName) to sOut
+            End
+            Find gt Functions by Index.1
+        Loop
+        Function_Return sOut
+    End_Function
+
+    /* The functions this run has selected that can CHANGE a file - the Selected + bPublished set the run
+       collects, less the report functions. For cPlanNoOps: a report never changes a file by design, so
+       "it ran and the file did not change" says nothing about it (2026-11-12, a plan of 40 files where 33
+       were there for three reports). */
+    Function _SelectedFunctionNames Returns String[]
+        String[] asOut
+
+        Clear Functions
+        Find gt Functions by Index.1
+        While (Found)
+            If (Functions.Selected = 1 and Functions.bPublished = 1 and Functions.Type <> eReportFunction and Functions.Type <> eReportFunctionAll) ;
+                Move (Trim(Functions.Function_Name)) to asOut[SizeOfArray(asOut)]
+            Find gt Functions by Index.1
+        Loop
+        Function_Return asOut
+    End_Function
+
+    Function UnparameterisedSelectedFunctions tRefactorSettings RefactorSettings Returns String
+        String sOut sName sParam
+        Boolean bNeeds
+
+        If (ghoFuncLib = 0) ;
+            Function_Return ""
+        Move "" to sOut
+        Clear Functions
+        Find gt Functions by Index.1
+        While (Found)
+            If (Functions.Selected = 1 and Functions.bPublished = 1) Begin
+                Move (Trim(Functions.Function_Name)) to sName
+                Move (Trim(Functions.Parameter))     to sParam
+                Get FunctionRequiresParameter of ghoFuncLib sName to bNeeds
+                If (bNeeds = True and sParam = "") ;
+                    Move (sOut + C_NewLine + "   " + sName) to sOut
+            End
+            Find gt Functions by Index.1
+        Loop
+        Function_Return sOut
+    End_Function
+
+    /* The write-protected files DropWriteProtectedFiles took out of this run, as a paragraph for a
+       message - "" when there were none. Names the first iMaxNames, so the reader can place them,
+       then "... and N more", and adds the DfPkg / package-cache note once when that is where they
+       sit - the whole VDFQuery20 checkout under E:\WinServ\DfPkg was 249 read-only files, and the
+       folder had been ticked like any other (Nils 2026-08-18). Shared by StartWarning (before) and
+       CollectSummary (after), so the two say the same thing. sLead is the line before the names. */
+    Function ReadOnlySkippedText String sLead Integer iMaxNames String sIndent Returns String
+        String[] asSkipped
+        Integer i iMax iNamed
+        String  sText sNote
+
+        Get pasReadOnlySkipped to asSkipped
+        Move (SizeOfArray(asSkipped) - 1) to iMax
+        If (iMax < 0) ;
+            Function_Return ""
+        Move 0  to iNamed
+        Move "" to sNote
+        Move (sLead + " " + String(iMax + 1) + " write-protected file(s) (READ-ONLY attribute) - treated as system files, like the DataFlex install, and skipped:") to sText
+        For i from 0 to iMax
+            If (iNamed < iMaxNames) Begin
+                Move (sText + "\n" + sIndent + asSkipped[i]) to sText
+                Increment iNamed
+            End
+            If (sNote = "") ;
+                Move (rfPackageManagedPathNote(asSkipped[i])) to sNote
+        Loop
+        If (iMax + 1 > iNamed) ;
+            Move (sText + "\n" + sIndent + "... and " + String(iMax + 1 - iNamed) + " more.") to sText
+        If (sNote <> "") ;
+            Move (sText + "\n" + sIndent + sNote) to sText
+        Function_Return sText
+    End_Function
+
+    /* The files DropMissingFiles took out of this run, as the same kind of paragraph - "" when there
+       were none. The likely reason is named because more often than not it is the tool's own doing:
+       [Rename them] retires a shadowing copy under a new name, and a plan built before that still
+       lists the old one (LegacyApp 2026-09-05: FlexCOM20.pkg and FlexCOM20_Base.pkg). */
+    Function MissingSkippedText String sLead Integer iMaxNames String sIndent Returns String
+        String[] asSkipped
+        Integer i iMax iNamed
+        String  sText
+
+        Get pasMissingSkipped to asSkipped
+        Move (SizeOfArray(asSkipped) - 1) to iMax
+        If (iMax < 0) ;
+            Function_Return ""
+        Move 0 to iNamed
+        Move (sLead + " " + String(iMax + 1) + " file(s) no longer on disk since the file list was made - renamed by [Rename them] or removed - and skipped:") to sText
+        For i from 0 to iMax
+            If (iNamed < iMaxNames) Begin
+                Move (sText + "\n" + sIndent + asSkipped[i]) to sText
+                Increment iNamed
+            End
+        Loop
+        If (iMax + 1 > iNamed) ;
+            Move (sText + "\n" + sIndent + "... and " + String(iMax + 1 - iNamed) + " more.") to sText
+        Function_Return sText
+    End_Function
+
+    /* The files DropBinaryFiles took out of this run - the same paragraph shape; "" when none. */
+    Function BinarySkippedText String sLead Integer iMaxNames String sIndent Returns String
+        String[] asSkipped
+        Integer i iMax iNamed
+        String  sText
+
+        Get pasBinarySkipped to asSkipped
+        Move (SizeOfArray(asSkipped) - 1) to iMax
+        If (iMax < 0) ;
+            Function_Return ""
+        Move 0 to iNamed
+        Move (sLead + " " + String(iMax + 1) + " file(s) carrying a NUL byte - binary content in a source file - left unchanged; remove the byte(s) and run again:") to sText
+        For i from 0 to iMax
+            If (iNamed < iMaxNames) Begin
+                Move (sText + "\n" + sIndent + asSkipped[i]) to sText
+                Increment iNamed
+            End
+        Loop
+        If (iMax + 1 > iNamed) ;
+            Move (sText + "\n" + sIndent + "... and " + String(iMax + 1 - iNamed) + " more.") to sText
+        Function_Return sText
+    End_Function
+
+    // Counts macro code the run left as written - once per file, however many passes see the file.
+    Procedure _CountMacroCodeKept String sFile Integer iLines
+        If (iLines <= 0 or Lowercase(Trim(sFile)) = Lowercase(Trim(psMacroCountedFile(Self)))) ;
+            Procedure_Return
+        Set psMacroCountedFile to sFile
+        Set piMacroLinesKept to (piMacroLinesKept(Self) + iLines)
+        Set piMacroFilesKept to (piMacroFilesKept(Self) + 1)
+    End_Procedure
+
+    // The rule's own line in the summary: how much macro code the run walked past. "" when none.
+    Function MacroCodeKeptText Returns String
+        Integer iLines iFiles
+
+        Get piMacroLinesKept to iLines
+        Get piMacroFilesKept to iFiles
+        If (iLines <= 0) ;
+            Function_Return ""
+        Function_Return ("Macro code left as written:" * String(iLines) * "line(s) in" * String(iFiles) * "file(s) - #COMMAND bodies, #DATA blocks and '!' directive lines are never refactored.")
+    End_Function
+
+    // One lifted include for the summary: its leaf name and the program whose walk lifted it.
+    Procedure _NoteLiftedInclude String sIncPath String sUser
+        String[] asNotes
+        String sLeaf
+        Get ParseFileName sIncPath to sLeaf
+        Get pasLiftedIncludeNotes to asNotes
+        Move (sLeaf + " (used by " + sUser + ")") to asNotes[SizeOfArray(asNotes)]
+        Set pasLiftedIncludeNotes to asNotes
+    End_Procedure
+
+    // The include lift's own line in the summary: which local includes converted with the run. "" when none.
+    Function LiftedIncludesText Returns String
+        String[] asNotes
+        String sList
+        Integer i
+        Get pasLiftedIncludeNotes to asNotes
+        If (SizeOfArray(asNotes) = 0) ;
+            Function_Return ""
+        Move "" to sList
+        For i from 0 to (SizeOfArray(asNotes) - 1)
+            If (i > 0) ;
+                Move (sList + ", ") to sList
+            Move (sList + asNotes[i]) to sList
+        Loop
+        Function_Return ("Local include(s) converted with the run:" * String(SizeOfArray(asNotes)) * "-" * sList * "- each reads an indicator the run converts, so the read and the program's write moved together; backed up like every file.")
+    End_Function
+
+    /* OPEN THE NUL-BYTE FILE WHERE THE BYTE IS (Nils 2026-09-23). The start question names the
+       file and the line; this puts the cursor there, so "remove the byte and run again" is a
+       keypress away instead of a search. The editor view is paged the way the app pages it -
+       the registered Activate message to the client area (see _EnsureEditorRealized) - then
+       the file is loaded and the line shown. Test Bench's editor is already on screen, so
+       there it is the jump only, as the compiler-output dock does. Nothing to do without an
+       editor: the caller has asked, and a batch run never asks. */
+    Procedure ShowFirstNulFileInEditor
+        Handle hoEditor hoPanel
+        String sFile sWhy
+        Integer iLine
+        Boolean bReady
+
+        Get psFirstNulFile to sFile
+        Get piFirstNulLine to iLine
+        Get phoEditor to hoEditor
+        If (hoEditor = 0) ;
+            Get phoEditor of ghoApplication to hoEditor
+        If (sFile = "" or hoEditor = 0) ;
+            Procedure_Return
+        If (psProduct(ghoApplication) <> "Test Bench") Begin
+            Get phoMainPanel of ghoApplication to hoPanel
+            If (hoPanel <> 0 and Window_Handle(hoPanel) <> 0) ;
+                Send Activate_oEditorView_vw of (Client_Id(hoPanel))
+            Get _EnsureEditorRealized hoEditor (&sWhy) to bReady
+            If (bReady = False) ;
+                Procedure_Return
+            Send LoadFile of hoEditor sFile
+        End
+        If (iLine > 0) ;
+            Send JumpToSourceLine of hoEditor (iLine - 1)
+    End_Procedure
+
     Function StartWarning tRefactorSettings RefactorSettings String sFileName Returns Integer
-        Boolean bSaveBak bReadOnly
-        Integer eResponse 
-        String  sMessage sReadOnlyMessage
-        
-        If (RefactorSettings.FileData.asFullFileNames[0] = "") Begin
-            If (RefactorSettings.FileData.asFolders[0] = "") Begin
+        Boolean bSaveBak bReadOnly bNoFiles bNoFolders
+        Integer eResponse
+        String  sMessage sReadOnlyMessage sSkipList sRoNote sMissNote sBinNote sNulFile
+
+        /* AN EMPTIED LIST HAS NO ELEMENT TO READ (2026-09-22). The gates in InitializeEngine hand
+           back a ZERO-LENGTH list when every file left the run, and reading [0] of a zero-length
+           array is error 4509 - which is what a plan run whose files had all been dropped showed
+           instead of the "Nothing to refactor" written for exactly that case. Sized first, read
+           second; the same for the folder list below. */
+        Move (SizeOfArray(RefactorSettings.FileData.asFullFileNames) = 0) to bNoFiles
+        If (bNoFiles = False) ;
+            Move (RefactorSettings.FileData.asFullFileNames[0] = "") to bNoFiles
+        If (bNoFiles = True) Begin
+            // Every file the run had left through a gate (a single-file run on a DfPkg file, a plan
+            // whose only files sit in a package checkout, a list older than the disk): say WHICH,
+            // not "no files found" - and every reason that applies, not the first one found.
+            Get ReadOnlySkippedText "Nothing to refactor:" 5 "   " to sRoNote
+            Get MissingSkippedText "Nothing to refactor:" 5 "   " to sMissNote
+            If (sMissNote <> "") ;
+                Move (If((sRoNote = ""), sMissNote, (sRoNote + "\n\n" + sMissNote))) to sRoNote
+            Get BinarySkippedText "Nothing to refactor:" 5 "   " to sBinNote
+            If (sBinNote <> "") ;
+                Move (If((sRoNote = ""), sBinNote, (sRoNote + "\n\n" + sBinNote))) to sRoNote
+            Move (SizeOfArray(RefactorSettings.FileData.asFolders) = 0) to bNoFolders
+            If (bNoFolders = False) ;
+                Move (RefactorSettings.FileData.asFolders[0] = "") to bNoFolders
+            If (sRoNote <> "") Begin
+                Move sRoNote to sMessage
+            End
+            Else If (bNoFolders = True) Begin
                 Move "No folders selected. Please adjust and try again." to sMessage
-            End 
+            End
             Else Begin
                 Move "No files found that matches the selected folders and file filter. Please adjust and try again." to sMessage
             End
             If (pbBatchMode(Self) = False) Begin
-                Send Info_Box sMessage                
+                /* THE NUL-BYTE FILE IS OFFERED IN THE EDITOR (Nils 2026-09-23). His run reached
+                   this branch because of it - the plan's one file was the one the gate dropped -
+                   and an OK button left him to find line 24 of that file by hand. A Yes puts
+                   the cursor on it. The run is over either way; the question is only where the
+                   user is left. */
+                Get psFirstNulFile to sNulFile
+                If (sNulFile <> "" and sBinNote <> "") Begin
+                    Get YesNo_Box (sMessage + "\n\nOpen " + sNulFile + " in the editor at line " + String(piFirstNulLine(Self)) ;
+                                   + ", so the byte can be removed?") "Binary content in a source file" MB_DEFBUTTON1 to eResponse
+                    If (eResponse = MBR_Yes) ;
+                        Send ShowFirstNulFileInEditor
+                End
+                Else ;
+                    Send Info_Box sMessage
+            End
+            Else Begin
+                // Nobody reads a message in a headless run, and returning let the program fall through to
+                // Start_UI and wait with its window open - no result file, no exit code (live run,
+                // 2026-10-24). Report the reason and exit: STATUS=FAILED.
+                Send ExitBatchWithCode of ghoApplication eEngineError sMessage
             End
             Function_Return MBR_No
+        End
+        // The write-protected files this run will NOT touch - said early, in the dialog that already
+        // exists (same rule as the unparameterised-function note below): a 27-minute run is a long way
+        // to go to learn that a folder was read-only all along (2026-08-18). "" when there were none.
+        Get ReadOnlySkippedText "NOTE:" 3 "   " to sRoNote
+        Get MissingSkippedText "NOTE:" 3 "   " to sMissNote
+        If (sMissNote <> "") ;
+            Move (If((sRoNote = ""), sMissNote, (sRoNote + "\n\n" + sMissNote))) to sRoNote
+        /* A NUL BYTE IS ASKED ABOUT, NOT JUST NOTED (Nils 2026-09-22). The other two gates skip what
+           the user cannot or should not fix here - a file that is gone, a file kept read-only by rule.
+           A NUL byte is different: it is a fault in the user's own source, fixed in a minute once it
+           is pointed at, and a file the run leaves out keeps every finding it has - the plan offers
+           it again next time, and again. Until today the skip was a NOTE inside the start question,
+           which is shown only when that setting is on, and otherwise a line in the summary log, after
+           the run. Its own dialog, default No: No stops the run so the byte can be removed and the
+           file included; Yes runs without it, as before. Batch mode has nobody to ask and keeps the
+           note; a run that changes nothing never reaches here with one (the gate is write-runs only). */
+        If (pbBatchMode(Self) = False) Begin
+            Get BinarySkippedText "This run will skip" 10 "   " to sBinNote
+            If (sBinNote <> "") Begin
+                // No stops the run AND opens the file at the byte (Nils 2026-09-23) - see
+                // ShowFirstNulFileInEditor; the first file when there are several.
+                Get psFirstNulFile to sNulFile
+                Get YesNo_Box (sBinNote + "\n\nYes runs without the file(s)." ;
+                               + "\n\nNo stops the run and opens " + sNulFile + " in the editor at line " + String(piFirstNulLine(Self)) ;
+                               + ", so the byte can be removed and the run repeated with the file included." ;
+                               + "\n\nContinue without the file(s)?") "Binary content in a source file" MB_DEFBUTTON2 to eResponse
+                If (eResponse <> MBR_Yes) Begin
+                    Send ShowFirstNulFileInEditor
+                    Function_Return MBR_No
+                End
+            End
+        End
+        Else Begin
+            Get BinarySkippedText "NOTE:" 3 "   " to sBinNote
+            If (sBinNote <> "") ;
+                Move (If((sRoNote = ""), sBinNote, (sRoNote + "\n\n" + sBinNote))) to sRoNote
         End
         Move ("\n\nYou have also selected ReadOnly mode, which means that statistics will be shown but no actual changes to the source code will be made.") to sReadOnlyMessage
         
@@ -1100,9 +2473,22 @@ Class cRefactorEngine is a BusinessProcess
         Else Begin
             If (RefactorSettings.bWorkspaceMode) Begin
                 Append sMessage ("You have selected" * String(RefactorSettings.iSelectedFunctionTotal) * "refactoring functions.\n" + "They will be applied to:\n")
-                Append sMessage (SizeOfArray(RefactorSettings.FileData.asFullFileNames)) " Files in " (SizeOfArray(RefactorSettings.FileData.asFolders)) " selected Folders" 
+                Append sMessage (SizeOfArray(RefactorSettings.FileData.asFullFileNames)) " Files in " (SizeOfArray(RefactorSettings.FileData.asFolders)) " selected Folders"
+                /* LIBRARY FOLDERS IN THE SELECTION (Nils 2026-07-31). Selecting one is allowed -
+                   "we don't want to prohibit the user from it" - so this warns and does not block,
+                   and only appears when a library folder is actually in the run.
+
+                   The warning deliberately does NOT say "you might lose work": the backup below
+                   covers the files, so that would be both wrong and easy to dismiss. The real cost
+                   is divergence - a library is maintained elsewhere, so the next update to it
+                   overwrites or conflicts with whatever was changed here, and nothing records that
+                   it happened. Read-only runs change nothing, so they say nothing. */
+                If (RefactorSettings.bReadOnly = False) ;
+                    Send AppendLibraryFolderWarning (&sMessage) (&RefactorSettings.FileData.asFolders)
+                If (sRoNote <> "") ;
+                    Append sMessage "\n\n" sRoNote
                 If (RefactorSettings.bReadOnly = False) Begin
-                    Append sMessage "\n\nYou should ALWAYS have checked in your source code with a version control system and/or "
+                    Append sMessage "\n\nYou should ALWAYS have checked in the source code with a version control system and/or "
                     Append sMessage "made a backup of the source code, before you continue!"
                 End
                 Else Begin
@@ -1111,15 +2497,51 @@ Class cRefactorEngine is a BusinessProcess
                 Append sMessage "\n\nContinue?"
             End
             Else Begin
-                Append sMessage ("You have selected" * String(RefactorSettings.iSelectedFunctionTotal) * "refactoring functions.\n" + "They will be applied to a sinlge source file:\n")
+                Append sMessage ("You have selected" * String(RefactorSettings.iSelectedFunctionTotal) * "refactoring functions.\n" + "They will be applied to a single source file:\n")
                 Append sMessage sFileName
                 If (RefactorSettings.bReadOnly = True) Begin
                     Append sMessage sReadOnlyMessage
                 End
+                If (sRoNote <> "") ;
+                    Append sMessage "\n\n" sRoNote
                 Append sMessage "\n\nContinue?"
             End
         End
         
+        /* NAME THE SELECTED FUNCTIONS THAT CANNOT ACT, before the user says Yes (Nils 2026-08-06).
+
+           Four converters do nothing without a parameter naming what to work on - the guided flow
+           always supplies it off the finding, so a MANUAL selection is the one path that reaches
+           them empty, and a Select All sweeps in every one. Each already logs a SKIPPED note when
+           it is reached (the 2026-08-03 "configuration state, not a fault" policy), but that only
+           explains the silence AFTERWARDS, in a log the user has to go and read.
+
+           This is the same fact said early, in the dialog that already exists and already defaults
+           to No - so the answer is one keystroke, not a second dialog to dismiss (one question per
+           dialog). The run is NOT refused: saying Yes proceeds and skips them, exactly as before.
+           Batch mode never sees it, which is right - there is nobody to answer, and the log note
+           is the headless channel. */
+        Get UnparameterisedSelectedFunctions RefactorSettings to sSkipList
+        If (sSkipList <> "") Begin
+            Append sMessage (C_NewLine + C_NewLine + "These selected function(s) need a Parameter and have none, so they will do nothing:" ;
+                             + C_NewLine + sSkipList ;
+                             + C_NewLine + "Set it in the Parameter column of Select Functions, or unselect them. A guided Check fills these in for you.")
+        End
+        // The character-mode gate, said before the run as well as in its notes (2026-09-20).
+        Get WindowsOnlySelectedFunctions RefactorSettings to sSkipList
+        If (sSkipList <> "") Begin
+            Append sMessage (C_NewLine + C_NewLine + "This program is a character-mode program with no Windows user interface yet. These selected function(s) rewrite Windows user-interface objects, so they will be skipped:" ;
+                             + C_NewLine + sSkipList ;
+                             + C_NewLine + "Its screens have to be rewritten by hand first - see the character-mode inventory on the Guided Dashboard.")
+        End
+        // The never-pick gate, said before the run as well as in its notes (2026-10-06).
+        Get NeverPickSelectedFunctions RefactorSettings to sSkipList
+        If (sSkipList <> "") Begin
+            Append sMessage (C_NewLine + C_NewLine + "These selected function(s) are on your never-pick list, so they will not run:" ;
+                             + C_NewLine + sSkipList ;
+                             + C_NewLine + "Untick them in the Never pick column of Select Functions to run them.")
+        End
+
         If (RefactorSettings.bShowStartQuestion = True) Begin
             Get YesNo_Box sMessage "" MB_DEFBUTTON2 to eResponse
         End
@@ -1129,19 +2551,83 @@ Class cRefactorEngine is a BusinessProcess
         Function_Return eResponse
     End_Function
 
+    // The coverage notes the run summary lists under the file counts, for a workspace run and a single-file
+    // run alike: what the write-protected gate took out (up to 10 names here; the pre-run dialog showed 3),
+    // the missing and the binary files, the macro code left alone, the includes lifted out.
+    Procedure _AppendSkippedNotes String ByRef sText String sTab
+        String sNotes
+
+        Get ReadOnlySkippedText "Skipped:" 10 (sTab + "   ") to sNotes
+        If (sNotes <> "") ;
+            Append sText sTab sNotes "\n"
+        Get MissingSkippedText "Skipped:" 10 (sTab + "   ") to sNotes
+        If (sNotes <> "") ;
+            Append sText sTab sNotes "\n"
+        Get BinarySkippedText "Skipped:" 10 (sTab + "   ") to sNotes
+        If (sNotes <> "") ;
+            Append sText sTab sNotes "\n"
+        Get MacroCodeKeptText to sNotes
+        If (sNotes <> "") ;
+            Append sText sTab sNotes "\n"
+        Get LiftedIncludesText to sNotes
+        If (sNotes <> "") ;
+            Append sText sTab sNotes "\n"
+    End_Procedure
+
+    /* ONE FUNCTION TYPE'S LINES in the run summary: the type heading, then one line per selected published
+       function of that type - its count in its own unit (SetSummaryUnit; a class converter counts objects, not
+       lines) or in sDefaultUnit, its summary text and its name, and any note the function recorded under it.
+       With bSubclassHint, a plan-selected CLASS converter (it has an {EnumList} class-names parameter) that
+       converted NOTHING gets the subclass note: the surviving analyzer rows are almost always SUBCLASS
+       instances the DEFAULT parameter never matches (LegacyApp2 2026-07-17: two grid fns at 0, then 207
+       conversions once the parameter was set); the analyzer row's hint carries the exact value. Five of the
+       seven type sections read this way; the two report types keep their own wording. */
+    Procedure _AppendFunctionTypeSummary String ByRef sText Integer eType String sTypeCaption String sDefaultUnit Boolean bSubclassHint
+        String sUnit sNotes
+        Boolean bHasParam
+
+        Append sText ("\n\nFunction Type:" * sTypeCaption + "(s):")
+        Constraint_Set (Self + eType) Clear
+        Constrained_Clear eq FunctionsA by Index.4
+        Constrain FunctionsA.Type eq eType
+        Constrain FunctionsA.Selected eq True
+        Constrain FunctionsA.bPublished eq True
+        Constrained_Find First FunctionsA by Index.4
+        While (Found)
+            Get SummaryUnit of ghoFuncLib (Trim(FunctionsA.Function_Name)) to sUnit
+            If (sUnit = "") ;
+                Move sDefaultUnit to sUnit
+            Append sText ("\n-" * String(FunctionsA.Counter) * sUnit * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
+            // Any note the function recorded, printed directly under its own count.
+            Get RunNotesText of ghoFuncLib (Trim(FunctionsA.Function_Name)) "      " to sNotes
+            If (sNotes <> "") ;
+                Append sText sNotes
+            If (bSubclassHint = True and FunctionsA.Counter = 0) Begin
+                Get FunctionHasEnumListParam of ghoFuncLib (Trim(FunctionsA.Function_Name)) to bHasParam
+                If (bHasParam = True) ;
+                    Append sText "\n      ^ 0 converted: if the remaining objects are SUBCLASS instances, set this converter's class-names parameter (see the analyzer row's hint), then run the plan again. For the Edit / dbEdit converters the objects of a subclass follow their class instead: the plan's subclass row converts the file that declares it."
+            End
+            Constrained_Find Next
+        Loop
+    End_Procedure
+
     Function CollectSummary tRefactorSettings RefactorSettings Boolean bWriteLogFile Returns String
-        String sText sLogText sLogFile sPath sTotalTime sProgram sFormatString sValue sSWSFile sFileName sReadOnlyTxt sTab
+        String sText sLogText sLogFile sPath sTotalTime sProgram sFormatString sValue sSWSFile sFileName sReadOnlyTxt sTab sNotes
         Integer iChangedFiles iCount iSize
         Integer iFileCount iCh
         DateTime dtToday
-        Boolean bExists bWorkspaceMode
-        
+        Boolean bExists bWorkspaceMode bPlanRun
+        String[] asIniWarnings asUnwritable
+
+        // Plan-sourced runs (Analyze or Deep Scan) carry the subclass-parameter hint below: only
+        // there does a 0-conversion class converter imply its triggering rows SURVIVED the run.
+        Move (peRunOrigin(Self) = eRunPlan or peRunOrigin(Self) = eRunDeepScan) to bPlanRun
         Move "    " to sTab
         Move ",#." to sFormatString
         Move SysFile.iCountNumberOfChangedFiles to iChangedFiles
         Move SysFile.iCountNumberOfFiles        to iFileCount
         Append sText "\n  Statistics:\n  ===========\n"
-        Append sText sTab ("Run source:" * RunOriginText(peRunOrigin(Self)) + "\n")
+        Append sText sTab ("Run source:" * RunOriginText(Self, peRunOrigin(Self)) + "\n")
         Move "Note: bReadOnly = True. *No* changes were actually made to the source code." to sReadOnlyTxt
         Get psSWSFile of ghoApplication to sSWSFile
         If (sSWSFile <> "") Begin
@@ -1152,16 +2638,20 @@ Class cRefactorEngine is a BusinessProcess
         If (bWorkspaceMode = True) Begin
             Append sText sTab ("File Filter:" * Trim(RefactorSettings.sFileFilter) + "\n") 
             Append sText sTab ("Files:" * String(SizeOfArray(RefactorSettings.FileData.asFullFileNames)) + "\n")
+            // Coverage fact, so it sits with the counts: what the write-protected gate took out (see
+            // DropWriteProtectedFiles). Up to 10 names here; the pre-run dialog showed 3.
+            Send _AppendSkippedNotes (&sText) sTab
             Move (SizeOfArray(RefactorSettings.FileData.asFolders)) to iSize
             Append sText sTab ("Folders:" * String(iSize) + "\n")
             Decrement iSize
             For iCount from 0  to iSize
                 Append sText sTab RefactorSettings.FileData.asFolders[iCount] "\n"
             Loop
-        End 
+        End
         Else Begin
             Get psCurrentSourceFileName of ghoApplication to sFileName
             Append sText sTab "Mode: Single file" " " sFileName  "\n"
+            Send _AppendSkippedNotes (&sText) sTab
             If (RefactorSettings.bReadOnly = True) Begin
                 Append sText sTab sReadOnlyTxt "\n"
             End
@@ -1170,7 +2660,23 @@ Class cRefactorEngine is a BusinessProcess
         If (RefactorSettings.bCountSourceLines = False) Begin
             Append sText "\n" sTab ("Selected Functions:" * String(SysFile.SelectedFunctionTotal))
         End
-        Else Begin
+
+        /* Anything the command-line INI asked for that is not there, HIGH UP - it changes how every
+           count below should be read. A /bm run is unattended, so a folder that has moved and a
+           function name this build does not have would otherwise just make the run do less than the
+           INI says, with nothing anywhere to show for it. Empty for an interactive run. */
+        Get pasCmdLineIniWarnings of ghoApplication to asIniWarnings
+        Move (SizeOfArray(asIniWarnings) - 1) to iSize
+        If (iSize >= 0) Begin
+            Append sText "\n\n" sTab "*** COMMAND-LINE INI - the run could not do everything it was asked for:"
+            For iCount from 0 to iSize
+                Append sText "\n" sTab "  - " asIniWarnings[iCount]
+            Loop
+        End
+        // ONLY when it is true (2026-08-16): this Else hung off the INI-warnings test, so every
+        // interactive run's summary said "'Count of Source Lines' selected. *All other functions
+        // were ignored*" while its function list right below showed them running.
+        Else If (RefactorSettings.bCountSourceLines = True) Begin
             Append sText "\n" "  'Count of Source Lines' selected.  *All other functions were ignored*"
         End
         
@@ -1182,86 +2688,28 @@ Class cRefactorEngine is a BusinessProcess
         End
 
         Else Begin
-            // *** Type: eRemoveFunction ***
-            //          Line-by-line
-            If (RefactorSettings.iSelectedRemoveFunctions <> 0) Begin
-                Append sText ("\n\nFunction Type:" * CS_RemoveFunction +"(s):")
-                Constraint_Set (Self + eRemoveFunction) Clear
-                Constrained_Clear eq FunctionsA by Index.4  
-                Constrain FunctionsA.Type eq eRemoveFunction
-                Constrain FunctionsA.Selected eq True
-                Constrain FunctionsA.bPublished eq True
-                Constrained_Find First FunctionsA by Index.4
-                While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
-                    Constrained_Find Next            
-                Loop
-            End
-            
-            // *** Type: eStandardFunction ***
-            //          Line-by-line
-            If (RefactorSettings.iSelectedStandardFunctions <> 0) Begin
-                Append sText ("\n\nFunction Type:" * CS_StandardFunction +"(s):")
-                Constraint_Set (Self + eStandardFunction) Clear
-                Constrained_Clear eq FunctionsA by Index.4  
-                Constrain FunctionsA.Type eq eStandardFunction        
-                Constrain FunctionsA.Selected eq True
-                Constrain FunctionsA.bPublished eq True
-                Constrained_Find First FunctionsA by Index.4
-                While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
-                    Constrained_Find Next            
-                Loop
-            End
-            
-            // Editor functions:
-            // One source file at a time was passed as a string array.
-            If (RefactorSettings.iSelectedEditorFunctions <> 0) Begin
-                Append sText ("\n\nFunction Type:" * CS_EditorFunction +"(s):")
-                Constraint_Set (Self + eEditorFunction) Clear
-                Constrained_Clear eq FunctionsA by Index.4  
-                Constrain FunctionsA.Type eq eEditorFunction
-                Constrain FunctionsA.Selected eq True
-                Constrain FunctionsA.bPublished eq True
-                Constrained_Find First FunctionsA by Index.4
-                While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
-                    Constrained_Find Next            
-                Loop
-            End
-            
-            // Other functions:
-            // One source file at a time was passed as a string array.
-            If (RefactorSettings.iSelectedOtherFunctions <> 0) Begin
-                Append sText ("\n\nFunction Type:" * CS_OtherFunction +"(s):")
-                Constraint_Set (Self + eOtherFunction) Clear
-                Constrained_Clear eq FunctionsA by Index.4  
-                Constrain FunctionsA.Type eq eOtherFunction
-                Constrain FunctionsA.Selected eq True
-                Constrain FunctionsA.bPublished eq True
-                Constrained_Find First FunctionsA by Index.4
-                While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "lines" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
-                    Constrained_Find Next            
-                Loop
-            End
+            // *** Type: eRemoveFunction *** - line-by-line
+            If (RefactorSettings.iSelectedRemoveFunctions <> 0) ;
+                Send _AppendFunctionTypeSummary (&sText) eRemoveFunction CS_RemoveFunction "lines" False
 
-            // OthertAll functions:
-            // All selected files were passed as a string array (with full path)
-            If (RefactorSettings.iSelectedOtherAllFunctions <> 0) Begin
-                Append sText ("\n\nFunction Type:" * CS_OtherFunctionAll +"(s):")
-                Constraint_Set (Self + eOtherFunctionAll) Clear
-                Constrained_Clear eq FunctionsA by Index.4  
-                Constrain FunctionsA.Type eq eOtherFunctionAll
-                Constrain FunctionsA.Selected eq True
-                Constrain FunctionsA.bPublished eq True
-                Constrained_Find First FunctionsA by Index.4
-                While (Found)
-                    Append sText ("\n-" * String(FunctionsA.Counter) * "file(s)" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
-                    Constrained_Find Next            
-                Loop
-            End
-            
+            // *** Type: eStandardFunction *** - line-by-line
+            If (RefactorSettings.iSelectedStandardFunctions <> 0) ;
+                Send _AppendFunctionTypeSummary (&sText) eStandardFunction CS_StandardFunction "lines" False
+
+            // Editor functions: one source file at a time was passed as a string array.
+            If (RefactorSettings.iSelectedEditorFunctions <> 0) ;
+                Send _AppendFunctionTypeSummary (&sText) eEditorFunction CS_EditorFunction "lines" False
+
+            // Other functions: one source file at a time was passed as a string array. A plan-selected class
+            // converter at 0 gets the subclass-parameter note (see _AppendFunctionTypeSummary).
+            If (RefactorSettings.iSelectedOtherFunctions <> 0) ;
+                Send _AppendFunctionTypeSummary (&sText) eOtherFunction CS_OtherFunction "lines" bPlanRun
+
+            // OtherAll functions: all selected files were passed as a string array (with full path). The
+            // grid converters count grid objects ("1505 file(s)" on a 985-file run was that); "file(s)" otherwise.
+            If (RefactorSettings.iSelectedOtherAllFunctions <> 0) ;
+                Send _AppendFunctionTypeSummary (&sText) eOtherFunctionAll CS_OtherFunctionAll "file(s)" bPlanRun
+
             // Report functions: These makes no code changes.
             // One source file at a time was passed as a string array.
             If (RefactorSettings.iSelectedReportFunctions <> 0) Begin
@@ -1274,6 +2722,10 @@ Class cRefactorEngine is a BusinessProcess
                 Constrained_Find First FunctionsA by Index.4
                 While (Found)
                     Append sText ("\n-" * String(FunctionsA.Counter) * "item(s)" * Trim(FunctionsA.SummaryText) * "(" + Trim(FunctionsA.Function_Name) + ")")
+                    // Any note the function recorded, printed directly under its own count.
+                    Get RunNotesText of ghoFuncLib (Trim(FunctionsA.Function_Name)) "      " to sNotes
+                    If (sNotes <> "") ;
+                        Append sText sNotes
                     Constrained_Find Next
                 Loop
             End
@@ -1296,10 +2748,73 @@ Class cRefactorEngine is a BusinessProcess
                 Loop
             End
         End
-        
+
+        // Deep Scan campaigns CONVERGE over several passes - teach that in the run summary itself,
+        // AT THE END: readers skip the header block, but the tail (counts -> verdict) is what they
+        // actually read (Nils 2026-07-17, same rule as compile verdicts at the end of the output).
+        // The reader wondering "why are rows left after my run?" gets the answer as the closing
+        // guidance, right above the file totals.
+        If (peRunOrigin(Self) = eRunDeepScan) Begin
+            Append sText "\n\n" sTab "Note: one scan + fix-plan cycle is rarely enough. Some conversions unlock others (e.g. legacy\n"
+            Append sText sTab "operators convert first; the 'If Not' on the same line becomes convertible on the NEXT pass).\n"
+            Append sText sTab "Re-scan after this run and apply the next plan - repeat until the scan reports itself exhausted."
+        End
+
+        /* THE CLOSING BLOCK IS PART OF THE SUMMARY, not something written straight to the log
+           channel. It used to be a run of Writeln's inside the bWriteLogFile branch below, so the
+           totals and "Process completed OK" reached DFRefactorLogFile.txt and nothing else - the
+           batch RESULT.txt, which is just this function's return value, ended mid-summary with no
+           file totals and no elapsed time (Nils, 2026-08-03). Built once here, appended to sText,
+           and the log now writes the same text everyone else sees. */
+        Get psTotalTime to sTotalTime
+        Move ("Process completed OK. Elapsed Time:" * String(sTotalTime)) to sTotalTime
+        // The SysFile totals are fed by the PER-FILE pipeline (IncrementFileCount). A plan run
+        // that selected ONLY All-Files function types never enters that loop, so the old line
+        // claimed "0 out of 0 Files" while the All-Files functions genuinely converted - they
+        // write to disk themselves (LegacyApp2 2026-07-17: 56 files written, log said 0/0). Name
+        // the truth instead; the per-function counts above carry the real numbers.
+        If (iFileCount = 0 and (RefactorSettings.iSelectedOtherAllFunctions > 0 or RefactorSettings.iSelectedReportAllFunctions > 0)) Begin
+            Append sText "\n\n" ("All-Files function type(s) only:" * String(SizeOfArray(RefactorSettings.FileData.asFullFileNames)) * "file(s) passed to them - the per-function counts above show what changed (these functions write to disk themselves).")
+        End
+        Else Begin
+            // All-Files functions run AFTER the per-file loop and write independently - a file
+            // only THEY changed is not in the total. Say so, or the two counts read as a
+            // contradiction (run 1's grid conversions vs the loop's changed count) - but as a
+            // CLAUSE ON THE TOTALS LINE, not its own line: a standalone line here sat in the
+            // log's closing position and stole attention from the Deep Scan multi-pass note,
+            // which is the message the tail must leave the reader with (Nils 2026-07-19).
+            If (RefactorSettings.iSelectedOtherAllFunctions > 0) ;
+                Append sText "\n\n" ("Total number of files changed:" * String(iChangedFiles) * "out of" * String(iFileCount) * "Files (All-Files function changes not included - see their counts above).")
+            Else ;
+                Append sText "\n\n" ("Total number of files changed:" * String(iChangedFiles) * "out of" * String(iFileCount) * "Files.")
+        End
+        /* FILES THE RUN COULD NOT WRITE - named, with the reason, right by the totals they are NOT in
+           (2026-08-18). Every entry here is a file the functions DID change in memory and the disk
+           never got: read-only (a DfPkg package checkout, a VCS working copy), a vanished folder, a
+           lock. Without this list the only trace was a StatLog row behind a toolbar button, and the
+           totals line read as if the file had been converted. The package note is printed once,
+           after the list, when any of them sits in a DfPkg / package-cache folder - it says why the
+           read-only attribute is not the thing to change. */
+        Get pasUnwritableFiles to asUnwritable
+        Move (SizeOfArray(asUnwritable)) to iSize
+        If (iSize > 0) Begin
+            Append sText "\n\n" ("NOT WRITTEN:" * String(iSize) * "file(s) could not be written and are UNCHANGED on disk (they are not in the changed total):")
+            Move "" to sNotes
+            For iCount from 0 to (iSize - 1)
+                Append sText "\n" sTab "- " asUnwritable[iCount]
+                If (sNotes = "") ;
+                    Move (rfPackageManagedPathNote(asUnwritable[iCount])) to sNotes
+            Loop
+            If (sNotes <> "") ;
+                Append sText "\n" sTab sNotes
+        End
+        Append sText "\n" sTotalTime
+        If (RefactorSettings.bReadOnly = True) ;
+            Append sText "\n  " sReadOnlyTxt
+        If (Error_Count(Self) <> 0) ;
+            Append sText "\n " ("ERROR! Process ended with:" * String(Error_Count(Self)) * "Error(s). Please see toolbar button: 'Refactor Engine Error log'.")
+
         If (bWriteLogFile = True) Begin
-            Get psTotalTime to sTotalTime    
-            Move ("Process completed without errors. Elapsed Time:" * String(sTotalTime)) to sTotalTime
             Get psHomeTarget of ghoApplication to sPath
             Move (vFolderFormat(sPath)) to sPath
             Move (sPath + CS_BackupFolder + CS_DirSeparator + CS_SummaryLogfileName) to sLogFile
@@ -1317,15 +2832,6 @@ Class cRefactorEngine is a BusinessProcess
             Writeln channel iCh "====================================================================================="
             Writeln channel iCh "*** CREATED BY: " sProgram " -- " dtToday " " "***"
             Writeln channel iCh sLogText
-            Writeln channel iCh  
-            Writeln channel iCh ("Total number of files changed:" * String(iChangedFiles) * "out of" * String(iFileCount) * "Files.")
-            Writeln channel iCh sTotalTime
-            If (RefactorSettings.bReadOnly = True) Begin
-                Writeln channel iCh "  " sReadOnlyTxt
-            End
-            If (Error_Count(Self) <> 0) Begin
-                Writeln channel iCh " " "ERROR! Process ended with: " (Error_Count(Self)) " Error(s). Please see toolbar button: 'Refactor Engine Error log'."
-            End
             Writeln channel iCh
             Send rfCloseAppendOutput iCh
         End
@@ -1345,7 +2851,7 @@ Class cRefactorEngine is a BusinessProcess
         Move False to bEndOfFile
         Move False to bLastLineBreak
         Move ""    to sLastLine
-        Move CS_CRLF to sLineBreak                // Overwritten by RFDetectFileLineBreak below.
+        Move C_NewLine to sLineBreak                // Overwritten by rfDetectFileLineBreak below.
 
         Get phoEditor to hoEditor
         Get ParseFileName sSourceFile to sFileNameOnly
@@ -1357,11 +2863,14 @@ Class cRefactorEngine is a BusinessProcess
         // "eats" OEM bytes in the 0x80..0xFF range that are not valid UTF-8 leads.
         // See cEncodingHelpers.pkg for the full explanation.
         // A UTF-8 BOM is what tells us "treat this file as UTF-8"; BOM-less
-        // files go through the OEM/legacy path. RFFileHasBOM lives in
+        // files go through the OEM/legacy path. rfFileHasBOM lives in
         // cEncodingHelpers.pkg.
-        Move (RFFileHasBOM(sSourceFile)) to bIsUtf8
+        Move (rfFileHasBOM(sSourceFile)) to bIsUtf8
         If (bIsUtf8 = False) Begin
-            Move (RFReadEncodedFileAsStringArray(sSourceFile)) to asSourceFile
+            // rfReadEncodedFileLines is rfReadEncodedFileAsStringArray with the one fact the array
+            // cannot carry: whether the file ended with a line break. Free - it reads the last byte
+            // it already had.
+            Move (rfReadEncodedFileLines(sSourceFile, False, &bLastLineBreak)) to asSourceFile
             // Configure the Scintilla editor for OEM display, matching what
             // DetectBOMCharacter would have set for a non-BOM line.
             Set pbOemMode    of hoEditor to True
@@ -1370,20 +2879,24 @@ Class cRefactorEngine is a BusinessProcess
             Send ShowTextEncoding   of hoEditor eTE_OEM
             Send ChangeTextEncoding of hoEditor
             // Determine line break from the raw file so psLineBreak matches
-            // the original. RFDetectFileLineBreak (in cEncodingHelpers.pkg)
+            // the original. rfDetectFileLineBreak (in cEncodingHelpers.pkg)
             // sniffs the first 4 KB of bytes -- encoding-agnostic.
-            Move (RFDetectFileLineBreak(sSourceFile)) to sLineBreak
+            Move (rfDetectFileLineBreak(sSourceFile)) to sLineBreak
             Set psLineBreak to sLineBreak
-            // No reliable way to infer "file ended without trailing newline" here;
-            // WriteStringArrayToFile honors pbLastLineBreak, so default False matches
-            // the array-based write (last line gets no trailing break).
-            Set pbLastLineBreak to False
+            /* THERE IS a reliable way to infer it, and hard-coding False here quietly retyped every
+               BOM-less file the engine wrote. The byte reader deliberately gives a file ending in a
+               line break no phantom empty last line, so the terminator survives nowhere in the array,
+               and the byte writer's default is not to add one - a lossy round trip in both halves.
+               The UTF-8 path below always tracked it, which is why only BOM-less files lost a newline
+               (2026-09-09: two of six files written over a legacy workspace came back one terminator
+               short, and the diff noise was the only symptom). */
+            Set pbLastLineBreak to bLastLineBreak
             Function_Return asSourceFile
         End
 
         // UTF8 (BOM) file: detect the line-break up front via the shared
         // byte-sniffer, then publish it. The read loop no longer cares.
-        Move (RFDetectFileLineBreak(sSourceFile)) to sLineBreak
+        Move (rfDetectFileLineBreak(sSourceFile)) to sLineBreak
         Set psLineBreak to sLineBreak
 
         Get rfOpenInput ("binary:" + sSourceFile) to iCh
@@ -1394,7 +2907,7 @@ Class cRefactorEngine is a BusinessProcess
             Set pbLastLineBreak to False
             Function_Return asSourceFile
         End
-        Move (RFFileSize(sSourceFile)) to iRFFileSize
+        Move (rfFileSize(sSourceFile)) to iRFFileSize
         Move (ResizeArray(asSourceFile, iRFFileSize)) to asSourceFile
 
         // Need to use binary read mode if we want to preserve tab characters and not have automatic tab replacement
@@ -1439,7 +2952,9 @@ Class cRefactorEngine is a BusinessProcess
         Function_Return asSourceFile
     End_Function
 
-    Function WriteStringArrayToFile String[] asCode String sSourceFile Returns Boolean
+    // (asCode ByRef purely to avoid deep-copying the whole file on every written file - a workspace
+    // run writes hundreds; the same interpreter tax the read path paid. Never modified.)
+    Function WriteStringArrayToFile String[] ByRef asCode String sSourceFile Returns Boolean
         Boolean bLastLineBreak bIsUtf8 bIsOem bOK
         Integer iCh iSize iCount
         String  sLineBreak sLine
@@ -1451,7 +2966,7 @@ Class cRefactorEngine is a BusinessProcess
         // CRLF). Fall back to CRLF only when the property is unset.
         Get psLineBreak to sLineBreak
         If (sLineBreak = "") ;
-            Move CS_CRLF to sLineBreak
+            Move C_NewLine to sLineBreak
         Get phoEditor      to hoEditor
         Get pbLastLineBreak to bLastLineBreak
         Get pbUtf8Mode of hoEditor to bIsUtf8
@@ -1469,13 +2984,29 @@ Class cRefactorEngine is a BusinessProcess
         // and emit raw CP850 bytes through a "binary:" channel.
         // See: cEncodingHelpers.pkg for the encoder and writer.
         If (bIsUtf8 = False and bIsOem = True) Begin
-            Get RFWriteEncodedFileFromStringArray asCode sSourceFile sLineBreak False to bOK
+            // ...and hand the flag on, so the file ends the way it began. The UTF-8/ANSI path below
+            // has always honoured bLastLineBreak; this is the OEM path catching up.
+            Get rfWriteEncodedFileFromStringArrayEx (&asCode) sSourceFile sLineBreak False bLastLineBreak to bOK
+            // The encoded writer checks SeqEof after its Direct_Output and returns False without a
+            // single Write - so a read-only target raises NOTHING here (see rfIsFileReadOnly's note).
+            // Say so, or the run reports the file as changed and completes "OK".
+            If (bOK = False) ;
+                Send ReportUnwritableFile sSourceFile
             Function_Return bOK
         End
 
-        // UTF-8 / ANSI path -- unchanged.
+        // UTF-8 / ANSI path.
         Get rfOpenOutput sSourceFile to iCh
         If (iCh < 0) Begin
+            Function_Return False
+        End
+        // Direct_Output on a target it cannot open raises nothing and only sets SeqEof; the Writes
+        // below would then raise error 32 ONCE PER LINE into the engine error log. Ask once, here,
+        // release the channel, and report the file with its reason instead. (SeqEof still reflects
+        // the Direct_Output inside rfOpenOutput - no sequential I/O has run in between.)
+        If (SeqEof) Begin
+            Send rfCloseOutput iCh    // Close_Output on the never-opened channel is silent (probed); releases it
+            Send ReportUnwritableFile sSourceFile
             Function_Return False
         End
 
@@ -1504,6 +3035,40 @@ Class cRefactorEngine is a BusinessProcess
         Send rfCloseOutput iCh
         Function_Return (Err = False)
     End_Function
+
+    /* A write that did not happen, made VISIBLE (2026-08-18). Called by WriteStringArrayToFile when
+       the target could not be opened. Three things, each for a different reader:
+         1. pasUnwritableFiles gets "<file> - <reason>", so CollectSummary can list the files with the
+            totals - the reader of the summary/log sees WHICH files stayed as they were, and why.
+         2. Error DFERR_PROGRAM: inside the running BusinessProcess this does not pop a dialog
+            (Display_Error_State is False) - it bumps Error_Count and lands in StatLog, which is what
+            turns "Process completed OK" into "ended with N error(s)" + the engine error log, and what
+            a /bm build reads as failure. The message names the file, the reason and - for a DfPkg /
+            package-cache path - why the read-only attribute is not the thing to change.
+         3. Once per file: the loop writes a line-by-line change twice (once for the editor functions,
+            once at the end), and both attempts fail the same way.
+       Not here: any attempt to clear the attribute and retry. A read-only source is read-only for a
+       reason (a package pinned to a commit, a VCS working copy); the honest outcome is "unchanged,
+       and here is why", left for the user to act on. */
+    Procedure ReportUnwritableFile String sFileName
+        String[] asFiles
+        String   sReason sNote sMsg
+
+        If (sFileName = psLastUnwritableFile(Self)) ;
+            Procedure_Return
+        Set psLastUnwritableFile to sFileName
+
+        Move (rfWriteFailureReason(sFileName)) to sReason
+        Move (rfPackageManagedPathNote(sFileName)) to sNote
+        Get pasUnwritableFiles to asFiles
+        Move (sFileName + " - " + sReason) to asFiles[SizeOfArray(asFiles)]
+        Set pasUnwritableFiles to asFiles
+
+        Move ("NOT WRITTEN - the file is unchanged on disk: " + sFileName + " (" + sReason + ").") to sMsg
+        If (sNote <> "") ;
+            Move (sMsg + " " + sNote) to sMsg
+        Error DFERR_PROGRAM sMsg
+    End_Procedure
 
     // Detects if a sLine has an UTF8 "BOM" file start.
     // If true it sets three properties of the phoEditor object.
@@ -1542,41 +3107,12 @@ Class cRefactorEngine is a BusinessProcess
         Function_Return bHasBom    
     End_Function
 
-    Function TimeSpanToString TimeSpan tsTime Returns String
-        Integer iDays iHours iMinutes iSeconds iMilliseconds
-        String  sTime
-
-        Move "" to sTime
-        Move (SpanDays(tsTime))    to iDays
-        Move (SpanHours(tsTime))   to iHours
-        Move (SpanMinutes(tsTime)) to iMinutes
-        Move (SpanSeconds(tsTime)) to iSeconds
-        Move (SpanMilliSeconds(tsTime)) to iMilliSeconds
-        If (iDays > 0) Begin   // Don't show days if it is zero
-            Move (String(iDays) + ":") to sTime
-        End
-        If (iHours < 10) Begin
-            Move (sTime+"0") to sTime
-        End
-        Move (sTime + String(iHours) + ":") to sTime
-        If (iMinutes < 10) Begin
-            Move (sTime + "0") to sTime
-        End
-        Move (sTime + String(iMinutes) + ":") to sTime
-        If (iSeconds < 10) Begin
-            Move (sTime + "0") to sTime
-        End
-        // Zero-pad ms to 3 digits so 1.007s renders as "01.007", not "01.7".
-        Move (sTime + String(iSeconds) + "." + Right("000" + String(iMilliseconds), 3)) to sTime
-
-        Function_Return sTime
-    End_Function
 
     Procedure UpdateStatusBar String sText Boolean bIdleTextOnly Integer iLi Integer iChrs
         Handle hoStatusBar
         Integer iLines iCharacters
 
-        Get StatusBar_Id to hoStatusBar
+        Get Statusbar_Id to hoStatusBar
         If (num_arguments > 2) Begin
             Move iChrs to iCharacters
             If (iCharacters = 0) Begin

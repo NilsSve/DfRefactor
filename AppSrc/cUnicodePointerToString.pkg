@@ -27,11 +27,26 @@
 //               can leave stuck. Anything whose operand types it cannot resolve is
 //               left untouched - a missed line is harmless, a wrong wrap is not.
 //
+//               2026-07-23 (WinServ mining): the same 4539 fires on the
+//               DF 19.1 runtime buffer-conversion idiom, where the pointer
+//               hides inside the source expression:
+//                   Move (Utf8ToOemBuffer(<stringVar>)) to <stringVar>
+//               For the four CharTranslate buffer functions (Utf8ToOemBuffer,
+//               OemToUtf8Buffer, Utf8ToAnsiBuffer, AnsiToUtf8Buffer) the fix
+//               is not a wrap but the String-returning sibling:
+//                   Move (Utf8ToOem(<stringVar>)) to <stringVar>
+//               - the identical conversion with the pointer gone. Renamed only
+//               when the call has ONE bare argument and both the argument and
+//               the destination are declared Strings; a two-argument call
+//               (AddressOf + length = the pointer-level API used deliberately)
+//               is left for a hand migration.
+//
 //               Deliberately OUT OF SCOPE (left for later / sibling functions):
 //                 - the String -> Pointer direction (needs MemCopy, a
 //                   structural rewrite, not a simple wrap)
-//                 - pointer-returning function calls used inside expressions
-//                 - method-parameter types (only body-local declarations map)
+//                 - pointer-returning function calls used inside expressions,
+//                   other than the four buffer conversions in the bare Move
+//                   shape described above
 //                 - a declaration that appears AFTER the Move that uses it
 //                   (single forward pass; such a Move is simply not rewritten)
 //
@@ -48,95 +63,185 @@
 Use cApplication.pkg
 Use cRefactorFuncLib.pkg
 Use RefactorStatusPanel.pkg
+Use cPointerConverterBase.pkg   // the type test, the name sets and the signature walk the three pointer converters share
 
-Class cUnicodePointerToString is a cObject
+Class cUnicodePointerToString is a cPointerConverterBase
 
     Procedure Construct_Object
         Forward Send Construct_Object
+        // The source lines (0-based) the last ParseFile rewrote - the Deep Scan's dry run reads them
+        // (cDeepScanner._PointerMoveHits, 2026-10-20).
+        Property Integer[] paiChangedLines
     End_Procedure
 
-    // True when the datatype keyword is pointer-like for the 4539 conversion.
-    // DataFlex treats Address the same as Pointer for this assignment, so both
-    // qualify. sType is the raw first token of a declaration line.
-    Function IsPointerLikeType String sType Returns Boolean
-        Move (Lowercase(Trim(sType))) to sType
-        Function_Return (sType = "pointer" or sType = "address")
+    // Parse one overstruck token of the shape "(Name(arg))" into its function
+    // name and single bare argument. True only for that exact shape - one
+    // call, one argument, no nested parentheses or comma (a two-argument
+    // buffer call is the pointer-level API used deliberately - left alone).
+    Function ParseBufferCallToken String sToken String ByRef sFnName String ByRef sArg Returns Boolean
+        String  sInner
+        Integer iLen iPos
+
+        Move (Trim(sToken)) to sToken
+        Move (Length(sToken)) to iLen
+        If (iLen < 5) ;
+            Function_Return False
+        If (Left(sToken, 1) <> "(" or Right(sToken, 2) <> "))") ;
+            Function_Return False
+        Move (Mid(sToken, (iLen - 2), 2)) to sInner         // strip the outer parens -> "Name(arg)"
+        Move (Pos("(", sInner)) to iPos
+        If (iPos < 2) ;
+            Function_Return False                           // no name before the "("
+        Move (Trim(Left(sInner, (iPos - 1)))) to sFnName
+        Move (Trim(Mid(sInner, (Length(sInner) - iPos - 1), (iPos + 1)))) to sArg
+        If (sFnName = "" or sArg = "") ;
+            Function_Return False
+        If (Pos("(", sArg) > 0 or Pos(")", sArg) > 0 or Pos(",", sArg) > 0) ;
+            Function_Return False
+        Function_Return True
     End_Function
 
-    // True when sName (compared case-insensitively) is one of the collected
-    // names. asNames is expected to already hold lowercased names.
-    Function NameInArray String[] asNames String sName Returns Boolean
-        Integer iCount iMax
-        Move (Lowercase(Trim(sName))) to sName
-        Move (SizeOfArray(asNames)) to iMax
-        Decrement iMax
-        For iCount from 0 to iMax
-            If (asNames[iCount] = sName) ;
-                Function_Return True
+    /* Split a two-argument buffer call token into its function name and the ONE
+       variable both arguments are about.
+
+       Accepts the DF 19.1 pointer-level shape, with or without the redundant
+       parentheses the old Studio emitted around each argument:
+           (OemToUtf8Buffer((AddressOf(sVar)),(Length(sVar))))
+           (OemToUtf8Buffer(AddressOf(sVar),SizeOfString(sVar)))
+       and returns sFnName="OemToUtf8Buffer", sVar="sVar".
+
+       BOTH arguments must name the SAME variable - that is what proves the call
+       is converting one string in place rather than walking a buffer someone
+       else owns. A length taken from a different variable, a literal, or an
+       expression means the pointer API was used deliberately: refuse. */
+    Function ParseBufferPairCallToken String sToken String ByRef sFnName String ByRef sVar Returns Boolean
+        String  sInner sArgs sArg1 sArg2 sV1 sV2
+        Integer iLen iPos iDepth i iComma
+
+        Move "" to sFnName
+        Move "" to sVar
+        Move (Trim(sToken)) to sToken
+        Move (Length(sToken)) to iLen
+        If (iLen < 12) ;
+            Function_Return False
+        If (Left(sToken, 1) <> "(" or Right(sToken, 1) <> ")") ;
+            Function_Return False
+        Move (Mid(sToken, (iLen - 2), 2)) to sInner          // strip the outer parens
+        Move (Pos("(", sInner)) to iPos
+        If (iPos < 2) ;
+            Function_Return False
+        Move (Trim(Left(sInner, (iPos - 1)))) to sFnName
+        Move (Trim(Mid(sInner, (Length(sInner) - iPos), (iPos + 1)))) to sArgs
+        If (Right(sArgs, 1) <> ")") ;
+            Function_Return False
+        Move (Left(sArgs, (Length(sArgs) - 1))) to sArgs     // drop the call's closing paren
+        // Split on the ONE comma at bracket depth 0. A comma nested inside an
+        // argument means something more complicated than this rewrite handles.
+        Move 0 to iDepth
+        Move 0 to iComma
+        For i from 1 to (Length(sArgs))
+            Move (Mid(sArgs, 1, i)) to sInner
+            If (sInner = "(") ;
+                Increment iDepth
+            If (sInner = ")") ;
+                Move (iDepth - 1) to iDepth
+            If (sInner = "," and iDepth = 0) Begin
+                If (iComma <> 0) ;
+                    Function_Return False                    // more than one top-level comma
+                Move i to iComma
+            End
         Loop
-        Function_Return False
+        If (iComma = 0) ;
+            Function_Return False
+        Move (Trim(Left(sArgs, (iComma - 1)))) to sArg1
+        Move (Trim(Mid(sArgs, (Length(sArgs) - iComma), (iComma + 1)))) to sArg2
+        Get _InnerCallArgument sArg1 "addressof" to sV1
+        If (sV1 = "") ;
+            Function_Return False
+        Get _InnerCallArgument sArg2 "length" to sV2
+        If (sV2 = "") ;
+            Get _InnerCallArgument sArg2 "sizeofstring" to sV2
+        If (sV2 = "") ;
+            Function_Return False
+        If (Lowercase(sV1) <> Lowercase(sV2)) ;
+            Function_Return False
+        Move sV1 to sVar
+        Function_Return True
     End_Function
 
-    // Collect the String and Pointer/Address PARAMETERS from a method signature
-    // line into the matching name sets (lowercased, to match the body-declaration
-    // collection + NameInArray). Walks the overstruck signature tokens: skips the
-    // Procedure|Function keyword + the method name, stops at "Returns", and for each
-    // String / Pointer / Address type token takes the following token (skipping a
-    // ByRef / ByVal) as the parameter name. Back-ported from cUnicodeStringToPointer
-    // so a Pointer/Address PARAMETER moved into a String is caught, not only
-    // body-declared locals.
-    Procedure CollectParameters String sOverSignature String[] ByRef asPointerVars String[] ByRef asStringVars
-        String[] asTokens
-        Integer  iIdx iNum
-        String   sTok sName
+    // "(AddressOf(sVar))" / "AddressOf(sVar)" -> "sVar" when the call is sWantedFn
+    // and its argument is a single bare identifier. "" for anything else.
+    Function _InnerCallArgument String sArg String sWantedFn Returns String
+        String sInner sName
+        Integer iPos
 
-        Move (StrSplitToArray(Trim(sOverSignature), CS_S)) to asTokens
-        Move (SizeOfArray(asTokens)) to iNum
-        Move 2 to iIdx                              // skip Procedure|Function + the method name
-        While (iIdx < iNum)
-            Move (Lowercase(asTokens[iIdx])) to sTok
-            If (sTok = "returns") ;
-                Procedure_Return                    // a Function's return type follows - done
-            If (sTok = "string" or sTok = "pointer" or sTok = "address") Begin
-                Increment iIdx
-                If (iIdx < iNum) Begin
-                    If (Lowercase(asTokens[iIdx]) = "byref" or Lowercase(asTokens[iIdx]) = "byval") ;
-                        Increment iIdx
-                End
-                If (iIdx < iNum) Begin
-                    Move (Lowercase(Trim(asTokens[iIdx]))) to sName
-                    Increment iIdx
-                    If (sName <> "") Begin
-                        If (sTok = "string") Begin
-                            Move sName to asStringVars[SizeOfArray(asStringVars)]
-                        End
-                        Else Begin
-                            Move sName to asPointerVars[SizeOfArray(asPointerVars)]
-                        End
-                    End
-                End
-            End
-            Else Begin
-                Increment iIdx
-            End
-        Loop
-    End_Procedure
+        Move (Trim(sArg)) to sArg
+        // Peel one optional layer of wrapping parentheses.
+        If (Left(sArg, 1) = "(" and Right(sArg, 1) = ")") ;
+            Move (Trim(Mid(sArg, (Length(sArg) - 2), 2))) to sArg
+        Move (Pos("(", sArg)) to iPos
+        If (iPos < 2 or Right(sArg, 1) <> ")") ;
+            Function_Return ""
+        If (Lowercase(Trim(Left(sArg, (iPos - 1)))) <> Lowercase(sWantedFn)) ;
+            Function_Return ""
+        Move (Trim(Mid(sArg, (Length(sArg) - iPos - 1), (iPos + 1)))) to sInner
+        Move (Trim(sInner)) to sName
+        If (sName = "") ;
+            Function_Return ""
+        If (Pos("(", sName) > 0 or Pos(")", sName) > 0 or Pos(",", sName) > 0 or Pos(CS_S, sName) > 0) ;
+            Function_Return ""
+        Function_Return sName
+    End_Function
+
+    // The four DF 19.1 runtime buffer conversion functions and their String-
+    // returning CharTranslate siblings (DF 20+). Returns the sibling name, or
+    // "" when sFnName is not one of the four.
+    Function BufferSiblingFor String sFnName Returns String
+        Move (Lowercase(Trim(sFnName))) to sFnName
+        If (sFnName = "utf8tooembuffer") ;
+            Function_Return "Utf8ToOem"
+        If (sFnName = "oemtoutf8buffer") ;
+            Function_Return "OemToUtf8"
+        If (sFnName = "utf8toansibuffer") ;
+            Function_Return "Utf8ToAnsi"
+        If (sFnName = "ansitoutf8buffer") ;
+            Function_Return "AnsiToUtf8"
+        Function_Return ""
+    End_Function
 
     // Single forward pass over the source file. For each method it gathers the
     // pointer-like and String local names from the declarations, then rewrites
     // the bare "Move <ptr> to <str>" lines. Returns the number of rewrites.
     Function ParseFile String[] ByRef asCode Returns Integer
-        Integer  iCount iMax iChanges iItems iIdx
-        String   sLine sOver sType sVars sName sId1 sId2
-        String[] asPointerVars asStringVars asVars asTokens
-        Boolean  bInMethod bIsProcDecl bIsFuncDecl bPtr bStr bId1 bId2 bIgnore
+        Integer  iCount iMax iChanges iTokens
+        Integer[] aiChanged
+        String   sLine sOver sId1 sId2
+        String   sCallToken sFnName sArg sFnTo sAligned sNew
+        String[] asPointerVars asStringVars asTokens asFromOne asToOne
+        Boolean  bExecutable bId1 bId2 bGate bCall
         tTokenizer TokenizerData
 
         Move 0 to iChanges
+        Set paiChangedLines to aiChanged
         Move (SizeOfArray(asCode)) to iMax
         If (iMax = 0) ;
             Function_Return 0
         Decrement iMax
+
+        // GATE (run profiler 2026-07-04): this pass tokenizes EVERY line and measured ~420ms on
+        // EVERY file (322s of a 27-min run). A "Move <ptr> to <str>" rewrite needs a Pointer or
+        // Address declaration somewhere, and the buffer-call rename needs a *Buffer function
+        // name - none of "pointer" / "address" / "buffer" ANYWHERE (raw scan; a comment hit
+        // just runs the normal pass) = nothing to rewrite.
+        Get _FileContainsText of ghoFuncLib (&asCode) "pointer" to bGate
+        If (bGate = False) Begin
+            Get _FileContainsText of ghoFuncLib (&asCode) "address" to bGate
+        End
+        If (bGate = False) Begin
+            Get _FileContainsText of ghoFuncLib (&asCode) "buffer" to bGate
+        End
+        If (bGate = False) ;
+            Function_Return 0
 
         For iCount from 0 to iMax
             Move asCode[iCount] to sLine
@@ -152,81 +257,84 @@ Class cUnicodePointerToString is a cObject
             Get Tokenizer of ghoFuncLib sLine to TokenizerData
             Move TokenizerData.sOverstrikeLine to sOver
 
-            Move (TokenizerData.bIsInProcedure = True or TokenizerData.bIsInFunction = True) to bInMethod
-
-            // A new method opens a fresh local scope - drop the previous method's
-            // name sets. Detect the method START from the SIGNATURE LINE itself (a
-            // Procedure or Function declaration) via _IsProcedureDeclaration /
-            // _IsFunctionDeclaration.
-            //
-            // History: this used to key off the lexer's in-method False->True
-            // transition, because _IsFunctionDeclaration was buggy - it matched
-            // "Function_Return", which would have wiped the type map on an early
-            // return mid-method (the original WinServCrypt.AESDecrypt miss). That
-            // helper now requires a word boundary after "Function", so it is safe
-            // again AND signature detection is strictly more robust: a preceding
-            // method with a mismatched end keyword (a Function closed with
-            // End_Procedure, which DataFlex tolerates but the lexer's function
-            // branch never treats as an end) leaves the lexer STUCK in-method, so
-            // the transition would never fire for the next method. (That is what
-            // bit cUnicodeStringToPointer on cJSONParser.)
-            Get _IsProcedureDeclaration of ghoFuncLib sOver to bIsProcDecl
-            Get _IsFunctionDeclaration  of ghoFuncLib sOver to bIsFuncDecl
-            If (bIsProcDecl = True or bIsFuncDecl = True) Begin
-                Move (ResizeArray(asPointerVars, 0)) to asPointerVars
-                Move (ResizeArray(asStringVars, 0))  to asStringVars
-                // Collect the method's String/Pointer/Address PARAMETERS too, so a
-                // Pointer/Address parameter moved into a String is caught - not just
-                // body-declared locals. (Back-ported from cUnicodeStringToPointer.)
-                Send CollectParameters sOver (&asPointerVars) (&asStringVars)
-            End
-
-            If (bInMethod = True) Begin
-                If (TokenizerData.bIsVariableDeclaration = True) Begin
-                    // Classify the declaration and collect its names into the
-                    // matching set. All names on the line share one datatype,
-                    // so resolve that once.
-                    Get RemoveLocalKeyWord  of ghoFuncLib (&sOver) "" to bIgnore
-                    Get _RetrieveFirstToken of ghoFuncLib sOver to sType
-                    Get _RemoveFirstToken   of ghoFuncLib sOver to sVars
-                    Get IsPointerLikeType sType to bPtr
-                    Move (Lowercase(Trim(sType)) = "string") to bStr
-                    If (bPtr = True or bStr = True) Begin
-                        Move (StrSplitToArray(Trim(sVars), CS_S)) to asVars
-                        Move (SizeOfArray(asVars)) to iItems
-                        Decrement iItems
-                        For iIdx from 0 to iItems
-                            Move (Lowercase(Trim(asVars[iIdx]))) to sName
-                            If (sName <> "") Begin
-                                If (bPtr = True) ;
-                                    Move sName to asPointerVars[SizeOfArray(asPointerVars)]
-                                If (bStr = True) ;
-                                    Move sName to asStringVars[SizeOfArray(asStringVars)]
-                            End
-                        Loop
+            // The method's Pointer/Address and String names, kept by _TrackScopeNames; only an executable
+            // line inside a method can hold a rewrite.
+            Get _TrackScopeNames sOver TokenizerData (&asPointerVars) (&asStringVars) to bExecutable
+            If (bExecutable = True) Begin
+                // Executable line: two unambiguous Move shapes qualify.
+                //   (a) Move <ptrVar> to <strVar>
+                //       -> wrap the source in PointerToString()
+                //   (b) Move (<XxxBuffer>(<strVar>)) to <strVar>
+                //       -> rename the call to its String-returning
+                //          CharTranslate sibling (Utf8ToOem & co); the
+                //          DF 19.1 buffer idiom relied on the pointer-to-
+                //          string Move this error now forbids.
+                // Both are detected on the overstruck token split (strings/
+                // comments masked): (a) is exactly 4 bare tokens; (b) is 4
+                // tokens - or 5 when the call has a space before its "(" -
+                // with one bare String argument. Anything else is left
+                // untouched.
+                Move (StrSplitToArray(Trim(sOver), CS_S)) to asTokens
+                Move (SizeOfArray(asTokens)) to iTokens
+                Move "" to sCallToken
+                If (iTokens = 4) Begin
+                    If (Lowercase(asTokens[0]) = "move" and Lowercase(asTokens[2]) = "to") Begin
+                        Move asTokens[1] to sId1
+                        Move asTokens[3] to sId2
+                        Get NameInArray asPointerVars sId1 to bId1
+                        Get NameInArray asStringVars  sId2 to bId2
+                        If (bId1 = True and bId2 = True) Begin
+                            // Wrap the source operand. Operate on the
+                            // ORIGINAL line so indentation and any trailing
+                            // comment are preserved; the space-bounded
+                            // Replace hits the source operand (first match).
+                            Move (Replace((CS_S + sId1 + CS_S), sLine, (CS_S + "(PointerToString(" + sId1 + "))" + CS_S))) to sLine
+                            Move (RTrim(sLine)) to sLine
+                            Move sLine to asCode[iCount]
+                            Increment iChanges
+                            Move iCount to aiChanged[SizeOfArray(aiChanged)]
+                        End
+                        Else ;
+                            Move asTokens[1] to sCallToken
                     End
                 End
-                Else Begin
-                    // Executable line: rewrite only the unambiguous bare form
-                    //   Move <id1> to <id2>
-                    // i.e. exactly 4 whitespace-separated tokens on the
-                    // overstruck line (strings/comments already masked).
-                    Move (StrSplitToArray(Trim(sOver), CS_S)) to asTokens
-                    If (SizeOfArray(asTokens) = 4) Begin
-                        If (Lowercase(asTokens[0]) = "move" and Lowercase(asTokens[2]) = "to") Begin
-                            Move asTokens[1] to sId1
-                            Move asTokens[3] to sId2
-                            Get NameInArray asPointerVars sId1 to bId1
-                            Get NameInArray asStringVars  sId2 to bId2
+                If (iTokens = 5) Begin
+                    // "Move (Fn (arg)) to sVar" - the call's name and its
+                    // argument land in two tokens; rejoin them for the parse.
+                    If (Lowercase(asTokens[0]) = "move" and Lowercase(asTokens[3]) = "to") Begin
+                        Move (asTokens[1] + asTokens[2]) to sCallToken
+                        Move asTokens[4] to sId2
+                    End
+                End
+                If (sCallToken <> "") Begin
+                    Get ParseBufferCallToken sCallToken (&sFnName) (&sArg) to bCall
+                    If (bCall = True) Begin
+                        Get BufferSiblingFor sFnName to sFnTo
+                        If (sFnTo <> "") Begin
+                            // Only when the argument AND the destination are
+                            // known Strings is the rename a pure encoding
+                            // conversion with the pointer gone; a Pointer/
+                            // Address argument means the buffer API was used
+                            // at the pointer level - hand-migrate.
+                            Get NameInArray asStringVars sArg to bId1
+                            Get NameInArray asStringVars sId2 to bId2
                             If (bId1 = True and bId2 = True) Begin
-                                // Wrap the source operand. Operate on the
-                                // ORIGINAL line so indentation and any trailing
-                                // comment are preserved; the space-bounded
-                                // Replace hits the source operand (first match).
-                                Move (Replace((CS_S + sId1 + CS_S), sLine, (CS_S + "(PointerToString(" + sId1 + "))" + CS_S))) to sLine
-                                Move (RTrim(sLine)) to sLine
-                                Move sLine to asCode[iCount]
-                                Increment iChanges
+                                Move (ResizeArray(asFromOne, 0)) to asFromOne
+                                Move (ResizeArray(asToOne, 0))   to asToOne
+                                Move sFnName to asFromOne[0]
+                                Move sFnTo   to asToOne[0]
+                                // Rename on the ORIGINAL line via the shared
+                                // masked-call renamer (case-insensitive,
+                                // boundary-aware, literal/comment-safe); the
+                                // aligned masked line = indent + overstrike.
+                                Move (TokenizerData.sIndentation + sOver) to sAligned
+                                Get _RenameMaskedCalls of ghoFuncLib sLine sAligned asFromOne asToOne to sNew
+                                If (sNew <> sLine) Begin
+                                    Move (RTrim(sNew)) to sLine
+                                    Move sLine to asCode[iCount]
+                                    Increment iChanges
+                                    Move iCount to aiChanged[SizeOfArray(aiChanged)]
+                                End
                             End
                         End
                     End
@@ -239,6 +347,201 @@ Class cUnicodePointerToString is a cObject
         If (Active_State(ghoStatusPanel) = True) ;
             Set piPosition of ghoProgressBar to (iMax + 1)
 
+        Set paiChangedLines to aiChanged
+        Function_Return iChanges
+    End_Function
+
+    /* THE METHOD'S NAME SETS, kept as the walk passes a line - the same bookkeeping in ParseFile and
+       ParseFilePairs. A method's signature line opens a fresh scope: both sets are emptied and the signature's
+       Pointer/Address and String parameters collected (CollectParameters); a declaration line inside a method
+       adds its names to the set its type belongs to. Returns True for an executable line inside a method - the
+       only kind of line either pass rewrites.
+
+       The method START is detected from the SIGNATURE LINE itself (_IsProcedureDeclaration /
+       _IsFunctionDeclaration), not from the lexer's in-method False->True transition. History: this used to key
+       off the transition, because _IsFunctionDeclaration was buggy - it matched "Function_Return", which would
+       have wiped the type map on an early return mid-method (the original WinServCrypt.AESDecrypt miss). That
+       helper now requires a word boundary after "Function", so it is safe again AND signature detection is
+       strictly more robust: a preceding method with a mismatched end keyword (a Function closed with
+       End_Procedure, which DataFlex tolerates but the lexer's function branch never treats as an end) leaves
+       the lexer STUCK in-method, so the transition would never fire for the next method. (That is what bit
+       cUnicodeStringToPointer on cJSONParser.) */
+    Function _TrackScopeNames String sOver tTokenizer TokenizerData String[] ByRef asPointerVars String[] ByRef asStringVars Returns Boolean
+        String   sType sVars sName
+        String[] asVars
+        Integer  iItems iIdx
+        Boolean  bIsProcDecl bIsFuncDecl bPtr bStr bIgnore
+
+        Get _IsProcedureDeclaration of ghoFuncLib sOver to bIsProcDecl
+        Get _IsFunctionDeclaration  of ghoFuncLib sOver to bIsFuncDecl
+        If (bIsProcDecl = True or bIsFuncDecl = True) Begin
+            Move (ResizeArray(asPointerVars, 0)) to asPointerVars
+            Move (ResizeArray(asStringVars, 0))  to asStringVars
+            Send CollectParameters sOver (&asPointerVars) (&asStringVars)
+        End
+        If (TokenizerData.bIsInProcedure = False and TokenizerData.bIsInFunction = False) ;
+            Function_Return False
+        If (TokenizerData.bIsVariableDeclaration = False) ;
+            Function_Return True
+        // Classify the declaration and collect its names into the matching set. All names on the
+        // line share one datatype, so resolve that once.
+        Get RemoveLocalKeyWord  of ghoFuncLib (&sOver) "" to bIgnore
+        Get _RetrieveFirstToken of ghoFuncLib sOver to sType
+        Get _RemoveFirstToken   of ghoFuncLib sOver to sVars
+        Get IsPointerLikeType sType to bPtr
+        Move (Lowercase(Trim(sType)) = "string") to bStr
+        If (bPtr = True or bStr = True) Begin
+            Move (StrSplitToArray(Trim(sVars), CS_S)) to asVars
+            Move (SizeOfArray(asVars)) to iItems
+            Decrement iItems
+            For iIdx from 0 to iItems
+                Move (Lowercase(Trim(asVars[iIdx]))) to sName
+                If (sName <> "") Begin
+                    If (bPtr = True) ;
+                        Move sName to asPointerVars[SizeOfArray(asPointerVars)]
+                    If (bStr = True) ;
+                        Move sName to asStringVars[SizeOfArray(asStringVars)]
+                End
+            Loop
+        End
+        Function_Return False
+    End_Function
+
+    /* THE TWO-LINE BUFFER PAIR. The DF 19.1 way of converting a string's encoding
+       through the pointer-level API:
+
+           Move (OemToUtf8Buffer((AddressOf(sVar)),(Length(sVar)))) to aBuf
+           Move aBuf to sVar
+
+       collapses to the one line that does the same thing in DF 20+:
+
+           Move (OemToUtf8(sVar)) to sVar
+
+       Nils asked for this 2026-07-29, having been doing it by hand. It is the shape
+       cUnicodePointerToString's one-argument rename deliberately declined ("a
+       two-argument call is the pointer-level API used deliberately") - and that call
+       was right for a two-argument call IN ISOLATION. What changes the answer is the
+       SECOND line: moving the buffer straight back into the same variable proves the
+       pointer was only ever a way to get a string back, so the pair as a whole is the
+       string conversion written the long way.
+
+       IT ALSO STOPS A LEAK. OemToUtf8Buffer returns a heap buffer that the caller must
+       free ("use free() to deallocate", CharTranslate.pkg); this idiom never does. The
+       String sibling does PointerToString + Free internally, so the rewrite removes a
+       leak per call as well as the pointer.
+
+       FOUR GUARDS, because deleting a line is not something to get wrong:
+         1. both arguments name the SAME variable (AddressOf(X) + Length/SizeOfString(X)),
+         2. the next CODE line is exactly "Move <buffer> to X" - same X,
+         3. <buffer> is used nowhere else but its own declaration; anything more and
+            removing the assignment orphans a later read,
+         4. X is a declared String (or String parameter) in this method's scope.
+       Any line of the pair carrying a trailing comment is refused rather than have the
+       comment silently deleted with the line.
+
+       The buffer's now-unused declaration is deliberately LEFT: removing declarations
+       is RemoveUnusedLocals's job, and its #INCLUDE blindness is exactly why that is a
+       separate, opt-in function. */
+    Function ParseFilePairs String[] ByRef asCode Returns Integer
+        Integer  iCount iMax iChanges iIdx iTokens iNext iUses
+        String   sLine sOver sName sFnName sFnTo sVar sBuf sCall
+        String   sNextOver sNextLine
+        String[] asPointerVars asStringVars asTokens asNextTok
+        Boolean  bExecutable bGate bCall bStrVar
+        Integer[] aiDelete
+        tTokenizer TokenizerData
+
+        Move 0 to iChanges
+        Move (SizeOfArray(asCode)) to iMax
+        If (iMax = 0) ;
+            Function_Return 0
+        Decrement iMax
+
+        // Pre-gate (the cheap raw scan every whole-file scanner uses): the pair needs a
+        // *Buffer call AND an AddressOf. No "addressof" anywhere = nothing to collapse.
+        Get _FileContainsText of ghoFuncLib (&asCode) "buffer" to bGate
+        If (bGate = True) ;
+            Get _FileContainsText of ghoFuncLib (&asCode) "addressof" to bGate
+        If (bGate = False) ;
+            Function_Return 0
+
+        For iCount from 0 to iMax
+            Move asCode[iCount] to sLine
+            If (Mod(iCount, 20) = 0 and Active_State(ghoStatusPanel) = True) Begin
+                Send Update_StatusPanel of ghoStatusPanel ("Source line:" * String(iCount + 1) * "of:" * String(iMax + 1))
+                Set piPosition of ghoProgressBar to (iCount + 1)
+            End
+
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Move TokenizerData.sOverstrikeLine to sOver
+            // The method's Pointer/Address and String names, kept by _TrackScopeNames; only an executable
+            // line inside a method can hold a rewrite.
+            Get _TrackScopeNames sOver TokenizerData (&asPointerVars) (&asStringVars) to bExecutable
+            If (bExecutable = True) Begin
+                // "Move <call> to <buffer>" - the call may carry spaces, so rejoin
+                // everything between "Move" and the trailing "to <dest>".
+                Move (StrSplitToArray(Trim(sOver), CS_S)) to asTokens
+                Move (SizeOfArray(asTokens)) to iTokens
+                If (iTokens >= 4 and Lowercase(asTokens[0]) = "move" and Lowercase(asTokens[iTokens - 2]) = "to") Begin
+                    Move "" to sCall
+                    For iIdx from 1 to (iTokens - 3)
+                        Move (sCall + asTokens[iIdx]) to sCall
+                    Loop
+                    Move asTokens[iTokens - 1] to sBuf
+                    Get ParseBufferPairCallToken sCall (&sFnName) (&sVar) to bCall
+                    If (bCall = True) Begin
+                        Get BufferSiblingFor sFnName to sFnTo
+                        Get NameInArray asStringVars sVar to bStrVar
+                        // Guard 4 + a known buffer function, else leave it alone.
+                        If (sFnTo <> "" and bStrVar = True and Pos("//", sLine) = 0) Begin
+                            // Guard 2: the next CODE line must hand the buffer back to X.
+                            Move (iCount + 1) to iNext
+                            While (iNext <= iMax and Trim(asCode[iNext]) = "")
+                                Increment iNext
+                            Loop
+                            If (iNext <= iMax) Begin
+                                Move asCode[iNext] to sNextLine
+                                Get Tokenizer of ghoFuncLib sNextLine to TokenizerData
+                                Move TokenizerData.sOverstrikeLine to sNextOver
+                                Move (StrSplitToArray(Trim(sNextOver), CS_S)) to asNextTok
+                                If ((SizeOfArray(asNextTok)) = 4 and Pos("//", sNextLine) = 0) Begin
+                                    If (Lowercase(asNextTok[0]) = "move" and Lowercase(asNextTok[2]) = "to" ;
+                                        and Lowercase(asNextTok[1]) = Lowercase(sBuf) ;
+                                        and Lowercase(asNextTok[3]) = Lowercase(sVar)) Begin
+                                        // Guard 3: nothing but its own declaration may name the buffer.
+                                        Get _WordUsesOutsidePair of ghoFuncLib (&asCode) sBuf iCount iNext to iUses
+                                        If (iUses <= 1) Begin
+                                            // The FIRST line's own indent - TokenizerData now
+                                            // describes the NEXT line, so its sIndentation is
+                                            // the wrong one to reach for here.
+                                            Get _LineIndent of ghoFuncLib sLine to sName
+                                            Move (sName + "Move (" + sFnTo + "(" + sVar + ")) to " + sVar) to asCode[iCount]
+                                            Move iNext to aiDelete[SizeOfArray(aiDelete)]
+                                            Increment iChanges
+                                        End
+                                    End
+                                End
+                            End
+                        End
+                    End
+                End
+            End
+        Loop
+
+        // The paired lines dropped in ONE rebuild after the walk (_RemoveLinesAt).
+        Send _RemoveLinesAt of ghoFuncLib (&asCode) aiDelete
+
+        If (Active_State(ghoStatusPanel) = True) ;
+            Set piPosition of ghoProgressBar to (iMax + 1)
+
+        Function_Return iChanges
+    End_Function
+
+    // Public entry for the two-line collapse. One source file as a String ByRef
+    // array; returns the number of PAIRS collapsed (each removes one line).
+    Function UnicodeBufferPairToString String[] ByRef asCode Returns Integer
+        Integer iChanges
+        Get ParseFilePairs (&asCode) to iChanges
         Function_Return iChanges
     End_Function
 

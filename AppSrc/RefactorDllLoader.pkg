@@ -1,0 +1,111 @@
+﻿//****************************************************************************
+// $Module type: Package
+// $Module name: RefactorDllLoader
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-28
+//
+// Description : Load the Scintilla DLL from the program folder, and say so plainly if it is not there.
+//
+//               WHAT IT REPLACES. SciControlLib's DLLHandler.pkg, 281 lines: a module registry keyed by
+//               uppercased filename, reference counting, a free-by-name path, version-info hooks that
+//               were never written. DFRefactor calls exactly three things on it - set the path, load
+//               one DLL, and that is all - so what came home is those three things.
+//
+//               The whole reason it needs a path at all: SciLexer<bits>.dll sits in the workspace's
+//               Programs folder, not on the system search path, and it must be mapped into the process
+//               BEFORE the first Scintilla control pages, because the window class it registers is what
+//               DataFlex hands to CreateWindowEx. That is why cScintillaControl loads it from
+//               Construct_Object rather than from a paged hook.
+//
+//               FAILING LOUDLY IS THE POINT. Without the DLL there is no editor at all - no syntax
+//               colouring, no control, nothing to fall back to - so a missing file stops the program
+//               with a message naming the exact path it looked in, rather than letting a window fail to
+//               create and leaving the user with an empty pane and no explanation. That is the old
+//               behaviour (pbErrorAbort defaulted True) and it is the right one.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use Windows.pkg
+Use vWin32fh.pkg        // vFolderFormat / vFilePathExists
+
+// LoadLibrary is NOT declared here. Windows.pkg already declares it, as
+//
+//     External_Function LoadLibrary "LoadLibraryW" Kernel32.dll WString sFileName Returns Handle
+//
+// taking a WString BY VALUE - DataFlex marshals the wide string itself. A local
+// declaration guarded with #IFNDEF get_LoadLibrary is worse than useless: the guard sees
+// the existing one and skips ours, so a call written against OUR signature (a Pointer)
+// silently compiles against THEIRS and hands a pointer where a string was expected. The
+// DLL then fails to load and the program aborts on startup, which is exactly what
+// happened while writing this file.
+
+Class cRefactorDllLoader is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // Where to look. Set by the caller before the first load; empty means "wherever
+        // Windows would look", which is not how we ship but is a sane fallback.
+        Property String  psDllLoadPath ""
+        // The handle of the last successful load, kept only so a second request for the
+        // same module is cheap. Nothing frees it: the DLL lives as long as the process,
+        // and unloading a library whose window class is still registered is a good way to
+        // crash on the next paint.
+        Property Handle  phLastModule 0
+        Property String  psLastModule ""
+    End_Procedure
+
+    /* Map a DLL into the process. True when it is loaded and usable.
+
+       Tries the configured folder first and only then a bare name, so a stray copy on the
+       system path can never quietly win over the one we ship beside the program. */
+    Function LoadDll String sModuleName Returns Boolean
+        Handle  hModule
+        String  sPath sFull
+
+        If (Trim(sModuleName) = "") ;
+            Function_Return False
+        If (Lowercase(psLastModule(Self)) = Lowercase(sModuleName) and phLastModule(Self) <> 0) ;
+            Function_Return True
+
+        Get psDllLoadPath to sPath
+        If (sPath <> "") ;
+            Move (vFolderFormat(sPath) + sModuleName) to sFull
+        Else ;
+            Move sModuleName to sFull
+        If (sPath <> "" and vFilePathExists(sFull) = 0) ;
+            Move sModuleName to sFull      // not beside the program - let Windows search
+
+        // Windows.pkg's LoadLibrary takes the name BY VALUE and marshals it - pass the
+        // string, not its address, and no explicit terminator.
+        Move (LoadLibrary(sFull)) to hModule
+        If (hModule = 0) ;
+            Function_Return False
+        Set phLastModule to hModule
+        Set psLastModule to sModuleName
+        Function_Return True
+    End_Function
+
+    // Load or stop. See the header on why this aborts rather than limping on.
+    Procedure doLoadLibrary String sModuleName
+        Boolean bLoaded
+        String  sPath sMessage
+
+        Get LoadDll sModuleName to bLoaded
+        If (bLoaded) ;
+            Procedure_Return
+
+        Get psDllLoadPath to sPath
+        Move ("The editor component could not be loaded." + Character(10) + Character(10)) to sMessage
+        Move (sMessage + "Missing or unreadable:" + Character(10)) to sMessage
+        Move (sMessage + vFolderFormat(sPath) + sModuleName + Character(10) + Character(10)) to sMessage
+        Move (sMessage + "The program cannot continue without it.") to sMessage
+        Send Stop_Box sMessage "Editor component missing"
+        Abort
+    End_Procedure
+
+End_Class
+
+Object oDllHandler is a cRefactorDllLoader
+End_Object

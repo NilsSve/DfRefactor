@@ -1,0 +1,341 @@
+﻿//****************************************************************************
+// $Module type: Class
+// $Module name: cLegacyClassSwap
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : Swaps a legacy class for a modern one across a workspace, driven
+//               entirely by a parameter - so ONE function serves every
+//               "third-party package the runtime has since absorbed" case rather
+//               than needing a new converter per package.
+//
+//               The case that prompted it (Nils 2026-07-30): a donated 2002
+//               package wrapping the Win32 SysMonthCal32 control, used all over a
+//               workspace. DataFlex now ships cMonthCalendar - the SAME control,
+//               maintained, already written in the modern idiom. Modernising the
+//               old package's internals would mean the hardest legacy family we
+//               have (Type/ZeroType/Put/GetBuff buffers passed to Win32 by
+//               address, where a Struct's padding is not a Type's packing).
+//               Swapping the class makes all of that disappear with the file.
+//
+//               THE GENERAL LESSON, worth more than this one conversion: before
+//               writing a converter for a legacy package's INTERNALS, grep the
+//               target install's Pkg folder for an equivalent class. Third time
+//               in one day that check changed the answer.
+//
+// Parameter   : Comma-separated pairs. The first is the class; the rest are
+//               optional and may appear in any order.
+//
+//                 <OldClass>=<NewClass>          required, must be first
+//                 use:<old.pkg>=<new.pkg>        rewrite the Use line
+//                 get:<OldMember>=<NewMember>    Get/Function member rename
+//                 send:<OldMember>=<NewMember>   Send/Procedure member rename
+//                 set:<OldProp>=<NewProcedure>   "Set X of o to v" becomes
+//                                                "Send <new> of o v" - a property
+//                                                that became a procedure
+//
+// Scope       : DECLARATIONS and MEMBER USES, not semantics. It cannot know that
+//               the new class's OnChange takes an extra argument, or that a
+//               property became read-only. Everything it changes is mechanical;
+//               everything it cannot verify it REPORTS instead, so what is left is
+//               a list rather than a hunt. See pasSwapReview.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS for a PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//****************************************************************************
+
+Use RefactorConstants.h.pkg
+
+Class cLegacyClassSwap is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        /* Only the OUTPUTS are properties. The parse results are locals threaded through ByRef,
+           because a DataFlex property array cannot be index-assigned - both "Move x to pasFoo[n]"
+           and "pasFoo(Self)[n]" are invalid, which is exactly what the first cut of this class got
+           wrong. Read/modify/Set-back would work but buys nothing here. */
+        Property String[] pasSwapReview      // what it refused to change, with line and reason
+        Property Integer piSubclassHits 0    // subclasses seen and deliberately left alone
+    End_Procedure
+
+    // "a=b" -> the two halves. False when the shape is wrong, so a typo in the parameter is
+    // refused rather than half-applied.
+    Function _SplitPair String sText String ByRef sLeft String ByRef sRight Returns Boolean
+        Integer iPos
+        Move (Pos("=", sText)) to iPos
+        If (iPos < 2) ;
+            Function_Return False
+        Move (Trim(Left(sText, (iPos - 1)))) to sLeft
+        Move (Trim(Mid(sText, ((Length(sText)) - iPos), (iPos + 1)))) to sRight
+        Function_Return (sLeft <> "" and sRight <> "")
+    End_Function
+
+    /* Read the whole parameter into the caller's locals. False when the FIRST pair is not a plain
+       class swap - the one mandatory part, and the one whose absence would otherwise mean a run
+       that quietly does nothing. */
+    Function ParseParameter String sParam String ByRef sOld String ByRef sNew ;
+                            String[] ByRef asFromUse  String[] ByRef asToUse ;
+                            String[] ByRef asFromGet  String[] ByRef asToGet ;
+                            String[] ByRef asFromSend String[] ByRef asToSend ;
+                            String[] ByRef asFromSet  String[] ByRef asToSet Returns Boolean
+        String[] asParts
+        String   sPart sLeft sRight sTag
+        Integer  i iLast iPos
+        Boolean  bOK
+
+        Move (Trim(sParam)) to sParam
+        If (sParam = "") ;
+            Function_Return False
+        Move (StrSplitToArray(sParam, ",")) to asParts
+        Move ((SizeOfArray(asParts)) - 1) to iLast
+        If (iLast < 0) ;
+            Function_Return False
+
+        Get _SplitPair (Trim(asParts[0])) (&sLeft) (&sRight) to bOK
+        If (bOK = False) ;
+            Function_Return False
+        Move sLeft  to sOld
+        Move sRight to sNew
+
+        For i from 1 to iLast
+            Move (Trim(asParts[i])) to sPart
+            If (sPart <> "") Begin
+                Move "" to sTag
+                Move (Pos(":", sPart)) to iPos
+                If (iPos > 1) Begin
+                    Move (Lowercase(Trim(Left(sPart, (iPos - 1))))) to sTag
+                    Move (Trim(Mid(sPart, ((Length(sPart)) - iPos), (iPos + 1)))) to sPart
+                End
+                Get _SplitPair sPart (&sLeft) (&sRight) to bOK
+                If (bOK = True) Begin
+                    If (sTag = "use") Begin
+                        Move sLeft  to asFromUse[SizeOfArray(asFromUse)]
+                        Move sRight to asToUse[SizeOfArray(asToUse)]
+                    End
+                    If (sTag = "get") Begin
+                        Move sLeft  to asFromGet[SizeOfArray(asFromGet)]
+                        Move sRight to asToGet[SizeOfArray(asToGet)]
+                    End
+                    If (sTag = "send") Begin
+                        Move sLeft  to asFromSend[SizeOfArray(asFromSend)]
+                        Move sRight to asToSend[SizeOfArray(asToSend)]
+                    End
+                    If (sTag = "set") Begin
+                        Move sLeft  to asFromSet[SizeOfArray(asFromSet)]
+                        Move sRight to asToSet[SizeOfArray(asToSet)]
+                    End
+                    // An untagged extra pair is a typo, not a second class swap - ignored rather
+                    // than acted on as a guess about what was meant.
+                End
+            End
+        Loop
+        Function_Return True
+    End_Function
+
+    // Index of sName in the array (whole-string, case-insensitive), else -1.
+    Function _IndexOf String[] asNames String sName Returns Integer
+        Integer i iLast
+        Move ((SizeOfArray(asNames)) - 1) to iLast
+        For i from 0 to iLast
+            If (Lowercase(Trim(asNames[i])) = Lowercase(Trim(sName))) ;
+                Function_Return i
+        Loop
+        Function_Return -1
+    End_Function
+
+    // Replace ONE whole-word occurrence of sFrom with sTo on the original line, preserving
+    // everything else. The position comes from the aligned MASKED line, so a name inside a string
+    // literal or a comment is never touched.
+    Function _SpliceWord String sLine String sMasked String sFrom String sTo Returns String
+        Integer iPos iFromLen iTailLen
+        Get _FindKeywordPos of ghoFuncLib sMasked sFrom True 1 to iPos
+        If (iPos < 1) ;
+            Function_Return sLine
+        Move (Length(sFrom)) to iFromLen
+        Move ((Length(sLine)) - iPos - iFromLen + 1) to iTailLen
+        If (iTailLen < 0) ;
+            Move 0 to iTailLen
+        Function_Return (Left(sLine, (iPos - 1)) + sTo + Mid(sLine, iTailLen, (iPos + iFromLen)))
+    End_Function
+
+    // True when the line names one of this file's converted objects - the only evidence available
+    // that a member use belongs to the swapped class.
+    Function _LineNamesObject String sMasked String[] asObjects Returns Boolean
+        Integer i iLast iPos
+        Move ((SizeOfArray(asObjects)) - 1) to iLast
+        For i from 0 to iLast
+            Get _FindKeywordPos of ghoFuncLib sMasked asObjects[i] True 1 to iPos
+            If (iPos > 0) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    /* One file. Returns the number of lines changed.
+
+       TWO PASSES, and the order matters. The first collects every object DECLARED as the old class
+       in this file, because a member rename is only safe on a line that demonstrably talks to one
+       of them - "Get Current_Item of (oCal(Self))" is convertible, "Get Current_Item of hoSomething"
+       is not, and guessing between them is how a converter corrupts a workspace. The second
+       rewrites.
+
+       Anything it cannot attribute goes to pasSwapReview with its line number and the reason, so
+       what remains is a list to work through rather than a hunt. */
+    Function ParseFile String[] ByRef asCode String sParam Returns Integer
+        Integer  iCount iMax iChanges iIdx iTok
+        String   sLine sOver sMaskedFull sOld sNew sVerb sIndent sRebuilt sNote
+        String[] asObjects asTok asReview
+        String[] asFromUse asToUse asFromGet asToGet asFromSend asToSend asFromSet asToSet
+        Boolean  bOK bNamed
+        tTokenizer TokenizerData
+
+        Move 0 to iChanges
+        Move (SizeOfArray(asCode)) to iMax
+        If (iMax = 0) ;
+            Function_Return 0
+        Decrement iMax
+
+        Get ParseParameter sParam (&sOld) (&sNew) (&asFromUse) (&asToUse) ;
+                           (&asFromGet) (&asToGet) (&asFromSend) (&asToSend) ;
+                           (&asFromSet) (&asToSet) to bOK
+        If (bOK = False) ;
+            Function_Return 0
+
+        // Pre-gate: the old class name must appear somewhere, or there is nothing here to do.
+        Get _FileContainsText of ghoFuncLib (&asCode) (Lowercase(sOld)) to bOK
+        If (bOK = False) ;
+            Function_Return 0
+
+        // ---- PASS 1: which objects in THIS file are of the old class? ----
+        For iCount from 0 to iMax
+            Get Tokenizer of ghoFuncLib asCode[iCount] to TokenizerData
+            Get _SplitWords of ghoFuncLib (TokenizerData.sOverstrikeLine) to asTok
+            If ((SizeOfArray(asTok)) >= 5) Begin
+                If (Lowercase(asTok[0]) = "object" and Lowercase(asTok[2]) = "is" ;
+                    and (Lowercase(asTok[3]) = "a" or Lowercase(asTok[3]) = "an") ;
+                    and Lowercase(asTok[4]) = Lowercase(sOld)) ;
+                    Move (Trim(asTok[1])) to asObjects[SizeOfArray(asObjects)]
+            End
+        Loop
+
+        // ---- PASS 2: rewrite ----
+        For iCount from 0 to iMax
+            Move asCode[iCount] to sLine
+            If (Mod(iCount, 20) = 0 and Active_State(ghoStatusPanel) = True) Begin
+                Send Update_StatusPanel of ghoStatusPanel ("Source line:" * String(iCount + 1) * "of:" * String(iMax + 1))
+                Set piPosition of ghoProgressBar to (iCount + 1)
+            End
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Move TokenizerData.sOverstrikeLine to sOver
+            Move (TokenizerData.sIndentation + sOver) to sMaskedFull
+            Get _SplitWords of ghoFuncLib sOver to asTok
+            Move (SizeOfArray(asTok)) to iTok
+
+            If (iTok >= 5) Begin
+                If (Lowercase(asTok[0]) = "object" and Lowercase(asTok[2]) = "is" ;
+                    and (Lowercase(asTok[3]) = "a" or Lowercase(asTok[3]) = "an") ;
+                    and Lowercase(asTok[4]) = Lowercase(sOld)) Begin
+                    Get _SpliceWord sLine sMaskedFull sOld sNew to sLine
+                    Move sLine to asCode[iCount]
+                    Increment iChanges
+                End
+                /* A SUBCLASS of the old class is NOT re-based. Changing someone's parent changes
+                   what their overrides are overriding - the same call the grid converters make,
+                   and for the same reason. Counted and reported. */
+                Else If (Lowercase(asTok[0]) = "class" and Lowercase(asTok[2]) = "is" ;
+                    and (Lowercase(asTok[3]) = "a" or Lowercase(asTok[3]) = "an") ;
+                    and Lowercase(asTok[4]) = Lowercase(sOld)) Begin
+                    Set piSubclassHits to (piSubclassHits(Self) + 1)
+                    Move (String(iCount + 1) + ": subclass of " + sOld + " - re-base by hand: " + Trim(sLine)) to sNote
+                    Move sNote to asReview[SizeOfArray(asReview)]
+                End
+            End
+
+            If (iTok >= 2 and Lowercase(asTok[0]) = "use") Begin
+                Get _IndexOf asFromUse (Trim(asTok[1])) to iIdx
+                If (iIdx >= 0) Begin
+                    Get _SpliceWord sLine sMaskedFull (Trim(asTok[1])) asToUse[iIdx] to sLine
+                    Move sLine to asCode[iCount]
+                    Increment iChanges
+                End
+            End
+
+            /* Member uses, only when the line NAMES one of this file's converted objects. A handle
+               variable or a cross-file reference is exactly where a blind rename does its damage. */
+            If (iTok >= 2) Begin
+                Move (Lowercase(asTok[0])) to sVerb
+                If (sVerb = "get" or sVerb = "send" or sVerb = "set") Begin
+                    Get _LineNamesObject sMaskedFull asObjects to bNamed
+
+                    If (sVerb = "get") Begin
+                        Get _IndexOf asFromGet (Trim(asTok[1])) to iIdx
+                        If (iIdx >= 0) Begin
+                            If (bNamed = True) Begin
+                                Get _SpliceWord sLine sMaskedFull (Trim(asTok[1])) asToGet[iIdx] to sLine
+                                Move sLine to asCode[iCount]
+                                Increment iChanges
+                            End
+                            Else Begin
+                                Move (String(iCount + 1) + ": " + Trim(asTok[1]) + " - cannot tell the object type here: " + Trim(sLine)) to sNote
+                                Move sNote to asReview[SizeOfArray(asReview)]
+                            End
+                        End
+                    End
+
+                    If (sVerb = "send") Begin
+                        Get _IndexOf asFromSend (Trim(asTok[1])) to iIdx
+                        If (iIdx >= 0) Begin
+                            If (bNamed = True) Begin
+                                Get _SpliceWord sLine sMaskedFull (Trim(asTok[1])) asToSend[iIdx] to sLine
+                                Move sLine to asCode[iCount]
+                                Increment iChanges
+                            End
+                            Else Begin
+                                Move (String(iCount + 1) + ": " + Trim(asTok[1]) + " - cannot tell the object type here: " + Trim(sLine)) to sNote
+                                Move sNote to asReview[SizeOfArray(asReview)]
+                            End
+                        End
+                    End
+
+                    /* "Set <prop> of <obj> to <value>" -> "Send <proc> of <obj> <value>". A SHAPE
+                       change, not a rename: the statement loses its "to". Rebuilt from tokens, so
+                       the original spacing goes - unavoidable when the grammar itself changes, and
+                       the indent is kept. Only the exact 6-token form is handled; anything longer
+                       (an expression with spaces in it) is reported, because rebuilding those
+                       correctly needs the expression parsed, not split. */
+                    If (sVerb = "set") Begin
+                        Get _IndexOf asFromSet (Trim(asTok[1])) to iIdx
+                        If (iIdx >= 0) Begin
+                            If (bNamed = True and iTok = 6 and Lowercase(asTok[4]) = "to") Begin
+                                Get _LineIndent of ghoFuncLib sLine to sIndent
+                                Move (sIndent + "Send " + asToSet[iIdx] + " of " + asTok[3] + " " + asTok[5]) to sRebuilt
+                                Move sRebuilt to asCode[iCount]
+                                Increment iChanges
+                            End
+                            Else Begin
+                                Move (String(iCount + 1) + ": Set " + Trim(asTok[1]) + " - rewrite by hand as a Send: " + Trim(sLine)) to sNote
+                                Move sNote to asReview[SizeOfArray(asReview)]
+                            End
+                        End
+                    End
+                End
+            End
+        Loop
+
+        Set pasSwapReview to asReview
+        If (Active_State(ghoStatusPanel) = True) ;
+            Set piPosition of ghoProgressBar to (iMax + 1)
+        Function_Return iChanges
+    End_Function
+
+    // Public entry. One source file as a String ByRef array.
+    Function ChangeLegacyClassToModern String[] ByRef asCode String sParam Returns Integer
+        Integer iChanges
+        Get ParseFile (&asCode) sParam to iChanges
+        Function_Return iChanges
+    End_Function
+
+End_Class

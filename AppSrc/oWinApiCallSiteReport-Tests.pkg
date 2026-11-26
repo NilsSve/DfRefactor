@@ -1,0 +1,131 @@
+//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oWinApiCallSiteReport-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-30
+//
+// Description : Unit tests for the two PURE cores behind WinApiCallSiteReport - finding the
+//               receiver of an API result on one line, and looking up the type that receiver
+//               was declared with. Everything else in that report is file I/O and catalogue
+//               lookup against a real workspace.
+//
+//               The report exists because correcting an API DECLARATION does not correct the
+//               call sites: "Move (Api(x)) to iRet" still puts eight bytes into four, compiles
+//               clean, and truncates an address on x64. These two functions are what find them.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+    Object oWinApiCallSiteReport is a cTestFixture
+        Set psFunctionName to "WinApiCallSiteReport"
+
+        // Helper: the receiver name, or "" when the line is not a storing call site.
+        Function ReceiverOn String sLine String sApi Returns String
+            String sReceiver
+            Boolean bFound
+            Get _ApiCallReceiverOnLine of ghoFuncLib sLine sApi (&sReceiver) to bFound
+            If (bFound = False) ;
+                Function_Return ""
+            Function_Return sReceiver
+        End_Function
+
+        Function DeclaredType String[] asCode String sVar Returns String
+            String sType
+            Get _DeclaredTypeOfVarInLines of ghoFuncLib (&asCode) sVar to sType
+            Function_Return sType
+        End_Function
+
+        /* The shape the whole report is built on. The receiver keeps the case it was written
+           with - it goes into a worksheet a person reads, so "iRetVal" must not come back
+           lowercased. */
+        {Published = True}
+        Procedure CallSite_MoveToReceiver
+            Send AssertSAreEqual "iRetVal" (ReceiverOn(Self, "    Move (GetFooHandle(hWnd)) to iRetVal", "GetFooHandle"))
+            Send AssertSAreEqual "hoWnd"   (ReceiverOn(Self, "Move (GetFooHandle(1)) to hoWnd", "GetFooHandle"))
+        End_Procedure
+
+        // A call whose result nothing stores has no receiver to fix - it must not be reported as
+        // if it had one. The report lists those separately, from a different branch.
+        {Published = True}
+        Procedure CallSite_NoReceiverIsNotAHit
+            Send AssertSAreEqual "" (ReceiverOn(Self, "    Send DoThing (GetFooHandle(hWnd))", "GetFooHandle"))
+            Send AssertSAreEqual "" (ReceiverOn(Self, "    If (GetFooHandle(hWnd) = 0) Begin", "GetFooHandle"))
+        End_Procedure
+
+        /* NOT A CALL unless the name is followed by "(". The declaration line names the API and
+           must never be counted as one of its own call sites - the report reads a file that
+           contains both. */
+        {Published = True}
+        Procedure CallSite_BareMentionIsNotACall
+            Send AssertSAreEqual "" (ReceiverOn(Self, "    Move GetFooHandle to sName", "GetFooHandle"))
+            Send AssertSAreEqual "" (ReceiverOn(Self, "        Returns Integer", "GetFooHandle"))
+        End_Procedure
+
+        // Whole-word, so a longer name that merely contains the API name is not a call site.
+        {Published = True}
+        Procedure CallSite_SubstringNameIsNotAHit
+            Send AssertSAreEqual "" (ReceiverOn(Self, "Move (MyGetFooHandle(1)) to i", "GetFooHandle"))
+        End_Procedure
+
+        // Masked before searching, so a call inside a literal or after "//" is invisible.
+        {Published = True}
+        Procedure CallSite_StringAndCommentAreInvisible
+            Send AssertSAreEqual "" (ReceiverOn(Self, '    Move "Move (GetFooHandle(1)) to i" to s', "GetFooHandle"))
+            Send AssertSAreEqual "" (ReceiverOn(Self, "    // Move (GetFooHandle(1)) to i", "GetFooHandle"))
+        End_Procedure
+
+        // A nested argument must not end the call early - the receiver is after the MATCHING paren.
+        {Published = True}
+        Procedure CallSite_NestedArgumentFindsTheOuterReceiver
+            Send AssertSAreEqual "hRes" ;
+                (ReceiverOn(Self, "Move (GetFooHandle(Value(oF, 3))) to hRes", "GetFooHandle"))
+        End_Procedure
+
+        {Published = True}
+        Procedure DeclaredType_LocalAndProperty
+            String[] asCode
+            Move "    Integer iRetVal"          to asCode[0]
+            Move "    Handle  hoWnd"            to asCode[1]
+            Move "    Property Integer piCount" to asCode[2]
+            Move "    Move (Api(1)) to iRetVal" to asCode[3]
+            Send AssertSAreEqual "Integer" (DeclaredType(Self, asCode, "iRetVal"))
+            Send AssertSAreEqual "Handle"  (DeclaredType(Self, asCode, "hoWnd"))
+            Send AssertSAreEqual "Integer" (DeclaredType(Self, asCode, "piCount"))
+        End_Procedure
+
+        // Several names on one declaration line - each of them is declared with that type.
+        {Published = True}
+        Procedure DeclaredType_SeveralNamesOnOneLine
+            String[] asCode
+            Move "    Integer iOne iTwo iThree" to asCode[0]
+            Send AssertSAreEqual "Integer" (DeclaredType(Self, asCode, "iTwo"))
+            Send AssertSAreEqual "Integer" (DeclaredType(Self, asCode, "iThree"))
+        End_Procedure
+
+        /* "" IS A REAL ANSWER and the report prints it as "not declared in this file". A receiver
+           can be a struct member or live in an include, and a report that silently dropped those
+           would understate the blast radius - the one thing it must not do. */
+        {Published = True}
+        Procedure DeclaredType_UnknownIsEmptyNotAGuess
+            String[] asCode
+            Move "    Integer iRetVal"           to asCode[0]
+            Move "    Move (Api(1)) to Foo.iBar" to asCode[1]
+            Send AssertSAreEqual "" (DeclaredType(Self, asCode, "Foo.iBar"))
+            Send AssertSAreEqual "" (DeclaredType(Self, asCode, "iNeverDeclared"))
+        End_Procedure
+
+        // A statement is not a declaration: "Move iRet to x" must not read as declaring iRet with
+        // a type called Move. The first token has to be a name DataFlex declares with.
+        {Published = True}
+        Procedure DeclaredType_StatementIsNotADeclaration
+            String[] asCode
+            Move "    Move iRetVal to iOther" to asCode[0]
+            Move "    Send DoThing iRetVal"   to asCode[1]
+            Send AssertSAreEqual "" (DeclaredType(Self, asCode, "iRetVal"))
+        End_Procedure
+
+        Procedure TearDown
+            Send _InitializeFuncLib of ghoFuncLib
+        End_Procedure
+    End_Object

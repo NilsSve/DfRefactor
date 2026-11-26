@@ -1,0 +1,320 @@
+﻿// Manual-Changes AREA - the third tab of the merged bottom dock (Output / Analyzer / Manual Changes),
+// #Include'd INSIDE OutputDockFT.dg so this object is a CHILD of the dock, exactly like the other two areas.
+//
+// WHY A SEPARATE GRID (Nils 2026-07-22): the Analyzer grid answers "what did the compiler find?" and people
+// already read it that way. "What is left for ME to do?" is a different question with a different lifetime,
+// and overloading one grid with both would blur a screen that currently has one clear job. A grid is also
+// simply the right instrument for a worklist - sortable, holds hundreds of rows, and double-click navigates
+// to the source, which a report file can never do.
+//
+// DELIBERATELY NOT tied to one converter. Any refactoring function that DECLINES something can push a row
+// here, so "what still needs a human" is ONE place rather than a dialog per converter. Today
+// ChangeAmbiguousCallToGet fills it; the un-guardable 4390 names and legacy leftovers are the next sources.
+// Rows carry the CONTRIBUTOR, so a re-run replaces only its own rows and never wipes another's findings.
+Use cCJGrid.pkg
+Use cFTDockArea.pkg             // the area root: Container3d with the Designer's top-level tag
+Use cRDCGridToolTip.pkg          // cRDCToolTipGrid / cRDCToolTipColumn - the tooltip settings (RDCToolsLib)
+Use cFTDockPanelGrid.pkg         // the grid inside the dock - one look for the three tabs, on RDCToolsLib's cRDCCJToolPanelGrid
+Use cRDCGridClipboard.pkg        // RDCCopyGridRows - the grid's rows onto the clipboard (RDCToolsLib)
+Use cCJCommandBars.pkg
+Use cCompilerOutputContextMenu.pkg
+Use FTThemeColors.pkg            // FTWebBg / FTCJTheme - the FT palette
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+
+Object oManualArea is a cFTDockArea
+    Set Size to 47 400
+    Set Location to 0 0
+    Set Color to (FTViewBg())
+    Set Border_Style to Border_None
+    Set peAnchors to anAll
+    Move Self to ghoManualChangesDock
+
+    // Accumulated rows, parallel arrays. Kept on the AREA (not the grid) so the data survives the grid's own
+    // reload, and so a contributor can add rows before the dock has ever been shown.
+    Property String[]  pasMcSource      // which refactoring function reported it
+    Property String[]  pasMcFile        // full path
+    Property Integer[] paiMcLine        // 1-based
+    Property String[]  pasMcWhat        // what is wrong / what to do
+    Property String[]  pasMcWhy         // why the tool declined it
+
+    Object oManualChanges_grd is a cFTDockPanelGrid
+        Set Size to 60 394
+        Set piMinSize to 54 100
+        Set Location to 2 4
+        Set psNoItemsText to "Nothing needs a hand change - run a refactoring to see what it could not do for you."
+        Set psLayoutSection to "oManualChanges_grd"
+        Set peAnchors to anAll
+        // Read at CONSTRUCT time, when the shared menu does not exist yet - so this is not what makes
+        // right-click work (it is 0 here, exactly as on the two sibling grids). OnComRowRClick below is,
+        // and its absence is why this grid had no menu and no Copy at all (Nils 2026-07-22).
+        Set phoContextMenu to (phoToolPanelContextMenu(Self))
+        // Header-click sorting, as on the Analyzer grid - a worklist is worth grouping by file or by reason.
+        Set pbHeaderReorders to True
+        Set pbHeaderTogglesDirection to True
+        Set pbShadeSortColumn to True
+
+        Object oMcFile_Col is a cCJGridColumn
+            Set piWidth to 190
+            Set psCaption to "File"
+            Set psToolTip to "Double-click to open this file in the editor at the line"
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Object oMcLine_Col is a cCJGridColumn
+            Set piWidth to 60
+            Set psCaption to "Line"
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Object oMcWhat_Col is a cCJGridColumn
+            Set piWidth to 240
+            Set psCaption to "What to change"
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Object oMcWhy_Col is a cCJGridColumn
+            Set piWidth to 240
+            Set psCaption to "Why it was left for you"
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        Object oMcSource_Col is a cCJGridColumn
+            Set piWidth to 170
+            Set psCaption to "Reported by"
+            Set pbEditable to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+        End_Object
+
+        // Double-click / Enter opens the source, the same way the Analyzer grid does - so the behaviour is
+        // already familiar and nothing new has to be learned for this tab.
+        Procedure OnComRowDblClick Variant llRow Variant llItem
+            Delegate Send JumpToManualChange
+        End_Procedure
+
+        On_Key kEnter Send JumpToManualChange
+
+        // Right-click: the SHARED dock menu (cRefactorCJToolPanel), exactly as ModAnalyzerFT.dg and
+        // CompilerOutputFT.dg - cRDCCJToolPanelGrid claims it for THIS grid (three grids share one dock and one
+        // context-menu slot) and pops it. Just before it pops: folding is an Analyzer notion - a worklist row
+        // has no occurrences to fold. Grey it out rather than leaving a live item that would do nothing.
+        Procedure OnToolPanelMenuPopup Handle hoMenu
+            Handle hoItem
+            Get phoFoldOccItem of hoMenu to hoItem
+            If (hoItem <> 0) ;
+                Set pbEnabled of hoItem to False
+        End_Procedure
+
+        // "Locate in Editor" - the menu sends this to the invoking grid; same target as double-click.
+        Procedure DisplayCurrentSourceLine
+            Delegate Send JumpToManualChange
+        End_Procedure
+
+        // The shared menu offers Unfold/Fold because the Analyzer needs it. Absorb it here (the item is
+        // greyed out above); without this the menu would fault with "invalid message" on this grid.
+        Procedure ToggleFoldOccurrences
+        End_Procedure
+
+        // The selected rows - the current row when none is selected - onto the clipboard, one line each, the
+        // columns tab-separated (RDCCopyGridRows, RDCToolsLib). Ctrl+C and the context menu send it.
+        Procedure Copy
+            Handle[] ahoColumns
+            Integer iRows
+
+            Move (oMcFile_Col(Self)) to ahoColumns[-1]
+            Move (oMcLine_Col(Self)) to ahoColumns[-1]
+            Move (oMcWhat_Col(Self)) to ahoColumns[-1]
+            Move (oMcWhy_Col(Self)) to ahoColumns[-1]
+            Move (oMcSource_Col(Self)) to ahoColumns[-1]
+            Get RDCCopyGridRows Self ahoColumns to iRows
+            If (iRows > 0) ;
+                Set StatusText of (Statusbar_Id(Self)) to (String(iRows) * "row(s) copied to Windows clipboard.")
+        End_Procedure
+
+        // "Copy ln number to Clipboard" - just the Line cell, as on the other two grids.
+        Procedure CopyErrorLineNo
+            Integer iLine iItem
+            Boolean bOk
+            Handle hoDataSource
+            tDataSourceRow[] TheData
+            String sData
+
+            Get piColumnId of oMcLine_Col to iLine
+            Get phoDataSource to hoDataSource
+            If (hoDataSource = 0) ;
+                Procedure_Return
+            Get SelectedRow of hoDataSource to iItem
+            If (iItem < 0) ;
+                Procedure_Return
+            Get DataSource of hoDataSource to TheData
+            Move (TheData[iItem].sValue[iLine]) to sData
+            If (sData = "") ;
+                Procedure_Return
+            Get rfSetClipboardText sData to bOk
+            If (bOk = False) ;
+                Procedure_Return
+            Set StatusText of (Statusbar_Id(Self)) to ("Line number copied to Windows clipboard.")
+        End_Procedure
+    End_Object
+
+    // Rebuild the grid from the accumulated rows. Cheap - this is a worklist, not a message dump.
+    Procedure RefreshManualGrid
+        tDataSourceRow[] TheData TheDataEmpty
+        String[] asSource asFile asWhat asWhy
+        Integer[] aiLine
+        Integer i iLast iFile_Col iLine_Col iWhat_Col iWhy_Col iSource_Col
+        Handle hoGrid hoDataSource
+
+        Move (oManualChanges_grd(Self)) to hoGrid
+        /* THE GRID MAY NOT EXIST YET (Nils 2026-08-15, err 4399 on "Check declarations"):
+
+               COM object method invocation error ... pvComObject is NULL
+               MSG_COMSETVIRTUALMODE - oManualChanges_grd
+               MSG_REFRESHMANUALGRID - oManualArea
+               MSG_PUSHMISMATCHDECLSTOMANUALGRID - oDashboard_vw
+
+           A cCJGrid builds its COM control when its page is first realized. "Check declarations"
+           runs from the DASHBOARD and pushes its findings straight into this grid, so in a session
+           where the Manual Changes tab has never been opened the control is not there and
+           InitializeData below dies inside ComSetVirtualMode. phoDataSource is NOT the same test -
+           the data source is a DataFlex object and exists from construction, which is why that
+           guard let this through.
+
+           NOTHING IS LOST by returning here: the rows live in pasMcFile / paiMcLine / pasMcWhat /
+           pasMcWhy / pasMcSource, which the caller has already filled. This procedure only PAINTS
+           them. OutputDockFT.ShowTab calls it again when the tab is shown, by which point the
+           control exists - so the findings appear the moment the user goes to look at them.
+
+           Same guard and same reason as Delete_Data / LoadData in CompilerOutput.dg; the difference
+           is that it tests the GRID rather than Self, because the caller here is the area. */
+        If (not(IsComObjectCreated(hoGrid))) ;
+            Procedure_Return
+        Get phoDataSource of hoGrid to hoDataSource
+        If (hoDataSource = 0) ;
+            Procedure_Return
+        Move TheDataEmpty to TheData
+        Get piColumnId of (oMcFile_Col(hoGrid))   to iFile_Col
+        Get piColumnId of (oMcLine_Col(hoGrid))   to iLine_Col
+        Get piColumnId of (oMcWhat_Col(hoGrid))   to iWhat_Col
+        Get piColumnId of (oMcWhy_Col(hoGrid))    to iWhy_Col
+        Get piColumnId of (oMcSource_Col(hoGrid)) to iSource_Col
+        Get pasMcSource to asSource
+        Get pasMcFile   to asFile
+        Get paiMcLine   to aiLine
+        Get pasMcWhat   to asWhat
+        Get pasMcWhy    to asWhy
+        Move (SizeOfArray(asFile) - 1) to iLast
+        For i from 0 to iLast
+            Move asFile[i]           to TheData[i].sValue[iFile_Col]
+            Move (String(aiLine[i])) to TheData[i].sValue[iLine_Col]
+            Move asWhat[i]           to TheData[i].sValue[iWhat_Col]
+            Move asWhy[i]            to TheData[i].sValue[iWhy_Col]
+            Move asSource[i]         to TheData[i].sValue[iSource_Col]
+        Loop
+        Send InitializeData of hoGrid TheData
+    End_Procedure
+
+    // Drop every row a given contributor reported ("" = all of them), so a RE-RUN replaces its own findings
+    // instead of duplicating them - and never discards another function's.
+    Procedure ClearManualChanges String sSource
+        String[] asSource asFile asWhat asWhy asKeepSource asKeepFile asKeepWhat asKeepWhy
+        Integer[] aiLine aiKeepLine
+        Integer i iLast iKeep
+
+        Get pasMcSource to asSource
+        Get pasMcFile   to asFile
+        Get paiMcLine   to aiLine
+        Get pasMcWhat   to asWhat
+        Get pasMcWhy    to asWhy
+        Move 0 to iKeep
+        Move (SizeOfArray(asFile) - 1) to iLast
+        For i from 0 to iLast
+            If (sSource <> "" and Lowercase(asSource[i]) <> Lowercase(sSource)) Begin
+                Move asSource[i] to asKeepSource[iKeep]
+                Move asFile[i]   to asKeepFile[iKeep]
+                Move aiLine[i]   to aiKeepLine[iKeep]
+                Move asWhat[i]   to asKeepWhat[iKeep]
+                Move asWhy[i]    to asKeepWhy[iKeep]
+                Increment iKeep
+            End
+        Loop
+        Set pasMcSource to asKeepSource
+        Set pasMcFile   to asKeepFile
+        Set paiMcLine   to aiKeepLine
+        Set pasMcWhat   to asKeepWhat
+        Set pasMcWhy    to asKeepWhy
+        Send RefreshManualGrid
+    End_Procedure
+
+    // Append one row. The entry point every contributor uses.
+    Procedure AddManualChange String sSource String sFile Integer iLine String sWhat String sWhy
+        String[] asSource asFile asWhat asWhy
+        Integer[] aiLine
+        Integer iAt
+
+        Get pasMcSource to asSource
+        Get pasMcFile   to asFile
+        Get paiMcLine   to aiLine
+        Get pasMcWhat   to asWhat
+        Get pasMcWhy    to asWhy
+        Move (SizeOfArray(asFile)) to iAt
+        Move sSource to asSource[iAt]
+        Move sFile   to asFile[iAt]
+        Move iLine   to aiLine[iAt]
+        Move sWhat   to asWhat[iAt]
+        Move sWhy    to asWhy[iAt]
+        Set pasMcSource to asSource
+        Set pasMcFile   to asFile
+        Set paiMcLine   to aiLine
+        Set pasMcWhat   to asWhat
+        Set pasMcWhy    to asWhy
+    End_Procedure
+
+    // How many rows are waiting - lets a caller decide whether the tab is worth showing at all.
+    Function ManualChangeCount Returns Integer
+        String[] asFile
+        Get pasMcFile to asFile
+        Function_Return (SizeOfArray(asFile))
+    End_Function
+
+    // Open the selected row's file in the editor at its line - the same phoEditor / LoadFile /
+    // JumpToSourceLine sequence the Analyzer grid uses for its own rows.
+    Procedure JumpToManualChange
+        String[] asFile
+        Integer[] aiLine
+        Integer iItem iLine
+        Handle hoGrid hoDataSource hoEditor
+        String sFile
+
+        Move (oManualChanges_grd(Self)) to hoGrid
+        Get phoDataSource of hoGrid to hoDataSource
+        If (hoDataSource = 0) ;
+            Procedure_Return
+        Get SelectedRow of hoDataSource to iItem
+        If (iItem < 0) ;
+            Procedure_Return
+        Get pasMcFile to asFile
+        Get paiMcLine to aiLine
+        If (iItem > (SizeOfArray(asFile) - 1)) ;
+            Procedure_Return
+        Move asFile[iItem] to sFile
+        Move aiLine[iItem] to iLine
+        Get phoEditor of ghoApplication to hoEditor
+        If (hoEditor <> 0 and sFile <> "" and iLine > 0) Begin
+            // Activate the VIEW through its registered activation message, not the editor object:
+            // a bare object Activate moves the DataFlex focus tree WITHOUT switching CodeJock's
+            // active TabWorkspace page (the findings-list jump had the same bug; Nils 2026-07-23).
+            Send Activate_oEditorView_vw of (Client_Id(ghoCommandBars))
+            Send LoadFile of hoEditor sFile
+            Send JumpToSourceLine of hoEditor (iLine - 1)
+        End
+    End_Procedure
+End_Object

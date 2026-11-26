@@ -17,6 +17,9 @@
    - "Set Line_Width   to N M"          ->  removed (no CJ equivalent)
    - "Set Select_Mode  to Multi_Select" ->  "Set pbMultipleSelection to True"
    - Other Set Select_Mode values       ->  removed
+   - "Set Numeric_Mask [Item] N to L R [T]" -> "Send CreateNumericMask L R" on column N+1, + psMask from the
+     template T (cGridToCJGridBase.NumericMaskLines); Currency_Mask -> CreateCurrencyMask the same way.
+     After the column objects: in place, "Send CreateNumericMask of oCol<N+1> L R"
    - Bare "Send <Name>" at grid level   ->  commented out
    - Procedure LoadData stub            ->  always generated
 
@@ -61,6 +64,13 @@
  and Header_Label statements found in the grid body.
  Columns with no explicit width default to 100; with no explicit caption
  default to an empty string.
+ A grid with NO Form_Width / Header_Label line of its own that fills itself
+ (Send Add_Item in its body) or defines its columns through a helper sent at
+ object level with arguments is NOT converted: GridDeclineReason passes it
+ through verbatim, uncounted, and names it in the run notes. Forcing one column
+ onto it used to turn every Add_Item into its own row in an iCol1 that was never
+ declared and to comment the helper lines out. A column-less grid with neither
+ trait converts as before (class swap, property translation, LoadData stub).
 
  All cCJGrid-level transformations (property removal, translation, method
  renaming, Entry_Display commenting, legacy method commenting, etc.) are
@@ -81,6 +91,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
 
     Procedure Construct_Object
         Forward Send Construct_Object
+        Set psLegacyRootToken to "grid"       // the Deep Scan's root token - an EMPTY parameter takes its learned subclasses
         // Default: convert the standard DataFlex "Grid" class to cCJGrid.
         // Pass an explicit sParameter to target a custom legacy class.
         Set psLegacyGridClass   to "Grid"
@@ -95,6 +106,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Property Boolean[] pabNdColReadOnly
         Property Boolean[] pabNdColCheckbox
         Property Boolean[] pabNdColEntryOff
+        // "L R [T]" from Numeric_Mask / Currency_Mask by item index (NumericMaskLines), and whether this
+        // grid's column objects are written yet - a mask after them goes in place (2026-10-04).
+        Property String[]  pasNdColNumericMask
+        Property String[]  pasNdColCurrencyMask
+        Property Boolean   pbNdColumnsEmitted False
         Property Boolean   pbNdInDataLoadProc    False
         Property Integer   piNdAddItemColIdx     0
         Property Boolean   pbNdDataLoadConverted False
@@ -128,6 +144,36 @@ Class cGridToCJGrid is a cGridToCJGridBase
         // declaration is processed so psNdMouseItemCountVar is known before any body line.
         Property String[]  pasNdMouseItemCountMethods
         Property String[]  pasNdMouseItemCountVars
+        // Methods whose grid cell access must NOT be half-converted: a Set Value side (no
+        // handler exists), a COMPUTED item-index expression ('(i * iColumns) + N' is item
+        // arithmetic, not a row index), cell reads without the Get Current_Item anchor
+        // (var injection never arms, so TheData/iCol would emit undeclared - LegacyApp
+        // Sublager_multi UpdateBalances, Nils 2026-07-25), or an Add_Item holder that cannot
+        // take the LoadData rename (setter / parameterized / function). Collected by
+        // PreScanForDataLoadProc; such a method is emitted VERBATIM with a hand-port note.
+        // NOTE: a 'Procedure Set <name>' entry keys as 'set' (ParseProcFuncName's first
+        // word), so EVERY setter in that grid then declines - conservative and safe.
+        Property String[]  pasNdCellDeclineMethods
+        Property Boolean   pbNdInCellDeclineBody False
+        // True when the marked data-load method is EXACTLY 'procedure <name>' - parameterless,
+        // not a 'Procedure Set' setter, not a function - i.e. the LoadData rename produces a
+        // legal signature and Activating's bare 'Send LoadData' loses nothing. Set by
+        // PreScanForDataLoadProc; consumed at the rename site, where the GRID flavor declines
+        // an un-renameable loader (the LIST flavor forwards + restores, so it may keep renaming;
+        // see AllowUnrenameableDataLoad). LegacyApp jobblista1 'Procedure Set Totals' emitted
+        // the mangled 'Procedure LoadData Totals Number ...' (Nils 2026-07-25).
+        Property Boolean   pbNdDataLoadRenameable True
+        // True while OnHandleGridLine walks a Procedure/Function BODY at grid level. The
+        // OBJECT-level property handlers (Line_Width / Select_Mode / Form_Width /
+        // Header_Label / Floating_Menu_Object) must not fire on body lines: a dynamic
+        // 'Set Header_Label 5 to ...' inside Delete_Data was collected as a column caption -
+        // clobbering the real one - and re-armed the pending-columns flush, DUPLICATING all
+        // column objects (LegacyApp Sublager_clear_order, Nils 2026-07-25).
+        Property Boolean   pbNdInMethodBody False
+        // Lowercase original names of data loaders renamed to LoadData in THIS FILE - the
+        // external callers ('Send <name> of (oGrid(Self))') are renamed to match by
+        // OnAfterTransformSource, which also clears the list (per-file lifecycle).
+        Property String[]  pasNdRenamedLoaders
     End_Procedure
 
     // *** Parameter parsing (override) ***
@@ -140,10 +186,12 @@ Class cGridToCJGrid is a cGridToCJGridBase
     // default first so a 2-part param does not inherit a stale 3-part value.
     Function ParseAndSetParameter String sParameter Returns Boolean
         Boolean bOK
+
         If (sParameter = "") Begin
             Set psLegacyGridClass   to "Grid"
             Set psTargetGridClass   to "cCJGrid"
             Set psTargetColumnClass to "cCJGridColumn"
+            Send _LoadLegacySubclasses ""      // the learned Grid subclasses ride the empty parameter (2026-09-05)
             Function_Return True
         End
         // For 2-part params, reset column class to default before calling base
@@ -156,38 +204,159 @@ Class cGridToCJGrid is a cGridToCJGridBase
     // *** IsGridDeclaration override ***
 
     // Returns True when sTrimLower looks like "object X is a <OldGridClass>".
-    // Default: case-insensitive exact match against psLegacyGridClass ("Grid").
+    // Default: case-insensitive exact match against psLegacyGridClass ("Grid") - plus, when the
+    // parameter came in EMPTY, the Grid subclasses the Deep Scan learned (IsLearnedLegacySubclass,
+    // 2026-09-05): that is how an empty parameter reaches "Object oX is a MyGrid" safely, where the
+    // name-ending pattern below could not (a modern "cLookupGrid is a cDbCJGrid" ends in "grid" too).
     // When psLegacyGridClass is empty (set directly or via a future API), falls back to
     // the pattern: any class name ending in "grid" but NOT ending in "dbgrid".
     Function IsGridDeclaration String sTrimLower Returns Boolean
-        Integer iIsA
-        String  sClassName sLegacy
+        String sClassName sLegacy
 
-        If (Pos("object ", sTrimLower) <> 1) Begin
+        Get DeclaredClassName sTrimLower to sClassName
+        If (sClassName = "") ;
             Function_Return False
-        End
-        Move (Pos(" is a ", sTrimLower)) to iIsA
-        If (iIsA = 0) Begin
-            Function_Return False
-        End
-        // Class name starts 6 chars after the start of " is a ".
-        Move (Trim(Mid(sTrimLower, CI_EOL, (iIsA + 6)))) to sClassName
-        // Strip any trailing content (e.g. metadata tags after a space).
-        Move (Pos(CS_S, sClassName)) to iIsA
-        If (iIsA > 0) Begin
-            Move (Left(sClassName, iIsA - 1)) to sClassName
-        End
 
         Get psLegacyGridClass to sLegacy
         If (sLegacy = "") Begin
-            // Pattern-based: any class ending in "grid" but not "dbgrid".
+            // Pattern-based: any class ending in "grid" but not "dbgrid". NOTE: this branch is currently
+            // UNREACHABLE - ParseAndSetParameter (override above) maps an empty sParameter to the exact default
+            // "Grid", never to "", so psLegacyGridClass is always a concrete legacy name. That is what keeps the
+            // converter idempotent (exact "grid" never matches the modern "cCJGrid"/"cDbCJGrid" output). If this
+            // fallback is ever made live, ALSO exclude the modern CodeJock classes (they contain "cjgrid" and end
+            // in "grid"), or it will re-detect its own output. Nils 2026-07-07.
             Function_Return (Right(sClassName, 4) = "grid" and Right(sClassName, 6) <> "dbgrid")
         End
-        // Case-insensitive exact match: lowercase both sides for comparison.
-        Function_Return (sClassName = Lowercase(sLegacy))
+        // Case-insensitive exact match: lowercase both sides for comparison - or a learned subclass
+        // (only after an EMPTY parameter; a named class narrows the run to that class).
+        Function_Return (sClassName = Lowercase(sLegacy) or IsLearnedLegacySubclass(Self, sClassName))
     End_Function
 
     // *** Subclass hook implementations ***
+
+    // True when an object-level "Send <Name> ..." carries arguments: 'Send Columns_Add "Code" 30' does,
+    // "Send Fill_the_List" does not, and neither does a bare target clause "Send Close_Panel to (oX(Self))"
+    // (arguments after a target clause are not looked for - such a grid simply keeps the old behaviour).
+    Function SendHasArguments String sTrimLower Returns Boolean
+        String  sRest
+        Integer iPos
+
+        Move sTrimLower to sRest
+        Move (Pos("//", sRest)) to iPos
+        If (iPos > 0) ;
+            Move (Trim(Left(sRest, iPos - 1))) to sRest
+        If (Left(sRest, 5) <> "send ") ;
+            Function_Return False
+        Move (Trim(Mid(sRest, CI_EOL, 6))) to sRest         // after "send "
+        Move (Pos(CS_S, sRest)) to iPos
+        If (iPos = 0) ;
+            Function_Return False                          // "Send Name" alone
+        Move (Trim(Mid(sRest, CI_EOL, (iPos + 1)))) to sRest // after the message name
+        If (sRest = "" or Left(sRest, 3) = "to " or Left(sRest, 3) = "of ") ;
+            Function_Return False
+        Function_Return True
+    End_Function
+
+    /* DECLINE a Grid this converter cannot model (base hook GridDeclineReason). The column list comes
+       from the object's OWN 'Set Form_Width [Item] N' / 'Set Header_Label [Item] N' lines outside its
+       methods. A grid with none, that ALSO fills itself (Send Add_Item anywhere in its own body) or
+       defines its columns through a helper sent at object level with arguments ('Send <Helper> "Caption"
+       30'), is declined: converting it forced ONE column - every Add_Item became its own row in an iCol1
+       that was never declared, the helper lines were commented out, and nothing said so (a workspace with
+       dozens of such grids, 2026-09-07). A column-less grid with neither trait keeps the established
+       conversion (class swap, property translation, LoadData stub) - that is the contract the property
+       and method tests pin down. Returns "" when the grid may convert, else the reason for the run
+       note; TransformSource then passes the whole object through untouched. */
+    Function GridDeclineReason String sGridIndent Integer iGridStartLine Returns String
+        String[] asSource asSends
+        String   sTrimLine sLower sNoStr sName sReason sList
+        Integer  iScan iSize iNest iIdx i iMax
+        Boolean  bIsObj bDone bInProc bEvidence bFill bHelper bArgs
+
+        Get pasSource to asSource
+        Move (SizeOfArray(asSource) - 1) to iSize
+        Move (iGridStartLine + 1) to iScan
+        Move 0 to iNest
+        Move False to bDone
+        Move False to bInProc
+        Move False to bEvidence
+        Move False to bFill
+        Move False to bHelper
+        While (iScan <= iSize and bDone = False)
+            Move (Trim(asSource[iScan])) to sTrimLine
+            Move (Lowercase(sTrimLine)) to sLower
+            Get IsObjectDeclaration sLower to bIsObj
+            If (bIsObj = True) Begin
+                Increment iNest
+            End
+            Else If (Left(sLower, 10) = "end_object") Begin
+                If (iNest = 0) Begin
+                    Move True to bDone
+                End
+                Else Begin
+                    Decrement iNest
+                End
+            End
+            // Only the grid's own body lines count (nesting 0), and not its comments.
+            If (bDone = False and iNest = 0 and Left(sLower, 2) <> "//") Begin
+                If (Left(sLower, 10) = "procedure " or Left(sLower, 9) = "function ") Begin
+                    Move True to bInProc
+                End
+                Else If (Left(sLower, 13) = "end_procedure" or Left(sLower, 12) = "end_function") Begin
+                    Move False to bInProc
+                End
+                Else Begin
+                    Get RemoveStringsFromLine of ghoFuncLib sLower to sNoStr
+                    If (sNoStr contains "send add_item") ;
+                        Move True to bFill
+                    If (bInProc = False) Begin
+                        If (Left(sLower, 4) = "set " and sLower contains "form_width") Begin
+                            Get ParseColumnItemIndex sLower "form_width" to iIdx
+                            If (iIdx >= 0) ;
+                                Move True to bEvidence
+                        End
+                        Else If (Left(sLower, 4) = "set " and sLower contains "header_label") Begin
+                            Get ParseColumnItemIndex sLower "header_label" to iIdx
+                            If (iIdx >= 0) ;
+                                Move True to bEvidence
+                        End
+                        Else If (Left(sLower, 5) = "send ") Begin
+                            Get SendHasArguments sLower to bArgs
+                            If (bArgs = True) Begin
+                                // An object-level Send with arguments is the likely column helper.
+                                Move True to bHelper
+                                Get _NthWord of ghoFuncLib sTrimLine 2 to sName
+                                If (sName <> "" and SearchArray(sName, asSends) = -1) ;
+                                    Move sName to asSends[SizeOfArray(asSends)]
+                            End
+                        End
+                    End
+                End
+            End
+            Increment iScan
+        Loop
+        If (bEvidence = True or (bFill = False and bHelper = False)) ;
+            Function_Return ""
+
+        Move "no column definitions (Set Form_Width / Set Header_Label) in the object, so its columns come from somewhere this converter cannot read: a helper command, a subclass, or code outside the object. Left as written" to sReason
+        If (bHelper = True) Begin
+            Move (SizeOfArray(asSends) - 1) to iMax
+            Move "" to sList
+            For i from 0 to iMax
+                If (i < 3) Begin
+                    If (sList <> "") ;
+                        Move (sList + ", ") to sList
+                    Move (sList + asSends[i]) to sList
+                End
+            Loop
+            If (iMax >= 3) ;
+                Move (sList + ", ...") to sList
+            Move (sReason + "; its object-level Send lines (" + sList + ") may be where they are defined") to sReason
+        End
+        If (bFill = True) ;
+            Move (sReason + "; its Add_Item fill would have been mapped onto columns that do not exist") to sReason
+        Function_Return sReason
+    End_Function
 
     // Called when a grid declaration is detected.
     // Resets all per-grid state, then pre-scans the grid body for the data-loading
@@ -196,13 +365,19 @@ Class cGridToCJGrid is a cGridToCJGridBase
         String[]  asEmpty
         Integer[] aiEmpty
         Boolean[] abEmpty
+
         Set paiNdColFormWidths    to aiEmpty
         Set pasNdColHeaderLabels  to asEmpty
         Set pbNdPendingColumns    to False
         Set psNdDataLoadProcName  to ""
+        Set pbNdDataLoadRenameable to True
+        Set pbNdInMethodBody      to False
         Set pabNdColReadOnly      to abEmpty
         Set pabNdColCheckbox      to abEmpty
         Set pabNdColEntryOff      to abEmpty
+        Set pasNdColNumericMask   to asEmpty
+        Set pasNdColCurrencyMask  to asEmpty
+        Set pbNdColumnsEmitted    to False
         Set pbNdInDataLoadProc    to False
         Set piNdAddItemColIdx     to 0
         Set pbNdDataLoadConverted to False
@@ -237,10 +412,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
     // from Set Item_Shadow_State / Set Checkbox_Item_State lines following Add_Items.
     Procedure PreScanForDataLoadProc String sGridIndent Integer iGridStartLine
         String[]  asSource asCurrentItemMethods asCurrentItemVars
-        String[]  asItemCountMethods asItemCountVars
-        String    sScanLine sScanLower sScanNoStr sProcName sTempVar
-        Integer   iScan iScanSize iScanNest iAddItemIdx iMaxColIdx iColCount iCol
+        String[]  asItemCountMethods asItemCountVars asCellDecline
+        String    sScanLine sScanLower sScanNoStr sProcName sTempVar sRowSlice
+        Integer   iScan iScanSize iScanNest iAddItemIdx iMaxColIdx iColCount iCol iCellPos
         Boolean   bScanDone bInProc bFoundAddItem bFoundCurrentItem bFoundItemCount bIsObj bHasNonStdAddItem
+        Boolean   bCellGet bCellSet bCellComputed bProcLoadable
         Boolean[] abReadOnly abCheckbox abEntryOff
 
         Get pasSource to asSource
@@ -284,17 +460,37 @@ Class cGridToCJGrid is a cGridToCJGridBase
                         Get ParseColumnItemIndex sScanLower "form_width" to iCol
                         If (iCol > iMaxColIdx) Move iCol to iMaxColIdx
                     End
-                    // Detect the start of any procedure.
-                    If (Left(sScanLower, 10) = "procedure ") Begin
+                    // Detect the start of any procedure OR function. Functions matter just as much:
+                    // a Get Current_Item inside a Function body fell to the TODO-comment path and
+                    // produced non-compiling output (undeclared hoDataSource/TheData - Nils
+                    // 2026-07-23, 32 post-plan errors on the LegacyApp replay).
+                    If (Left(sScanLower, 10) = "procedure " or Left(sScanLower, 9) = "function ") Begin
                         Get ParseProcFuncName sScanLower to sProcName
                         Move True to bInProc
                         Move 0 to iAddItemIdx
                         Move False to bFoundCurrentItem
                         Move False to bHasNonStdAddItem
+                        Move False to bCellGet
+                        Move False to bCellSet
+                        Move False to bCellComputed
+                        // LoadData-renameable = EXACTLY 'procedure <name>': parameterless, and not a
+                        // 'Procedure Set' setter. ParseProcFuncName takes the FIRST word after the
+                        // keyword, so renaming a setter produced 'Procedure LoadData Totals Number ...'
+                        // - a mangled signature - while Activating's bare 'Send LoadData' dropped the
+                        // arguments and the old Set-callers kept calling the vanished setter (LegacyApp
+                        // jobblista1 'Procedure Set Totals', Nils 2026-07-25). Functions and
+                        // parameterized procedures are equally un-renameable: the LoadData contract is
+                        // a bare Send from Activating.
+                        Move False to bProcLoadable
+                        If (Left(sScanLower, 10) = "procedure ") Begin
+                            Move (Trim(Mid(sScanLower, CI_EOL, 11))) to sTempVar
+                            If (sTempVar <> "" and Pos(CS_S, sTempVar) = 0) ;
+                                Move True to bProcLoadable
+                        End
                     End
                 End
                 Else Begin
-                    If (Left(sScanLower, 13) = "end_procedure") Begin
+                    If (Left(sScanLower, 13) = "end_procedure" or Left(sScanLower, 12) = "end_function") Begin
                         // A `Send Add_Item` line that uses anything other than the
                         // standard `Msg_None` first arg (e.g. `Send Add_Item 0 "x"`)
                         // can't be parsed by ParseAddItemValue, and the same procedure
@@ -306,12 +502,23 @@ Class cGridToCJGrid is a cGridToCJGridBase
                         If (bHasNonStdAddItem = True and bFoundAddItem = True) Begin
                             Set psNdDataLoadProcName to ""
                         End
+                        // Cell-access DECLINE verdict (before sProcName is cleared below): a Set
+                        // Value side, a computed item-index, or a Get without the Current_Item
+                        // anchor cannot be converted faithfully - the whole method is emitted
+                        // verbatim with a note instead of half-converted (Nils 2026-07-25).
+                        If (sProcName <> "" and ;
+                            (bCellSet = True or (bCellGet = True and (bFoundCurrentItem = False or bCellComputed = True)))) Begin
+                            Move sProcName to asCellDecline[SizeOfArray(asCellDecline)]
+                        End
                         If (bFoundAddItem = False) Move "" to sProcName
                         Move False to bInProc
                         Move False to bFoundAddItem
                         Move False to bFoundCurrentItem
                         Move False to bFoundItemCount
                         Move False to bHasNonStdAddItem
+                        Move False to bCellGet
+                        Move False to bCellSet
+                        Move False to bCellComputed
                         Move 0 to iAddItemIdx
                     End
                     Else If (Left(sScanLower, 2) <> "//") Begin
@@ -325,6 +532,12 @@ Class cGridToCJGrid is a cGridToCJGridBase
                             If (bFoundAddItem = False) Begin
                                 Move True to bFoundAddItem
                                 Set psNdDataLoadProcName to sProcName
+                                // A LoadData-UNrenameable holder of the Add_Items (a 'Procedure Set'
+                                // setter, a parameterized procedure, a function) still takes the mark
+                                // - the LIST converter's programmatic-fill flow KEEPS the method name
+                                // and needs it - but the flag below lets the GRID flavor's rename path
+                                // decline instead of emitting 'Procedure LoadData Totals Number ...'.
+                                Set pbNdDataLoadRenameable to bProcLoadable
                             End
                             Move (iMaxColIdx + 1) to iColCount
                             If (iColCount < 1) Move 1 to iColCount
@@ -355,6 +568,25 @@ Class cGridToCJGrid is a cGridToCJGridBase
                             Move (Mod(iAddItemIdx - 1, iColCount)) to iCol
                             Move True to abEntryOff[iCol]
                         End
+                        // Grid cell access by ITEM index: 'Get/Set Value of <obj> (<expr> + N)'.
+                        // The GET with a bare row variable is the supported Current_Item companion
+                        // shape (mirrors OnHandleGridLine's own gate); a computed <expr> - any
+                        // paren/operator/space in the row slice - is legacy row*columns arithmetic
+                        // with no faithful row-index mapping, and the SET side has no handler at
+                        // all. Either marks the method for the verbatim decline at End_Procedure.
+                        If (sScanNoStr contains "get value of " and sScanNoStr contains " + ") Begin
+                            Move True to bCellGet
+                            Move (Pos("(", sScanNoStr)) to iCellPos
+                            Move (Trim(Mid(sScanNoStr, CI_EOL, (iCellPos + 1)))) to sRowSlice
+                            Move (Pos(" + ", sRowSlice)) to iCellPos
+                            If (iCellPos > 0) ;
+                                Move (Trim(Left(sRowSlice, iCellPos - 1))) to sRowSlice
+                            If (sRowSlice contains "(" or sRowSlice contains "*" or ;
+                                sRowSlice contains "/" or sRowSlice contains "-" or sRowSlice contains " ") ;
+                                Move True to bCellComputed
+                        End
+                        If (sScanNoStr contains "set value of " and sScanNoStr contains " + ") ;
+                            Move True to bCellSet
                         // Get Current_Item: record proc name + row-var name for var injection (once per proc).
                         If (bFoundCurrentItem = False and sScanNoStr contains "get current_item") Begin
                             Move True to bFoundCurrentItem
@@ -387,6 +619,8 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Set pasNdCurrentItemVars        to asCurrentItemVars
         Set pasNdMouseItemCountMethods  to asItemCountMethods
         Set pasNdMouseItemCountVars     to asItemCountVars
+        Set pasNdCellDeclineMethods     to asCellDecline
+        Set pbNdInCellDeclineBody       to False
     End_Procedure
 
     // *** Parsing helpers ***
@@ -397,6 +631,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
     Function IsVarDeclLine String sTrimLower Returns Boolean
         Integer iSpace
         String  sFirst
+
         If (Left(sTrimLower, 8) = "integer ") Function_Return True
         If (Left(sTrimLower, 7) = "string ") Function_Return True
         If (Left(sTrimLower, 8) = "boolean ") Function_Return True
@@ -420,6 +655,57 @@ Class cGridToCJGrid is a cGridToCJGridBase
         String[]  asMethods
         Integer   iIdx iSize
         Get pasNdCurrentItemMethods to asMethods
+        Move (SizeOfArray(asMethods) - 1) to iSize
+        For iIdx from 0 to iSize
+            If (asMethods[iIdx] = sProcName) Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    // May the data-load rename proceed even for an UN-renameable loader (setter/parameterized)?
+    // The GRID flavor says no - it would mangle the signature and orphan the callers. The LIST
+    // flavor (cListToCJGrid) overrides to True: it forwards into the rename and then RESTORES
+    // the original declaration (RestoreFillProcSignature), so only the BODY is modernized.
+    Function AllowUnrenameableDataLoad Returns Boolean
+        Function_Return False
+    End_Function
+
+    // File-wide sweep after all grids converted: rename EXTERNAL callers of every data loader
+    // that became LoadData ('Send FillArticleList of (oGrid(Self))' dangled after the rename -
+    // LegacyApp Sublager_clear_order, three call sites, Nils 2026-07-25). Sound because only a
+    // PARAMETERLESS loader takes the rename (pbNdDataLoadRenameable), so no caller loses
+    // arguments. Word-boundary rename, gated on the name appearing OUTSIDE string literals
+    // (the masked copy decides); comments mentioning the old name follow along, which reads
+    // as documentation of the rename rather than damage. Clears the per-file list.
+    Procedure OnAfterTransformSource String[] ByRef asOutput
+        String[] asOld asEmpty
+        String   sMasked
+        Integer  i iLine iSize iNames iPos
+
+        Get pasNdRenamedLoaders to asOld
+        Move (SizeOfArray(asOld)) to iNames
+        If (iNames = 0) ;
+            Procedure_Return
+        Move (SizeOfArray(asOutput) - 1) to iSize
+        For iLine from 0 to iSize
+            For i from 0 to (iNames - 1)
+                If (Lowercase(asOutput[iLine]) contains asOld[i]) Begin
+                    Get RemoveStringsFromLine of ghoFuncLib (Lowercase(asOutput[iLine])) to sMasked
+                    Get _FindKeywordPos of ghoFuncLib sMasked asOld[i] True 1 to iPos
+                    If (iPos > 0) ;
+                        Get ReplaceWordOccurrences asOutput[iLine] asOld[i] "LoadData" to asOutput[iLine]
+                End
+            Loop
+        Loop
+        Set pasNdRenamedLoaders to asEmpty
+    End_Procedure
+
+    // Returns True when sProcName (already lowercase) is in the cell-access DECLINE list
+    // collected by PreScanForDataLoadProc (see pasNdCellDeclineMethods for the criteria).
+    Function IsInCellDeclineMethods String sProcName Returns Boolean
+        String[]  asMethods
+        Integer   iIdx iSize
+        Get pasNdCellDeclineMethods to asMethods
         Move (SizeOfArray(asMethods) - 1) to iSize
         For iIdx from 0 to iSize
             If (asMethods[iIdx] = sProcName) Function_Return True
@@ -674,16 +960,41 @@ Class cGridToCJGrid is a cGridToCJGridBase
     End_Procedure
 
     // Extracts the value argument from "Send Add_Item Msg_None <value>".
+    // Any trailing "// note" is stripped: legacy fill loops routinely annotate each
+    // Add_Item with its column name ("Send Add_Item Msg_None sStatus  //Status"), and
+    // without this the comment became part of the "value", so the caller's generated
+    // " to TheData[iRow].sValue[iColN]" was appended after it and commented out. The
+    // caller re-attaches the comment to the END of the rewritten line.
     Function ParseAddItemValue String sLine Returns String
         Integer iPos
         String  sLower
         Move (Lowercase(sLine)) to sLower
         Move (Pos("msg_none ", sLower)) to iPos
         If (iPos = 0) Function_Return ""
-        Function_Return (Trim(Mid(sLine, CI_EOL, (iPos + 9))))
+        Function_Return (StripTrailingComment(Self, (Trim(Mid(sLine, CI_EOL, (iPos + 9))))))
     End_Function
 
     // *** Data-loading procedure helpers ***
+
+    /* THE ONE COLUMN COUNT OF THE GRID BEING CONVERTED. The column objects are built from BOTH the
+       Form_Width widths and the Header_Label captions (AppendColumnObjects takes the longer list), and
+       every consumer of "how many columns" must agree with that: the merged local declaration
+       (iCol1..iColN), the Get piColumnId lines, the LoadData stub and the Add_Item rewrite. Three of them
+       counted the width list alone, so a grid whose columns are declared by Header_Label only got its
+       column objects and NOTHING that referenced them by name - 'Undefined symbol ICOL1' eleven times in
+       one file, and every Add_Item its own row in column 1 (a workspace, 2026-09-07). */
+    Function NdColumnCount Returns Integer
+        Integer[] aiWidths
+        String[]  asLabels
+        Integer   iCount
+
+        Get paiNdColFormWidths   to aiWidths
+        Get pasNdColHeaderLabels to asLabels
+        Move (SizeOfArray(aiWidths)) to iCount
+        If (SizeOfArray(asLabels) > iCount) ;
+            Move (SizeOfArray(asLabels)) to iCount
+        Function_Return iCount
+    End_Function
 
     // Emits merged variable declarations when the declaration section ends.
     //   - Prepends:  tDataSourceRow[] TheData TheDataEmpty
@@ -693,13 +1004,12 @@ Class cGridToCJGrid is a cGridToCJGridBase
     //                Move 0 to iRow
     Procedure EmitMergedVarDecls String[] ByRef asOutput String sGridIndent
         String[]  asProcVarDecls
-        Integer[] aiWidths
         String    sLine sLower sIndent sSingle sMergedInt sExistingIntVars
-        Integer   iIdx iSize iColCount iColIdx
+        String    sInjected sRest sName
+        Integer   iIdx iSize iColCount iColIdx iPos
 
         Get pasNdProcVarDecls to asProcVarDecls
-        Get paiNdColFormWidths to aiWidths
-        Move (SizeOfArray(aiWidths)) to iColCount
+        Get NdColumnCount to iColCount
         Set pbNdInProcVarDecl to False
 
         Get MakeSingleIndent to sSingle
@@ -709,19 +1019,48 @@ Class cGridToCJGrid is a cGridToCJGridBase
             Get GetIndent sLine to sIndent
         End
 
-        // Gather existing Integer variable names into one string.
+        // The set of names this procedure is about to inject, lowercase and space-delimited
+        // so a whole-word test is a simple "contains".
+        Move " irow" to sInjected
+        For iColIdx from 1 to iColCount
+            Append sInjected (" icol" + String(iColIdx))
+        Loop
+        Append sInjected " "
+
+        // Gather existing Integer variable names, SKIPPING any name we inject ourselves.
+        // A legacy fill method may already declare its own "Integer iRow" - LegacyApp's
+        // forsta_faktura AddEmptyItems does - and the old code appended the existing names
+        // wholesale, producing "Integer iRow iCol1 ... iCol8 iRow": the same name declared
+        // twice in one statement, which the compiler rejects (Nils 2026-07-26). The names are
+        // walked ONE AT A TIME so a single clashing name is dropped on its own instead of the
+        // whole declaration being kept (duplicate) or discarded (losing the other variables).
         Move "" to sExistingIntVars
         Move (SizeOfArray(asProcVarDecls) - 1) to iSize
         For iIdx from 0 to iSize
             Move asProcVarDecls[iIdx] to sLine
             Move (Lowercase(Trim(sLine))) to sLower
             If (Left(sLower, 8) = "integer ") Begin
-                Move (Trim(Mid(Trim(sLine), CI_EOL, 9))) to sLower
-                If (sExistingIntVars <> "") Begin
-                    Append sExistingIntVars " "
-                    Append sExistingIntVars sLower
-                End
-                Else Move sLower to sExistingIntVars
+                Move (Trim(Mid(Trim(sLine), CI_EOL, 9))) to sRest
+                While (sRest <> "")
+                    Move (Pos(CS_S, sRest)) to iPos
+                    If (iPos > 0) Begin
+                        Move (Left(sRest, iPos - 1))          to sName
+                        Move (Trim(Mid(sRest, CI_EOL, iPos + 1))) to sRest
+                    End
+                    Else Begin
+                        Move sRest to sName
+                        Move ""    to sRest
+                    End
+                    If (sName <> "") Begin
+                        If (sInjected contains (" " + Lowercase(sName) + " ")) Begin
+                            // Already injected above - declaring it again is the bug.
+                        End
+                        Else Begin
+                            If (sExistingIntVars <> "") Append sExistingIntVars " "
+                            Append sExistingIntVars sName
+                        End
+                    End
+                Loop
             End
         Loop
 
@@ -763,6 +1102,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
     // are one further level in (grid + 3 indents).
     Procedure AppendLoadDataIfElse String[] ByRef asOutput String sGridIndent
         String sSingle sOuter sInner
+
         Get MakeSingleIndent to sSingle
         Move (sGridIndent + sSingle + sSingle)           to sOuter
         Move (sGridIndent + sSingle + sSingle + sSingle) to sInner
@@ -796,11 +1136,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
     //   - Data-loading Procedure declaration -> rename + activate conversion state
     Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
         String    sLineIndent sLabel sValue sProcName sDataLoadName sMergedInt sSingle sRowOrigVar
-        String    sSafeSearch
-        Integer   iItemIdx iWidth iAddIdx iColN iColCount
+        String    sSafeSearch sComment
+        Integer   iItemIdx iWidth iAddIdx iColN iColCount iMask
         Integer[] aiWidths
-        String[]  asLabels asProcVarDecls asEmpty
-        Boolean   bPending bInDataLoad bIsVarDecl bNeedInject
+        String[]  asLabels asProcVarDecls asEmpty asMaskLines
+        Boolean   bPending bInDataLoad bIsVarDecl bNeedInject bWasInMethod bCurrency
 
         // sSafeSearch is sLower with all quoted string content stripped.
         // Using it for "contains" keyword checks prevents false positives when a
@@ -815,6 +1155,31 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Move (Left(sLower, 2) = "//") to bSkip
         If (bSkip = True) Begin
             Move sLine to asOutput[SizeOfArray(asOutput)]
+            Procedure_Return
+        End
+
+        // Were we inside a method body BEFORE this line was classified? Captured ahead of the
+        // tracker below, which turns the flag off on the End_Procedure line itself - on that
+        // line a pending var-decl flush is still legitimately INSIDE the method.
+        Move (pbNdInMethodBody(Self)) to bWasInMethod
+
+        // Method-body scope tracker (passive - never consumes). Sits ABOVE every consuming
+        // handler so it also sees the End_Procedure lines that CASE A / the decline bypass
+        // consume. Read by the OBJECT-level property handlers in CASE B (see pbNdInMethodBody).
+        If (Left(sLower, 10) = "procedure " or Left(sLower, 9) = "function ") ;
+            Set pbNdInMethodBody to True
+        Else If (Left(sLower, 13) = "end_procedure" or Left(sLower, 12) = "end_function") ;
+            Set pbNdInMethodBody to False
+
+        // DECLINED method body (prescan verdict - see pasNdCellDeclineMethods): every line
+        // passes VERBATIM until its End_Procedure/End_Function. Consuming here also stops
+        // the BASE dispatch, so no property translation (Line_Size etc.) nibbles at a body
+        // we have chosen to leave whole - a half-converted method is worse than a legacy one.
+        If (pbNdInCellDeclineBody(Self) = True) Begin
+            If (Left(sLower, 13) = "end_procedure" or Left(sLower, 12) = "end_function") ;
+                Set pbNdInCellDeclineBody to False
+            Move sLine to asOutput[SizeOfArray(asOutput)]
+            Move True to bSkip
             Procedure_Return
         End
 
@@ -911,12 +1276,15 @@ Class cGridToCJGrid is a cGridToCJGridBase
             If (sSafeSearch contains "send add_item") Begin
                 Get piNdAddItemColIdx to iAddIdx
                 Get ParseAddItemValue sLine to sValue
-                Get paiNdColFormWidths to aiWidths
-                Move (SizeOfArray(aiWidths)) to iColCount
+                Get NdColumnCount to iColCount                 // widths OR captions - see NdColumnCount
                 If (iColCount < 1) Move 1 to iColCount
                 Move (Mod(iAddIdx, iColCount)) to iColN
                 Get GetIndent sLine to sLineIndent
-                Move (sLineIndent + "Move " + sValue + " to TheData[iRow].sValue[iCol" + String(iColN + 1) + "]") to asOutput[SizeOfArray(asOutput)]
+                // Re-attach the source's own "// note" AFTER the finished statement so the
+                // user's column annotation survives without swallowing the assignment target.
+                Get ExtractTrailingComment sLine to sComment
+                If (sComment <> "") Move ("  " + sComment) to sComment
+                Move (sLineIndent + "Move " + sValue + " to TheData[iRow].sValue[iCol" + String(iColN + 1) + "]" + sComment) to asOutput[SizeOfArray(asOutput)]
                 Increment iAddIdx
                 Set piNdAddItemColIdx to iAddIdx
                 // After the last column in a row, emit Increment iRow.
@@ -953,59 +1321,97 @@ Class cGridToCJGrid is a cGridToCJGridBase
             Procedure_Return
         End
 
-        // Remove Set Line_Width silently (no CJ equivalent).
-        If (Left(sLower, 4) = "set " and sLower contains "line_width") Begin
-            Move True to bSkip
-            Procedure_Return
-        End
-
-        // Translate Set Select_Mode.
-        If (Left(sLower, 4) = "set " and sLower contains "select_mode") Begin
-            If (sLower contains "multi_select") Begin
-                Get GetIndent sLine to sLineIndent
-                Move (sLineIndent + "Set pbMultipleSelection to True") to asOutput[SizeOfArray(asOutput)]
+        // The five OBJECT-level property handlers below apply ONLY outside method bodies
+        // (pbNdInMethodBody) - a dynamic 'Set Header_Label 5 to ...' inside a method is
+        // runtime behaviour, not a column definition (see the property's comment). Body
+        // lines fall through to the remaining handlers / base dispatch and stay VISIBLE.
+        If (pbNdInMethodBody(Self) = False) Begin
+            // Remove Set Line_Width silently (no CJ equivalent).
+            If (Left(sLower, 4) = "set " and sLower contains "line_width") Begin
+                Move True to bSkip
+                Procedure_Return
             End
-            Move True to bSkip
-            Procedure_Return
-        End
 
-        // Collect Set Form_Width [Item] N to W.
-        If (Left(sLower, 4) = "set " and sLower contains "form_width") Begin
-            Get ParseColumnItemIndex sLower "form_width" to iItemIdx
-            If (iItemIdx >= 0) Begin
-                Get ParseFormWidth sLower to iWidth
-                If (iWidth >= 0) Begin
-                    Get paiNdColFormWidths to aiWidths
-                    Move iWidth to aiWidths[iItemIdx]
-                    Set paiNdColFormWidths to aiWidths
+            // Translate Set Select_Mode.
+            If (Left(sLower, 4) = "set " and sLower contains "select_mode") Begin
+                If (sLower contains "multi_select") Begin
+                    Get GetIndent sLine to sLineIndent
+                    Move (sLineIndent + "Set pbMultipleSelection to True") to asOutput[SizeOfArray(asOutput)]
+                End
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Collect Set Form_Width [Item] N to W.
+            If (Left(sLower, 4) = "set " and sLower contains "form_width") Begin
+                Get ParseColumnItemIndex sLower "form_width" to iItemIdx
+                If (iItemIdx >= 0) Begin
+                    Get ParseFormWidth sLower to iWidth
+                    If (iWidth >= 0) Begin
+                        Get paiNdColFormWidths to aiWidths
+                        Move iWidth to aiWidths[iItemIdx]
+                        Set paiNdColFormWidths to aiWidths
+                        Set pbNdPendingColumns to True
+                    End
+                End
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Collect Set Header_Label [Item] N to "Label".
+            If (Left(sLower, 4) = "set " and sLower contains "header_label") Begin
+                Get ParseColumnItemIndex sLower "header_label" to iItemIdx
+                If (iItemIdx >= 0) Begin
+                    Get ParseHeaderLabel sLine to sLabel
+                    Get pasNdColHeaderLabels to asLabels
+                    Move sLabel to asLabels[iItemIdx]
+                    Set pasNdColHeaderLabels to asLabels
                     Set pbNdPendingColumns to True
                 End
+                Move True to bSkip
+                Procedure_Return
             End
-            Move True to bSkip
-            Procedure_Return
-        End
 
-        // Collect Set Header_Label [Item] N to "Label".
-        If (Left(sLower, 4) = "set " and sLower contains "header_label") Begin
-            Get ParseColumnItemIndex sLower "header_label" to iItemIdx
-            If (iItemIdx >= 0) Begin
-                Get ParseHeaderLabel sLine to sLabel
-                Get pasNdColHeaderLabels to asLabels
-                Move sLabel to asLabels[iItemIdx]
-                Set pasNdColHeaderLabels to asLabels
-                Set pbNdPendingColumns to True
+            /* Collect Set Numeric_Mask / Currency_Mask [Item] N to L R [T] (2026-10-04): the CodeJock
+               column's CreateNumericMask / CreateCurrencyMask on column N+1 (NumericMaskLines). Until then
+               the legacy line stayed in the converted grid, which does not understand it (161 grids of one
+               workspace). Collected WITHOUT arming the pending columns - Form_Width / Header_Label define
+               the columns; once those are written, the line goes in place against oCol<N+1>. */
+            If (Left(sLower, 4) = "set " and (Pos("numeric_mask", sLower) <> 0 or Pos("currency_mask", sLower) <> 0)) Begin
+                Move (Pos("currency_mask", sLower) <> 0) to bCurrency
+                Get ParseColumnItemIndex sLower (If(bCurrency, "currency_mask", "numeric_mask")) to iItemIdx
+                If (iItemIdx >= 0) Begin
+                    Get ParseValueAfterTo sLine to sValue
+                    If (pbNdColumnsEmitted(Self) = True) Begin
+                        Get GetIndent sLine to sLineIndent
+                        Get NumericMaskLines sLineIndent sValue (" of oCol" + String(iItemIdx + 1)) bCurrency (Trim(sLine)) to asMaskLines
+                        For iMask from 0 to (SizeOfArray(asMaskLines) - 1)
+                            Move asMaskLines[iMask] to asOutput[SizeOfArray(asOutput)]
+                        Loop
+                    End
+                    Else If (bCurrency = True) Begin
+                        Get pasNdColCurrencyMask to asMaskLines
+                        Move sValue to asMaskLines[iItemIdx]
+                        Set pasNdColCurrencyMask to asMaskLines
+                    End
+                    Else Begin
+                        Get pasNdColNumericMask to asMaskLines
+                        Move sValue to asMaskLines[iItemIdx]
+                        Set pasNdColNumericMask to asMaskLines
+                    End
+                    Move True to bSkip
+                    Procedure_Return
+                End
             End
-            Move True to bSkip
-            Procedure_Return
-        End
 
-        // Translate Set Floating_Menu_Object to phoHeaderContextMenu.
-        If (Left(sLower, 4) = "set " and sLower contains "floating_menu_object") Begin
-            Get GetIndent sLine to sLineIndent
-            Get ParseValueAfterTo sLine to sValue
-            Move (sLineIndent + "Set phoHeaderContextMenu to " + Trim(sValue)) to asOutput[SizeOfArray(asOutput)]
-            Move True to bSkip
-            Procedure_Return
+            // Translate Set Floating_Menu_Object to phoHeaderContextMenu.
+            If (Left(sLower, 4) = "set " and sLower contains "floating_menu_object") Begin
+                Get GetIndent sLine to sLineIndent
+                Get ParseValueAfterTo sLine to sValue
+                Move (sLineIndent + "Set phoHeaderContextMenu to " + Trim(sValue)) to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+                Procedure_Return
+            End
         End
 
         // Mouse_Click / Mouse_Down2 body sub-handler.
@@ -1105,7 +1511,10 @@ Class cGridToCJGrid is a cGridToCJGridBase
         // Exempt: Send Refresh is valid in cCJGrid and passes through unchanged.
         //         Send Redraw does not exist in cCJGrid and is commented out.
         If (pbNdInMouseBody(Self) = False and Left(sLower, 5) = "send ") Begin
-            If (Left(sLower, 12) <> "send refresh") Begin
+            /* EXACTLY "Send Refresh", not any "send refresh*" - the 12-character prefix test
+               also matched "send refresh_page", so that legacy call was exempted from the
+               comment-out and passed through into non-compiling output (Nils 2026-08-04). */
+            If (Trim(sLower) <> "send refresh" and Left(sLower, 13) <> "send refresh ") Begin
                 Get CommentOutLine sLine to sLine
                 Move sLine to asOutput[SizeOfArray(asOutput)]
                 Move True to bSkip
@@ -1113,13 +1522,31 @@ Class cGridToCJGrid is a cGridToCJGridBase
             End
         End
 
-        // Detect Procedure declaration for a method that needs var injection or that
-        // is a Mouse_Click / Mouse_Down2 needing full subclass-side conversion.
+        // Detect a Procedure OR Function declaration for a method that needs var injection or that
+        // is a Mouse_Click / Mouse_Down2 needing full subclass-side conversion. Functions included
+        // (2026-07-23): a Get Current_Item inside a Function fell to the TODO-comment path and
+        // produced non-compiling output. The mouse-name checks inside simply never match a function.
         // Guard: not the data-loading procedure (handled separately below).
-        If (Left(sLower, 10) = "procedure ") Begin
+        If (Left(sLower, 10) = "procedure " or Left(sLower, 9) = "function ") Begin
             Get ParseProcFuncName sLower to sProcName
             Get psNdDataLoadProcName to sDataLoadName
             If (not (sDataLoadName <> "" and sProcName = sDataLoadName)) Begin
+                // Cell-access DECLINE (prescan verdict): emit the declaration plus a hand-port
+                // note, then the whole body verbatim (state consumed at the top of this proc).
+                // Half-converting emitted TheData/iCol into a method that never got the var
+                // injection, and kept item-arithmetic '(i * iColumns)' as a row index
+                // (LegacyApp Sublager_multi UpdateBalances, Nils 2026-07-25). Checked BEFORE
+                // the mouse branch so a declined Mouse_Click also stays whole.
+                Get IsInCellDeclineMethods sProcName to bNeedInject
+                If (bNeedInject = True) Begin
+                    Move sLine to asOutput[SizeOfArray(asOutput)]
+                    Get GetIndent sLine to sLineIndent
+                    Get MakeSingleIndent to sSingle
+                    Move (sLineIndent + sSingle + "// DFRefactor: NOT converted - this method's shape has no faithful cCJGrid equivalent (legacy ITEM-index cell access, a Set Value cell write, or a setter/parameterized data loader that cannot become the bare LoadData). Port it to the TheData/DataSource model by hand; the grid's LoadData shows the pattern.") to asOutput[SizeOfArray(asOutput)]
+                    Set pbNdInCellDeclineBody to True
+                    Move True to bSkip
+                    Procedure_Return
+                End
                 // Mouse_Click -> OnRowDoubleClick / Mouse_Down2 -> OnRowRightClick.
                 // Handle entirely here so body lines flow through OnHandleGridLine
                 // and get Current_Item conversion, var injection, etc.
@@ -1190,8 +1617,29 @@ Class cGridToCJGrid is a cGridToCJGridBase
 
         // Var decl buffering: when inside a method needing Handle/tDataSourceRow injection,
         // collect existing var declarations so we can append the two new ones after them.
-        // Guard: skip the Procedure declaration line itself (already handled above).
-        If (pbNdInMethodVarDecl(Self) = True and Left(sLower, 10) <> "procedure ") Begin
+        // Guard: skip the Procedure/Function declaration line itself (already handled above) -
+        // without the Function half, the signature line would read as "first non-decl line" and
+        // flush the injected declarations ABOVE itself.
+        // A buffered flush may ONLY ever emit inside a method body. If we are back at OBJECT
+        // level with declarations still pending, the method's End_Procedure was consumed by a
+        // restructuring path (the data-loader rewrite emits its own LoadData carrying its own
+        // declarations), so what is left in the buffer is a redundant duplicate. Emitting it
+        // here would put variable declarations at OBJECT level - and DataFlex makes those
+        // MODULE-SCOPE symbols, not locals. One such stranded block ("Integer iRow iCol",
+        // "Handle hoDataSource", "tDataSourceRow[] TheData") in a single .sl defined those four
+        // names globally and collided with 355 later declarations right across LegacyApp's
+        // build - 387 of 389 compile errors from three lines (Nils 2026-07-26). Drop it.
+        // Both flags must read "outside a method": bWasInMethod excludes the End_Procedure line
+        // (where a pending flush still belongs INSIDE the closing method, and is handled below),
+        // and pbNdInMethodBody excludes the Procedure/Function declaration line (where injection
+        // has just been switched on for the method we are entering).
+        If (pbNdInMethodVarDecl(Self) = True and bWasInMethod = False and pbNdInMethodBody(Self) = False) Begin
+            Set pbNdInMethodVarDecl   to False
+            Set pbNdInVarInjectMethod to False
+            Set pasNdMethodVarDecls   to asEmpty
+        End
+
+        If (pbNdInMethodVarDecl(Self) = True and Left(sLower, 10) <> "procedure " and Left(sLower, 9) <> "function ") Begin
             If (sTrimLine = "") Begin
                 // A blank line before any var decl has been buffered (e.g. a blank line
                 // between the Procedure declaration and the first var decl) must NOT
@@ -1415,6 +1863,23 @@ Class cGridToCJGrid is a cGridToCJGridBase
             Get ParseProcFuncName sLower to sProcName
             Get psNdDataLoadProcName to sDataLoadName
             If (sDataLoadName <> "" and sProcName = sDataLoadName) Begin
+                // An UN-renameable loader (a 'Procedure Set' setter / parameterized - see
+                // pbNdDataLoadRenameable) must not become 'Procedure LoadData Totals Number ...'
+                // with its callers dangling and Activating's bare Send LoadData dropping the
+                // arguments (LegacyApp jobblista1, Nils 2026-07-25). The GRID flavor declines it
+                // whole - verbatim + note - and OnBeforeGridEndObject then emits the rich stub
+                // LoadData to port into. The LIST flavor forwards here and RESTORES the original
+                // signature afterwards, so it overrides AllowUnrenameableDataLoad to keep renaming.
+                If (pbNdDataLoadRenameable(Self) = False and AllowUnrenameableDataLoad(Self) = False) Begin
+                    Move sLine to asOutput[SizeOfArray(asOutput)]
+                    Get GetIndent sLine to sLineIndent
+                    Get MakeSingleIndent to sSingle
+                    Move (sLineIndent + sSingle + "// DFRefactor: NOT converted - this data loader is a setter or takes parameters, so it cannot become the parameterless LoadData. Port its Add_Item body into the generated LoadData by hand (or call the new row-based fill from here).") to asOutput[SizeOfArray(asOutput)]
+                    Set pbNdInCellDeclineBody to True
+                    Set psNdDataLoadProcName  to ""
+                    Move True to bSkip
+                    Procedure_Return
+                End
                 // Ensure exactly one blank line before Procedure LoadData.
                 If (SizeOfArray(asOutput) > 0 and Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
                     Move "" to asOutput[SizeOfArray(asOutput)]
@@ -1425,6 +1890,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
                 Set piNdAddItemColIdx    to 0
                 Set pbNdInProcVarDecl    to True
                 Set pasNdProcVarDecls    to asEmpty
+                // Remember the old name: EXTERNAL callers ('Send <name> of (oGrid(Self))')
+                // must follow the rename or they dangle - OnAfterTransformSource sweeps them.
+                Get pasNdRenamedLoaders to asProcVarDecls
+                Move sProcName to asProcVarDecls[SizeOfArray(asProcVarDecls)]
+                Set pasNdRenamedLoaders to asProcVarDecls
                 Move True to bSkip
             End
         End
@@ -1448,6 +1918,7 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Boolean bPending bConverted
         Integer iProcDepth
         String  sSingle
+
         Get pbNdPendingColumns    to bPending
         Get pbNdDataLoadConverted to bConverted
         Get piProcDepthAtGrid     to iProcDepth
@@ -1485,8 +1956,9 @@ Class cGridToCJGrid is a cGridToCJGridBase
         String[]  asHeaderLabels
         Integer[] aiFormWidths
         Boolean[] abReadOnly abCheckbox abEntryOff
+        String[]  asNumMask asCurMask asMaskLines
         String    sSingle sColIndent sColProp sLabel sTargetCol
-        Integer   iCount iMaxIdx iWidth
+        Integer   iCount iMaxIdx iWidth iMask
 
         Send FlushEntryDisplayExtracted (&asOutput) sGridIndent
 
@@ -1495,6 +1967,8 @@ Class cGridToCJGrid is a cGridToCJGridBase
         Get pabNdColReadOnly     to abReadOnly
         Get pabNdColCheckbox     to abCheckbox
         Get pabNdColEntryOff     to abEntryOff
+        Get pasNdColNumericMask  to asNumMask
+        Get pasNdColCurrencyMask to asCurMask
         Get psTargetColumnClass  to sTargetCol
         Get MakeSingleIndent     to sSingle
         Move (sGridIndent + sSingle)           to sColIndent
@@ -1533,7 +2007,9 @@ Class cGridToCJGrid is a cGridToCJGridBase
             Else Begin
                 Move (sColProp + "Set piWidth to " + String(iWidth))                       to asOutput[SizeOfArray(asOutput)]
             End
-            Move (sColProp   + "Set psCaption to " + '"' + sLabel + '"')                   to asOutput[SizeOfArray(asOutput)]
+            // sLabel is already emittable (ParseHeaderLabel keeps a literal's quotes, leaves an expression
+            // verbatim); emit AS-IS. An empty label (no Header_Label collected) becomes "" so the Set never dangles.
+            Move (sColProp   + "Set psCaption to " + (If(Trim(sLabel) = "", '""', sLabel)))    to asOutput[SizeOfArray(asOutput)]
             If (iCount < SizeOfArray(abReadOnly) and abReadOnly[iCount] = True) Begin
                 Move (sColProp + "Set pbReadOnly to True")                                  to asOutput[SizeOfArray(asOutput)]
             End
@@ -1543,8 +2019,26 @@ Class cGridToCJGrid is a cGridToCJGridBase
             If (iCount < SizeOfArray(abEntryOff) and abEntryOff[iCount] = True) Begin
                 Move (sColProp + "Set pbEditable to False")                                 to asOutput[SizeOfArray(asOutput)]
             End
+            // The column's mask (NumericMaskLines, 2026-10-04).
+            If (iCount < SizeOfArray(asNumMask)) Begin
+                If (asNumMask[iCount] <> "") Begin
+                    Get NumericMaskLines sColProp asNumMask[iCount] "" False ("Set Numeric_Mask Item " + String(iCount) + " to " + asNumMask[iCount]) to asMaskLines
+                    For iMask from 0 to (SizeOfArray(asMaskLines) - 1)
+                        Move asMaskLines[iMask] to asOutput[SizeOfArray(asOutput)]
+                    Loop
+                End
+            End
+            If (iCount < SizeOfArray(asCurMask)) Begin
+                If (asCurMask[iCount] <> "") Begin
+                    Get NumericMaskLines sColProp asCurMask[iCount] "" True ("Set Currency_Mask Item " + String(iCount) + " to " + asCurMask[iCount]) to asMaskLines
+                    For iMask from 0 to (SizeOfArray(asMaskLines) - 1)
+                        Move asMaskLines[iMask] to asOutput[SizeOfArray(asOutput)]
+                    Loop
+                End
+            End
             Move (sColIndent + "End_Object")                                                to asOutput[SizeOfArray(asOutput)]
         Loop
+        Set pbNdColumnsEmitted to True
     End_Procedure
 
     // *** Stub generation ***
@@ -1555,13 +2049,11 @@ Class cGridToCJGrid is a cGridToCJGridBase
     Procedure AppendLoadDataStub String[] ByRef asOutput String sGridIndent
         String    sSingle sOuter sInner sMergedInt
         Integer   iColIdx iColCount
-        Integer[] aiWidths
 
         Get MakeSingleIndent to sSingle
         Move (sGridIndent + sSingle)           to sOuter
         Move (sGridIndent + sSingle + sSingle) to sInner
-        Get paiNdColFormWidths to aiWidths
-        Move (SizeOfArray(aiWidths)) to iColCount
+        Get NdColumnCount to iColCount
 
         If (SizeOfArray(asOutput) > 0 and Trim(asOutput[SizeOfArray(asOutput) - 1]) <> "") Begin
             Move "" to asOutput[SizeOfArray(asOutput)]

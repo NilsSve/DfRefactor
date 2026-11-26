@@ -48,9 +48,9 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
             Set Size to 12 42
             Set Location to 44 112
             Set Label to "ID"
-            Set Label_Justification_mode to jMode_right
+            Set Label_Justification_Mode to jMode_right
             Set Label_Col_Offset to 2
-            Set Label_row_Offset to 0
+            Set Label_Row_Offset to 0
         End_Object 
     
         Object oFunctionsFunction_Name is a cRDCDbForm
@@ -58,7 +58,7 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
             Set Size to 12 321
             Set Location to 57 112
             Set Label to "Function Name"
-            Set Label_Justification_mode to jMode_right
+            Set Label_Justification_Mode to jMode_right
             Set Label_Col_Offset to 2
             Set Label_Row_Offset to 0
         End_Object 
@@ -68,7 +68,7 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
             Set Size to 47 321
             Set Location to 73 112
             Set Label to "Function Help"
-            Set Label_Justification_mode to jMode_right
+            Set Label_Justification_Mode to jMode_right
             Set Label_Col_Offset to 2
             Set Label_Row_Offset to 0
 
@@ -97,7 +97,7 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
             Set Size to 12 321
             Set Location to 124 112
             Set Label to "Summary Text"
-            Set Label_Justification_mode to jMode_right
+            Set Label_Justification_Mode to jMode_right
             Set Label_Col_Offset to 2
             Set Label_Row_Offset to 0
         End_Object 
@@ -114,13 +114,13 @@ Object oFunctionMaintenance_vw is a cRefactorDbView
             Set Label_Row_Offset to 0
             Set Entry_State to False
             Set Combo_Sort_State to False   
-            Set psToolTip to ("Determines how data is passed to the function." + CS_CRLF + ;
-                              "Standard - Line-by-line" + CS_CRLF + ;
-                              "Remove - Line-by-line" + CS_CRLF + ;
-                              "Editor One - A source file as a string array." + CS_CRLF + ;
-                              "Other One - A source file as a string array." + CS_CRLF + ;
-                              "Other All - All source files as a string array with full path." + CS_CRLF + ;
-                              "Report One - A source file as a string array." + CS_CRLF + ;
+            Set psToolTip to ("Determines how data is passed to the function." + C_NewLine + ;
+                              "Standard - Line-by-line" + C_NewLine + ;
+                              "Remove - Line-by-line" + C_NewLine + ;
+                              "Editor One - A source file as a string array." + C_NewLine + ;
+                              "Other One - A source file as a string array." + C_NewLine + ;
+                              "Other All - All source files as a string array with full path." + C_NewLine + ;
+                              "Report One - A source file as a string array." + C_NewLine + ;
                               "Report All - All source files as a string array with full path.")
         End_Object 
 

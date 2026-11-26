@@ -1,0 +1,1583 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oWorkspaceCopyPlan-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-05
+//
+// Description : Unit tests for the migration copy scope (BuildCopyPlan, cWorkspaceCopyPlan).
+//
+//               Built against a REAL fixture workspace in the Windows temp folder (under the workspace's Data
+//               folder until 2026-10-05), for the same reason the library
+//               inventory's tests are: every hard part here is a filesystem/format fact, not a string
+//               transform. The .ws has to be found through the .sws, the relative paths have to resolve
+//               against the RIGHT base, and the undeclared folders have to actually exist on disk to be
+//               found.
+//
+//               The fixture reproduces the four traps measured on a real 19.1 workspace 2026-08-05:
+//               1. the .ws lives in Programs\ and says "Home=..\", so Home is relative to the .ws FILE
+//               while every other key is relative to HOME - resolving both against one base puts
+//               AppSrc inside Programs;
+//               2. it declares a path key this build does not model, which must still become a row
+//               (the real workspace declared IdeSrcPath; tWorkspacePaths has no field for it);
+//               3. dead "Data - *" copies sit beside the live Data folder, indistinguishable on disk -
+//               5.5 GB of the real workspace's 6.5 GB - and must come out UNTICKED;
+//               4. a declared folder can simply be absent (that workspace declares HelpPath and has no
+//               Help folder), which is a state to render, not an error.
+//
+//               ASCII content only; every file and folder is removed at the end.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+Use WorkspaceCopyRecord.pkg      // the copy record's pure half
+    Object oWorkspaceCopyPlan_Tests is a cTestFixture
+        Set psFunctionName to "BuildCopyPlan"
+
+        // In the Windows TEMP folder (Nils 2026-10-05), not in the workspace's Data folder as before.
+        // vGetTempPath is a method of the Desktop, not a global function.
+        Function _CopyTestRoot Returns String
+            Function_Return (vFolderFormat(vGetTempPath(Desktop)) + "DFRefactorTests_CopyPlan\")
+        End_Function
+
+        Procedure _WriteLines String[] asLines String sPath
+            Boolean bOk
+            Get rfWriteEncodedFileFromStringArray (&asLines) sPath C_NewLine False to bOk
+            Send Assert bOk ("could not write fixture " + sPath)
+        End_Procedure
+
+        /* Builds the fixture and returns the .sws path.
+
+           Layout (mirrors the real workspace's shape):
+             DFRefactorTests_CopyPlan\
+               Main.sws                    -> [WorkspacePaths] ConfigFile=.\Programs\Main.ws
+               Programs\Main.ws            -> Home=..\  + the path keys
+               AppSrc\ AppSrc2\ DdSrc\ Data\ Bitmaps\ Custom\
+               Data - OLD\                 (undeclared - the trap)
+               DFRefactor_Backup\          (excluded)
+             ...and NO Help folder, though HelpPath is declared. */
+        Function _BuildFixture Returns String
+            String sRoot sSws sWs
+            String[] asSws asWs asLib asAlpha
+            Boolean bOk
+            Integer i iMax
+            String[] asFolders
+
+            Get _CopyTestRoot to sRoot
+            Move "AppSrc"            to asFolders[0]
+            Move "AppSrc2"           to asFolders[1]
+            Move "DdSrc"             to asFolders[2]
+            Move "Data"              to asFolders[3]
+            Move "Bitmaps"           to asFolders[4]
+            Move "Custom"            to asFolders[5]
+            Move "Programs"          to asFolders[6]
+            Move "IdeSrc"            to asFolders[9]
+            Move "Data - OLD"        to asFolders[7]
+            Move CS_BackupFolder     to asFolders[8]
+            Move (SizeOfArray(asFolders) - 1) to iMax
+            For i from 0 to iMax
+                Move (rfDirectoryCreateEx((sRoot + asFolders[i] + "\"), False)) to bOk
+                Send Assert bOk ("could not create fixture folder " + asFolders[i])
+            Loop
+
+            // A LIBRARY, referenced the way a real workspace does it: a [Libraries] entry holding a
+            // home-relative path to another workspace's .sws. Present because the library path was
+            // the one branch the first version of this fixture never exercised - and it was the
+            // branch that crashed at runtime (error 57, 2026-08-05) while the suite stayed green.
+            // ALPHA offers BOTH 19.1 and 26.0 - it can be retargeted locally (eLibRetargetLocal).
+            /* DELTA - a library declared by ALPHA rather than by the workspace, and deliberately
+               OUTSIDE Alpha's own folder. Inside it, Alpha's recursive copy would sweep it up and
+               the test would pass whatever LibraryCopyItems did; outside, only a walk of the
+               library CHAIN can find it. This is the WinServ shape (Nils 2026-08-14): the
+               workspace named one library, that library named seven more, and the copy took none
+               of them. */
+            Move (rfDirectoryCreateEx((sRoot + "Libraries\Delta\"), False)) to bOk
+            Send Assert bOk "could not create the Delta library fixture folder"
+            Move "[Properties]" to asLib[0]
+            Move "Version=19.1" to asLib[1]
+            Send _WriteLines asLib (sRoot + "Libraries\Delta\DeltaLibrary19.1.sws")
+
+            Move (rfDirectoryCreateEx((sRoot + "Libraries\Alpha\"), False)) to bOk
+            Send Assert bOk "could not create the Alpha library fixture folder"
+            Move "[Properties]"                       to asAlpha[0]
+            Move "Version=19.1"                       to asAlpha[1]
+            Move "[Libraries]"                        to asAlpha[2]
+            Move "Lib1=..\Delta\DeltaLibrary19.1.sws" to asAlpha[3]
+            Send _WriteLines asAlpha (sRoot + "Libraries\Alpha\AlphaLibrary19.1.sws")
+            Move "Version=25.0" to asAlpha[1]
+            Send _WriteLines asAlpha (sRoot + "Libraries\Alpha\AlphaLibrary25.0.sws")
+            Move "Version=26.0" to asAlpha[1]
+            Send _WriteLines asAlpha (sRoot + "Libraries\Alpha\AlphaLibrary26.0.sws")
+
+            // BETA offers ONLY 19.1 - nothing local for the target (eLibNoLocalBuild). It must be
+            // left alone and named, never guessed at.
+            Move (rfDirectoryCreateEx((sRoot + "Libraries\Beta\"), False)) to bOk
+            Send Assert bOk "could not create the Beta library fixture folder"
+            Move "Version=19.1" to asLib[1]
+            Send _WriteLines asLib (sRoot + "Libraries\Beta\BetaLibrary19.1.sws")
+
+            Move (sRoot + "Main.sws") to sSws
+            Move "[Properties]"                                to asSws[0]
+            Move "Version=19.1"                                to asSws[1]
+            Move "[WorkspacePaths]"                            to asSws[2]
+            Move "ConfigFile=.\Programs\Main.ws"               to asSws[3]
+            Move "[Libraries]"                                 to asSws[4]
+            Move "Lib1=Libraries\Alpha\AlphaLibrary19.1.sws"   to asSws[5]
+            Move "Lib2=Libraries\Beta\BetaLibrary19.1.sws"     to asSws[6]
+            Send _WriteLines asSws sSws
+
+            // TRAP 1: Home is relative to the .ws (which lives in Programs\); everything else is
+            // relative to Home. TRAP 2: MyOwnPath is a key this build does not model.
+            // AppSrcPath carries TWO folders separated by ";".
+            Move (sRoot + "Programs\Main.ws") to sWs
+            Move "[Workspace]"                        to asWs[0]
+            Move "Home=..\"                           to asWs[1]
+            Move "AppSrcPath=.\AppSrc;.\AppSrc2"      to asWs[2]
+            Move "DdSrcPath=.\DdSrc"                  to asWs[3]
+            Move "DataPath=.\Data"                    to asWs[4]
+            Move "BitmapPath=.\Bitmaps"               to asWs[5]
+            Move "ProgramPath=.\Programs"             to asWs[6]
+            Move "HelpPath=.\Help"                    to asWs[7]
+            Move "IdeSrcPath=.\IdeSrc"                to asWs[11]
+            // Two shapes taken verbatim from real .ws files on this machine (2026-08-05):
+            //   "Path=c:\"  - a drive root, which the "*path" rule would turn into a row for the
+            //                 WHOLE DRIVE, and Measure would then walk it.
+            //   an absolute folder OUTSIDE the home - legitimate, common in older workspaces, and
+            //                 must survive as a row rather than be dropped.
+            Move "Path=c:\"                           to asWs[12]
+            Move "OutsidePath=C:\Windows\Fonts"       to asWs[13]
+            Move "MyOwnPath=.\Custom"                 to asWs[8]
+            Move "Description=Copy plan fixture"      to asWs[9]
+            Move "FileList=.\Data\Filelist.cfg"       to asWs[10]
+            Send _WriteLines asWs sWs
+
+            Function_Return sSws
+        End_Function
+
+        // Leaves nothing behind - unlike the library-inventory fixture, this one creates FOLDERS,
+        // so a file-only cleanup would silently accumulate them in its folder on every run.
+        Procedure _RemoveFixture
+            String sRoot
+            Boolean bOk
+            Get _CopyTestRoot to sRoot
+            Move (rfRemoveFolderTree(sRoot)) to bOk
+        End_Procedure
+
+        // Find the row whose folder leaf is sName; -1 when absent.
+        Function _RowByName tCopyItem[] aItems String sName Returns Integer
+            Integer i iMax
+            Move (SizeOfArray(aItems) - 1) to iMax
+            For i from 0 to iMax
+                If (Lowercase(aItems[i].sName) = Lowercase(sName)) ;
+                    Function_Return i
+            Loop
+            Function_Return -1
+        End_Function
+
+        /* TRAP 1 - the anchoring one. "Home=..\" is relative to the .ws in Programs\, so it means
+           the workspace root; ".\AppSrc" is then relative to THAT, not to Programs\. Getting this
+           wrong yields ...\Programs\AppSrc, which exists nowhere. */
+        { Published = True }
+        Procedure CopyPlan_HomeIsRelativeToTheWsFileNotToItself
+            Handle ho
+            String sSws sRoot sWs sHome
+            Get _CopyTestRoot to sRoot
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get WorkspaceConfigFile of ho sSws to sWs
+            Send AssertSAreEqual (sRoot + "Programs\Main.ws") sWs
+            Get WorkspaceHomeFromConfig of ho sWs to sHome
+            // RemoveFolderSeperator'd form - compare without the trailing slash.
+            Send AssertSAreEqual (Left(sRoot, Length(sRoot) - 1)) sHome
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // TRAP 2 - a declared key this build does not model still becomes a row, and is TICKED.
+        // Dropping it silently is the worst failure this step can have.
+        { Published = True }
+        Procedure CopyPlan_UnmodelledDeclaredKeyStillBecomesARow
+            Handle ho
+            String sSws
+            tCopyItem[] aItems
+            Integer iRow
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Get _RowByName aItems "Custom" to iRow
+            Send Assert (iRow >= 0) "the unmodelled MyOwnPath key produced no row"
+            Send AssertIAreEqual eCopyDeclaredOther aItems[iRow].eRole
+            Send Assert aItems[iRow].bDeclared
+            Send Assert aItems[iRow].bSelected
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // A path value may hold several folders separated by ";" - each becomes its own row.
+        // Taking only the first would silently drop the rest.
+        { Published = True }
+        Procedure CopyPlan_SemicolonSeparatedPathsBecomeSeparateRows
+            Handle ho
+            String sSws
+            tCopyItem[] aItems
+            Integer iA iB
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Get _RowByName aItems "AppSrc"  to iA
+            Get _RowByName aItems "AppSrc2" to iB
+            Send Assert (iA >= 0) "AppSrc row missing"
+            Send Assert (iB >= 0) "the SECOND AppSrcPath folder produced no row"
+            Send AssertIAreEqual eCopySource aItems[iB].eRole
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* TRAP 3 - the 5.5 GB one. A folder nothing references is OFFERED (a user may really want
+           it) but never TICKED, and the backup tree is excluded outright. */
+        { Published = True }
+        Procedure CopyPlan_UndeclaredFolderIsOfferedButNotSelected
+            Handle ho
+            String sSws
+            tCopyItem[] aItems
+            Integer iOld iBak
+
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Get _RowByName aItems "Data - OLD" to iOld
+            Send Assert (iOld >= 0) "the undeclared folder was not offered at all"
+            Send AssertIAreEqual eCopyUndeclared aItems[iOld].eRole
+            Send Assert (aItems[iOld].bSelected = False) "an unreferenced folder must not be ticked"
+            Send Assert (aItems[iOld].bDeclared = False)
+
+            Get _RowByName aItems CS_BackupFolder to iBak
+            Send Assert (iBak >= 0) "the backup tree should be listed, not hidden"
+            Send AssertIAreEqual eCopyExcluded aItems[iBak].eRole
+            Send Assert (aItems[iBak].bSelected = False) "a backup tree must never be ticked"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // TRAP 4 - a declared folder that does not exist is a STATE, not an error: the row is
+        // present, flagged absent, and still selected (it may be created by the copy).
+        { Published = True }
+        Procedure CopyPlan_DeclaredButAbsentFolderIsAStateNotAnError
+            Handle ho
+            String sSws
+            tCopyItem[] aItems
+            Integer iRow
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Get _RowByName aItems "Help" to iRow
+            Send Assert (iRow >= 0) "a declared-but-absent path must still produce a row"
+            Send Assert (aItems[iRow].bExists = False)
+            Send Assert aItems[iRow].bDeclared
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // The Data row carries its own role - it is the one the view has to let the user reason
+        // about, being the bulk of any real workspace.
+        { Published = True }
+        Procedure CopyPlan_DataAndProgramsCarryTheirOwnRoles
+            Handle ho
+            String sSws
+            tCopyItem[] aItems
+            Integer iData iProg
+
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Get _RowByName aItems "Data" to iData
+            Get _RowByName aItems "Programs" to iProg
+            Send Assert (iData >= 0) "Data row missing"
+            Send AssertIAreEqual eCopyData aItems[iData].eRole
+            // Programs is NOT optional - it holds the .ws config the whole workspace resolves
+            // through, so it must be present and ticked.
+            Send Assert (iProg >= 0) "Programs row missing"
+            Send AssertIAreEqual eCopyOutput aItems[iProg].eRole
+            Send Assert aItems[iProg].bSelected
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* A referenced library becomes a row, ticked - copied by default because the [Libraries]
+           entries are relative to home, so a copy that leaves them behind has dangling references.
+
+           This test exists because its absence let a runtime crash ship: with no [Libraries] in the
+           fixture, LibraryCopyItems' loop body never ran, so the suite was green while Alt+P died
+           with error 57. A branch no fixture reaches is a branch with no tests. */
+        { Published = True }
+        Procedure CopyPlan_ReferencedLibraryBecomesATickedRow
+            Handle ho
+            String sSws
+            tCopyItem[] aItems
+            Integer iRow
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Get _RowByName aItems "Alpha" to iRow
+            Send Assert (iRow >= 0) "the referenced library produced no row"
+            Send AssertIAreEqual eCopyLibrary aItems[iRow].eRole
+            Send Assert aItems[iRow].bSelected "a referenced library must be copied by default"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* A library declared by a LIBRARY is a row too - the copy plan walks the whole chain.
+
+           Nils 2026-08-14, from a workspace that would not convert: WinServ declared one library,
+           WebAppSrc, and WebAppSrc's own .sws declared seven more. The plan read only the
+           WORKSPACE's [Libraries], so those seven were never candidates - the dialog could not
+           offer them and the copy could not take them, and df-cli then refused the result as a
+           workspace that will not load.
+
+           Delta sits OUTSIDE Alpha deliberately. A sub-library inside its parent is swept up by the
+           parent's own recursive copy whatever this function does, so an inside-the-parent fixture
+           would pass against the OLD code and prove nothing. */
+        { Published = True }
+        Procedure CopyPlan_LibraryDeclaredByALibraryBecomesARow
+            Handle ho
+            String sSws
+            tCopyItem[] aItems
+            Integer iAlpha iDelta
+
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Get _RowByName aItems "Alpha" to iAlpha
+            Get _RowByName aItems "Delta" to iDelta
+            Send Assert (iAlpha >= 0) "the workspace's own library produced no row"
+            Send Assert (iDelta >= 0) "a library declared by a LIBRARY produced no row - the chain is not being walked"
+            Send AssertIAreEqual eCopyLibrary aItems[iDelta].eRole
+            Send Assert aItems[iDelta].bSelected "a sub-library must be copied by default, like any other referenced library"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // IdeSrcPath is the STUDIO's own project folder, not application source (Nils 2026-08-05).
+        // It still travels with the workspace, but must not be classed alongside AppSrc.
+        { Published = True }
+        Procedure CopyPlan_IdeSrcIsStudioNotSource
+            Handle ho
+            String sSws
+            tCopyItem[] aItems
+            Integer iRow
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Get _RowByName aItems "IdeSrc" to iRow
+            Send Assert (iRow >= 0) "IdeSrc row missing"
+            Send AssertIAreEqual eCopyStudio aItems[iRow].eRole
+            Send Assert aItems[iRow].bSelected "IdeSrc still travels with the workspace"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // Ins / "Add Folder" appends a ticked row; asking for one already listed TICKS it rather
+        // than adding a duplicate.
+        { Published = True }
+        Procedure CopyPlan_AddFolderAppendsOrTicks
+            Handle ho
+            String sSws sRoot
+            tCopyItem[] aItems
+            Integer iRow iBefore
+
+            Get _CopyTestRoot to sRoot
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Move (SizeOfArray(aItems)) to iBefore
+
+            Get AddFolderToPlan of ho aItems (sRoot + "Elsewhere") to aItems
+            Send AssertIAreEqual (iBefore + 1) (SizeOfArray(aItems))
+            Get _RowByName aItems "Elsewhere" to iRow
+            Send Assert (iRow >= 0) "the added folder produced no row"
+            Send AssertIAreEqual eCopyAdded aItems[iRow].eRole
+            Send Assert aItems[iRow].bSelected "a hand-added folder must be ticked"
+
+            // Already listed -> ticked, never duplicated.
+            Get AddFolderToPlan of ho aItems (sRoot + "Data - OLD") to aItems
+            Send AssertIAreEqual (iBefore + 1) (SizeOfArray(aItems))
+            Get _RowByName aItems "Data - OLD" to iRow
+            Send Assert aItems[iRow].bSelected "re-adding a listed folder should tick it"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // Del / "Remove From Grid" drops exactly one row, matched by path.
+        { Published = True }
+        Procedure CopyPlan_RemoveFolderDropsOneRowOnly
+            Handle ho
+            String sSws sPath
+            tCopyItem[] aItems
+            Integer iRow iBefore
+
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Move (SizeOfArray(aItems)) to iBefore
+            Get _RowByName aItems "Bitmaps" to iRow
+            Send Assert (iRow >= 0) "Bitmaps row missing"
+            Move aItems[iRow].sPath to sPath
+
+            Get RemoveFolderFromPlan of ho aItems sPath to aItems
+            Send AssertIAreEqual (iBefore - 1) (SizeOfArray(aItems))
+            Get _RowByName aItems "Bitmaps" to iRow
+            Send Assert (iRow = -1) "the removed folder is still listed"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* A declared DRIVE ROOT never becomes a row.
+
+           "Path=c:\" is real - found in Rcmain.ws on this machine. The rule that makes a row from
+           every key ending in "path" takes it literally, so the plan offered the entire C: drive and
+           Measure would have walked it. Refused outright. */
+        { Published = True }
+        Procedure CopyPlan_DeclaredDriveRootIsRefused
+            Handle ho
+            String sSws
+            tCopyItem[] aItems
+            Integer i iMax
+            Boolean bFound
+
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Move False to bFound
+            Move (SizeOfArray(aItems) - 1) to iMax
+            For i from 0 to iMax
+                If (Length(aItems[i].sPath) <= 3) ;
+                    Move True to bFound
+            Loop
+            Send Assert (bFound = False) "a drive root was offered as a copy row"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* An absolute path OUTSIDE the home is kept and FLAGGED, never dropped.
+
+           Older workspaces really do declare AppSrcPath=C:\Program Files (x86)\... - dropping it
+           would silently lose real source. The flag matters because such a path does not travel
+           with a copy unless the new .ws is rewritten. */
+        { Published = True }
+        Procedure CopyPlan_OutsideHomePathIsKeptAndFlagged
+            Handle ho
+            String sSws
+            tCopyItem[] aItems
+            Integer iRow
+
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Get _RowByName aItems "Fonts" to iRow
+            Send Assert (iRow >= 0) "an out-of-home declared path was dropped"
+            Send Assert aItems[iRow].bOutsideHome "the out-of-home path was not flagged"
+            Send Assert aItems[iRow].bDeclared
+            // Rows inside the home must NOT carry the flag.
+            Get _RowByName aItems "AppSrc" to iRow
+            Send Assert (aItems[iRow].bOutsideHome = False) "an in-home path was wrongly flagged"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* The .ws rewrite. A path inside the home follows the copy; a path OUTSIDE it is left
+           exactly as written, because it was not copied and repointing it would aim at nothing.
+
+           This is the check that matters most in the whole file: a real .ws on this machine declares
+           every path absolutely, and without the rewrite the "copy" would compile, run and be
+           REFACTORED against the original's folders. */
+        { Published = True }
+        Procedure CopyPlan_RewriteMakesInHomePathsRelative
+            Handle ho
+            String sSws sRoot sJoined
+            String[] asLines asShared
+            tCopyItem[] aPlan
+            Integer i iMax
+
+            Get _CopyTestRoot to sRoot
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+
+            // The plan is passed in because an out-of-home path is only repointed when it was
+            // TICKED to travel; here nothing is, so it must be left alone.
+            Get BuildCopyPlan of ho sSws to aPlan
+            Get RewrittenWorkspaceLines of ho sSws (sRoot + "NewHome") aPlan to asLines
+            Move "" to sJoined
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                Move (sJoined + Trim(asLines[i]) + Character(10)) to sJoined
+            Loop
+            // Already-relative entries survive unchanged...
+            Send Assert (sJoined contains "AppSrcPath=.\AppSrc") "the relative AppSrcPath was lost"
+            // ...Home is never touched (it anchors everything else, and the .ws keeps its place)...
+            Send Assert (sJoined contains "Home=..\") "Home must not be rewritten"
+            /* ...and the out-of-home absolute path is REPOINTED, because the plan ticks it: a ticked
+               row travels (copied under the new home by its leaf name), so the entry must follow it
+               there. This is what makes the copy self-contained - a workspace whose AppSrc lives in
+               C:\Program Files would otherwise leave the "copy" refactoring the original's source. */
+            Send Assert (sJoined contains "OutsidePath=.\Fonts") "a ticked out-of-home path was not repointed into the copy"
+
+            // UNTICKED, the same path is left EXACTLY as written - it was not copied, so repointing
+            // it would aim at nothing.
+            Move (SizeOfArray(aPlan) - 1) to iMax
+            For i from 0 to iMax
+                If (aPlan[i].bOutsideHome = True) ;
+                    Move False to aPlan[i].bSelected
+            Loop
+            Get RewrittenWorkspaceLines of ho sSws (sRoot + "NewHome") aPlan to asLines
+            Move "" to sJoined
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                Move (sJoined + Trim(asLines[i]) + Character(10)) to sJoined
+            Loop
+            Send Assert (sJoined contains "OutsidePath=C:\Windows\Fonts") "an unticked out-of-home path must be left alone"
+
+            // ...and it is REPORTED, so the user learns the copy shares it.
+            Get PathsSharedWithOriginal of ho sSws aPlan to asShared
+            Move "" to sJoined
+            Move (SizeOfArray(asShared) - 1) to iMax
+            For i from 0 to iMax
+                Move (sJoined + asShared[i] + Character(10)) to sJoined
+            Loop
+            Send Assert (sJoined contains "OutsidePath") "the shared path was not reported"
+            Send Assert (sJoined contains "AppSrcPath" = False) "an in-home path was reported as shared"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* The copy's .sws states the TARGET version AND points its libraries at that version's
+           builds - a workspace created "for DF 26" whose libraries still name the 19.1 builds is not
+           a DF 26 workspace, it only claims to be.
+
+           ALPHA has a 26.0 sibling -> retargeted, and the entry stays RELATIVE (rebuilding it from
+           the resolved absolute path would produce an entry that cannot survive a copy).
+           BETA has only 19.1 -> left exactly as it was and NAMED, because the honest answer is
+           "fetch a newer one", not a guess. */
+        { Published = True }
+        Procedure CopyPlan_NewSwsRetargetsLibrariesItCan
+            Handle ho
+            String sSws sJoined
+            String[] asLines asMissing
+            Integer i iMax
+
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get NewSwsLines of ho sSws "25.0" to asLines
+            Move "" to sJoined
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                Move (sJoined + Trim(asLines[i]) + Character(10)) to sJoined
+            Loop
+            Send Assert (sJoined contains "Version=25.0") "the target version was not written"
+            Send Assert (sJoined contains "Lib1=Libraries\Alpha\AlphaLibrary25.0.sws") "Alpha was not retargeted to its 25.0 build"
+            Send Assert (sJoined contains "AlphaLibrary19.1.sws" = False) "the old Alpha entry survived"
+            // BETA ships no 26.0 header, so one is SYNTHESISED and the entry names the file that
+            // will be written - pointing at the old build would leave the new header dead weight.
+            Send Assert (sJoined contains "Lib2=Libraries\Beta\BetaLibrary25.0.sws") "Beta was not pointed at its synthesised 25.0 header"
+
+            Get LibrariesWithoutTargetBuild of ho sSws "25.0" to asMissing
+            Send AssertIAreEqual 1 (SizeOfArray(asMissing))
+            Send AssertSAreEqual "Beta" asMissing[0]
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* FROM DATAFLEX 26, LIBRARY FILENAMES ARE LEFT ALONE (Nils 2026-08-14).
+
+           "The .sws file names for libraries should never be touched when the Target version is
+           DF 26 and up." Below 26 the version lives in the filename, so a copy renames the entry
+           and writes the header it now names. From 26 the workspace declares DEPENDENCIES and the
+           package handler resolves them - a versioned filename is whatever the library author
+           shipped, not something this program can derive.
+
+           Deriving it anyway is what broke a real migration: the synthesised WebAppSrc header had
+           its nested entry rewritten to vWin32fh-Library-DF260.sws, which exists nowhere, and
+           df-cli then refused to load the workspace at all. An entry left as written resolves; a
+           workspace that will not load cannot even be converted.
+
+           The [Properties] version IS still written - the copy is for DF26, it just does not
+           rename anyone else's files to say so. */
+        { Published = True }
+        Procedure CopyPlan_LibraryFilenamesUntouchedFromDf26Up
+            Handle ho
+            String sSws sJoined
+            String[] asLines
+            tLibrarySwsToAdd[] aAdd
+            Integer i iMax
+
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get NewSwsLines of ho sSws "26.0" to asLines
+            Move "" to sJoined
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                Move (sJoined + Trim(asLines[i]) + Character(10)) to sJoined
+            Loop
+            // The workspace IS for 26 ...
+            Send Assert (sJoined contains "Version=26.0") "the target version was not written"
+            // ... and every library entry is exactly as the original wrote it.
+            Send Assert (sJoined contains "Lib1=Libraries\Alpha\AlphaLibrary19.1.sws") ;
+                "Alpha's entry was rewritten - library filenames must be left alone from DF26 up"
+            Send Assert (sJoined contains "Lib2=Libraries\Beta\BetaLibrary19.1.sws") ;
+                "Beta's entry was rewritten - library filenames must be left alone from DF26 up"
+            Send Assert (sJoined contains "AlphaLibrary26.0.sws" = False) ;
+                "an entry was pointed at a 26.0 build; even an EXISTING one is not ours to choose"
+            // And no header is synthesised, because nothing would reference it.
+            Get LibrarySwsToAdd of ho sSws "26.0" to aAdd
+            Send AssertIAreEqual 0 (SizeOfArray(aAdd))
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* The synthesised header: which file to write, from which template, and what goes inside it.
+
+           A library .sws is a Studio HEADER, not a code variant - upstream's own DF26 support was a
+           commit adding a df26 .sws - so writing one for a version-transparent library is exactly
+           what its author would do. The header must carry the TARGET version inside, by the same
+           rule the workspace's own .sws follows. */
+        { Published = True }
+        Procedure CopyPlan_MissingLibraryVersionGetsASynthesisedHeader
+            Handle ho
+            String sSws sJoined
+            tLibrarySwsToAdd[] aAdd
+            String[] asLines
+            Integer i iMax
+
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+
+            Get LibrarySwsToAdd of ho sSws "25.0" to aAdd
+            Send AssertIAreEqual 1 (SizeOfArray(aAdd))
+            Send AssertSAreEqual "Beta" aAdd[0].sLibName
+            Send AssertSAreEqual "25.0" aAdd[0].sVersion
+            Send Assert (aAdd[0].sTemplateFile contains "BetaLibrary19.1.sws") "the referenced build should be the template"
+            Send Assert (aAdd[0].sNewFile contains "BetaLibrary25.0.sws") "the synthesised header has the wrong name"
+
+            // ...and its CONTENT states the target version, not the template's.
+            Get NewLibrarySwsLines of ho aAdd[0].sTemplateFile "25.0" to asLines
+            Move "" to sJoined
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                Move (sJoined + Trim(asLines[i]) + Character(10)) to sJoined
+            Loop
+            Send Assert (sJoined contains "Version=25.0") "the synthesised header does not state the target version"
+            Send Assert (sJoined contains "Version=19.1" = False) "the template version survived in the new header"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* The copy's .sws filename. The real defect it fixes: "Acme-UMS VDF 18.0.sws" migrating to
+           25.0 produced "Acme-UMS VDF 18.0 DF25.0.sws" - two versions named, one of them wrong, plus
+           spaces. Nils 2026-08-05.
+
+           TARGETING DF26 OR LATER APPENDS NOTHING (Nils 2026-08-14): the JSON .sws states its own
+           version and the package handler resolves libraries, so a "_DF26.0" suffix would restate
+           what the file says and could later contradict it. Everything else still applies - the old
+           version still comes off, spaces still become underscores. */
+        { Published = True }
+        Procedure CopyPlan_MigratedSwsNameDropsOldVersionAndSpaces
+            Handle ho
+            String sName
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            // --- below DF26: the suffix is still appended ---
+            // "VDF 18.0" goes as ONE token: the old product name and its number are the version
+            // marker together, so "Acme-UMS" is the whole of the name (Nils 2026-08-14).
+            Get MigratedSwsFileName of ho "C:\W\Acme-UMS VDF 18.0.sws" "18.0" "25.0" to sName
+            Send AssertSAreEqual "Acme-UMS_DF25.0.sws" sName
+            // --- DF26 and up: no suffix ---
+            // Compact form in the name, dotted version inside the file.
+            Get MigratedSwsFileName of ho "C:\W\Ledger 180.sws" "18.0" "26.0" to sName
+            Send AssertSAreEqual "Ledger.sws" sName
+            // No version in the name at all - nothing to remove, spaces still handled.
+            Get MigratedSwsFileName of ho "C:\W\Plain Workspace.sws" "18.0" "26.0" to sName
+            Send AssertSAreEqual "Plain_Workspace.sws" sName
+            // A name that merely CONTAINS the digits must not be mangled when the dotted form is
+            // present and already removed.
+            Get MigratedSwsFileName of ho "C:\W\Route180 19.1.sws" "19.1" "26.0" to sName
+            Send AssertSAreEqual "Route180.sws" sName
+            // DF27 is "26 or later" too - the rule is a floor, not an equality test.
+            Get MigratedSwsFileName of ho "C:\W\Plain Workspace.sws" "18.0" "27.0" to sName
+            Send AssertSAreEqual "Plain_Workspace.sws" sName
+            Send Destroy of ho
+        End_Procedure
+
+        /* "DF" or "VDF" carrying a number comes off, and the suffix must not STACK when a workspace
+           is copied twice. Nils 2026-08-14: "when the .sws name contains 'DF' or 'VDF' together with
+           a number, remove them both."
+
+           TOGETHER WITH A NUMBER is the whole rule, and these cases are what stop it being a blunt
+           digit-stripper: "Route180" (above) keeps its digits, "ExportPDF" and "MyDF25Tool" keep
+           their letters because the token is not at a separator or has no number, and "MyApp DF
+           Tools" keeps a bare "DF" that names no version. This file never parses a filename to
+           learn a version - see SynthesizedLibrarySwsName. */
+        { Published = True }
+        Procedure CopyPlan_MigratedSwsNameDoesNotStackDfSuffixes
+            Handle ho
+            String sName
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            // A copy of a copy: the DF25.0 this function wrote comes off before anything is added.
+            Get MigratedSwsFileName of ho "C:\W\MyApp_DF25.0.sws" "25.0" "26.0" to sName
+            Send AssertSAreEqual "MyApp.sws" sName
+            // Same, going to a version that DOES append - one suffix out, one in, never two.
+            Get MigratedSwsFileName of ho "C:\W\MyApp_DF19.1.sws" "19.1" "25.0" to sName
+            Send AssertSAreEqual "MyApp_DF25.0.sws" sName
+            // The version in the NAME, none known from inside the file.
+            Get MigratedSwsFileName of ho "C:\W\DFRefactor_DF25.0.sws" "" "26.0" to sName
+            Send AssertSAreEqual "DFRefactor.sws" sName
+            // VDF with the number spaced off it, and nothing known from inside the file.
+            Get MigratedSwsFileName of ho "C:\W\Ledger VDF 18.0.sws" "" "26.0" to sName
+            Send AssertSAreEqual "Ledger.sws" sName
+            // VDF with the number hard against it, and in the middle of the name.
+            Get MigratedSwsFileName of ho "C:\W\Ledger_VDF191_Live.sws" "" "26.0" to sName
+            Send AssertSAreEqual "Ledger_Live.sws" sName
+            // NO separator before it, but it runs to the END of the name - a suffix, so it goes.
+            // This is the real one: C:\Projects\DF19\WinServ\WinServDF19.sws, 2026-08-14.
+            Get MigratedSwsFileName of ho "C:\W\WinServDF19.sws" "19.1" "26.0" to sName
+            Send AssertSAreEqual "WinServ.sws" sName
+            // Same shape, below DF26: stripped, then the target suffix added once.
+            Get MigratedSwsFileName of ho "C:\W\WinServDF19.sws" "19.1" "25.0" to sName
+            Send AssertSAreEqual "WinServ_DF25.0.sws" sName
+            // "DF" not followed by a digit, and "DF" with the name CARRYING ON after the number:
+            // neither is a version marker, so both survive whole.
+            Get MigratedSwsFileName of ho "C:\W\ExportPDF.sws" "" "26.0" to sName
+            Send AssertSAreEqual "ExportPDF.sws" sName
+            Get MigratedSwsFileName of ho "C:\W\MyDF25Tool.sws" "" "26.0" to sName
+            Send AssertSAreEqual "MyDF25Tool.sws" sName
+            // A bare "DF" naming no version is not a version token.
+            Get MigratedSwsFileName of ho "C:\W\MyApp DF Tools.sws" "" "26.0" to sName
+            Send AssertSAreEqual "MyApp_DF_Tools.sws" sName
+            // All version and no name - the stem must not be stripped to nothing.
+            Get MigratedSwsFileName of ho "C:\W\DF26.0.sws" "" "26.0" to sName
+            Send AssertSAreEqual "DF26.0.sws" sName
+            Send Destroy of ho
+        End_Procedure
+
+        /* Naming, the part that cannot be done by parsing. Conventions are irreconcilable across
+           libraries, so the KNOWN version string (read from inside the file) is substituted where it
+           appears in the name - dotted first, then the compact form some headers use. */
+        { Published = True }
+        Procedure CopyPlan_SynthesisedHeaderNamingFollowsTheTemplate
+            Handle ho
+            String sName
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            // Dotted form.
+            Get SynthesizedLibrarySwsName of ho "C:\L\AlphaLibrary19.1.sws" "19.1" "26.0" to sName
+            Send AssertSAreEqual "AlphaLibrary26.0.sws" sName
+            // Compact form - vwin32fh's real shape, where "19.1" never appears literally.
+            Get SynthesizedLibrarySwsName of ho "C:\L\vWin32fh-Library-DF191.sws" "19.1" "26.0" to sName
+            Send AssertSAreEqual "vWin32fh-Library-DF260.sws" sName
+            // No recognisable version in the name - append something obvious rather than invent.
+            Get SynthesizedLibrarySwsName of ho "C:\L\PlainLibrary.sws" "19.1" "26.0" to sName
+            Send AssertSAreEqual "PlainLibrary DF26.0.sws" sName
+            Send Destroy of ho
+        End_Procedure
+
+        /* A JSON .sws is REFUSED by NewSwsLines, never rewritten.
+
+           This is the one path in the copy step that can DESTROY rather than mislead. NewSwsLines is
+           INI surgery throughout, and its "no Version= found" fallback appends [Properties] and
+           Version= to the end of the file - on a JSON document that yields something neither the
+           Studio nor this tool can read. The DF26 Studio converts a workspace .sws to JSON when it
+           migrates one, so this is the shape of the second pass over any workspace this tool creates,
+           not a rarity.
+
+           An empty return means "not written"; the caller reports that rather than claiming a copy. */
+        { Published = True }
+        Procedure CopyPlan_JsonSwsIsRefusedNotRewritten
+            Handle ho
+            String sRoot sJson sJoined
+            String[] asLines asOut
+            Integer i iMax
+            Boolean bOk
+
+            Get _CopyTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "Modern.sws") to sJson
+            Move "{"                                     to asLines[0]
+            Move '  "df": "19.1",'                       to asLines[1]
+            Move '  "dependencies": [ "Lib/A.sws" ]'     to asLines[2]
+            Move "}"                                     to asLines[3]
+            Send _WriteLines asLines sJson
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get NewSwsLines of ho sJson "26.0" to asOut
+            Send AssertIAreEqual 0 (SizeOfArray(asOut))
+
+            // And the file on disk is untouched - no INI block appended to the JSON.
+            Move (rfReadEncodedFileAsStringArray(sJson)) to asLines
+            Move "" to sJoined
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                Move (sJoined + Trim(asLines[i])) to sJoined
+            Loop
+            Send Assert (sJoined contains "[Properties]" = False) "INI lines were appended to a JSON .sws"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // A .sws that declares no ConfigFile yields an empty plan rather than faulting.
+        { Published = True }
+        Procedure CopyPlan_SwsWithoutAConfigFileYieldsNoRows
+            Handle ho
+            String sRoot sSws
+            String[] asSws
+            tCopyItem[] aItems
+            Boolean bOk
+
+            Get _CopyTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "Bare.sws") to sSws
+            Move "[Properties]" to asSws[0]
+            Move "Version=19.1" to asSws[1]
+            Send _WriteLines asSws sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Send AssertIAreEqual 0 (SizeOfArray(aItems))
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // rfFolderSize counts real bytes and files, and BuildCopyPlan leaves them unmeasured -
+        // the plan must stay cheap enough to build on a render path.
+        { Published = True }
+        Procedure CopyPlan_SizesAreAbsentUntilMeasured
+            Handle ho
+            String sSws sRoot
+            String[] asLines
+            tCopyItem[] aItems
+            tCopyItem Row
+            Integer iRow
+
+            Get _CopyTestRoot to sRoot
+            Get _BuildFixture to sSws
+            Move "0123456789" to asLines[0]
+            Send _WriteLines asLines (sRoot + "AppSrc\Sample.pkg")
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aItems
+            Get _RowByName aItems "AppSrc" to iRow
+            Send Assert (iRow >= 0) "AppSrc row missing"
+            Send Assert (aItems[iRow].bMeasured = False) "BuildCopyPlan must not walk the disk"
+            Send AssertIAreEqual 0 aItems[iRow].iFiles
+
+            Move aItems[iRow] to Row
+            Send Assert (Row.bExists = True) ("the AppSrc fixture folder is missing: " + Row.sPath)
+
+            Get MeasureCopyItems of ho aItems iRow to aItems
+            Send Assert aItems[iRow].bMeasured "the measured row did not come back measured"
+            Send AssertIAreEqual 1 aItems[iRow].iFiles
+            Send Assert (aItems[iRow].nBytes > 0) "the measured folder reported zero bytes"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* WHERE A ROW LANDS - the rule the copy's whole shape depends on, so it is asserted
+           directly rather than through a fixture. Pure string work: no folder need exist.
+
+           A library keeps the RELATIONSHIP the workspace was built with. Internal stays internal,
+           a sibling stays a sibling, a pooled library stays pooled - which is what lets the .ws
+           and .sws entries naming it keep working untouched. Only a path that is neither inside
+           the home nor beside it is flattened into the copy, because nothing else would make the
+           copy self-contained. */
+        { Published = True }
+        Procedure CopyPlan_SiblingLibraryKeepsItsPositionBesideTheCopy
+            Handle ho
+            tCopyItem Row
+            String sOld sNew sDest
+
+            Move "C:\Proj\Wsp"    to sOld
+            Move "E:\Dest\NewWsp" to sNew
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+
+            // INSIDE the home - the same relative position.
+            Move "C:\Proj\Wsp\Libraries\Alpha" to Row.sPath
+            Get DestinationForRow of ho Row sOld sNew to sDest
+            Send AssertSAreEqual "E:\Dest\NewWsp\Libraries\Alpha" sDest
+
+            // A SIBLING library - beside the new home, not swallowed into it.
+            Move "C:\Proj\vdfquery" to Row.sPath
+            Get DestinationForRow of ho Row sOld sNew to sDest
+            Send AssertSAreEqual "E:\Dest\vdfquery" sDest
+
+            // Inside a SIBLING POOL - the pool is reproduced, the library keeps its place in it.
+            Move "C:\Proj\Libraries\Reports 5.0.1" to Row.sPath
+            Get DestinationForRow of ho Row sOld sNew to sDest
+            Send AssertSAreEqual "E:\Dest\Libraries\Reports 5.0.1" sDest
+
+            // NEITHER - flattened into the copy by its leaf, so the copy owns it.
+            Move "C:\Windows\Fonts" to Row.sPath
+            Get DestinationForRow of ho Row sOld sNew to sDest
+            Send AssertSAreEqual "E:\Dest\NewWsp\Fonts" sDest
+
+            /* The parent ITSELF must never mirror: ".\" would mean copying everything beside the
+               workspace - every other workspace on the drive - into the destination's parent. */
+            Move "C:\Proj" to Row.sPath
+            Get DestinationForRow of ho Row sOld sNew to sDest
+            Send AssertSAreEqual "E:\Dest\NewWsp\Proj" sDest
+            Send Destroy of ho
+        End_Procedure
+
+        /* A FILE lands wherever its FOLDER landed - the same four answers as above.
+
+           THE BUG THIS PINS (2026-08-12, a real 19.1 -> 26.0 copy of a DataFlex example): the
+           synthesised library headers were placed with RelativeInsideHome, which answers only the
+           ENCLOSED case and returns "" for everything else. A SIBLING library therefore got no
+           header, while the copy's [Libraries] entry had already been retargeted to name one - so
+           the .sws pointed at a file nobody wrote and df-cli reported the workspace BROKEN.
+
+           Sibling libraries are not exotic: Nils's copy rule has a branch for them and the whole
+           pool model is built on them, so this was the common case failing quietly. */
+        /* A RELATIVE DESTINATION PLACES NOTHING. It is the one bad destination that does not fail -
+           Windows resolves it against the process working directory, so the copy succeeds somewhere
+           nobody chose and reports success.
+
+           It happened (2026-08-12): a whole workspace and its sibling library were written under
+           C:\Users\...\OneDrive\Documents while the chosen E: drive stayed empty, silently. Every
+           guard upstream passed it - not empty, not a drive root, not inside the source - because
+           none of them asked whether it was a full path. Refused here at the root so no caller can
+           reintroduce it, and again in the dialog and in RunWorkspaceCopy so the user is told. */
+        { Published = True }
+        Procedure CopyPlan_RelativeDestinationPlacesNothing
+            Handle ho
+            String sOld sDest
+
+            Move "C:\Proj\Wsp" to sOld
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+
+            // A bare leaf - what the failing run actually had.
+            Get DestinationForFolder of ho "C:\Proj\Wsp\AppSrc" sOld "SpecializedComponents" to sDest
+            Send AssertSAreEqual "" sDest
+            // ...including the sibling branch, which is where the library went astray.
+            Get DestinationForFolder of ho "C:\Proj\Example Library" sOld "SpecializedComponents" to sDest
+            Send AssertSAreEqual "" sDest
+            // A leading separator is still not a full path - it names no drive.
+            Get DestinationForFolder of ho "C:\Proj\Wsp\AppSrc" sOld "\Dest\NewWsp" to sDest
+            Send AssertSAreEqual "" sDest
+            // ...and a file placed into one goes nowhere either.
+            Get DestinationForFile of ho "C:\Proj\Example Library\Example Library DF26.0.sws" sOld "SpecializedComponents" to sDest
+            Send AssertSAreEqual "" sDest
+
+            // The two forms that ARE full paths still work.
+            Get DestinationForFolder of ho "C:\Proj\Wsp\AppSrc" sOld "E:\Dest\NewWsp" to sDest
+            Send AssertSAreEqual "E:\Dest\NewWsp\AppSrc" sDest
+            Get DestinationForFolder of ho "C:\Proj\Wsp\AppSrc" sOld "\\server\share\NewWsp" to sDest
+            Send AssertSAreEqual "\\server\share\NewWsp\AppSrc" sDest
+            Send Destroy of ho
+        End_Procedure
+
+        { Published = True }
+        Procedure CopyPlan_SynthesizedHeaderFollowsItsLibrary
+            Handle ho
+            String sOld sNew sDest
+
+            Move "C:\Proj\Wsp"    to sOld
+            Move "E:\Dest\NewWsp" to sNew
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+
+            // ENCLOSED - the case that always worked.
+            Get DestinationForFile of ho "C:\Proj\Wsp\Libraries\Alpha\Alpha-DF26.0.sws" sOld sNew to sDest
+            Send AssertSAreEqual "E:\Dest\NewWsp\Libraries\Alpha\Alpha-DF26.0.sws" sDest
+
+            // THE ONE THAT WAS SKIPPED - a sibling library, beside the new home.
+            Get DestinationForFile of ho "C:\Proj\Example Library\Example Library DF26.0.sws" sOld sNew to sDest
+            Send AssertSAreEqual "E:\Dest\Example Library\Example Library DF26.0.sws" sDest
+
+            // Inside a sibling POOL - keeps its place in the reproduced pool.
+            Get DestinationForFile of ho "C:\Proj\Libraries\vwin32fh\vWin32fh-DF26.0.sws" sOld sNew to sDest
+            Send AssertSAreEqual "E:\Dest\Libraries\vwin32fh\vWin32fh-DF26.0.sws" sDest
+
+            // Neither enclosed nor beside - flattened into the copy by its folder's leaf.
+            Get DestinationForFile of ho "C:\Vendor\SigCJ\SigCj-DF26.0.sws" sOld sNew to sDest
+            Send AssertSAreEqual "E:\Dest\NewWsp\SigCJ\SigCj-DF26.0.sws" sDest
+
+            // A path with no folder half has no answer, and does not invent one.
+            Get DestinationForFile of ho "Alpha-DF26.0.sws" sOld sNew to sDest
+            Send AssertSAreEqual "" sDest
+            Send Destroy of ho
+        End_Procedure
+
+        /* A sibling pool that ALREADY EXISTS at the destination is used as it stands, never
+           written into. It can belong to other workspaces, and this workspace's libraries are not
+           necessarily the newest ones there - copying in would overwrite their files with ours.
+
+           Both halves are asserted, because the dangerous failure is silent: skipping a folder
+           that does NOT exist yet produces a copy that cannot compile. */
+        { Published = True }
+        Procedure CopyPlan_ExistingSiblingPoolIsUsedNotOverwritten
+            Handle ho
+            String sSws sRoot sOld sNew sDest
+            String[] asReused
+            tCopyItem[] aRows
+            tCopyPair[] aFiles
+
+            Get _CopyTestRoot to sRoot
+            Get _BuildFixture to sSws
+            // A home whose PARENT is the fixture root, so the fixture's own Libraries\Alpha is a
+            // sibling pool of it - and exists. Gamma is the same shape but absent.
+            Move (sRoot + "Wsp")     to sOld
+            Move (sRoot + "NewHome") to sNew
+
+            Move (sRoot + "Libraries\Alpha") to aRows[0].sPath
+            Move "Alpha" to aRows[0].sName
+            Move True    to aRows[0].bSelected
+            Move True    to aRows[0].bExists
+            Move (sRoot + "Libraries\Gamma") to aRows[1].sPath
+            Move "Gamma" to aRows[1].sName
+            Move True    to aRows[1].bSelected
+            Move True    to aRows[1].bExists
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            // The fixture's own preconditions, asserted so a future failure here is diagnosable:
+            // Alpha must land back on itself, and that folder must really be on disk.
+            Get DestinationForRow of ho aRows[0] sOld sNew to sDest
+            Send Assert (Lowercase(sDest) = Lowercase(sRoot + "Libraries\Alpha")) ("Alpha landed at " + sDest)
+            Send Assert (rfDirectoryExists(sDest) = True) ("the fixture pool is missing: " + sDest)
+            Get ExistingSiblingFolders of ho aRows sOld sNew to asReused
+            Send AssertIAreEqual 1 (SizeOfArray(asReused))
+            Send Assert (Lowercase(asReused[0]) contains "libraries\alpha") ;
+                ("the reused folder should be the existing pool, was: " + asReused[0])
+
+            // ...and it contributes NO files to copy, while the absent one still would.
+            Get CopyFileList of ho aRows sOld sNew to aFiles
+            Send Assert (SizeOfArray(aFiles) = 0) ;
+                "an existing sibling pool must not be written into"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* A RE-COPY MUST STILL COPY THE WORKSPACE'S OWN FOLDERS (Nils 2026-08-06).
+
+           The reported symptom was a warning listing AppSrc, Pkg, Bitmaps, Data, DDSrc, Help,
+           IdeSrc and Programs as "libraries [that] will NOT be copied", next to the one real
+           library in the list. The cause was _MirrorsBesideHome answering True for anything under
+           home's PARENT - which is every folder under home as well - so on a second copy to a
+           destination that already held the first, the skip meant for shared library pools ate
+           the workspace's own content and CopyFileList wrote nothing.
+
+           Both halves are asserted for the reason the sibling test gives: the dangerous failure is
+           silent. A folder wrongly skipped produces a copy that looks like it worked. */
+        { Published = True }
+        Procedure CopyPlan_OwnFolderIsCopiedEvenWhenTheDestinationExists
+            Handle ho
+            String sSws sRoot sOld sNew sDest
+            String[] asReused
+            tCopyItem[] aRows
+            tCopyPair[] aFiles
+            Boolean bOk
+
+            Get _CopyTestRoot to sRoot
+            Get _BuildFixture to sSws
+            /* THE SECOND COPY. Old home is the fixture root, so Programs and AppSrc are folders it
+               OWNS; the destination below it already holds a Programs from the first run, which is
+               what used to trigger the "already there beside the destination" skip. */
+            Move (RemoveFolderSeperator(Self, sRoot)) to sOld
+            Move (sRoot + "NewHome") to sNew
+            Move (rfDirectoryCreateEx((sNew + "\Programs\"), False)) to bOk
+            Send Assert bOk "could not create the pre-existing destination folder"
+
+            /* Programs, not AppSrc, carries the file assertion: _BuildFixture creates AppSrc and
+               Data as EMPTY folders and only writes Main.ws under Programs, so an AppSrc row
+               yields nothing to copy whether it is skipped or not - it could not tell the two
+               apart. AppSrc rides along for the sibling assertion, which does not need files. */
+            Move (sRoot + "Programs") to aRows[0].sPath
+            Move "Programs" to aRows[0].sName
+            Move True       to aRows[0].bSelected
+            Move True       to aRows[0].bExists
+            Move (sRoot + "AppSrc") to aRows[1].sPath
+            Move "AppSrc"   to aRows[1].sName
+            Move True       to aRows[1].bSelected
+            Move True       to aRows[1].bExists
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            // Preconditions: the row lands under the NEW home, and that folder is really there.
+            Get DestinationForRow of ho aRows[0] sOld sNew to sDest
+            Send Assert (Lowercase(sDest) = Lowercase(sNew + "\Programs")) ("Programs landed at " + sDest)
+            Send Assert (rfDirectoryExists(sDest) = True) ("the destination folder is missing: " + sDest)
+
+            // A folder the workspace OWNS is never a sibling, however crowded the destination is.
+            Get ExistingSiblingFolders of ho aRows sOld sNew to asReused
+            Send AssertIAreEqual 0 (SizeOfArray(asReused))
+
+            // ...and it still contributes its files. Main.ws lives under Programs, so this is > 0
+            // for a reason rather than by luck - and it was 0 before the fix.
+            Get CopyFileList of ho aRows sOld sNew to aFiles
+            Send Assert (SizeOfArray(aFiles) > 0) ;
+                "the workspace's own folders must still be copied when the destination exists"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* COMPILER OUTPUT DOES NOT TRAVEL (Nils 2026-08-17). The recopied WinServ arrived with the
+           original's WINSERV.prn and three .err files, and "Show last Check" read them as this copy's
+           compile. CopyFileList leaves .prn / .err / .dep behind - and COUNTS them, so the report can
+           say so - while everything else in the folder still goes. Case-insensitive on the extension;
+           a .prn-lookalike stem ("notes.prn.txt") is a .txt and goes. */
+        { Published = True }
+        Procedure CopyPlan_CompilerOutputIsNotCopiedAndIsCounted
+            Handle ho
+            String sSws sRoot sOld sNew sSrc
+            String[] asOne
+            tCopyItem[] aRows
+            tCopyPair[] aFiles
+            Integer i iMax iSkipped iOutputsListed iOthersListed
+
+            Get _CopyTestRoot to sRoot
+            Get _BuildFixture to sSws
+            Move (RemoveFolderSeperator(Self, sRoot)) to sOld
+            Move (sRoot + "OutHome") to sNew
+            // Under the fixture's (empty) AppSrc: two outputs, one lookalike, one real source file.
+            Move "x" to asOne[0]
+            Send _WriteLines asOne (sRoot + "AppSrc\Main.prn")
+            Send _WriteLines asOne (sRoot + "AppSrc\MAIN.ERR")
+            Send _WriteLines asOne (sRoot + "AppSrc\Main.dep")
+            Send _WriteLines asOne (sRoot + "AppSrc\notes.prn.txt")
+            Send _WriteLines asOne (sRoot + "AppSrc\Main.src")
+            Move (sRoot + "AppSrc") to aRows[0].sPath
+            Move "AppSrc"   to aRows[0].sName
+            Move True       to aRows[0].bSelected
+            Move True       to aRows[0].bExists
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get CopyFileList of ho aRows sOld sNew to aFiles
+            Get piCompilerOutputsSkipped of ho to iSkipped
+            Move 0 to iOutputsListed
+            Move 0 to iOthersListed
+            Move (SizeOfArray(aFiles) - 1) to iMax
+            For i from 0 to iMax
+                Move (Lowercase(aFiles[i].sSource)) to sSrc
+                If (Right(sSrc, 4) = ".prn" or Right(sSrc, 4) = ".err" or Right(sSrc, 4) = ".dep") ;
+                    Increment iOutputsListed
+                If (Right(sSrc, 9) = "\main.src" or Right(sSrc, 14) = "\notes.prn.txt") ;
+                    Increment iOthersListed
+            Loop
+            Send AssertIAreEqual 0 iOutputsListed
+            Send AssertIAreEqual 3 iSkipped
+            Send AssertIAreEqual 2 iOthersListed
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* The unit the bug actually lived in, pinned directly - the two callers above go through
+           DestinationForRow, which masked it by resolving inside-home first. */
+        { Published = True }
+        Procedure CopyPlan_InsideHomeIsNotBesideHome
+            Handle ho
+            Boolean bBeside
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+
+            // Home's own subtree: never beside it, at any depth.
+            Get _MirrorsBesideHome of ho "C:\Proj\Wsp\AppSrc" "C:\Proj\Wsp" to bBeside
+            Send Assert (bBeside = False) "AppSrc inside the home is not beside it"
+            Get _MirrorsBesideHome of ho "C:\Proj\Wsp\Libraries\Alpha" "C:\Proj\Wsp" to bBeside
+            Send Assert (bBeside = False) "an internal library is not beside the home"
+            // Home itself.
+            Get _MirrorsBesideHome of ho "C:\Proj\Wsp" "C:\Proj\Wsp" to bBeside
+            Send Assert (bBeside = False) "the home is not beside itself"
+
+            // ...while genuine siblings still are, which is what the skip exists for.
+            Get _MirrorsBesideHome of ho "C:\Proj\vdfquery" "C:\Proj\Wsp" to bBeside
+            Send Assert (bBeside = True) "a sibling library IS beside the home"
+            Get _MirrorsBesideHome of ho "C:\Proj\Libraries\Reports 5.0.1" "C:\Proj\Wsp" to bBeside
+            Send Assert (bBeside = True) "a pooled sibling library IS beside the home"
+            // The parent itself still never mirrors.
+            Get _MirrorsBesideHome of ho "C:\Proj" "C:\Proj\Wsp" to bBeside
+            Send Assert (bBeside = False) "the parent itself must never mirror"
+            Send Destroy of ho
+        End_Procedure
+
+
+        /* A PARENT LIBRARY IS NOT COVERED BY ITS OWN CHILD (Nils 2026-08-15).
+
+           WinServ's shape exactly: the workspace declares Parent, whose .sws declares Child
+           sitting INSIDE Parent's folder - and the [Libraries] section lists them child-first,
+           which is what makes the order matter. BuildCopyPlan used to test each library row
+           against every row already kept, so the child (kept first) "covered" the parent by the
+           nested-under rule, and the parent - with all of its own files - was silently dropped
+           while the child copied. df-cli then reported the parent's .sws missing at a path that
+           was correct.
+
+           Two assertions: BOTH library rows survive into the plan, and the parent's own file is
+           in the copy list. The second is the one that matters - the first could pass while the
+           executor still skipped the row. */
+        {Published = True}
+        Procedure CopyPlan_ParentLibraryIsNotCoveredByItsChild
+            Handle ho
+            tCopyItem[] aPlan
+            tCopyPair[] aPairs
+            String[] asWs asWsCfg asParent asChild asOwn
+            String sRoot sSws sParentPath sChildPath
+            Integer i iMax iParentRows iChildRows
+            Boolean bOk bParentFile
+
+            Get _CopyTestRoot to sRoot
+            Move (sRoot + "PC\") to sRoot
+            Move (rfDirectoryCreateEx((sRoot + "Wsp\Programs\"), False)) to bOk
+            Move (rfDirectoryCreateEx((sRoot + "Wsp\AppSrc\"), False)) to bOk
+            Move (rfDirectoryCreateEx((sRoot + "Parent\Child\"), False)) to bOk
+            Send Assert bOk "could not create the parent/child fixture folders"
+
+            // Child: its own .sws INSIDE the parent's folder.
+            Move "[Properties]" to asChild[0]
+            Move "Version=19.1" to asChild[1]
+            Send _WriteLines asChild (sRoot + "Parent\Child\ChildLibrary19.1.sws")
+            // Parent: declares the child; carries a file of its OWN that only the parent row copies.
+            Move "[Properties]"                    to asParent[0]
+            Move "Version=19.1"                    to asParent[1]
+            Move "[Libraries]"                     to asParent[2]
+            Move "Lib1=Child\ChildLibrary19.1.sws" to asParent[3]
+            Send _WriteLines asParent (sRoot + "Parent\ParentLibrary19.1.sws")
+            Move "// the parent's own source" to asOwn[0]
+            Send _WriteLines asOwn (sRoot + "Parent\parentonly.pkg")
+
+            // The workspace: CHILD FIRST, then parent - WinServ's Lib2/Lib3-before-Lib1 order.
+            Move "[Properties]"                                 to asWs[0]
+            Move "Version=19.1"                                 to asWs[1]
+            Move "[WorkspacePaths]"                             to asWs[2]
+            Move "ConfigFile=.\Programs\Wsp.ws"                to asWs[3]
+            Move "[Libraries]"                                  to asWs[4]
+            Move "Lib2=..\Parent\Child\ChildLibrary19.1.sws"   to asWs[5]
+            Move "Lib1=..\Parent\ParentLibrary19.1.sws"        to asWs[6]
+            Move (sRoot + "Wsp\Wsp.sws") to sSws
+            Send _WriteLines asWs sSws
+            Move "[Workspace]"        to asWsCfg[0]
+            Move "Home=..\"           to asWsCfg[1]
+            Move "AppSrcPath=.\AppSrc" to asWsCfg[2]
+            Send _WriteLines asWsCfg (sRoot + "Wsp\Programs\Wsp.ws")
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get BuildCopyPlan of ho sSws to aPlan
+            Move (Lowercase(sRoot + "Parent")) to sParentPath
+            Move (Lowercase(sRoot + "Parent\Child")) to sChildPath
+            Move 0 to iParentRows
+            Move 0 to iChildRows
+            Move (SizeOfArray(aPlan) - 1) to iMax
+            For i from 0 to iMax
+                If (aPlan[i].eRole = eCopyLibrary) Begin
+                    If (Lowercase(RemoveFolderSeperator(ho, aPlan[i].sPath)) = sParentPath) ;
+                        Increment iParentRows
+                    If (Lowercase(RemoveFolderSeperator(ho, aPlan[i].sPath)) = sChildPath) ;
+                        Increment iChildRows
+                End
+            Loop
+            Send Assert (iChildRows = 1)  ("the child library row is missing from the plan (" + String(iChildRows) + ")")
+            Send Assert (iParentRows = 1) ("the PARENT library row was dropped from the plan - covered by its own child (" + String(iParentRows) + ")")
+
+            // And the parent's OWN file is actually going to be written.
+            Get CopyFileList of ho aPlan (sRoot + "Wsp") (sRoot + "Out\Wsp") to aPairs
+            Move False to bParentFile
+            Move (SizeOfArray(aPairs) - 1) to iMax
+            For i from 0 to iMax
+                If (Pos("parentonly.pkg", Lowercase(aPairs[i].sSource)) > 0) ;
+                    Move True to bParentFile
+            Loop
+            Send Assert bParentFile "the parent library's own file is not in the copy list"
+            Send Destroy of ho
+        End_Procedure
+
+        /* A LIBRARY INSIDE THE HOME THAT IS NOT TICKED IS NAMED (Nils 2026-09-03, LegacyApp).
+           VDFQuery and vWin32fh lived under the workspace's own Libraries\ folder and were left
+           unticked; their entries went into the copy as written, pointed at folders the copy did
+           not have, and df-cli refused to convert the workspace. Here BETA is the one left out:
+           it is named, and with every row chosen nothing is. */
+        { Published = True }
+        Procedure CopyPlan_UncopiedInsideHomeLibraryIsNamed
+            Handle ho
+            String sSws sRoot sBeta
+            tCopyItem[] aRows aChosen
+            tLibraryInfo[] aOut
+            Integer i iMax
+
+            Get _BuildFixture to sSws
+            Get _CopyTestRoot to sRoot
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get LibraryCopyItems of ho sSws to aRows
+            Move (Lowercase(RemoveFolderSeperator(ho, (sRoot + "Libraries\Beta")))) to sBeta
+            Move (SizeOfArray(aRows) - 1) to iMax
+            For i from 0 to iMax
+                If (Lowercase(RemoveFolderSeperator(ho, aRows[i].sPath)) <> sBeta) ;
+                    Move aRows[i] to aChosen[SizeOfArray(aChosen)]
+            Loop
+            Send Assert (SizeOfArray(aChosen) = SizeOfArray(aRows) - 1) "the fixture has no Beta library row to leave out"
+
+            Get UncopiedInsideHomeLibraries of ho aChosen sSws sRoot to aOut
+            Send AssertIAreEqual 1 (SizeOfArray(aOut))
+            Send AssertSAreEqual "Libraries\Beta\BetaLibrary19.1.sws" aOut[0].sRawEntry
+
+            // Every row chosen: nothing is left behind.
+            Get UncopiedInsideHomeLibraries of ho aRows sSws sRoot to aOut
+            Send AssertIAreEqual 0 (SizeOfArray(aOut))
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* The drop list removes ONLY the named entry, and the survivors are renumbered from Lib1
+           because the Studio reads Lib1, Lib2... in sequence and a gap ends the list early. */
+        { Published = True }
+        Procedure CopyPlan_NewSwsLinesDroppingRemovesAndRenumbers
+            Handle ho
+            String sSws sJoined
+            String[] asLines asDrop
+            Integer i iMax
+
+            Get _BuildFixture to sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Move "Libraries\Alpha\AlphaLibrary19.1.sws" to asDrop[0]
+            Get NewSwsLinesDropping of ho sSws "26.0" asDrop to asLines
+            Move "" to sJoined
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                Move (sJoined + Trim(asLines[i]) + Character(10)) to sJoined
+            Loop
+            Send Assert (sJoined contains "Version=26.0") "the target version was not written"
+            Send Assert (sJoined contains "Alpha" = False) "the dropped Alpha entry survived"
+            Send Assert (sJoined contains "Lib1=Libraries\Beta\BetaLibrary19.1.sws") "Beta was not renumbered to Lib1"
+            Send Assert (sJoined contains "Lib2=" = False) "a Lib2 key remains after the drop"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* EVERY PROGRAM GOES INTO THE COPY (2026-09-11). The source .sws repeats a slot number -
+           Project1 twice, no Project0 - the shape a real workspace had when its main program
+           disappeared in the DataFlex 26 conversion: the copy's .sws is what df-cli converts next,
+           and df-cli keeps only the last of two lines that share a key. The copy must carry all
+           three programs, renumbered from Project0 in the order they were written, in place. */
+        { Published = True }
+        Procedure CopyPlan_NewSwsKeepsEveryProgram
+            Handle ho
+            String sSws sJoined
+            String[] asSws asLines
+            Integer i iMax
+
+            Get _BuildFixture to sSws
+            Move "[Properties]"                              to asSws[0]
+            Move "Version=19.1"                              to asSws[1]
+            Move "[WorkspacePaths]"                          to asSws[2]
+            Move "ConfigFile=.\Programs\Main.ws"             to asSws[3]
+            Move "[Projects]"                                to asSws[4]
+            Move "Project1=Main.src"                         to asSws[5]
+            Move "Project1=Login.src"                        to asSws[6]
+            Move "Project2=Report.src"                       to asSws[7]
+            Move "[Libraries]"                               to asSws[8]
+            Move "Lib1=Libraries\Alpha\AlphaLibrary19.1.sws" to asSws[9]
+            Move "Lib2=Libraries\Beta\BetaLibrary19.1.sws"   to asSws[10]
+            Send _WriteLines asSws sSws
+
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get NewSwsLines of ho sSws "26.0" to asLines
+            Move "" to sJoined
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                Move (sJoined + Trim(asLines[i]) + Character(10)) to sJoined
+            Loop
+            Send Assert (sJoined contains ("[Projects]" + Character(10) + "Project0=Main.src" + Character(10) + "Project1=Login.src" + Character(10) + "Project2=Report.src" + Character(10) + "[Libraries]")) "the three programs were not renumbered in place, in order"
+            Send Assert (sJoined contains "Project1=Main.src" = False) "the repeated slot survived into the copy"
+            Send Assert (sJoined contains "Version=26.0") "the target version was not written"
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* The chain walk NAMES a conflict-marked library file (2026-09-14), with the words that say
+           what to do - the copy report and the Convert dialog list what this returns. A missing file
+           still reads as before, bare. */
+        {Published = True}
+        Procedure UnresolvableRefs_NameTheConflictMarkedFile
+            String sRoot sSws sLibDir sLib
+            String[] asSws asBad asOut
+            Handle ho
+            Boolean bOk
+            Integer iVoid i
+
+            Get _CopyTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZConflictLib\") to sLibDir
+            Move (rfDirectoryCreateEx(sLibDir, False)) to bOk
+            Move (sLibDir + "ZConflictLib25.0.sws") to sLib
+            Move "<<<<<<< HEAD"     to asBad[0]
+            Move "[Properties]"     to asBad[1]
+            Move "Version=25.0"     to asBad[2]
+            Move "======="          to asBad[3]
+            Move ">>>>>>> 772bacec" to asBad[4]
+            Send _WriteLines asBad sLib
+            Move (sRoot + "ZConflictMain.sws") to sSws
+            Move "[Properties]"                          to asSws[0]
+            Move "Version=25.0"                          to asSws[1]
+            Move "[Libraries]"                           to asSws[2]
+            Move "Lib1=ZConflictLib\ZConflictLib25.0.sws" to asSws[3]
+            Move "Lib2=ZNowhere\ZNowhere25.0.sws"         to asSws[4]
+            Send _WriteLines asSws sSws
+            Get Create (RefClass(cWorkspaceCopyPlan)) to ho
+            Get UnresolvableLibraryRefs of ho sSws "26.0" to asOut
+            Send Destroy of ho
+            Send AssertIAreEqual 2 (SizeOfArray(asOut))
+            For i from 0 to (SizeOfArray(asOut) - 1)
+                If (Pos("ZConflictLib", asOut[i]) > 0) ;
+                    Send Assert (Pos("git conflict markers", asOut[i]) > 0)
+                If (Pos("ZNowhere", asOut[i]) > 0) ;
+                    Send Assert (Pos("git conflict markers", asOut[i]) = 0)
+            Loop
+            Move (rfDeleteFile(sLib)) to iVoid
+            Move (rfDeleteFile(sSws)) to iVoid
+        End_Procedure
+
+        // The copy report quotes df-cli's LAST lines: blank ones dropped, capped, "" when it said nothing.
+        {Published = True}
+        Procedure DfCliOutputNote_QuotesTheLastLines
+            String[] asLines asNone
+            String sOut
+
+            Move "first"  to asLines[0]
+            Move ""       to asLines[1]
+            Move "second" to asLines[2]
+            Move "   "    to asLines[3]
+            Move "third"  to asLines[4]
+            Get DfCliOutputNote (&asLines) 2 to sOut
+            Send AssertSAreEqual (Character(10) + "   second" + Character(10) + "   third") sOut
+            Get DfCliOutputNote (&asLines) 0 to sOut
+            Send Assert (Pos("first", sOut) > 0)
+            Get DfCliOutputNote (&asNone) 5 to sOut
+            Send AssertSAreEqual "" sOut
+        End_Procedure
+
+        // df-cli's "Config file for project ... using defaults." lines are left out of the quote and
+        // counted (LegacyApp5_20, 2026-10-29: thirteen of them filled the box and hid the real reason).
+        {Published = True}
+        Procedure DfCliOutputNote_LeavesOutTheConfigDefaultsLines
+            String[] asLines asOnlyNotes
+            String sOut
+
+            Move "Config file for project 'A.SRC' could not be found in workspace 'W.sws', using defaults." to asLines[0]
+            Move "Config file for project 'B.SRC' could not be found in workspace 'W.sws', using defaults." to asLines[1]
+            Move "Installing P..." to asLines[2]
+            Move "Incompatible ref for O/L: 1.0.0 does not match 5432741c" to asLines[3]
+            Get DfCliOutputNote (&asLines) 15 to sOut
+            Send Assert (Pos("Config file", sOut) = 0 and Pos("Incompatible ref", sOut) > 0 and Pos("(2 line(s) left out", sOut) > 0)
+            Move asLines[0] to asOnlyNotes[0]
+            Get DfCliOutputNote (&asOnlyNotes) 6 to sOut
+            Send Assert (Pos("(1 line(s) left out", sOut) > 0)
+        End_Procedure
+
+        // An incompatible ref is put in plain words, naming the package and both refs; no such line = "".
+        {Published = True}
+        Procedure DfCliIncompatibleRefHint_NamesThePackageAndBothRefs
+            String[] asLines asNone
+            String sOut
+
+            Move "Processing dependency NilsSve/vWin32fh-Library-DF26.0..." to asLines[0]
+            Move "Incompatible ref for NilsSve/vWin32fh-Library-DF26.0: 1.0.0 does not match 5432741c" to asLines[1]
+            Get DfCliIncompatibleRefHint (&asLines) to sOut
+            Send Assert (Pos("for NilsSve/vWin32fh-Library-DF26.0 in different ways - as 1.0.0 and as 5432741c.", sOut) > 0)
+            Get DfCliIncompatibleRefHint (&asNone) to sOut
+            Send AssertSAreEqual "" sOut
+        End_Procedure
+
+        /* A lock-file fixture shaped like LegacyApp5_20 (2026-10-29): the workspace pins O/Library-DUF at a
+           commit, the lock also pins O/L-Lib at 5432741c, and DUF's checkout under DfPkg asks for
+           L-Lib as sDufAsks. Returns the .sws path. */
+        Function _StaleLockFixture String sDufAsks Returns String
+            String[] asSws asLock asDuf
+            String sRoot sDufDir
+            Boolean bOk
+
+            Get _CopyTestRoot to sRoot
+            Move (sRoot + "StaleLock\") to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (rfDirectoryCreateEx((sRoot + "DfPkg\"), False)) to bOk
+            Move (sRoot + "DfPkg\O_DUF-abc123\") to sDufDir
+            Move (rfDirectoryCreateEx(sDufDir, False)) to bOk
+            Move '{ "df": 26.0, "dependencies": [' to asSws[0]
+            Move '  { "source": "https://github.com/O/Library-DUF.git", "sws": "DUF.sws", "version": "abc123" } ] }' to asSws[1]
+            Send _WriteLines asSws (sRoot + "W.sws")
+            Move '{ "dependencies": {' to asLock[0]
+            Move '    "github.com/O/Library-DUF.git/DUF": { "ref": "abc123" },' to asLock[1]
+            Move '    "github.com/O/Library-L.git/Studio/L-Lib": { "ref": "5432741c" } },' to asLock[2]
+            Move '  "lockVersion": "1.0.0" }' to asLock[3]
+            Send _WriteLines asLock (sRoot + "W.sws.lock")
+            Move '{ "dependencies": [' to asDuf[0]
+            Move ('  { "source": "https://github.com/O/Library-L.git", "sws": "Studio/L-Lib.sws", "version": "' + sDufAsks + '" } ] }') to asDuf[1]
+            Send _WriteLines asDuf (sDufDir + "DUF.sws")
+            Function_Return (sRoot + "W.sws")
+        End_Function
+
+        // The lock's pin is offered for removal only while nothing in the chain still asks for it.
+        {Published = True}
+        Procedure StaleLockPin_OnlyWhenNothingStillAsksForIt
+            String[] asCli
+            String sSws sPkg sKey sRef1 sRef2
+            Handle ho
+            Boolean bOk
+
+            Move "Processing dependency O/L-Lib..." to asCli[0]
+            Move "Incompatible ref for O/L-Lib: 1.0.0 does not match 5432741c" to asCli[1]
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get _StaleLockFixture "^1.0.0" to sSws
+            Get StaleLockPin of ho sSws asCli (&sPkg) (&sKey) to sRef1
+            Get _StaleLockFixture "5432741c" to sSws
+            Get StaleLockPin of ho sSws asCli (&sPkg) (&sKey) to sRef2
+            Send Destroy of ho
+            Get _CopyTestRoot to sSws
+            Move (rfRemoveFolderTree(sSws + "StaleLock\")) to bOk
+            Send Assert ((sRef1 = "5432741c") and (sRef2 = "")) ("stale pin: '" + sRef1 + "', still asked: '" + sRef2 + "'")
+        End_Procedure
+
+        // Removing the entry leaves the rest of the lock; putting it back restores the file byte for byte.
+        {Published = True}
+        Procedure RemoveLockEntry_RemovesOneAndRestoresExactly
+            String[] asCli asKeys asRefs
+            UChar[] ucaBefore
+            String sSws sPkg sKey sRef sOrig sAfter sBack
+            Handle ho
+            Integer iLeft
+            Boolean bRemoved bPutBack bOk
+
+            Move "Incompatible ref for O/L-Lib: 1.0.0 does not match 5432741c" to asCli[0]
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get _StaleLockFixture "^1.0.0" to sSws
+            Get _JsonFileText of ho (sSws + ".lock") to sOrig
+            Get StaleLockPin of ho sSws asCli (&sPkg) (&sKey) to sRef
+            Get RemoveLockEntry of ho (sSws + ".lock") sKey (&ucaBefore) to bRemoved
+            Get _JsonFileText of ho (sSws + ".lock") to sAfter
+            Get LockFileEntries sAfter (&asKeys) (&asRefs) to iLeft
+            Get RestoreFileBytes of ho (sSws + ".lock") ucaBefore to bPutBack
+            Get _JsonFileText of ho (sSws + ".lock") to sBack
+            Send Destroy of ho
+            Get _CopyTestRoot to sSws
+            Move (rfRemoveFolderTree(sSws + "StaleLock\")) to bOk
+            Send Assert ((bRemoved = True) and (iLeft = 1) and (Pos("Library-DUF", sAfter) > 0) and (Pos("L-Lib", sAfter) = 0) and (bPutBack = True) and (sBack = sOrig)) ;
+                ("removed " + String(bRemoved) + ", left " + String(iLeft) + ", restored " + String(bPutBack) + "/" + String(sBack = sOrig))
+        End_Procedure
+
+        // THE COPY RECORD (Nils 2026-10-07: a copy of a copy makes little sense). A record carries the
+        // other side's .sws and the day, and the day reads as a person writes it.
+        {Published = True}
+        Procedure CopyRecord_PathAndDayRoundTrip
+            String sRec
+            Move (WorkspaceCopyRecord("E:\Order Entry DF26.0\Order_Entry.sws", "2026-10-07")) to sRec
+            Send AssertSAreEqual "E:\Order Entry DF26.0\Order_Entry.sws|2026-10-07" sRec
+            Send AssertSAreEqual "E:\Order Entry DF26.0\Order_Entry.sws" (WorkspaceCopyRecordPath(sRec))
+            Send AssertSAreEqual "7 October 2026" (WorkspaceCopyRecordDateText(sRec))
+            Send AssertSAreEqual "31 December 1999" (WorkspaceCopyRecordDateText("X.sws|1999-12-31"))
+        End_Procedure
+
+        // A record without a readable day still names its .sws, and its day reads as nothing - the Start
+        // Center then leaves the date out rather than printing a broken one.
+        {Published = True}
+        Procedure CopyRecord_NoReadableDay
+            Send AssertSAreEqual "E:\X\X.sws" (WorkspaceCopyRecordPath("E:\X\X.sws"))
+            Send AssertSAreEqual "" (WorkspaceCopyRecordDateText("E:\X\X.sws"))
+            Send AssertSAreEqual "" (WorkspaceCopyRecordDateText("E:\X\X.sws|2026-13-07"))
+            Send AssertSAreEqual "" (WorkspaceCopyRecordDateText("E:\X\X.sws|2026-1-7"))
+            Send AssertSAreEqual "" (WorkspaceCopyRecordDateText("E:\X\X.sws|2026/10/07"))
+            Send AssertSAreEqual "" (WorkspaceCopyRecordPath(""))
+        End_Procedure
+
+    End_Object

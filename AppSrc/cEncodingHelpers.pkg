@@ -26,20 +26,20 @@ Use VDFBase.pkg                     // C_BOM_UTF8c1 / C_BOM_UTF8c2 / C_BOM_UTF8c
 Use CharTranslate.pkg               // MultiToWideBuffer / WideToMultiBuffer / CP_UTF8 / CP_OEMCP
 Use GlobalFunctionsProcedures.pkg   // MemCopy, ResizeArray, AddressOf, PointerToString
 
-// Line-break constants -- guarded so this file stays usable standalone
-// even if RefactorConstants.h.pkg hasn't been Used by the caller.
-#IFNDEF CS_CRLF
+// Lone CR / LF constants -- guarded so this file stays usable standalone even if
+// RefactorConstants.h.pkg hasn't been Used by the caller. CRLF itself is VDFBase's C_NewLine
+// (Used above) - ONE system definition for the whole product, never redeclared; this file's
+// own copy sat one line below the Use that already provided it (Nils 2026-08-28).
+#IFNDEF CS_CR
     Define CS_CR   for (Character(13))
     Define CS_LF   for (Character(10))
-    Define CS_CRLF for (Character(13) + Character(10))
 #ENDIF
 
 // File-attribute introspection: declared inline so this package doesn't
 // have to Use vwin32fh.pkg (or any other workspace-specific library) just
 // to learn a file's size. The struct layout below matches Win32's
 // WIN32_FILE_ATTRIBUTE_DATA byte-for-byte (36 bytes).
-#IFDEF GetFileExInfoStandard
-#ELSE
+#IFNDEF GetFileExInfoStandard
     Define GetFileExInfoStandard for 0
 #ENDIF
 
@@ -55,8 +55,7 @@ Struct tWin32FileAttributeData
     DWord nRFFileSizeLow
 End_Struct
 
-#IFDEF get_rfGetFileAttributesExW
-#ELSE
+#IFNDEF get_rfGetFileAttributesExW
 External_Function rfGetFileAttributesExW "GetFileAttributesExW" Kernel32.dll ;
     WString lpFileName ;
     Integer fInfoLevelId ;
@@ -64,7 +63,21 @@ External_Function rfGetFileAttributesExW "GetFileAttributesExW" Kernel32.dll ;
     Returns Integer
 #ENDIF
 
-/* Global Function: RFFileSize
+// MultiByteToWideChar, called only to ASK whether bytes are valid UTF-8 (_rfBytesAreUtf8): with MB_ERR_INVALID_CHARS
+// and no output buffer it returns the length they would convert to, or 0 when they are not valid.
+#IFNDEF get_rfMultiByteToWideChar
+External_Function rfMultiByteToWideChar "MultiByteToWideChar" Kernel32.dll ;
+    UInteger uCodePage ;
+    DWord dwFlags ;
+    Pointer lpMultiByteStr ;
+    Integer cbMultiByte ;
+    Pointer lpWideCharStr ;
+    Integer cchWideChar ;
+    Returns Integer
+#ENDIF
+Define CI_rfMbErrInvalidChars for 8     // MB_ERR_INVALID_CHARS, under a name of our own
+
+/* Global Function: rfFileSize
 
  Returns the size in bytes of sFilePath, or 0 if the file does not exist
  or its attributes cannot be read. Encoding-agnostic.
@@ -73,7 +86,7 @@ External_Function rfGetFileAttributesExW "GetFileAttributesExW" Kernel32.dll ;
  lets this package stand on its own without dragging the rest of
  vwin32fh.pkg along into a host workspace.
 */
-Function RFFileSize Global String sFilePath Returns Integer
+Function rfFileSize Global String sFilePath Returns Integer
     tWin32FileAttributeData fad
     Integer iOk
 
@@ -83,7 +96,7 @@ Function RFFileSize Global String sFilePath Returns Integer
     Function_Return ((fad.nRFFileSizeHigh * 4294967296) + fad.nRFFileSizeLow)
 End_Function
 
-/* Global function: RFUtf8LineToOemBytes
+/* Global function: rfUtf8LineToOemBytes
 
  Converts a Unicode String to a UChar[] of CP850 (OEM) bytes.
  Returns an empty array on failure or empty input.
@@ -91,7 +104,7 @@ End_Function
  Unlike DAC's Utf8ToOem, this function NEVER passes OEM bytes through
  PointerToString, so characters at the tail of the line cannot be dropped.
 */
-Function RFUtf8LineToOemBytes Global String sValue Returns UChar[]
+Function rfUtf8LineToOemBytes Global String sValue Returns UChar[]
     Pointer pWideBuf pOemBuf
     Integer iWideBufLen iOemBufLen iVoid
     Boolean bOk
@@ -100,7 +113,10 @@ Function RFUtf8LineToOemBytes Global String sValue Returns UChar[]
     Move 0 to pWideBuf
     Move 0 to pOemBuf
 
-    If (sValue = "") Begin
+    // Empty means NO BYTES. Never (sValue = ""): DataFlex string equality stops at a NUL, so a line
+    // that BEGINS with one compared equal to "" and left here with nothing - the two junk bytes of
+    // a NUL line vanished on the write (2026-09-07, measured with a standalone probe).
+    If (SizeOfString(sValue) = 0) Begin
         Function_Return ucaResult
     End
 
@@ -126,13 +142,36 @@ Function RFUtf8LineToOemBytes Global String sValue Returns UChar[]
     Function_Return ucaResult
 End_Function
 
-/* Global Function: RFStringToUtf8Bytes
+/* Global Function: rfHtmlEscape
+
+ Text destined for an HTML body, escaped so it renders as itself.
+
+ &, < and " are replaced. & is the one that matters most: a folder called "R&D" is an ordinary
+ name, and an unescaped & silently truncates whatever follows it - the sort of defect that works
+ on every machine except the one that has it. " is escaped so the same call is safe inside an
+ attribute value, not only in element text.
+
+ THE ONE COPY. Three FT dialogs each carried their own private Esc, and they had already drifted:
+ ConvertWorkspaceFT.dg was missing the " replacement, so a quote in a path would have broken out
+ of any attribute it landed in. Those three now forward here, which is also what makes this
+ callable from a DIALOG-level method - a private Esc lives on one child object, and calling it
+ from the dialog raises "Invalid message" at RUNTIME, where the compiler cannot warn about it.
+*/
+Function rfHtmlEscape Global String sText Returns String
+    String s
+    Move (Replaces("&", sText, "&amp;")) to s
+    Move (Replaces("<", s, "&lt;")) to s
+    Move (Replaces('"', s, "&quot;")) to s
+    Function_Return s
+End_Function
+
+/* Global Function: rfStringToUtf8Bytes
 
  Converts a Unicode String to a UChar[] of UTF-8 bytes.
- The inverse of RFUtf8BytesToString; used when writing a UTF-8-with-BOM file.
+ The inverse of rfUtf8BytesToString; used when writing a UTF-8-with-BOM file.
  Returns an empty array on failure or empty input.
 */
-Function RFStringToUtf8Bytes Global String sValue Returns UChar[]
+Function rfStringToUtf8Bytes Global String sValue Returns UChar[]
     Pointer pWideBuf pUtf8Buf
     Integer iWideBufLen iUtf8BufLen iVoid
     Boolean bOk
@@ -141,7 +180,8 @@ Function RFStringToUtf8Bytes Global String sValue Returns UChar[]
     Move 0 to pWideBuf
     Move 0 to pUtf8Buf
 
-    If (sValue = "") Begin
+    // By byte count, not (sValue = "") - see rfUtf8LineToOemBytes: equality stops at a NUL.
+    If (SizeOfString(sValue) = 0) Begin
         Function_Return ucaResult
     End
 
@@ -165,17 +205,17 @@ Function RFStringToUtf8Bytes Global String sValue Returns UChar[]
     Function_Return ucaResult
 End_Function
 
-/* Global Function: RFFileHasBOM
+/* Global Function: rfFileHasBOM
 
  Returns True if the file at sFilePath starts with the UTF-8 BOM
  (bytes 0xEF 0xBB 0xBF, i.e. 239 187 191 - or C_BOM_UTF8c1, C_BOM_UTF8c2 and C_BOM_UTF8c3).
  Returns False for OEM files, empty files, or if the file cannot be opened.
 */
-Function RFFileHasBOM Global String sFilePath Returns Boolean
+Function rfFileHasBOM Global String sFilePath Returns Boolean
     Integer iChannel iRFFileSize
     UChar[] ucaHeader
 
-    Move (RFFileSize(sFilePath)) to iRFFileSize
+    Move (rfFileSize(sFilePath)) to iRFFileSize
     If (iRFFileSize < 3) Begin
         Function_Return False
     End
@@ -196,10 +236,10 @@ Function RFFileHasBOM Global String sFilePath Returns Boolean
     Function_Return (SizeOfArray(ucaHeader) = 3 and ucaHeader[0] = C_BOM_UTF8c1 and ucaHeader[1] = C_BOM_UTF8c2 and ucaHeader[2] = C_BOM_UTF8c3)
 End_Function
 
-/* Global Function: RFDetectFileLineBreak
+/* Global Function: rfDetectFileLineBreak
 
- Returns the line-break convention used by sFilePath -- either CS_CRLF or
- CS_LF. Defaults to CS_CRLF when the answer can't be determined (file
+ Returns the line-break convention used by sFilePath -- either C_NewLine or
+ CS_LF. Defaults to C_NewLine when the answer can't be determined (file
  can't be opened, or contains no line terminator at all).
 
  Operates on raw bytes from a "binary:" channel, so it is
@@ -213,13 +253,13 @@ End_Function
  UTF-8 path a reliable up-front answer so detection no longer depends
  on the first non-empty line returned by Readln.
 */
-Function RFDetectFileLineBreak Global String sFilePath Returns String
+Function rfDetectFileLineBreak Global String sFilePath Returns String
     String  sLineBreak
     Integer iChannel iRFFileSize iSniffLen iJ
     UChar[] ucSniff
 
-    Move CS_CRLF to sLineBreak             // safe default
-    Move (RFFileSize(sFilePath)) to iRFFileSize
+    Move C_NewLine to sLineBreak             // safe default
+    Move (rfFileSize(sFilePath)) to iRFFileSize
     If (iRFFileSize <= 0) Begin
         Function_Return sLineBreak
     End
@@ -239,7 +279,7 @@ Function RFDetectFileLineBreak Global String sFilePath Returns String
         For iJ from 0 to (SizeOfArray(ucSniff) - 1)
             If (ucSniff[iJ] = 10) Begin
                 If (iJ > 0 and ucSniff[iJ - 1] = 13) Begin
-                    Move CS_CRLF to sLineBreak
+                    Move C_NewLine to sLineBreak
                 End
                 Else Begin
                     Move CS_LF to sLineBreak
@@ -252,16 +292,62 @@ Function RFDetectFileLineBreak Global String sFilePath Returns String
     Function_Return sLineBreak
 End_Function
 
-/* Global Function: RFOemBytesToUtf8
+/* The UTF-8 buffer a native decode produced, as a String - by LENGTH, never by NUL.
+
+   PointerToString stops at the first 0 byte, and a source file can carry one: a junk line of the
+   bytes 00 02 in the middle of an 8 KB decode window ended that window's text at the NUL, the next
+   window resumed as if nothing were missing, and 96 lines of a file the compiler itself accepted
+   were gone - silently, on 2026-09-07. Every decoder below now comes through here: the buffer is
+   copied by MemCopy into a UChar[] and converted with UCharArrayToString, both length-bound. When
+   the conversion still comes up short of the byte count (a NUL it would not carry), the NUL-free
+   stretches are converted one by one and each NUL is re-inserted as the character it is, so the line
+   survives as written and rfWriteEncodedFileFromStringArray (MultiToWideBuffer by SizeOfString,
+   MemCopy by count) writes it back byte for byte. */
+Function _rfUtf8BufferToString Global Pointer pUtf8Buf Integer iLen Returns String
+    UChar[] ucaUtf8 ucaSeg
+    String  sResult
+    Integer iScan iFrom iSegLen
+    Boolean bOk
+
+    If (iLen <= 0 or pUtf8Buf = 0) ;
+        Function_Return ""
+    Move (ResizeArray(ucaUtf8, iLen)) to ucaUtf8
+    Move (MemCopy(AddressOf(ucaUtf8), pUtf8Buf, iLen)) to bOk
+    Move (UCharArrayToString(ucaUtf8)) to sResult
+    If (SizeOfString(sResult) = iLen) ;
+        Function_Return sResult
+
+    // Rare path: the bytes hold a NUL the whole-array conversion stopped at.
+    Move "" to sResult
+    Move 0 to iFrom
+    Move 0 to iScan
+    While (iScan <= iLen)
+        If (iScan = iLen or ucaUtf8[iScan] = 0) Begin
+            Move (iScan - iFrom) to iSegLen
+            If (iSegLen > 0) Begin
+                Move (ResizeArray(ucaSeg, iSegLen)) to ucaSeg
+                Move (MemCopy(AddressOf(ucaSeg), (AddressOf(ucaUtf8) + iFrom), iSegLen)) to bOk
+                Move (sResult + UCharArrayToString(ucaSeg)) to sResult
+            End
+            If (iScan < iLen) ;
+                Move (sResult + Character(0)) to sResult
+            Move (iScan + 1) to iFrom
+        End
+        Increment iScan
+    Loop
+    Function_Return sResult
+End_Function
+
+/* Global Function: rfOemBytesToUtf8
 
  Converts a UChar[] of e.g. CP850 (OEM) bytes back to a Unicode String.
  Returns "" on failure or empty input.
 
- The inbound direction IS safe to route through PointerToString at the end
- -- the intermediate buffer holds UTF-8, which is exactly the encoding
- PointerToString expects.
+ The intermediate buffer holds UTF-8; it becomes the String through
+ _rfUtf8BufferToString, by length - never through PointerToString, which
+ stops at the first NUL byte (see that helper).
 */
-Function RFOemBytesToUtf8 Global UChar[] ucaOemBytes Returns String
+Function rfOemBytesToUtf8 Global UChar[] ucaOemBytes Returns String
     Pointer pWideBuf pUtf8Buf
     Integer iOemLen iWideBufLen iUtf8BufLen iVoid
     String  sResult
@@ -287,22 +373,22 @@ Function RFOemBytesToUtf8 Global UChar[] ucaOemBytes Returns String
         Function_Return ""
     End
 
-    // Safe: pUtf8Buf contains UTF-8 bytes, which PointerToString decodes correctly.
-    Move (PointerToString(pUtf8Buf)) to sResult
+    // pUtf8Buf holds UTF-8 bytes; converted by LENGTH (an embedded NUL survives).
+    Move (_rfUtf8BufferToString(pUtf8Buf, iUtf8BufLen)) to sResult
     Move (Free(pUtf8Buf)) to iVoid
 
     Function_Return sResult
 End_Function
 
-/* Global Function: RFUtf8BytesToString
+/* Global Function: rfUtf8BytesToString
 
  Converts a UChar[] of UTF-8 bytes to a Unicode String.
  Used when reading a UTF-8-with-BOM source file: each line's raw bytes are
  already valid UTF-8, so they only need the UTF-8 -> UTF-16 -> UTF-8 ->
  PointerToString path (as opposed to the OEM -> UTF-16 -> UTF-8 path used
- by RFOemBytesToUtf8).
+ by rfOemBytesToUtf8).
 */
-Function RFUtf8BytesToString Global UChar[] ucaUtf8Bytes Returns String
+Function rfUtf8BytesToString Global UChar[] ucaUtf8Bytes Returns String
     Pointer pWideBuf pUtf8Buf
     Integer iLen iWideBufLen iUtf8BufLen iVoid
     String  sResult
@@ -319,18 +405,269 @@ Function RFUtf8BytesToString Global UChar[] ucaUtf8Bytes Returns String
     If (iWideBufLen = 0) ;
         Function_Return ""
 
-    // UTF-16 -> UTF-8 (the encoding PointerToString expects).
+    // UTF-16 -> UTF-8, then to a String by LENGTH (an embedded NUL survives).
     Move (WideToMultiBuffer(CP_UTF8, pWideBuf, iWideBufLen, AddressOf(pUtf8Buf))) to iUtf8BufLen
     Move (Free(pWideBuf)) to iVoid
     If (iUtf8BufLen = 0) ;
         Function_Return ""
 
-    Move (PointerToString(pUtf8Buf)) to sResult
+    Move (_rfUtf8BufferToString(pUtf8Buf, iUtf8BufLen)) to sResult
     Move (Free(pUtf8Buf)) to iVoid
     Function_Return sResult
 End_Function
 
-/* Global Function: RFReadEncodedFileAsStringArray
+/* Range variants of rfOemBytesToUtf8 / rfUtf8BytesToString: decode iLen bytes STARTING AT iStart of a
+   larger UChar[] in ONE native conversion, WITHOUT copying the slice into its own array first. Used by
+   the incremental .prn tail (rfPrnTailConsume), where the whole-lines region of a 256 KB chunk is
+   decoded in one call - a per-byte copy loop of that region in interpreted DataFlex would dwarf the
+   conversion itself. Pointer arithmetic on AddressOf is the established idiom (see
+   _rfFileTimeToLocalDateTime's PointerToString(AddressOf(...) + offset) in RefactorFileIO.pkg). */
+// ucaBytes is ByRef purely to avoid deep-copying the (multi-MB) source array per call; never modified.
+Function rfOemBytesRangeToString Global UChar[] ByRef ucaBytes Integer iStart Integer iLen Returns String
+    Pointer pWideBuf pUtf8Buf
+    Integer iWideBufLen iUtf8BufLen iVoid
+    String  sResult
+
+    If (iLen <= 0) ;
+        Function_Return ""
+    Move 0 to pWideBuf
+    Move 0 to pUtf8Buf
+    // OEM (CP850) -> UTF-16.
+    Move (MultiToWideBuffer(CP_OEMCP, (AddressOf(ucaBytes) + iStart), iLen, AddressOf(pWideBuf))) to iWideBufLen
+    If (iWideBufLen = 0) ;
+        Function_Return ""
+    // UTF-16 -> UTF-8, then to a String by LENGTH (an embedded NUL survives).
+    Move (WideToMultiBuffer(CP_UTF8, pWideBuf, iWideBufLen, AddressOf(pUtf8Buf))) to iUtf8BufLen
+    Move (Free(pWideBuf)) to iVoid
+    If (iUtf8BufLen = 0) ;
+        Function_Return ""
+    Move (_rfUtf8BufferToString(pUtf8Buf, iUtf8BufLen)) to sResult
+    Move (Free(pUtf8Buf)) to iVoid
+    Function_Return sResult
+End_Function
+
+// ucaBytes is ByRef purely to avoid deep-copying the (multi-MB) source array per call; never modified.
+Function rfUtf8BytesRangeToString Global UChar[] ByRef ucaBytes Integer iStart Integer iLen Returns String
+    Pointer pWideBuf pUtf8Buf
+    Integer iWideBufLen iUtf8BufLen iVoid
+    String  sResult
+
+    If (iLen <= 0) ;
+        Function_Return ""
+    Move 0 to pWideBuf
+    Move 0 to pUtf8Buf
+    // UTF-8 bytes -> UTF-16.
+    Move (MultiToWideBuffer(CP_UTF8, (AddressOf(ucaBytes) + iStart), iLen, AddressOf(pWideBuf))) to iWideBufLen
+    If (iWideBufLen = 0) ;
+        Function_Return ""
+    // UTF-16 -> UTF-8, then to a String by LENGTH (an embedded NUL survives).
+    Move (WideToMultiBuffer(CP_UTF8, pWideBuf, iWideBufLen, AddressOf(pUtf8Buf))) to iUtf8BufLen
+    Move (Free(pWideBuf)) to iVoid
+    If (iUtf8BufLen = 0) ;
+        Function_Return ""
+    Move (_rfUtf8BufferToString(pUtf8Buf, iUtf8BufLen)) to sResult
+    Move (Free(pUtf8Buf)) to iVoid
+    Function_Return sResult
+End_Function
+
+/* Are iLen bytes of ucaBytes, from iStart, valid UTF-8? Windows answers (rfMultiByteToWideChar with
+   MB_ERR_INVALID_CHARS returns 0 for bytes that are not), so no byte is examined in DataFlex. An empty range
+   is. ucaBytes is ByRef only to avoid a copy; never modified. */
+Function _rfBytesAreUtf8 Global UChar[] ByRef ucaBytes Integer iStart Integer iLen Returns Boolean
+    If (iLen <= 0) ;
+        Function_Return True
+    Function_Return (rfMultiByteToWideChar(CP_UTF8, CI_rfMbErrInvalidChars, (AddressOf(ucaBytes) + iStart), iLen, 0, 0) > 0)
+End_Function
+
+// The Windows (ANSI) code page's twin of rfOemBytesRangeToString, for a tool's output written in it - see
+// rfReadToolOutputLines. ucaBytes is ByRef only to avoid a copy; never modified.
+Function rfAnsiBytesRangeToString Global UChar[] ByRef ucaBytes Integer iStart Integer iLen Returns String
+    Pointer pWideBuf pUtf8Buf
+    Integer iWideBufLen iUtf8BufLen iVoid
+    String  sResult
+
+    If (iLen <= 0) ;
+        Function_Return ""
+    Move 0 to pWideBuf
+    Move 0 to pUtf8Buf
+    // ANSI (the Windows code page) -> UTF-16.
+    Move (MultiToWideBuffer(CP_ACP, (AddressOf(ucaBytes) + iStart), iLen, AddressOf(pWideBuf))) to iWideBufLen
+    If (iWideBufLen = 0) ;
+        Function_Return ""
+    // UTF-16 -> UTF-8, then to a String by LENGTH (an embedded NUL survives).
+    Move (WideToMultiBuffer(CP_UTF8, pWideBuf, iWideBufLen, AddressOf(pUtf8Buf))) to iUtf8BufLen
+    Move (Free(pWideBuf)) to iVoid
+    If (iUtf8BufLen = 0) ;
+        Function_Return ""
+    Move (_rfUtf8BufferToString(pUtf8Buf, iUtf8BufLen)) to sResult
+    Move (Free(pUtf8Buf)) to iVoid
+    Function_Return sResult
+End_Function
+
+/* Shared front half of rfReadEncodedFileHead and rfReadEncodedFileAsStringArrayEx: sizes the file,
+   sniffs its BOM, Read_Blocks the first iRead bytes into ucaFile on a binary channel (iMaxBytes caps
+   the read; 0 = the whole file) and computes the first byte to decode (3 past a BOM, else 0).
+   Returns True when ucaFile holds bytes to decode; False on an empty or unreadable file, or when
+   nothing follows the BOM - the caller then returns its (still empty) String[]. iRFFileSize, iRead,
+   bHasBom and iStart come back ByRef; ucaFile is ByRef so the file bytes are never copied. */
+Function _rfReadFileBytes Global String sFilePath Integer iMaxBytes UChar[] ByRef ucaFile Integer ByRef iRFFileSize Integer ByRef iRead Boolean ByRef bHasBom Integer ByRef iStart Returns Boolean
+    Integer iChannel
+
+    Move (rfFileSize(sFilePath)) to iRFFileSize
+    If (iRFFileSize <= 0) ;
+        Function_Return False
+    Move (rfFileHasBOM(sFilePath)) to bHasBom
+    Move iRFFileSize to iRead
+    If (iMaxBytes > 0 and iMaxBytes < iRead) ;
+        Move iMaxBytes to iRead
+
+    Move (Seq_New_Channel()) to iChannel
+    If (iChannel < 0) ;
+        Function_Return False
+    Direct_Input channel iChannel ("binary:" + sFilePath)
+    If (SeqEof) Begin
+        Send Seq_Release_Channel iChannel
+        Function_Return False
+    End
+    Read_Block channel iChannel ucaFile iRead
+    Close_Input channel iChannel
+    Send Seq_Release_Channel iChannel
+
+    // Skip the 3-byte UTF-8 BOM so the callers never decode it into asLines[0]. Keyed on the BOM, NOT on the
+    // decode: a forced-UTF-8 file without a BOM starts at byte 0.
+    If (bHasBom) ;
+        Move 3 to iStart
+    Else ;
+        Move 0 to iStart
+    If (iRead <= iStart) ;
+        Function_Return False
+    Function_Return True
+End_Function
+
+/* The 1-based line of the first NUL byte in the file, 0 when it has none (or cannot be read). A NUL
+   in a source file is junk or a binary file under a source name - either way something the engine
+   should name before it writes the file (see cRefactorEngine.DropBinaryFiles). One native SearchArray
+   over the bytes; only a hit pays for the LF count in front of it. */
+Function rfFirstNulLine Global String sFilePath Returns Integer
+    UChar[] ucaFile
+    UChar   ucNul
+    Integer iRFFileSize iRead iStart iNul i iLine
+    Boolean bHasBom bOk
+
+    Get _rfReadFileBytes sFilePath 0 (&ucaFile) (&iRFFileSize) (&iRead) (&bHasBom) (&iStart) to bOk
+    If (bOk = False) ;
+        Function_Return 0
+    Move 0 to ucNul
+    Move (SearchArray(ucNul, ucaFile)) to iNul
+    If (iNul < 0) ;
+        Function_Return 0
+    Move 1 to iLine
+    For i from 0 to (iNul - 1)
+        If (ucaFile[i] = 10) ;
+            Increment iLine
+    Loop
+    Function_Return iLine
+End_Function
+
+/* THE HEAD OF A FILE, decoded and split - for a caller that needs an early line and nothing else.
+
+   Why it exists (2026-08-20): the findings render attributes 533 compiler warnings to their cause by
+   looking at the source line each one sits on. Those lines are at median 13, p90 26, max 271 - yet
+   rfReadEncodedFileAsStringArray above reads the WHOLE file (48 KB average, 25.3 MB across the 533)
+   and splits every line of it, which measured 2.9 seconds of a 3.0 second workspace open. A byte cap
+   is the only thing that helps: the cost is the Read_Block and the String[] build, not the scan, so
+   an early exit inside that function would have saved nothing.
+
+   Deliberately NOT windowed: windowing exists there to keep Pos/Mid offsets small on multi-MB files,
+   and this never decodes more than iMaxBytes. Everything else matches - the same BOM detection, the
+   same two range decoders, the same CR strip - so a line read here is identical to the same line read
+   there. Bytes are trimmed back to the last LF so a truncated read can never split a UTF-8 sequence
+   or hand back half a line; a caller that needs a line beyond what it asked for gets a SHORTER array
+   and must fall back to the full read. */
+Function rfReadEncodedFileHead Global String sFilePath Integer iMaxBytes Returns String[]
+    Integer iRFFileSize iStart iRead iScan iPosStart iLF iSegLen
+    Boolean bIsUtf8 bOk
+    UChar[] ucaFile
+    String[] asLines
+    String   sBuf sLine
+
+    // Size, BOM sniff, capped Read_Block and BOM skip: shared with the full reader below.
+    Get _rfReadFileBytes sFilePath iMaxBytes (&ucaFile) (&iRFFileSize) (&iRead) (&bIsUtf8) (&iStart) to bOk
+    If (bOk = False) ;
+        Function_Return asLines
+
+    // Trim back to just after the last LF - only whole lines, and never a split character.
+    If (iRead < iRFFileSize) Begin
+        Move (iRead - 1) to iScan
+        While (iScan >= iStart and ucaFile[iScan] <> 10)
+            Decrement iScan
+        Loop
+        If (iScan < iStart) ;
+            Function_Return asLines
+        Move (iScan + 1) to iRead
+    End
+
+    If (bIsUtf8) ;
+        Get rfUtf8BytesRangeToString (&ucaFile) iStart (iRead - iStart) to sBuf
+    Else ;
+        Get rfOemBytesRangeToString (&ucaFile) iStart (iRead - iStart) to sBuf
+
+    Move 1 to iPosStart
+    Move (Pos(CS_LF, sBuf, iPosStart)) to iLF
+    While (iLF > 0)
+        Move (iLF - iPosStart) to iSegLen
+        Move (Mid(sBuf, iSegLen, iPosStart)) to sLine
+        If (Right(sLine, 1) = (Character(13))) ;
+            Move (Left(sLine, (Length(sLine) - 1))) to sLine
+        Move sLine to asLines[SizeOfArray(asLines)]
+        Move (iLF + 1) to iPosStart
+        Move (Pos(CS_LF, sBuf, iPosStart)) to iLF
+    Loop
+    // A final line with no trailing LF (only possible on a COMPLETE read).
+    If (iPosStart <= Length(sBuf)) Begin
+        Move (Mid(sBuf, (Length(sBuf) - iPosStart + 1), iPosStart)) to sLine
+        If (Right(sLine, 1) = (Character(13))) ;
+            Move (Left(sLine, (Length(sLine) - 1))) to sLine
+        Move sLine to asLines[SizeOfArray(asLines)]
+    End
+    Function_Return asLines
+End_Function
+
+/* The end (exclusive) of the decode window that starts at iByteStart, for
+   rfReadEncodedFileAsStringArrayEx below: up to 8 KB, cut back to end just after the last LF inside
+   it so the window holds only whole lines - or, when the window holds no LF at all, extended forward
+   to just past the next LF (or EOF) so the caller's loop always advances. Returns that byte offset.
+   Called once per WINDOW, never per line or byte; ucaFile is ByRef so the file bytes are never
+   copied, and is never modified. */
+Function _rfDecodeWindowEnd Global UChar[] ByRef ucaFile Integer iByteStart Integer iRFFileSize Returns Integer
+    Integer iByteEnd iScan
+
+    // Window of up to 8 KB, cut back to end just AFTER the last LF inside it so it holds
+    // only WHOLE lines. The backward scan is interpreted but short (half a line on average).
+    Move (iByteStart + 8192) to iByteEnd
+    If (iByteEnd >= iRFFileSize) Begin
+        Move iRFFileSize to iByteEnd
+    End
+    Else Begin
+        Move (iByteEnd - 1) to iScan
+        While (iScan >= iByteStart and ucaFile[iScan] <> 10)
+            Decrement iScan
+        Loop
+        If (iScan >= iByteStart) Begin
+            Move (iScan + 1) to iByteEnd
+        End
+        Else Begin
+            // No LF anywhere in the window (a pathological >8 KB single line): extend forward
+            // to just past the next LF - or EOF - so the loop always advances.
+            While (iByteEnd < iRFFileSize and ucaFile[iByteEnd - 1] <> 10)
+                Increment iByteEnd
+            Loop
+        End
+    End
+    Function_Return iByteEnd
+End_Function
+
+/* Global Function: rfReadEncodedFileAsStringArray
 
  Reads a legacy OEM (e.g. CP850) source file from disk as raw bytes and returns
  a Unicode String[] of lines, one per source line.
@@ -348,124 +685,234 @@ End_Function
 
  This function bypasses the lossy text-mode pipeline entirely:
    1. Read the whole file into a UChar[] with Read_Block on a binary channel.
-   2. Walk the byte array, splitting on 0x0A (LF) and stripping trailing
-      0x0D (CR) so both CRLF and LF line endings are handled.
-   3. Convert each line's bytes to Unicode via RFOemBytesToUtf8, which does
-      the full OEM -> UTF-16 -> UTF-8 -> PointerToString dance SAFELY
-      (PointerToString only ever sees the UTF-8 intermediate, never OEM
-      bytes).
+   2. Decode the bytes to Unicode in ~8 KB WINDOWS, each cut back to end on
+      an LF so a window always holds whole lines (rfOemBytesRangeToString /
+      rfUtf8BytesRangeToString - PointerToString only ever sees the UTF-8
+      intermediate, never raw OEM bytes; an LF can never sit INSIDE a UTF-8
+      sequence, so a window boundary never splits a character).
+   3. Split each decoded window on LF with Pos/Mid and strip each line's
+      trailing CR, so CRLF, LF and mixed line endings are all handled.
+
+ Why windows (perf history, profiled 2026-07-03):
+   - The original decoded PER LINE, building a scratch UChar[] per line with
+     an interpreted byte-copy loop: ~18 ms per source file; the analyzer's
+     700 source-guard reads paid 12.4 s of a 23 s analyze.
+   - Decoding the WHOLE file in one call and splitting the resulting String
+     was 4.5x SLOWER still (~80 ms/file): Pos/Mid re-scan a String from its
+     START to resolve a character position, so per-line positional calls on
+     a whole-file String are O(n^2) - StrSplitToArray is built on exactly
+     those calls. (The .prn tail gets away with big-String Pos because its
+     diagnostic hits are sparse - a few calls per MB, not one per line.)
+   - Byte-window decode + in-window split keeps every positional offset
+     under the window size: all native, effectively linear in file size.
 */
-Function RFReadEncodedFileAsStringArray Global String sFilePath Returns String[]
-    Integer iChannel iRFFileSize iIdx iLineStart iLineLen iJ iLineCount
-    Boolean bIsUtf8
-    UChar[] ucaFile ucaLine
+
+/*  Read a text file into lines, deciding the encoding BY BOM - the long-standing behaviour, and
+    what every existing caller wants for DataFlex source.
+
+    rfReadEncodedFileAsStringArrayEx adds the one case a BOM cannot answer: output that is KNOWN to
+    be UTF-8 but carries no BOM. Console output redirected to a file is exactly that. df-cli emits
+    UTF-8 - the package registry's descriptions contain typographic punctuation - and a redirect
+    writes no BOM, so read by the BOM rule those bytes are decoded as OEM and E2 80 99 (U+2019, a
+    right single quote) surfaces as three mojibake characters. Nils saw it in Browse Packages
+    (2026-08-21): "Implementation of the security API<mojibake>s using Microsoft CNG."
+
+    bForceUtf8 does NOT change the BOM SKIP: a BOM is still skipped when present, and its absence
+    still means "start at byte 0". It only overrides the DECODE.
+
+    df-cli's log turned out to be MIXED - its own messages in the Windows code page, the registry's
+    text in UTF-8 - and is read by rfReadToolOutputLines since 2026-09-30. bForceUtf8 stays for a web
+    response body, which is UTF-8 by definition. */
+/* THE TRAILING LINE BREAK, answered from bytes this function already has (2026-09-09).
+
+   A file's final terminator survives NOWHERE in the returned array - see the note at the tail of
+   the loop below: a file ending in LF deliberately gains no phantom empty last line, which is what
+   makes the array 1-based-indexable against SizeOfArray. So a caller that reads a file, edits a
+   line and writes it back cannot know whether to end the file with a break, and the byte writer's
+   default is not to. That is how every BOM-less file the engine wrote lost its final newline -
+   measured on a legacy workspace, where two of six written files came back one terminator short.
+
+   bEndsWithLineBreak is the missing fact, and it is free here: the last byte is already in ucaFile,
+   so no second pass over the file is needed. LF or CR both count, so a CRLF, a bare LF and an old
+   lone-CR file all answer True. Pair it with rfWriteEncodedFileFromStringArrayEx to round-trip. */
+Function rfReadEncodedFileLines Global String sFilePath Boolean bForceUtf8 Boolean ByRef bEndsWithLineBreak Returns String[]
+    Integer iRFFileSize iRead iStart iLineCount iByteStart iByteEnd iLastByte
+    Integer iWinLen iWinChars iPosStart iLF iSegLen
+    Boolean bIsUtf8 bHasBom bOk
+    UChar[] ucaFile
     String[] asLines
-    String   sLine
+    String   sWin sLine
 
-    Move (RFFileSize(sFilePath)) to iRFFileSize
-    If (iRFFileSize <= 0) Begin
-        Function_Return asLines
-    End
+    Move False to bEndsWithLineBreak
 
-    // Detect UTF-8 BOM before opening for full read.
-    Move (RFFileHasBOM(sFilePath)) to bIsUtf8
-
+    // Detect UTF-8 BOM before opening for full read. The BOM decides the SKIP; the decode is the
+    // BOM or the caller's assertion, whichever says UTF-8.
     // Read entire file as raw bytes.
-    Move (Seq_New_Channel()) to iChannel
-    If (iChannel < 0) Begin
+    // (Both in _rfReadFileBytes, shared with the head reader above; iMaxBytes 0 = the whole file,
+    // so iRead comes back equal to iRFFileSize and is only a receiver here.)
+    Get _rfReadFileBytes sFilePath 0 (&ucaFile) (&iRFFileSize) (&iRead) (&bHasBom) (&iStart) to bOk
+    If (bOk = False) ;
         Function_Return asLines
+    Move (bHasBom or bForceUtf8) to bIsUtf8
+    // The last byte read IS the answer - 10 (LF) covers CRLF and bare LF, 13 (CR) an old lone-CR file.
+    If (iRead > iStart) Begin
+        Move ucaFile[iRead - 1] to iLastByte
+        Move (iLastByte = 10 or iLastByte = 13) to bEndsWithLineBreak
     End
-    Direct_Input channel iChannel ("binary:" + sFilePath)
-    If (SeqEof) Begin
-        Send Seq_Release_Channel iChannel
-        Function_Return asLines
-    End
-    Read_Block channel iChannel ucaFile iRFFileSize
-    Close_Input channel iChannel
-    Send Seq_Release_Channel iChannel
 
-    // Skip the 3-byte UTF-8 BOM so it never lands in asLines[0].
-    If (bIsUtf8) ;
-        Move 3 to iLineStart
-    Else ;
-        Move 0 to iLineStart
-
-    // Split on LF, strip any trailing CR, decode each line via the safe helper.
     Move 0 to iLineCount
-    For iIdx from iLineStart to (iRFFileSize - 1)
-        If (ucaFile[iIdx] = 10) Begin          // LF
-            Move (iIdx - iLineStart) to iLineLen
-            If (iLineLen > 0) Begin
-                If (ucaFile[iIdx - 1] = 13) Begin
-                    Decrement iLineLen  // strip trailing CR
-                End
-            End
-            // Build a UChar[] for just this line's bytes.
-            Move (ResizeArray(ucaLine, 0)) to ucaLine
-            If (iLineLen > 0) Begin
-                Move (ResizeArray(ucaLine, iLineLen)) to ucaLine
-                For iJ from 0 to (iLineLen - 1)
-                    Move ucaFile[iLineStart + iJ] to ucaLine[iJ]
-                Loop
-            End
-            If (bIsUtf8) ;
-                Move (RFUtf8BytesToString(ucaLine))  to sLine
+    Move iStart to iByteStart
+    While (iByteStart < iRFFileSize)
+        // Window bounds (up to 8 KB, ending just after an LF): _rfDecodeWindowEnd above, one call
+        // per window - never per line or byte.
+        Get _rfDecodeWindowEnd (&ucaFile) iByteStart iRFFileSize to iByteEnd
+
+        // ONE native decode for the window (ByRef: the file bytes are never copied).
+        Move (iByteEnd - iByteStart) to iWinLen
+        If (bIsUtf8) ;
+            Get rfUtf8BytesRangeToString (&ucaFile) iByteStart iWinLen to sWin
+        Else ;
+            Get rfOemBytesRangeToString (&ucaFile) iByteStart iWinLen to sWin
+        Move (Length(sWin)) to iWinChars
+
+        // Split the window on LF; every Pos/Mid offset stays under the window size.
+        Move 1 to iPosStart
+        Move (Pos(CS_LF, sWin, iPosStart)) to iLF
+        While (iLF > 0)
+            Move (iLF - iPosStart) to iSegLen
+            If (iSegLen > 0) ;
+                Move (Mid(sWin, iSegLen, iPosStart)) to sLine
             Else ;
-                Move (RFOemBytesToUtf8(ucaLine))     to sLine
+                Move "" to sLine
+            If (Right(sLine, 1) = CS_CR) ;
+                Move (Left(sLine, Length(sLine) - 1)) to sLine
             Move sLine to asLines[iLineCount]
             Increment iLineCount
-            Move (iIdx + 1) to iLineStart
-        End
-    Loop
-    
-    // Final line if file does not end with LF.
-    If (iLineStart < iRFFileSize) Begin
-        Move (iRFFileSize - iLineStart) to iLineLen
-        Move (ResizeArray(ucaLine, iLineLen)) to ucaLine
-        For iJ from 0 to (iLineLen - 1)
-            Move ucaFile[iLineStart + iJ] to ucaLine[iJ]
+            Move (iLF + 1) to iPosStart
+            Move (Pos(CS_LF, sWin, iPosStart)) to iLF
         Loop
-        If (bIsUtf8) ;
-            Move (RFUtf8BytesToString(ucaLine))  to sLine
-        Else ;
-            Move (RFOemBytesToUtf8(ucaLine))     to sLine
-        Move sLine to asLines[iLineCount]
-    End
+        // Only the FINAL window can end without an LF - its tail is the file's last, unterminated
+        // line, appended WITHOUT a CR strip exactly like the per-line splitter this replaces.
+        // (Interior windows end ON an LF, so their tail is always empty. A file ENDING in LF thus
+        // never gains a phantom empty last line - callers index lines 1-based to SizeOfArray.)
+        If (iPosStart <= iWinChars) Begin
+            Move (Mid(sWin, (iWinChars - iPosStart + 1), iPosStart)) to sLine
+            Move sLine to asLines[iLineCount]
+            Increment iLineCount
+        End
+
+        Move iByteEnd to iByteStart
+    Loop
 
     Function_Return asLines
 End_Function
 
-/* Global Function: RFReadEncodedFileAsString
+// The two original names, behaviour unchanged for their existing callers - they simply discard the
+// trailing-line-break answer.
+Function rfReadEncodedFileAsStringArrayEx Global String sFilePath Boolean bForceUtf8 Returns String[]
+    Boolean bEndsWithLineBreak
+    String[] asLines
+    Move (rfReadEncodedFileLines(sFilePath, bForceUtf8, &bEndsWithLineBreak)) to asLines
+    Function_Return asLines
+End_Function
+
+// The original name and behaviour, unchanged for its existing callers: encoding by BOM.
+Function rfReadEncodedFileAsStringArray Global String sFilePath Returns String[]
+    Function_Return (rfReadEncodedFileAsStringArrayEx(sFilePath, False))
+End_Function
+
+/* Global Function: rfReadToolOutputLines
+
+ A file a console tool's output was REDIRECTED to, as lines - each line decoded as what its own bytes are.
+ Such a file has no BOM, and it need not be in one encoding: df-cli's is not (measured 2026-09-30). Its own
+ messages are in the Windows code page - a workspace path with "åäö" in it, in "Successfully converted
+ workspace '...'", arrived as E5 E4 F6 - while the package registry's text is passed through as UTF-8 -
+ E2 80 99 for a typographic apostrophe (2026-08-21). Read by the BOM rule, as OEM, the path showed as "Õõ÷"
+ in the Convert dialog (Nils 2026-09-30); read as asserted UTF-8, as the package dialogs did, it would have
+ been replacement characters. No one code page reads both.
+
+ So each line is UTF-8 when its bytes are valid UTF-8 - pure ASCII is - and in the Windows code page
+ otherwise; a BOM means UTF-8 throughout. The lines are found by scanning the bytes for LF - a tool's output
+ is a few KB - and CR LF, LF, an empty line and an unterminated last line come back as rfReadEncodedFileLines
+ returns them. Source files keep rfReadEncodedFileLines. */
+Function rfReadToolOutputLines Global String sFilePath Returns String[]
+    UChar[] ucaFile
+    String[] asLines
+    String sLine
+    Integer iRFFileSize iRead iStart iFrom iPos iEnd iLen iLines
+    Boolean bOk bHasBom bHigh bAtLF
+
+    Get _rfReadFileBytes sFilePath 0 (&ucaFile) (&iRFFileSize) (&iRead) (&bHasBom) (&iStart) to bOk
+    If (bOk = False) ;
+        Function_Return asLines
+    Move 0 to iLines
+    Move iStart to iFrom
+    While (iFrom < iRead)
+        // To the next LF, or to the end - noting on the way whether the line has a byte above ASCII.
+        Move iFrom to iPos
+        Move False to bHigh
+        Move False to bAtLF
+        While ((iPos < iRead) and (bAtLF = False))
+            If (ucaFile[iPos] = 10) ;
+                Move True to bAtLF
+            Else Begin
+                If (ucaFile[iPos] > 127) ;
+                    Move True to bHigh
+                Increment iPos
+            End
+        Loop
+        Move iPos to iEnd
+        If (iEnd > iFrom) Begin
+            If (ucaFile[iEnd - 1] = 13) ;
+                Decrement iEnd
+        End
+        Move (iEnd - iFrom) to iLen
+        If (iLen <= 0) ;
+            Move "" to sLine
+        Else If (bHasBom or (bHigh = False)) ;
+            Get rfUtf8BytesRangeToString (&ucaFile) iFrom iLen to sLine
+        Else If (_rfBytesAreUtf8(&ucaFile, iFrom, iLen)) ;
+            Get rfUtf8BytesRangeToString (&ucaFile) iFrom iLen to sLine
+        Else ;
+            Get rfAnsiBytesRangeToString (&ucaFile) iFrom iLen to sLine
+        Move sLine to asLines[iLines]
+        Increment iLines
+        Move (iPos + 1) to iFrom
+    Loop
+    Function_Return asLines
+End_Function
+
+/* Global Function: rfReadEncodedFileAsString
 
  Reads an entire file from disk as raw bytes and returns its full contents
  as a single Unicode String - the whole-blob counterpart to
- RFReadEncodedFileAsStringArray. Use this when you want the file's text in
+ rfReadEncodedFileAsStringArray. Use this when you want the file's text in
  one piece (e.g. dumping a compiler log into a cTextEdit) rather than split
  into lines.
 
  Same byte-safe pipeline: Read_Block the whole file into a UChar[] on a
  binary channel, skip a leading UTF-8 BOM if present, then decode the bytes
- ONCE - via RFUtf8BytesToString (BOM present => UTF-8) or RFOemBytesToUtf8
+ ONCE - via rfUtf8BytesToString (BOM present => UTF-8) or rfOemBytesToUtf8
  (no BOM => CP850/OEM, which is how redirected Windows console output is
  encoded). The single decode pass avoids both the lossy Readln text-mode
- pipeline (see RFReadEncodedFileAsStringArray's header) and the O(n^2)
+ pipeline (see rfReadEncodedFileAsStringArray's header) and the O(n^2)
  per-line string concatenation a Readln-accumulate loop incurs.
 
  Returns "" when the file is missing, empty, locked, or unreadable, so a
  caller polling a file another process is still writing can simply retry on
  its next tick.
 */
-Function RFReadEncodedFileAsString Global String sFilePath Returns String
+Function rfReadEncodedFileAsString Global String sFilePath Returns String
     Integer  iChannel iRFFileSize iLen iJ
     Boolean  bIsUtf8
     UChar[]  ucaFile ucaBody
 
-    Move (RFFileSize(sFilePath)) to iRFFileSize
+    Move (rfFileSize(sFilePath)) to iRFFileSize
     If (iRFFileSize <= 0) ;
         Function_Return ""
 
     // Detect a UTF-8 BOM before opening for the full read.
-    Move (RFFileHasBOM(sFilePath)) to bIsUtf8
+    Move (rfFileHasBOM(sFilePath)) to bIsUtf8
 
     // Read the entire file as raw bytes on a binary channel.
     Move (Seq_New_Channel()) to iChannel
@@ -483,7 +930,7 @@ Function RFReadEncodedFileAsString Global String sFilePath Returns String
     // No BOM: treat the bytes as CP850/OEM (redirected console output) and
     // decode the whole buffer in one pass - no copy needed.
     If (bIsUtf8 = False) ;
-        Function_Return (RFOemBytesToUtf8(ucaFile))
+        Function_Return (rfOemBytesToUtf8(ucaFile))
 
     // UTF-8 BOM present: copy the post-BOM bytes into their own buffer so
     // the 3-byte marker never lands in the decoded text, then decode once.
@@ -494,29 +941,35 @@ Function RFReadEncodedFileAsString Global String sFilePath Returns String
     For iJ from 0 to (iLen - 1)
         Move ucaFile[3 + iJ] to ucaBody[iJ]
     Loop
-    Function_Return (RFUtf8BytesToString(ucaBody))
+    Function_Return (rfUtf8BytesToString(ucaBody))
 End_Function
 
-/* Global Function: RFWriteEncodedFileFromStringArray
+/* Global Function: rfWriteEncodedFileFromStringArray
 
  Writes an array of Unicode source lines to disk as either a CP850 (OEM)
  or a UTF-8-with-BOM text file, using byte-safe encoders and a binary channel.
- Every line is terminated with the supplied sLineBreak (typically CS_CRLF).
+ Every line is terminated with the supplied sLineBreak (typically C_NewLine).
 
  bIsUtf8  True  — prepend the UTF-8 BOM (0xEF 0xBB 0xBF) and encode each
-                  line with RFStringToUtf8Bytes.
-          False — encode each line with RFUtf8LineToOemBytes (CP850), no BOM.
+                  line with rfStringToUtf8Bytes.
+          False — encode each line with rfUtf8LineToOemBytes (CP850), no BOM.
 
  Returns True on success, False on any I/O or allocation failure.
+
+ (asLines is ByRef purely to avoid deep-copying the whole file's line array per
+ call - the engine writes every modified file through here. Never modified.)
 */
-Function RFWriteEncodedFileFromStringArray Global String[] asLines String sFilePath String sLineBreak Boolean bIsUtf8 Returns Boolean
+/* bTrailingLineBreak ends the file with a line break, so a source file that had one keeps it.
+   Pair it with rfReadEncodedFileLines, which answers whether the file had one; the four-argument
+   name below keeps the old default of NO trailing break for every other caller. */
+Function rfWriteEncodedFileFromStringArrayEx Global String[] ByRef asLines String sFilePath String sLineBreak Boolean bIsUtf8 Boolean bTrailingLineBreak Returns Boolean
     Integer iChannel iLineIdx iByteIdx iLineBytes iLineBreakBytes iDst iMax
     UChar[] ucaLine ucaLineBreak ucaFile
 
     If (bIsUtf8) ;
-        Move (RFStringToUtf8Bytes(sLineBreak))  to ucaLineBreak
+        Move (rfStringToUtf8Bytes(sLineBreak))  to ucaLineBreak
     Else ;
-        Move (RFUtf8LineToOemBytes(sLineBreak)) to ucaLineBreak
+        Move (rfUtf8LineToOemBytes(sLineBreak)) to ucaLineBreak
     Move (SizeOfArray(ucaLineBreak)) to iLineBreakBytes
 
     Move 0 to iDst
@@ -533,18 +986,18 @@ Function RFWriteEncodedFileFromStringArray Global String[] asLines String sFileP
 
     For iLineIdx From 0 To iMax
         If (bIsUtf8) ;
-            Move (RFStringToUtf8Bytes(asLines[iLineIdx]))  to ucaLine
+            Move (rfStringToUtf8Bytes(asLines[iLineIdx]))  to ucaLine
         Else ;
-            Move (RFUtf8LineToOemBytes(asLines[iLineIdx]))  to ucaLine
+            Move (rfUtf8LineToOemBytes(asLines[iLineIdx]))  to ucaLine
         Move (SizeOfArray(ucaLine)) to iLineBytes
         For iByteIdx From 0 To (iLineBytes - 1)
             Move ucaLine[iByteIdx] to ucaFile[iDst]
             Increment iDst
         Loop
-        // Append the line break (skip for the last line to preserve any
-        // "no trailing newline" intent of the source; callers that want an
-        // explicit trailing newline can pass it as part of asLines).
-        If (iLineIdx < iMax) Begin
+        // Append the line break. The last line gets one only when the caller asked, so a file that
+        // ended without a terminator keeps that shape and one that ended with a break keeps THAT -
+        // the read/write pair is lossless in both directions.
+        If (iLineIdx < iMax or bTrailingLineBreak = True) Begin
             For iByteIdx From 0 To (iLineBreakBytes - 1)
                 Move ucaLineBreak[iByteIdx] to ucaFile[iDst]
                 Increment iDst
@@ -568,3 +1021,36 @@ Function RFWriteEncodedFileFromStringArray Global String[] asLines String sFileP
 
     Function_Return (Err = False)
 End_Function
+
+// The original name and behaviour, unchanged for its existing callers: no trailing line break.
+Function rfWriteEncodedFileFromStringArray Global String[] ByRef asLines String sFilePath String sLineBreak Boolean bIsUtf8 Returns Boolean
+    Function_Return (rfWriteEncodedFileFromStringArrayEx(&asLines, sFilePath, sLineBreak, bIsUtf8, False))
+End_Function
+
+/* ONE LINE OF THE WALK THAT FINDS WHERE A NEW USE GOES (2026-11-02). iAnchor ends on the last Use outside every compiler
+   conditional, or on the #ENDIF closing a conditional with a Use in it, whichever comes later; it stays as it was when
+   the walk finds neither. A Use inside a conditional compiles in that arm only, so 18 new Uses placed after one were
+   missing from the compile and the file still failed on the classes they were for. iDepth and bUseInBlock start at 0
+   and False. The directives are built, not written: FMAC reads them before string literals exist. */
+Procedure rfUseAnchorStep Global String sLine Integer iLine Integer ByRef iDepth Boolean ByRef bUseInBlock Integer ByRef iAnchor
+    String sTrim
+
+    Move (Lowercase(Trim(Replaces(Character(9), sLine, " ")))) to sTrim
+    If (Left(sTrim, 3) = (Character(35) + "if")) Begin
+        Move (iDepth + 1) to iDepth
+    End
+    Else If (Left(sTrim, 6) = (Character(35) + "endif")) Begin
+        If (iDepth > 0) ;
+            Move (iDepth - 1) to iDepth
+        If (iDepth = 0 and bUseInBlock = True) Begin
+            Move iLine to iAnchor
+            Move False to bUseInBlock
+        End
+    End
+    Else If (Left(sTrim, 4) = "use ") Begin
+        If (iDepth = 0) ;
+            Move iLine to iAnchor
+        Else ;
+            Move True to bUseInBlock
+    End
+End_Procedure

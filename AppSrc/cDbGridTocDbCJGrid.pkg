@@ -2,7 +2,7 @@
 /* cDbGridTocDbCJGrid.pkg
 
  Data-aware subclass of cGridToCJGridBase.
- Converts legacy DbGrid (or any subclass, e.g. cLangDbGrid) to cDbCJGrid,
+ Converts legacy DbGrid (or any subclass, e.g. cTrDbGrid) to cDbCJGrid,
  with individual cDbCJGridColumn child objects for each Entry_Item column.
 
  Transformation rules applied on top of the shared base class logic:
@@ -35,12 +35,24 @@
    - "Set Column_Prompt_Object  [Item] N to SL"  ->  "Set Prompt_Button_Mode to PB_PromptOn" +
                                                      "Set Prompt_Object to SL" on column N
    - "Set Form_Mask             [Item] N to V"   ->  "Set psMask to V"         on column N
-   - "Set Numeric_Mask          [Item] N to V"   ->  "Set psMask to V"         on column N
+   - "Set Numeric_Mask          [Item] N to L R [T]" -> "Send CreateNumericMask L R" on column N, + psMask from
+                                                     the template T (cGridToCJGridBase.NumericMaskLines);
+                                                     Currency_Mask -> CreateCurrencyMask the same way
+   - "Set Object_Shadow_State   [Item] N to V"   ->  as Column_Shadow_State on column N; "Set Enabled_State
+                                                     [Item] N to V" the same, inverted. The ITEM forms only -
+                                                     the object's own Object_Shadow_State is left for
+                                                     ChangeLegacyShadow_State (-> Enabled_State)
+   - "Set Column_Validate_Msg / Column_Entry_Msg / Column_Exit_Msg [Item] N to M"
+                                                 ->  a TODO in column N naming its OnValidating / OnEntry /
+                                                     OnExit event
+   - A mask, an item shadow or a column message AFTER the column objects is written in place against
+     the column object ("Send CreateNumericMask of <columnObject> L R", the TODO naming it)
    - "Set Form_DataType         [Item] N to V"   ->  "Set peDataType to V"     on column N
      (MASK_NUMERIC_WINDOW->typeNumeric, MASK_DATE_WINDOW->typeDate, MASK_DEFAULT_WINDOW->typeText)
    - "Set column_option [Item] N to NoEnter True/False" -> "Set pbEditable to False/True" on col N
      (only when NoEnter is present; other flags like NoTab are silently consumed)
-   - Removed: Define <constant> N  (column index constants no longer needed after conversion)
+   - PRESERVED: Define <constant> N - preserved as-is since 2026-07-03 (was removed as "no longer
+     needed", but preserved procedures still reference these constants; deleting broke the compile)
 
  All cCJGrid-level transformations (property removal, translation, method renaming, etc.)
  are provided by the base class cGridToCJGridBase.
@@ -52,6 +64,7 @@
 */
 
 Use cGridToCJGridBase.pkg
+Use cModAnalyzer.pkg      // ObjExprCallArgCount / DeclaredParamCountIn - the arity check on a calculated column's Get
 
 // Default target class names (standard DataFlex CJ grid classes).
 // Used when sParameter is empty or when a column class is not supplied.
@@ -62,11 +75,14 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
 
     Procedure Construct_Object
         Forward Send Construct_Object
+        Set psLegacyRootToken to "dbgrid"     // the Deep Scan's root token - an EMPTY parameter takes its learned subclasses
         // Default target classes for cDbCJGrid conversion.
         // psLegacyGridClass = "" enables pattern-based detection (any class ending in "dbgrid").
         Set psLegacyGridClass   to ""
         Set psTargetGridClass   to CS_CJGrid_TargetClass
         Set psTargetColumnClass to CS_CJGrid_TargetColumn
+        // dbGrid lives in Dftable.pkg (dedicated) - swapped for cDbCJGrid.pkg on convert.
+        Set psLegacyUsePackage  to "Dftable.pkg"
         // Per-grid column collection state (reset by OnGridStarted via ResetColumnCollections).
         Property Boolean   pbInBeginRow       False
         Property Boolean   pbPendingColumns   False
@@ -88,6 +104,13 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Property String[]  pasColMask
         Property String[]  pasColDataType
         Property String[]  pasColFocusable
+        // "L R [T]" from Numeric_Mask / Currency_Mask, by column index - NumericMaskLines makes the column's
+        // CreateNumericMask / CreateCurrencyMask of them (2026-10-04; Numeric_Mask went into psMask before).
+        Property String[]  pasColNumericMask
+        Property String[]  pasColCurrencyMask
+        // The TODO lines a column message leaves (ColumnMessageTodo): column index / text, parallel.
+        Property Integer[] paiColTodoIdx
+        Property String[]  pasColTodoText
         // Per-column expression flag: True when the Entry_Item held a calculated
         // expression (e.g. "(Table.A * String(Table.B))") rather than a plain
         // "Table.Field" reference.  Drives OnSetCalculatedValue emission.
@@ -95,6 +118,23 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         // True once Begin_Row has been seen for the current grid.
         // Used to distinguish pre-Begin_Row (pre-collect) from post-flush (remove).
         Property Boolean   pbBeginRowSeen     False
+        // CONDITIONAL per-column properties - 'If (PsLANG eq "es") Set Header_Label 2 to "Calle"',
+        // the legacy inline-If localization pattern (LegacyApp compin.vw, 2026-07-05). Collected by
+        // TryCollectConditionalColumnProperty during the same windows as the plain properties and
+        // emitted AFTER the column objects by AppendColumnObjects, rewritten as
+        // 'If (<cond>) Set <newProp> of <columnObject> to <value>'. Without this the FIRST such
+        // line ended the pending-columns window - every later column lost its width/caption to the
+        // defaults - and the lines passed through raw, referencing item numbers that no longer
+        // exist. Parallel arrays: condition text / item index / new property name / value.
+        Property String[]  pasCondColConds
+        Property Integer[] paiCondColIdx
+        Property String[]  pasCondColProps
+        Property String[]  pasCondColValues
+        // The emitted column OBJECT names by column index, stored by AppendColumnObjects. Needed
+        // AFTER the flush too: a grid-level property wedged between the item properties (LegacyApp
+        // compin.vw: 'Set Read_Only_State to True' inside column 13's block) closes the pending
+        // window, and a conditional arriving after it is translated IMMEDIATELY against these names.
+        Property String[]  pasColObjectNames
     End_Procedure
 
     // Resets all per-grid column collection state to empty.
@@ -105,6 +145,7 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         String[]  asEmpty
         Integer[] aiEmpty
         Boolean[] abEmpty
+
         Set pbInBeginRow     to False
         Set pbPendingColumns to False
         Set pasColEntryItems        to asEmpty
@@ -121,8 +162,17 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Set pasColMask          to asEmpty
         Set pasColDataType      to asEmpty
         Set pasColFocusable     to asEmpty
+        Set pasColNumericMask   to asEmpty
+        Set pasColCurrencyMask  to asEmpty
+        Set paiColTodoIdx       to aiEmpty
+        Set pasColTodoText      to asEmpty
         Set pabColIsExpression  to abEmpty
         Set pbBeginRowSeen      to False
+        Set pasCondColConds     to asEmpty
+        Set paiCondColIdx       to aiEmpty
+        Set pasCondColProps     to asEmpty
+        Set pasCondColValues    to asEmpty
+        Set pasColObjectNames   to asEmpty
     End_Procedure
 
     // *** Parameter parsing (override) ***
@@ -132,10 +182,12 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     //   - 2-part sParameter does not inherit a column class from a previous 3-part call.
     Function ParseAndSetParameter String sParameter Returns Boolean
         Boolean bOK
+
         If (sParameter = "") Begin
             Set psLegacyGridClass   to ""
             Set psTargetGridClass   to CS_CJGrid_TargetClass
             Set psTargetColumnClass to CS_CJGrid_TargetColumn
+            Send _LoadLegacySubclasses ""      // the learned dbGrid subclasses ride the empty parameter (2026-09-05)
             Function_Return True
         End
         // For 2-part params, reset column class to default before calling base
@@ -153,6 +205,7 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     // consumed by OnHandleGridLine before IsLegacyGridProperty is ever reached.
     Function IsLegacyGridProperty String sTrimLower Returns Boolean
         Boolean bResult
+
         If (Left(sTrimLower, 4) <> "set ") Begin
             Function_Return False
         End
@@ -187,6 +240,9 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         If (sTrimLower contains "numeric_mask") Begin
             Function_Return True
         End
+        If (sTrimLower contains "currency_mask") Begin
+            Function_Return True
+        End
         If (sTrimLower contains "form_datatype") Begin
             Function_Return True
         End
@@ -209,30 +265,18 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     // Returns True when sTrimLower looks like "object X is a <OldGridClass>".
     // When psLegacyGridClass is set, performs an exact (case-insensitive) match.
     // When psLegacyGridClass is empty, falls back to the pattern: any class
-    // name ending in "dbgrid".
+    // name ending in "dbgrid" - and any subclass the Deep Scan learned (2026-09-05).
     Function IsGridDeclaration String sTrimLower Returns Boolean
-        Integer iIsA
-        String  sClassName sLegacy
+        String sClassName sLegacy
 
-        If (Pos("object ", sTrimLower) <> 1) Begin
+        Get DeclaredClassName sTrimLower to sClassName
+        If (sClassName = "") ;
             Function_Return False
-        End
-        Move (Pos(" is a ", sTrimLower)) to iIsA
-        If (iIsA = 0) Begin
-            Function_Return False
-        End
-        // Class name starts 6 chars after the start of " is a ".
-        Move (Trim(Mid(sTrimLower, CI_EOL, (iIsA + 6)))) to sClassName
-        // Strip any trailing content (e.g. metadata tags after a space).
-        Move (Pos(CS_S, sClassName)) to iIsA
-        If (iIsA > 0) Begin
-            Move (Left(sClassName, iIsA - 1)) to sClassName
-        End
 
         Get psLegacyGridClass to sLegacy
         If (sLegacy = "") Begin
-            // Pattern-based: any class ending in "dbgrid".
-            Function_Return (Right(sClassName, 6) = "dbgrid")
+            // Pattern-based: any class ending in "dbgrid" - or a learned subclass under another name.
+            Function_Return (Right(sClassName, 6) = "dbgrid" or IsLearnedLegacySubclass(Self, sClassName))
         End
         // Exact match (psLegacyGridClass is stored as lowercase).
         Function_Return (sClassName = sLegacy)
@@ -246,36 +290,31 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Send ResetColumnCollections
     End_Procedure
 
-    // Removes a trailing line comment ("// ...") from an Entry_Item field spec
-    // and returns the trimmed result.  This MUST run before IsEntryItemExpression
-    // and before the spec is stored: a plain "Table.Field // comment" would
-    // otherwise be misread as a calculated expression (the spaces inside the
-    // comment trip the space-test in IsEntryItemExpression) and the comment text
-    // would leak into the generated Entry_Item / OnSetCalculatedValue line.
-    // Local utility - first "//" wins (leftmost match). Note: differs from
-    // cBaseFuncLib._RemoveEndComment which uses RightPos (rightmost match).
-    // A "//" inside a string literal in an expression is a rare edge case that
-    // the rest of the tool treats the same way.
-    Function StripTrailingComment String sSpec Returns String
+    // StripTrailingComment / ExtractTrailingComment moved UP to cGridToCJGridBase.pkg
+    // (2026-07-26): the non-db Grid converter needs the same split when it rewrites
+    // "Send Add_Item Msg_None <value>  // note" into a TheData row assignment.
+
+    // Strips a trailing legacy entry-item options block ("{Autoclear, Noput, Capslock, ...}") from a field
+    // spec and returns the trimmed result. MUST run (after StripTrailingComment) before IsEntryItemExpression
+    // and before the spec is stored: the spaces INSIDE "{...}" would otherwise make a plain "Table.Field
+    // {options}" read as a calculated expression, and the "{...}" would then leak into the generated
+    // 'Move <field> {...} to sValue' - illegal, so the compiler mangles it (|GO{$C023,...} / orphaned TO;
+    // LegacyApp POP_PROJ.PKG / ITM0010B.SL). Leftmost "{" wins.
+    Function StripEntryItemOptions String sSpec Returns String
         Integer iPos
-        Move (Pos(CS_CommentSymbol, sSpec)) to iPos
-        If (iPos > 0) Begin
+        Move (Pos("{", sSpec)) to iPos
+        If (iPos > 0) ;
             Move (Left(sSpec, iPos - 1)) to sSpec
-        End
         Function_Return (Trim(sSpec))
     End_Function
 
-    // Companion to StripTrailingComment: returns the trailing line comment
-    // ("// ...", trimmed) of an Entry_Item field spec, or "" when there is
-    // none.  The comment is kept aside so it can be re-attached to the
-    // generated column line without ever participating in classification or
-    // column-name derivation.
-    Function ExtractTrailingComment String sSpec Returns String
+    // Companion to StripEntryItemOptions: returns the trailing "{...}" options block (trimmed), or "" when
+    // there is none - kept so the dropped options can be surfaced in the column's TODO comment.
+    Function ExtractEntryItemOptions String sSpec Returns String
         Integer iPos
-        Move (Pos(CS_CommentSymbol, sSpec)) to iPos
-        If (iPos = 0) Begin
+        Move (Pos("{", sSpec)) to iPos
+        If (iPos = 0) ;
             Function_Return ""
-        End
         Function_Return (Trim(Mid(sSpec, CI_EOL, iPos)))
     End_Function
 
@@ -292,16 +331,119 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Function_Return False
     End_Function
 
+    // Column iItemIdx shadowed (bShadow) or not: read-only and non-focusable when shadowed, editable when
+    // not - pbFocusable is only written when shadowed, True is the default. Column_Shadow_State and the item
+    // forms of Object_Shadow_State / Enabled_State all land here.
+    Procedure _CollectColumnShadow Integer iItemIdx Boolean bShadow
+        String[] asEditable asFocusable
+
+        Get pasColEditable to asEditable
+        Move (If(bShadow, "False", "True")) to asEditable[iItemIdx]
+        Set pasColEditable to asEditable
+        If (bShadow = True) Begin
+            Get pasColFocusable to asFocusable
+            Move "False" to asFocusable[iItemIdx]
+            Set pasColFocusable to asFocusable
+        End
+    End_Procedure
+
+    /* The TODO a legacy column message leaves (2026-10-04): Column_Validate_Msg, Column_Entry_Msg and
+       Column_Exit_Msg named a message the grid sent for one column, and a CodeJock column raises events
+       instead - OnValidating, OnEntry / OnEntering, OnExit / OnExiting (cCJGridColumn.pkg). sWhere says whose
+       event: "this column's" inside the column object, "<columnObject>'s" in place. sWas is the legacy line. */
+    Function ColumnMessageTodo String sLower String sWas String sWhere Returns String
+        String sMsg sEvent
+
+        If (Pos("column_validate_msg", sLower) <> 0) Begin
+            Move "Column_Validate_Msg" to sMsg
+            Move "OnValidating event" to sEvent
+        End
+        Else If (Pos("column_entry_msg", sLower) <> 0) Begin
+            Move "Column_Entry_Msg" to sMsg
+            Move "OnEntry event (OnEntering to refuse the entry)" to sEvent
+        End
+        Else Begin
+            Move "Column_Exit_Msg" to sMsg
+            Move "OnExit event (OnExiting to refuse leaving)" to sEvent
+        End
+        Function_Return ("TODO: " + sMsg + " has no CodeJock counterpart - move what its message does into " + sWhere + " " + sEvent + ". Was: " + sWas)
+    End_Function
+
+    /* A per-column line AFTER the column objects (2026-10-04, see OnHandleGridLine): a Numeric_Mask /
+       Currency_Mask, the item form of Object_Shadow_State / Enabled_State, or a column message - written in
+       place against the column object of its item. An item no column object was made for keeps a TODO.
+       Leaves bSkip False for any other line, and for the object's own Object_Shadow_State / Enabled_State. */
+    Procedure TryPostFlushColumnLine String sLine String sLower String[] ByRef asOutput Boolean ByRef bSkip
+        String[] asColNames asLines
+        String   sProp sIndent sValue sValLower sCol sTodo
+        Integer  iItemIdx i
+        Boolean  bShadow
+
+        If (Left(sLower, 4) <> "set ") ;
+            Procedure_Return
+        Move "" to sProp
+        If (Pos("numeric_mask", sLower) <> 0) ;
+            Move "numeric_mask" to sProp
+        Else If (Pos("currency_mask", sLower) <> 0) ;
+            Move "currency_mask" to sProp
+        Else If (Pos("object_shadow_state", sLower) <> 0) ;
+            Move "object_shadow_state" to sProp
+        Else If (Pos("enabled_state", sLower) <> 0) ;
+            Move "enabled_state" to sProp
+        Else If (Pos("column_validate_msg", sLower) <> 0) ;
+            Move "column_validate_msg" to sProp
+        Else If (Pos("column_entry_msg", sLower) <> 0) ;
+            Move "column_entry_msg" to sProp
+        Else If (Pos("column_exit_msg", sLower) <> 0) ;
+            Move "column_exit_msg" to sProp
+        If (sProp = "") ;
+            Procedure_Return
+        Get ParseColumnItemIndex sLower sProp to iItemIdx
+        If (iItemIdx < 0) ;
+            Procedure_Return
+        Get pasColObjectNames to asColNames
+        Get GetIndent sLine to sIndent
+        If (iItemIdx >= SizeOfArray(asColNames)) Begin
+            Move (sIndent + "// TODO (cCJGrid conversion): this per-column line names item " + String(iItemIdx) + ", and no column object was made for it. Was: " + Trim(sLine)) to asOutput[SizeOfArray(asOutput)]
+            Move True to bSkip
+            Procedure_Return
+        End
+        Move asColNames[iItemIdx] to sCol
+        If (sProp = "numeric_mask" or sProp = "currency_mask") Begin
+            Get ParseValueAfterTo sLine to sValue
+            Get NumericMaskLines sIndent sValue (" of " + sCol) (sProp = "currency_mask") (Trim(sLine)) to asLines
+            For i from 0 to (SizeOfArray(asLines) - 1)
+                Move asLines[i] to asOutput[SizeOfArray(asOutput)]
+            Loop
+        End
+        Else If (sProp = "object_shadow_state" or sProp = "enabled_state") Begin
+            Get ParseValueAfterTo sLine to sValue
+            Move (Lowercase(Trim(sValue))) to sValLower
+            If (sProp = "object_shadow_state") ;
+                Move (sValLower = "true" or sValLower = "1") to bShadow
+            Else ;
+                Move (sValLower = "false" or sValLower = "0") to bShadow
+            Move (sIndent + "Set pbEditable of " + sCol + " to " + If(bShadow, "False", "True")) to asOutput[SizeOfArray(asOutput)]
+            If (bShadow = True) ;
+                Move (sIndent + "Set pbFocusable of " + sCol + " to False") to asOutput[SizeOfArray(asOutput)]
+        End
+        Else Begin
+            Get ColumnMessageTodo sLower (Trim(sLine)) (sCol + "'s") to sTodo
+            Move (sIndent + "// " + sTodo) to asOutput[SizeOfArray(asOutput)]
+        End
+        Move True to bSkip
+    End_Procedure
+
     // Attempts to match sLine/sLower against any known per-column Set property.
     // When a match is found, updates the relevant array property and sets bHandled True.
     // Called from both the bPendingColumns window (sub-state 2) and the pre-Begin_Row
     // collection path (sub-state 4) of OnHandleGridLine.
     Procedure TryCollectColumnProperty String sLine String sLower Boolean ByRef bHandled
-        Boolean  bOK
-        String   sValue sValLower sLabel
+        Boolean  bOK bCurrency bShadowProp
+        String   sValue sValLower sLabel sMsgProp sTodo
         String[] asCheckbox asEditable asComboButton asComboSort
-        String[] asCapslock asTextAlign asPromptObject asMask asDataType asFocusable asLabels
-        Integer[] aiWidths
+        String[] asCapslock asTextAlign asPromptObject asMask asDataType asLabels asNumMask asTodoText
+        Integer[] aiWidths aiTodoIdx
         Integer  iItemIdx iWidth
 
         // Fast exit: per-column properties always begin with "Set ".
@@ -346,17 +488,30 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
                 // Shadow_State=True means read-only and non-focusable; invert both.
                 Move (Lowercase(Trim(sValue))) to sValLower
                 Move (sValLower = "true" or sValLower = "1") to bOK
-                Get pasColEditable to asEditable
-                Move (If(bOK, "False", "True")) to asEditable[iItemIdx]
-                Set pasColEditable to asEditable
-                // Only emit pbFocusable when shadowed (True); True is the default.
-                If (bOK = True) Begin
-                    Get pasColFocusable to asFocusable
-                    Move "False" to asFocusable[iItemIdx]
-                    Set pasColFocusable to asFocusable
-                End
+                Send _CollectColumnShadow iItemIdx bOK
             End
             Move True to bHandled
+        End
+        /* The ITEM forms of Object_Shadow_State and Enabled_State (2026-10-04, Nils: "Object_Shadow_State =
+           Enabled_State"). In a grid, 'Set Object_Shadow_State Item 3 to True' shadows column 3 - what
+           Column_Shadow_State says - and Enabled_State says the same, inverted. The OBJECT's own
+           Object_Shadow_State (no item) is not a column property: it passes through for
+           ChangeLegacyShadow_State, which makes it Enabled_State, and a cCJGrid has that. Its item form would
+           come out of that function as 'Set Enabled_State Item 3 to False', which a cCJGrid takes for the
+           whole grid's state - so both item forms end here. */
+        Else If (Pos("object_shadow_state", sLower) <> 0 or Pos("enabled_state", sLower) <> 0) Begin
+            Move (Pos("object_shadow_state", sLower) <> 0) to bShadowProp
+            Get ParseColumnItemIndex sLower (If(bShadowProp, "object_shadow_state", "enabled_state")) to iItemIdx
+            If (iItemIdx >= 0) Begin
+                Get ParseValueAfterTo sLine to sValue
+                Move (Lowercase(Trim(sValue))) to sValLower
+                If (bShadowProp = True) ;
+                    Move (sValLower = "true" or sValLower = "1") to bOK
+                Else ;
+                    Move (sValLower = "false" or sValLower = "0") to bOK
+                Send _CollectColumnShadow iItemIdx bOK
+                Move True to bHandled
+            End
         End
         Else If (Pos("column_combo_state", sLower) <> 0) Begin
             Get ParseColumnItemIndex sLower "column_combo_state" to iItemIdx
@@ -429,13 +584,23 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
             End
             Move True to bHandled
         End
-        Else If (Pos("numeric_mask", sLower) <> 0) Begin
-            Get ParseColumnItemIndex sLower "numeric_mask" to iItemIdx
+        Else If (Pos("numeric_mask", sLower) <> 0 or Pos("currency_mask", sLower) <> 0) Begin
+            // The pair (and template) as written - AppendColumnObjects makes the column's CreateNumericMask /
+            // CreateCurrencyMask of it (NumericMaskLines, 2026-10-04). It went into psMask before.
+            Move (Pos("currency_mask", sLower) <> 0) to bCurrency
+            Get ParseColumnItemIndex sLower (If(bCurrency, "currency_mask", "numeric_mask")) to iItemIdx
             Get ParseValueAfterTo sLine to sValue
             If (iItemIdx >= 0) Begin
-                Get pasColMask to asMask
-                Move sValue to asMask[iItemIdx]
-                Set pasColMask to asMask
+                If (bCurrency = True) Begin
+                    Get pasColCurrencyMask to asNumMask
+                    Move sValue to asNumMask[iItemIdx]
+                    Set pasColCurrencyMask to asNumMask
+                End
+                Else Begin
+                    Get pasColNumericMask to asNumMask
+                    Move sValue to asNumMask[iItemIdx]
+                    Set pasColNumericMask to asNumMask
+                End
             End
             Move True to bHandled
         End
@@ -469,11 +634,92 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
             End
             Move True to bHandled
         End
+        // Column_Validate_Msg / Column_Entry_Msg / Column_Exit_Msg (2026-10-04): no CodeJock counterpart, a
+        // CodeJock column has events instead. The TODO goes into the column (ColumnMessageTodo).
+        Else If (Pos("column_validate_msg", sLower) <> 0 or Pos("column_entry_msg", sLower) <> 0 or Pos("column_exit_msg", sLower) <> 0) Begin
+            Move "column_exit_msg" to sMsgProp
+            If (Pos("column_validate_msg", sLower) <> 0) ;
+                Move "column_validate_msg" to sMsgProp
+            Else If (Pos("column_entry_msg", sLower) <> 0) ;
+                Move "column_entry_msg" to sMsgProp
+            Get ParseColumnItemIndex sLower sMsgProp to iItemIdx
+            If (iItemIdx >= 0) Begin
+                Get ColumnMessageTodo sLower (Trim(sLine)) "this column's" to sTodo
+                Get paiColTodoIdx  to aiTodoIdx
+                Get pasColTodoText to asTodoText
+                Move iItemIdx to aiTodoIdx[SizeOfArray(aiTodoIdx)]
+                Move sTodo    to asTodoText[SizeOfArray(asTodoText)]
+                Set paiColTodoIdx  to aiTodoIdx
+                Set pasColTodoText to asTodoText
+                Move True to bHandled
+            End
+        End
     End_Procedure
 
     // Called for each source line at nesting level 1 (direct grid body content)
     // before the base class dispatches properties/methods.
     //
+    // Collect a CONDITIONAL per-column property - 'If (<cond>) Set Header_Label N to "X"' or
+    // 'If (<cond>) Set Form_Width [item] N to W' (the legacy inline-If localization pattern;
+    // LegacyApp compin.vw CompH, 2026-07-05). Handled for the two per-column properties the
+    // converter maps (Header_Label -> psCaption, Form_Width -> piWidth); any OTHER conditional
+    // line keeps the old fall-through (ends the pending window, passes through for manual
+    // review). Collected entries are emitted after the column objects by AppendColumnObjects -
+    // inline object-body code runs at create time, so the semantics match the legacy lines.
+    // Sets bHandled True (and keeps the pending-columns window OPEN) when collected.
+    Procedure TryCollectConditionalColumnProperty String sTrimLine String sLower Boolean ByRef bHandled
+        Integer   iSetPos iItemIdx iWidth
+        String    sCond sSetLower sSetOrig sVal sProp sLabel
+        String[]  asConds asProps asVals
+        Integer[] aiIdx
+
+        If (Left(sLower, 3) <> "if ") ;
+            Procedure_Return
+        Move (Pos(" set ", sLower)) to iSetPos
+        If (iSetPos = 0) ;
+            Procedure_Return
+        // Split at the Set keyword: sLower is the trimmed-lowercase twin of sTrimLine, so the
+        // positions align. sSetOrig keeps the original casing for the label parse.
+        Move (Trim(Left(sTrimLine, iSetPos))) to sCond
+        Move (Trim(Mid(sTrimLine, Length(sTrimLine), iSetPos + 1))) to sSetOrig
+        Move (Lowercase(sSetOrig)) to sSetLower
+        If (sSetLower contains "header_label") Begin
+            Get ParseColumnItemIndex sSetLower "header_label" to iItemIdx
+            If (iItemIdx < 0) ;
+                Procedure_Return
+            Get ParseHeaderLabel sSetOrig to sLabel
+            Move "psCaption" to sProp
+            // sLabel is emittable (literal keeps quotes, expression verbatim); store AS-IS, empty -> "".
+            Move (If(Trim(sLabel) = "", '""', sLabel)) to sVal
+        End
+        Else If (sSetLower contains "form_width") Begin
+            Get ParseColumnItemIndex sSetLower "form_width" to iItemIdx
+            If (iItemIdx < 0) ;
+                Procedure_Return
+            Get ParseFormWidth sSetLower to iWidth
+            If (iWidth < 0) ;
+                Procedure_Return
+            Move "piWidth" to sProp
+            Move (String(iWidth)) to sVal
+        End
+        Else Begin
+            Procedure_Return
+        End
+        Get pasCondColConds  to asConds
+        Get paiCondColIdx    to aiIdx
+        Get pasCondColProps  to asProps
+        Get pasCondColValues to asVals
+        Move sCond    to asConds[SizeOfArray(asConds)]
+        Move iItemIdx to aiIdx[SizeOfArray(aiIdx)]
+        Move sProp    to asProps[SizeOfArray(asProps)]
+        Move sVal     to asVals[SizeOfArray(asVals)]
+        Set pasCondColConds  to asConds
+        Set paiCondColIdx    to aiIdx
+        Set pasCondColProps  to asProps
+        Set pasCondColValues to asVals
+        Move True to bHandled
+    End_Procedure
+
     // Handles four sub-states:
     //   1. Inside a Begin_Row / End_Row block: collect Entry_Items.
     //   2. After End_Row (bPendingColumns=True): collect per-column Set properties.
@@ -486,8 +732,18 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
         Boolean  bInBeginRow bPendingColumns bBeginRowSeen bIsExpr
         Boolean[] abIsExpression
-        String   sFieldSpec sFieldComment
+        String   sFieldSpec sFieldComment sColOptions
         String[] asItems asComments asEmpty
+        Boolean  bHandledCall
+
+        /* A legacy-only grid method used as a CALL is commented out with its hint, BEFORE the
+           column state machine sees the line - a "Send Refresh_Page ..." is not column data and
+           would otherwise be emitted verbatim into code that cannot compile. */
+        Get TryRewriteLegacyGridCall sLine sLower (&asOutput) to bHandledCall
+        If (bHandledCall = True) Begin
+            Move True to bSkip
+            Procedure_Return
+        End
 
         // --- Sub-state 1: Inside Begin_Row / End_Row ---
         Get pbInBeginRow to bInBeginRow
@@ -508,6 +764,19 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
                 Move (Trim(Mid(sTrimLine, CI_EOL, 12))) to sFieldSpec
                 Get ExtractTrailingComment sFieldSpec to sFieldComment
                 Get StripTrailingComment   sFieldSpec to sFieldSpec
+                // Strip legacy entry-item options "{Autoclear, Noput, Capslock, ...}" BEFORE classification /
+                // storage: their inner spaces would make a plain field read as a calculated expression, and the
+                // "{...}" would then leak into the generated 'Move <field> {...} to sValue' (illegal - the 20
+                // LegacyApp POP_PROJ/ITM0010B errors). Preserve the dropped options in the column comment (which is
+                // re-attached to the generated line) so nothing is silently lost; the field then binds normally.
+                Get ExtractEntryItemOptions sFieldSpec to sColOptions
+                Get StripEntryItemOptions   sFieldSpec to sFieldSpec
+                If (sColOptions <> "") Begin
+                    If (sFieldComment = "") ;
+                        Move ("// TODO: legacy entry-item options " + sColOptions + " were dropped in the cCJGrid conversion - re-map to column properties if needed") to sFieldComment
+                    Else ;
+                        Move (sFieldComment + " (TODO: dropped entry-item options " + sColOptions + ")") to sFieldComment
+                End
                 Move sFieldSpec    to asItems[SizeOfArray(asItems)]
                 Move sFieldComment to asComments[SizeOfArray(asComments)]
                 Set pasColEntryItems        to asItems
@@ -531,11 +800,22 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
                     Move True to bSkip
                 End
                 Else If (Left(sLower, 7) = "define ") Begin
-                    // Skip "Define COL_xxx for N" column index constants.
+                    // PRESERVE "Define COL_xxx for N" (emitted here, before the column objects - a
+                    // Define's position is free as long as it precedes use). These were SKIPPED as dead
+                    // column-index constants until Nils' LegacyApp dbGrid0 run (2026-07-03): preserved
+                    // procedures still REFERENCE them ('Set Item_Option Item (BI+list0041w_Amount)'),
+                    // so deleting them broke ~145 compiles across 5 views. The pending-columns block
+                    // stays open, so later "Set Form_Width item N" lines still collect.
+                    Move sLine to asOutput[SizeOfArray(asOutput)]
                     Move True to bSkip
                 End
                 Else Begin
                     Send TryCollectColumnProperty sLine sLower (&bSkip)
+                    // A CONDITIONAL per-column property ('If (...) Set Header_Label N ...') is
+                    // collected too and keeps the window OPEN - it used to fall through here and
+                    // flush, losing every later column's width/caption (LegacyApp compin.vw).
+                    If (bSkip = False) ;
+                        Send TryCollectConditionalColumnProperty sTrimLine sLower (&bSkip)
                     If (bSkip = False) Begin
                         // First non-column-property, non-blank, non-Define line:
                         // emit the accumulated column objects now, then fall through
@@ -581,7 +861,36 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
             Get pbBeginRowSeen to bBeginRowSeen
             If (bBeginRowSeen = False) Begin
                 Send TryCollectColumnProperty sLine sLower (&bSkip)
+                If (bSkip = False) ;
+                    Send TryCollectConditionalColumnProperty sTrimLine sLower (&bSkip)
             End
+        End
+
+        // --- Post-flush conditional per-column property ---
+        // The pending window is closed (the column objects are already emitted) but a conditional
+        // item property can STILL follow: LegacyApp compin.vw had 'Set Read_Only_State to True' (a
+        // grid-level property) between column 13's item properties and its 'If (PsLANG eq "es") Set
+        // Header_Label 13 ...' line, so the window flushed and that one conditional leaked through
+        // RAW. Collect + translate it IMMEDIATELY, in place, against the persisted column names.
+        If (bSkip = False) Begin
+            Get pbBeginRowSeen to bBeginRowSeen
+            If (bBeginRowSeen = True and SizeOfArray(pasColObjectNames(Self)) > 0) Begin
+                Send TryCollectConditionalColumnProperty sTrimLine sLower (&bSkip)
+                If (bSkip = True) ;
+                    Send AppendConditionalColumnLines (&asOutput) sGridIndent
+            End
+        End
+
+        // --- Post-flush per-column property (2026-10-04) ---
+        // A mask, an item shadow or a column message that arrives after the column objects were written
+        // (a view of one workspace: two Column_Validate_Msg lines below the grid's methods) is written IN PLACE
+        // against the persisted column names (TryPostFlushColumnLine). Until then the masks were dropped in
+        // silence (IsLegacyGridProperty) and the messages passed through raw, into a grid that does not
+        // understand them.
+        If (bSkip = False) Begin
+            Get pbBeginRowSeen to bBeginRowSeen
+            If (bBeginRowSeen = True and SizeOfArray(pasColObjectNames(Self)) > 0) ;
+                Send TryPostFlushColumnLine sLine sLower (&asOutput) (&bSkip)
         End
 
         // --- Sub-state 5: Set Main_File ---
@@ -598,10 +907,10 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
 
     // Derives a cDbCJGrid Set Server suggestion from a legacy Set Main_File line.
     // Emits both as comments:
-    //   // Set Main_File to Arbtrans.File_Number   <- original, retained for context
-    //   // Set Server to oArbtrans_dd               <- suggestion; uncomment after verifying
+    //   // Set Main_File to Worktrans.File_Number   <- original, retained for context
+    //   // Set Server to oWorktrans_dd               <- suggestion; uncomment after verifying
     // The DDO name is a best-effort derivation: "Table" is taken from the part
-    // before the first "." in the value (e.g. "Arbtrans.File_Number" -> "oArbtrans_dd").
+    // before the first "." in the value (e.g. "Worktrans.File_Number" -> "oWorktrans_dd").
     // The programmer verifies the name, then uncomments Set Server (or adjusts it first).
     Procedure HandleMainFileLine String sLine String[] ByRef asOutput
         String  sIndent sValue sTableName sDDOName
@@ -718,6 +1027,39 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
 
     // *** Column object emission ***
 
+    /* THE COUNT THE GET REWRITE WOULD BURY (Nils 2026-09-04, LegacyApp PlanView.VW). The calculated
+       column below rewrites "(fheadvalue(Self, plandetail.ref, plandetail.porder))" to
+       "Get fheadvalue plandetail.ref plandetail.porder to sValue" - and against a fHeadValue that
+       declares ONE parameter that compiles clean under DF26 (a message send does not count
+       arguments) where the expression form was an E 4379. So the conversion would make the error
+       vanish with the count never looked at. This reads the declaration out of the ORIGINAL source
+       and the arguments off the generated line; when both are known and disagree, the caller puts
+       the returned TODO on the line above the Get. "" when the counts agree or either cannot be
+       measured - never a guess. asSource by value on purpose: it is handed on ByRef, and a ByRef
+       parameter passed onward ByRef arrives empty (the ChangeLegacyIndicators lesson). */
+    Function _CalcArityTodo String[] asSource String sCalcLine Returns String
+        Handle  hoAn
+        String  sName sPlural
+        Integer iArgs iDecl iDeclLine
+
+        Get Create (RefClass(cModAnalyzer)) to hoAn
+        If (hoAn = 0) ;
+            Function_Return ""
+        Move -1 to iArgs
+        Move -1 to iDecl
+        Move 0  to iDeclLine
+        Get ObjExprCallNameInLine of hoAn sCalcLine to sName
+        If (sName <> "") Begin
+            Get ObjExprCallArgCount of hoAn sCalcLine sName to iArgs
+            Get DeclaredParamCountIn of hoAn (&asSource) sName (&iDeclLine) to iDecl
+        End
+        Send Destroy of hoAn
+        If (sName = "" or iArgs < 0 or iDecl < 0 or iArgs = iDecl) ;
+            Function_Return ""
+        Move (If((iDecl = 1), " parameter", " parameters")) to sPlural
+        Function_Return ("// TODO: " + sName + " declares " + String(iDecl) + sPlural + " (line " + String(iDeclLine) + ") and this call passes " + String(iArgs) + ". A Get compiles at any count and drops the surplus in silence - hold the call against the declaration before trusting the value.")
+    End_Function
+
     // Reads all column arrays from class properties and appends the generated
     // cDbCJGridColumn child objects to asOutput.
     //
@@ -727,11 +1069,12 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
     Procedure AppendColumnObjects String[] ByRef asOutput String sGridIndent
         String[]  asEntryItems asHeaderLabels asCheckbox asEditable asComboButton asComboSort
         String[]  asCapslock asTextAlign asPromptObject asMask asDataType asFocusable
-        String[]  asComments
+        String[]  asComments asColNames asCondConds asCondProps asCondVals asEmpty asSource asLocalFns
+        String[]  asNumMask asCurMask asMaskLines asTodoText
         Boolean[] abIsExpression
-        Integer[] aiFormWidths
-        String    sSingle sColIndent sColProp sColName sFieldSpec sLabel sTargetCol sComment sSuffix
-        Integer   iCount iSize iWidth iProcDepth
+        Integer[] aiFormWidths aiCondIdx aiEmpty aiTodoIdx
+        String    sSingle sColIndent sColProp sColName sFieldSpec sLabel sTargetCol sComment sSuffix sCalcLine sCalcGet sArityTodo
+        Integer   iCount iSize iWidth iProcDepth iCondIdx iCalcAction iLine
         Boolean   bIsExpr
 
         Get pasColEntryItems        to asEntryItems
@@ -749,6 +1092,10 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Get pasColDataType      to asDataType
         Get pasColFocusable     to asFocusable
         Get pabColIsExpression  to abIsExpression
+        Get pasColNumericMask   to asNumMask
+        Get pasColCurrencyMask  to asCurMask
+        Get paiColTodoIdx       to aiTodoIdx
+        Get pasColTodoText      to asTodoText
 
         // Flush Entry_Display translated properties before the first column object,
         // so they appear together with the other grid-level Set properties above.
@@ -758,6 +1105,13 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
         Move (sGridIndent + sSingle)           to sColIndent
         Move (sGridIndent + sSingle + sSingle) to sColProp
         Get psTargetColumnClass to sTargetCol
+
+        // DF26 rejects a legacy in-file method called in the expression form '(Func(Self, args))' as a
+        // calculated-value body; collect THIS file's in-file method names (pasSource still holds the ORIGINAL
+        // source here - it is overwritten with the output only at the end of TransformSource) so the
+        // OnSetCalculatedValue emission below can rewrite such a call to the 'Get ... to sValue' command.
+        Get pasSource to asSource
+        Get _CollectLocalFunctionNames of ghoFuncLib (&asSource) to asLocalFns
 
         Move (SizeOfArray(asEntryItems)) to iSize
         Decrement iSize
@@ -799,7 +1153,10 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
                 Move "" to sLabel
             End
             Else Begin
+                // A bare DD field name is the default caption STRING, so quote it here - the emission
+                // below no longer wraps sLabel (a collected Header_Label is already emittable).
                 Get ExtractFieldName sFieldSpec to sLabel
+                Move ('"' + sLabel + '"') to sLabel
             End
 
             // Column object name: derive from Table.Field for plain columns;
@@ -810,6 +1167,9 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
             Else Begin
                 Get DeriveColumnName sFieldSpec to sColName
             End
+            // Remember the name by column index - the CONDITIONAL per-column properties emitted
+            // after this loop reference their column object by name.
+            Move sColName to asColNames[iCount]
 
             // Blank separator before each column object.
             // Only add one if the last emitted line is not already blank,
@@ -824,7 +1184,9 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
                 Move (sColProp + "Entry_Item " + sFieldSpec + sSuffix) to asOutput[SizeOfArray(asOutput)]
             End
             Move (sColProp   + "Set piWidth to " + String(iWidth)) to asOutput[SizeOfArray(asOutput)]
-            Move (sColProp   + "Set psCaption to " + '"' + sLabel + '"') to asOutput[SizeOfArray(asOutput)]
+            // sLabel is already emittable (a quoted literal / verbatim expression from ParseHeaderLabel, or the
+            // just-quoted field name); emit AS-IS, empty -> "" so the Set never dangles.
+            Move (sColProp   + "Set psCaption to " + (If(Trim(sLabel) = "", '""', sLabel))) to asOutput[SizeOfArray(asOutput)]
 
             // Optional per-column translated properties.
             If (iCount < SizeOfArray(asCheckbox) and asCheckbox[iCount] <> "") Begin
@@ -858,6 +1220,27 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
             If (iCount < SizeOfArray(asDataType) and asDataType[iCount] <> "") Begin
                 Move (sColProp + "Set peDataType to " + asDataType[iCount]) to asOutput[SizeOfArray(asOutput)]
             End
+            // The masks (NumericMaskLines) and the TODO lines of the column's messages (2026-10-04).
+            If (iCount < SizeOfArray(asNumMask)) Begin
+                If (asNumMask[iCount] <> "") Begin
+                    Get NumericMaskLines sColProp asNumMask[iCount] "" False ("Set Numeric_Mask Item " + String(iCount) + " to " + asNumMask[iCount]) to asMaskLines
+                    For iLine from 0 to (SizeOfArray(asMaskLines) - 1)
+                        Move asMaskLines[iLine] to asOutput[SizeOfArray(asOutput)]
+                    Loop
+                End
+            End
+            If (iCount < SizeOfArray(asCurMask)) Begin
+                If (asCurMask[iCount] <> "") Begin
+                    Get NumericMaskLines sColProp asCurMask[iCount] "" True ("Set Currency_Mask Item " + String(iCount) + " to " + asCurMask[iCount]) to asMaskLines
+                    For iLine from 0 to (SizeOfArray(asMaskLines) - 1)
+                        Move asMaskLines[iLine] to asOutput[SizeOfArray(asOutput)]
+                    Loop
+                End
+            End
+            For iLine from 0 to (SizeOfArray(aiTodoIdx) - 1)
+                If (aiTodoIdx[iLine] = iCount) ;
+                    Move (sColProp + "// " + asTodoText[iLine]) to asOutput[SizeOfArray(asOutput)]
+            Loop
 
             // Calculated columns: emit OnSetCalculatedValue with the original expression -
             // UNLESS the grid is inside a Procedure body (e.g. Construct_Object), where a
@@ -873,13 +1256,82 @@ Class cDbGridTocDbCJGrid is a cGridToCJGridBase
                 Else Begin
                     Move "" to asOutput[SizeOfArray(asOutput)]
                     Move (sColProp + "Procedure OnSetCalculatedValue tDataSourceRow TheRow String ByRef sValue") to asOutput[SizeOfArray(asOutput)]
-                    Move (sColProp + sSingle + "Move " + sFieldSpec + " to sValue" + sSuffix) to asOutput[SizeOfArray(asOutput)]
+                    // DF26: an in-file method called in the expression form '(Func(Self, args))' is rejected
+                    // as this calculated-value body. Route the generated 'Move (expr) to sValue' through the
+                    // same converter ChangeObjectFunctionCallToGet uses: iAction=1 means it became a clean
+                    // 'Get Func args to sValue' (used here); a plain-field / arithmetic / global-function
+                    // expression stays the Move form. The trailing comment rides on whichever form wins.
+                    Move (sColProp + sSingle + "Move " + sFieldSpec + " to sValue") to sCalcLine
+                    Get _ObjExprCallToGet of ghoFuncLib sCalcLine asLocalFns (&iCalcAction) to sCalcGet
+                    If (iCalcAction = 1) Begin
+                        // The Get compiles at ANY argument count - say so where the counts disagree
+                        // (see _CalcArityTodo), before the rewrite buries an E 4379 for good.
+                        Get _CalcArityTodo asSource sCalcLine to sArityTodo
+                        If (sArityTodo <> "") ;
+                            Move (sColProp + sSingle + sArityTodo) to asOutput[SizeOfArray(asOutput)]
+                        Move (sCalcGet + sSuffix) to asOutput[SizeOfArray(asOutput)]
+                    End
+                    Else ;
+                        Move (sCalcLine + sSuffix) to asOutput[SizeOfArray(asOutput)]
                     Move (sColProp + "End_Procedure") to asOutput[SizeOfArray(asOutput)]
                 End
             End
 
             Move (sColIndent + "End_Object") to asOutput[SizeOfArray(asOutput)]
         Loop
+
+        // A column message for an item no column object was made for keeps its TODO, at the grid's level -
+        // then the TODO list is consumed, so a second flush cannot write it twice.
+        For iLine from 0 to (SizeOfArray(aiTodoIdx) - 1)
+            If (aiTodoIdx[iLine] > iSize) ;
+                Move (sColIndent + "// (no column object was made for item " + String(aiTodoIdx[iLine]) + ") " + asTodoText[iLine]) to asOutput[SizeOfArray(asOutput)]
+        Loop
+        Set paiColTodoIdx  to aiEmpty
+        Set pasColTodoText to asEmpty
+
+        // Persist the emitted column names by index: the conditional emitter below uses them, and
+        // so does the POST-flush path in OnHandleGridLine (a conditional arriving after a grid-level
+        // property closed the pending window - LegacyApp compin.vw column 13's 'Estado').
+        Set pasColObjectNames to asColNames
+        Send AppendConditionalColumnLines (&asOutput) sGridIndent
+    End_Procedure
+
+    // Emit the collected CONDITIONAL per-column properties, rewritten as
+    // 'If (<cond>) Set <newProp> of <columnObject> to <value>' - inline object-body code runs at
+    // create time, exactly like the legacy 'If (...) Set Header_Label N ...' lines these replace
+    // (LegacyApp compin.vw CompH, 2026-07-05). An index with no matching column is preserved as a
+    // TODO comment instead of being dropped. Called by AppendColumnObjects right after the column
+    // objects, AND by OnHandleGridLine's post-flush branch (immediate, in-place translation). The
+    // pending arrays are consumed so nothing is ever emitted twice.
+    Procedure AppendConditionalColumnLines String[] ByRef asOutput String sGridIndent
+        String[]  asColNames asCondConds asCondProps asCondVals asEmpty
+        Integer[] aiCondIdx aiEmpty
+        String    sSingle sColIndent
+        Integer   iCount iCondIdx
+
+        Get pasCondColConds  to asCondConds
+        If (SizeOfArray(asCondConds) = 0) ;
+            Procedure_Return
+        Get paiCondColIdx     to aiCondIdx
+        Get pasCondColProps   to asCondProps
+        Get pasCondColValues  to asCondVals
+        Get pasColObjectNames to asColNames
+        Get MakeSingleIndent  to sSingle
+        Move (sGridIndent + sSingle) to sColIndent
+        For iCount from 0 to (SizeOfArray(asCondConds) - 1)
+            Move aiCondIdx[iCount] to iCondIdx
+            If (iCondIdx >= 0 and iCondIdx < SizeOfArray(asColNames)) Begin
+                Move (sColIndent + asCondConds[iCount] + " Set " + asCondProps[iCount] + " of " + asColNames[iCondIdx] + " to " + asCondVals[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+            Else Begin
+                Move (sColIndent + "// TODO (cCJGrid conversion): conditional legacy column property had no matching column - " + asCondConds[iCount] + " Set " + asCondProps[iCount] + " (item " + String(iCondIdx) + ") to " + asCondVals[iCount]) to asOutput[SizeOfArray(asOutput)]
+            End
+        Loop
+        // Consumed - a second flush (or the next grid) must not re-emit them.
+        Set pasCondColConds  to asEmpty
+        Set paiCondColIdx    to aiEmpty
+        Set pasCondColProps  to asEmpty
+        Set pasCondColValues to asEmpty
     End_Procedure
 
     // *** Public interface ***

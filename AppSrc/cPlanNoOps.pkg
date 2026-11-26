@@ -1,0 +1,258 @@
+//****************************************************************************
+// $Module type: Package
+// $Module name: cPlanNoOps.pkg
+//
+// $Author     : Nils Svedmyr, RDC Tools International.
+// Copyright (c) 2026 RDC Tools International
+// E-mail      : support@rdctools.com
+// Web-site    : http://www.rdctools.com
+//
+// Created     : 2026-11-12 (Military date format - Year-Month-Day)
+//
+// Description : The files a refactoring plan ran on and left exactly as they were, with the
+//               functions that run had selected, so the next plan does not offer those
+//               functions for those files again. See the class comment.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use cJsonObject.pkg
+Use RefactorConstants.h.pkg
+Use RefactorFileIO.pkg           // rfFileDate / rfFileSizeLive / rfParseJsonFile / rfOpenOutput
+
+/* A PLAN THAT KEEPS OFFERING WHAT IT CANNOT DO (Nils 2026-11-12, on a workspace's fourth plan round:
+   "After a new check a new refactoring plan is suggested with exactly the same three functions
+   suggested again. So there is something wrong here.").
+
+   The analyzer dry-runs an Auto-fix row before it trusts it, but a Review row goes into the plan as it
+   is, and three converters ran round after round on lines they always leave: Deep Scan DFCreate_Menu
+   rows on legacy menus the menu converter keeps, a 'Procedure X for DBGrid' line and a 'Class X is a
+   DBList' line the object converters do not touch, and Begin_Row in an object of a workspace subclass.
+   Each Check raised the same messages, and each plan the same functions.
+
+   THE SAFETY NET, for every converter at once. The engine stamps every file of a plan run before the
+   run (last-write time and size) and again after it. A file whose stamp did not move was run by every
+   function that run had selected, and none of them changed it. Those files are recorded here with the
+   functions, and the analyzer (cModAnalyzer.VerifyPlanNoOp) shows such a row as Explain, with the
+   reason, in the grid and the plan alike. A record holds only while its file keeps the stamp it was
+   recorded with: once the file changes - by hand or by another run - its rows are offered again. Only a
+   run that finished OK is recorded; a cancelled run may have skipped files.
+
+   MEASURED before it was written: a converter that declines a file does not rewrite it. The files of
+   that workspace's fourth round all kept the stamps they had before it. */
+
+// A file's stamp: its last-write time and size, "" when the file is not there.
+Function PlanNoOpFileStamp Global String sFile Returns String
+    Boolean bThere
+
+    Move (Trim(sFile)) to sFile
+    If (sFile = "") ;
+        Function_Return ""
+    File_Exist sFile bThere
+    If (bThere = False) ;
+        Function_Return ""
+    Function_Return (String(rfFileDate(sFile)) + "|" + String(rfFileSizeLive(sFile)))
+End_Function
+
+/* The functions a plan ran on sFile without changing it, lowercased - none when the file is not in the
+   record or has changed since. asFiles (lowercased), asStamps and asFns (each "|"-joined) are the
+   record as cPlanNoOps.LoadRecord lays it out, parallel. The file's stamp is read only when it is in
+   the record at all. */
+Function PlanNoOpFunctionsIn Global String[] ByRef asFiles String[] ByRef asStamps String[] ByRef asFns String sFile Returns String[]
+    String[] asNone
+    Integer iAt
+
+    If (SizeOfArray(asFiles) = 0) ;
+        Function_Return asNone
+    Move (SearchArray(Lowercase(Trim(sFile)), asFiles)) to iAt
+    If (iAt = -1) ;
+        Function_Return asNone
+    If (PlanNoOpFileStamp(sFile) <> asStamps[iAt]) ;
+        Function_Return asNone
+    Function_Return (StrSplitToArray(asFns[iAt], "|"))
+End_Function
+
+Class cPlanNoOps is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // Test-only: the record file in place of Data\PlanNoOps-<workspace>.json. "" in production.
+        Property String psJsonFile ""
+        // The record LoadRecord read, laid out for PlanNoOpFunctionsIn: parallel arrays, one per row.
+        Property String[] pasRecFiles
+        Property String[] pasRecStamps
+        Property String[] pasRecFns
+    End_Procedure
+
+    /* Data\PlanNoOps-<workspace>.json: the saved plan's path with its base swapped, as KeptShadows does.
+       Under the DFUnit runner ghoApplication is a plain cApplication and this is "" - so a test sets
+       psJsonFile, and a read or write with no path does nothing. */
+    Function JsonPath Returns String
+        String sPath sSavedBase sBase
+
+        Get psJsonFile to sPath
+        If (sPath <> "") ;
+            Function_Return sPath
+        Get SavedPlanJsonPath of ghoApplication to sPath
+        If (sPath = "") ;
+            Function_Return ""
+        Move (Left(CS_SavedPlanJson, (Length(CS_SavedPlanJson) - 5))) to sSavedBase   // "LastPlan"
+        Move (Left(CS_PlanNoOpsJson, (Length(CS_PlanNoOpsJson) - 5))) to sBase        // "PlanNoOps"
+        Function_Return (Replaces(sSavedBase, sPath, sBase))
+    End_Function
+
+    // The record's rows. Empty when absent, unparseable or of another layout.
+    Function ReadRows Returns tPlanNoOp[]
+        Handle hoJson
+        tPlanNoOpFile TheFile
+        tPlanNoOp[] aEmpty
+        String sFile
+        Boolean bThere
+
+        Get JsonPath to sFile
+        If (sFile = "") ;
+            Function_Return aEmpty
+        File_Exist sFile bThere
+        If (bThere = False) ;
+            Function_Return aEmpty
+        Get rfParseJsonFile sFile to hoJson
+        If (hoJson = 0) ;
+            Function_Return aEmpty
+        Get JsonToDataType of hoJson to TheFile
+        Send Destroy of hoJson
+        If (TheFile.iVersion <> CI_PlanNoOpsVersion) ;
+            Function_Return aEmpty
+        Function_Return TheFile.aRows
+    End_Function
+
+    // Persist the rows (pretty, NO BOM - a BOM breaks ParseUtf8 on the way back in).
+    Procedure WriteRows tPlanNoOp[] aRows
+        Handle hoJson
+        UChar[] ucJson
+        Integer iCh
+        String sFile
+        tPlanNoOpFile TheFile
+
+        Get JsonPath to sFile
+        If (sFile = "") ;
+            Procedure_Return
+        Move CI_PlanNoOpsVersion to TheFile.iVersion
+        Move aRows to TheFile.aRows
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson TheFile
+        Set peWhiteSpace of hoJson to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoJson to ucJson
+        Send Destroy of hoJson
+        Get rfOpenOutput sFile to iCh
+        If (iCh < 0) ;
+            Procedure_Return
+        Write channel iCh ucJson
+        Send rfCloseOutput iCh
+    End_Procedure
+
+    // The record, read and laid out for PlanNoOpFunctionsIn (pasRecFiles / pasRecStamps / pasRecFns).
+    Procedure LoadRecord
+        tPlanNoOp[] aRows
+        String[] asFiles asStamps asFns
+        Integer i iLast
+
+        Get ReadRows to aRows
+        Move (SizeOfArray(aRows) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(Trim(aRows[i].sFile)))           to asFiles[i]
+            Move aRows[i].sStamp                             to asStamps[i]
+            Move (StrJoinFromArray(aRows[i].asFns, "|"))     to asFns[i]
+        Loop
+        Set pasRecFiles  to asFiles
+        Set pasRecStamps to asStamps
+        Set pasRecFns    to asFns
+    End_Procedure
+
+    // Each file's stamp (PlanNoOpFileStamp), in the same order.
+    Function StampsOf String[] asFiles Returns String[]
+        String[] asOut
+        Integer i iLast
+
+        Move (SizeOfArray(asFiles) - 1) to iLast
+        For i from 0 to iLast
+            Move (PlanNoOpFileStamp(asFiles[i])) to asOut[i]
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* PURE. The record after one run. An old row stays while its file still has the stamp it was recorded
+       with (asOldNow, parallel to aOld). A run file whose stamp did not move (asBefore = asAfter, and not
+       "") gets the run's functions, lowercased - joined to what an old row already holds for it. Files are
+       kept lowercased, which is how they are compared. */
+    Function MergedRecord tPlanNoOp[] aOld String[] asOldNow String[] asFiles String[] asBefore String[] asAfter String[] asFns Returns tPlanNoOp[]
+        tPlanNoOp[] aOut
+        tPlanNoOp Row
+        String[] asFnsLow asOutFiles asNone
+        String sLow
+        Integer i iLast j iAt
+
+        Move (SizeOfArray(asFns) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(Trim(asFns[i]))) to sLow
+            If (sLow <> "" and SearchArray(sLow, asFnsLow) = -1) ;
+                Move sLow to asFnsLow[SizeOfArray(asFnsLow)]
+        Loop
+        // the old rows whose file is unchanged since they were recorded
+        Move (SizeOfArray(aOld) - 1) to iLast
+        For i from 0 to iLast
+            If (i < SizeOfArray(asOldNow)) Begin
+                If (asOldNow[i] <> "" and asOldNow[i] = aOld[i].sStamp) Begin
+                    Move aOld[i] to Row
+                    Move (Lowercase(Trim(Row.sFile))) to Row.sFile
+                    Move Row to aOut[SizeOfArray(aOut)]
+                    Move Row.sFile to asOutFiles[SizeOfArray(asOutFiles)]
+                End
+            End
+        Loop
+        If (SizeOfArray(asFnsLow) = 0) ;
+            Function_Return aOut
+        // the run's files it left unchanged
+        Move (SizeOfArray(asFiles) - 1) to iLast
+        For i from 0 to iLast
+            If (i < SizeOfArray(asBefore) and i < SizeOfArray(asAfter)) Begin
+                If (asBefore[i] <> "" and asBefore[i] = asAfter[i]) Begin
+                    Move (Lowercase(Trim(asFiles[i]))) to sLow
+                    Move (SearchArray(sLow, asOutFiles)) to iAt
+                    If (iAt = -1) Begin
+                        Move sLow       to Row.sFile
+                        Move asAfter[i] to Row.sStamp
+                        Move asFnsLow   to Row.asFns
+                        Move Row to aOut[SizeOfArray(aOut)]
+                        Move sLow to asOutFiles[SizeOfArray(asOutFiles)]
+                    End
+                    Else Begin
+                        For j from 0 to (SizeOfArray(asFnsLow) - 1)
+                            If (SearchArray(asFnsLow[j], aOut[iAt].asFns) = -1) ;
+                                Move asFnsLow[j] to aOut[iAt].asFns[SizeOfArray(aOut[iAt].asFns)]
+                        Loop
+                    End
+                End
+            End
+        Loop
+        Function_Return aOut
+    End_Function
+
+    /* After a plan run that finished OK: asFiles is the run's file list, asBefore their stamps from before
+       it (StampsOf), asFns the functions it had selected. Reads the record, merges the run in
+       (MergedRecord) and writes it back. */
+    Procedure RecordRun String[] asFiles String[] asBefore String[] asFns
+        tPlanNoOp[] aOld aNew
+        String[] asOldNow asAfter
+        Integer i iLast
+
+        Get ReadRows to aOld
+        Move (SizeOfArray(aOld) - 1) to iLast
+        For i from 0 to iLast
+            Move (PlanNoOpFileStamp(aOld[i].sFile)) to asOldNow[i]
+        Loop
+        Get StampsOf asFiles to asAfter
+        Get MergedRecord aOld asOldNow asFiles asBefore asAfter asFns to aNew
+        Send WriteRows aNew
+    End_Procedure
+
+End_Class

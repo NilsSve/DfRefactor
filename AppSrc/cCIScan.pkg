@@ -1,0 +1,444 @@
+//****************************************************************************
+// $Module type: Package
+// $Module name: cCIScan.pkg
+//
+// $Author     : Nils Svedmyr, RDC Tools International.
+// Copyright (c) 2026 RDC Tools International
+// E-mail      : support@rdctools.com
+// Web-site    : http://www.rdctools.com
+//
+// Created     : 2026-11-20 (Military date format - Year-Month-Day)
+//
+// Description : The CI check - Analyze Source's findings as JSON and SARIF, each with a
+//               fingerprint, compared with a baseline, so a build fails on a NEW finding only.
+//               See the class comment.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use cJsonObject.pkg
+Use RefactorConstants.h.pkg
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput / rfParseJsonFile
+Use cEncodingHelpers.pkg         // rfReadEncodedFileAsStringArray
+Use CompileErrorParser.pkg       // tCompileError - Analyze Source's findings arrive as analyzer messages
+
+/* THE CI CHECK (Nils 2026-11-20, from the 10-23 list of add-ons: "a read-only check for CI").
+
+   DFRefactorFT /scan <ini> runs Analyze Source over the folders the INI names, changes nothing, and
+   writes what it found twice: as JSON for a person or a script, and as SARIF 2.1.0, which GitHub
+   and Azure DevOps show on a pull request. The build fails - exit code 1 - only on a finding the
+   baseline does not hold (Nils: "Any new finding"), so an old workspace with thousands of findings
+   can adopt the check the same day: /scan <ini> /baseline records today's findings as accepted.
+
+   A FINGERPRINT PER FINDING, NOT THE IGNORE LIST. The analyzer's ignore list is keyed by file and
+   rule, so an ignored rule in a file hides every new hit of it there too - a baseline that cannot
+   see new findings in the files that need watching most. The fingerprint is the rule, the file
+   (relative to the workspace, so another machine's checkout matches), the line's text as
+   NormalisedLine leaves it, and which occurrence of that text in the file it is. NEVER the line
+   number: a line added above a finding would make it "new". A changed line is a new finding -
+   which is what it is.
+
+   Exit codes (RunCIScanAndExit in DFRefactorFT.src): 0 no new findings, 1 new findings, 2 the scan
+   could not run (no INI, no workspace, a folder that is not there). */
+Class cCIScan is a cObject
+
+    // PURE. A line as the fingerprint holds it: trimmed, tabs as spaces, every run of spaces one, lowercase.
+    Function NormalisedLine String sLine Returns String
+        String sOut
+        Move (Replaces((Character(13)), sLine, "")) to sOut
+        Move (Replaces((Character(9)), sOut, " ")) to sOut
+        Move (Lowercase(Trim(sOut))) to sOut
+        While (Pos("  ", sOut) > 0)
+            Move (Replaces("  ", sOut, " ")) to sOut
+        Loop
+        Function_Return sOut
+    End_Function
+
+    /* PURE. sFile relative to sHome (both full paths), "/" between folders - the same on every machine that
+       checks the workspace out. A file outside sHome but on its drive climbs out with "../"; one on another
+       drive keeps its full path. The case is the file's, as given. */
+    Function RelativePath String sFile String sHome Returns String
+        String[] asHome asFile
+        String sH sOut
+        Integer i iCommon iHomeLast iFileLast
+        Boolean bSame
+
+        Move (Trim(sHome)) to sH
+        If (sH = "") ;
+            Function_Return (Replaces("\", sFile, "/"))
+        If (Right(sH, 1) <> "\") ;
+            Move (sH + "\") to sH
+        If (Lowercase(Left(sFile, Length(sH))) = Lowercase(sH)) ;
+            Function_Return (Replaces("\", (Right(sFile, (Length(sFile) - Length(sH)))), "/"))
+        Move (StrSplitToArray(Left(sH, (Length(sH) - 1)), "\")) to asHome
+        Move (StrSplitToArray(sFile, "\")) to asFile
+        Move (SizeOfArray(asHome) - 1) to iHomeLast
+        Move (SizeOfArray(asFile) - 1) to iFileLast
+        // DataFlex evaluates every operand of a condition, so the folder compare is inside the loop, not in it.
+        Move 0 to iCommon
+        Move True to bSame
+        While (bSame = True and iCommon <= iHomeLast and iCommon < iFileLast)
+            If (Lowercase(asHome[iCommon]) = Lowercase(asFile[iCommon])) ;
+                Increment iCommon
+            Else ;
+                Move False to bSame
+        Loop
+        If (iCommon = 0) ;
+            Function_Return (Replaces("\", sFile, "/"))
+        Move "" to sOut
+        For i from iCommon to iHomeLast
+            Move (sOut + "../") to sOut
+        Loop
+        For i from iCommon to iFileLast
+            Move (sOut + asFile[i] + (If(i < iFileLast, "/", ""))) to sOut
+        Loop
+        Function_Return sOut
+    End_Function
+
+    // PURE. 8 hex digits for a value from 0 to 16^8 - 1.
+    Function _Hex8 BigInt biValue Returns String
+        String sOut sDigits
+        Integer i iDigit
+
+        Move "0123456789abcdef" to sDigits
+        Move "" to sOut
+        For i from 1 to 8
+            Move (Mod(biValue, 16)) to iDigit
+            Move (Mid(sDigits, 1, (iDigit + 1)) + sOut) to sOut
+            Move ((biValue - iDigit) / 16) to biValue
+        Loop
+        Function_Return sOut
+    End_Function
+
+    // PURE. A string's polynomial hash modulo 2^31 - 1 (a prime), as 8 hex digits.
+    Function _HashHex String s Integer iMul Returns String
+        BigInt biH biMod
+        Integer i iLen
+
+        Move 2147483647 to biMod
+        Move 7 to biH
+        Move (Length(s)) to iLen
+        For i from 1 to iLen
+            Move (Mod(((biH * iMul) + Ascii(Mid(s, 1, i))), biMod)) to biH
+        Loop
+        Function_Return (_Hex8(Self, biH))
+    End_Function
+
+    /* PURE. A finding's fingerprint, 16 hex digits: its rule, its file (RelativePath), its line's text
+       (NormalisedLine) and which occurrence of that text in the file it is - never the line number. */
+    Function Fingerprint String sRule String sFile String sText Integer iOccurrence Returns String
+        String sKey
+        Move (Lowercase(sRule) + "|" + Lowercase(sFile) + "|" + sText + "|" + String(iOccurrence)) to sKey
+        Function_Return (_HashHex(Self, sKey, 31) + _HashHex(Self, sKey, 131))
+    End_Function
+
+    // PURE. The analyzer's words for a category (cModAnalyzer.CategoryText).
+    Function CategoryName Integer eCategory Returns String
+        If (eCategory = eModAutoFix) ;
+            Function_Return "Auto-fix"
+        If (eCategory = eModSuggest) ;
+            Function_Return "Review"
+        If (eCategory = eModExplain) ;
+            Function_Return "Explain"
+        Function_Return "Unknown"
+    End_Function
+
+    /* PURE. Numbers the findings that share a rule, a file and a text (1, 2 ...) and gives each its
+       fingerprint. The findings come file by file, as Analyze Source returns them (cFTDeepScanDriver scans
+       one file at a time and appends its hits together), so the count starts again with each file. */
+    Function NumberedFindings tCIScanFinding[] aFindings Returns tCIScanFinding[]
+        String[] asKeys
+        Integer[] aiCounts
+        String sKey sFile
+        Integer i iLast iAt
+
+        Move (Character(1)) to sFile
+        Move (SizeOfArray(aFindings) - 1) to iLast
+        For i from 0 to iLast
+            If (aFindings[i].sFile <> sFile) Begin
+                Move aFindings[i].sFile to sFile
+                Move (ResizeArray(asKeys, 0)) to asKeys
+                Move (ResizeArray(aiCounts, 0)) to aiCounts
+            End
+            Move (aFindings[i].sRule + "|" + aFindings[i].sText) to sKey
+            Move (SearchArray(sKey, asKeys)) to iAt
+            If (iAt = -1) Begin
+                Move (SizeOfArray(asKeys)) to iAt
+                Move sKey to asKeys[iAt]
+                Move 0 to aiCounts[iAt]
+            End
+            Move (aiCounts[iAt] + 1) to aiCounts[iAt]
+            Move aiCounts[iAt] to aFindings[i].iOccurrence
+            Move (Fingerprint(Self, aFindings[i].sRule, aFindings[i].sFile, aFindings[i].sText, aiCounts[iAt])) to aFindings[i].sFingerprint
+        Loop
+        Function_Return aFindings
+    End_Function
+
+    /* The findings for Analyze Source's messages (the bDeepScan ones), each with its line read from its file -
+       a file is read once, while its messages last - then numbered and fingerprinted (NumberedFindings). sHome
+       is the workspace's home folder, which the file names are made relative to. */
+    Function FindingsFromMessages tCompileError[] ByRef aMsgs String sHome Returns tCIScanFinding[]
+        tCIScanFinding[] aOut
+        tCIScanFinding Finding Blank
+        String[] asLines
+        String sFile sLine
+        Integer i iLast iLine
+
+        Move (Character(1)) to sFile
+        Move (SizeOfArray(aMsgs) - 1) to iLast
+        For i from 0 to iLast
+            If (aMsgs[i].bDeepScan = True) Begin
+                If (aMsgs[i].sFileName <> sFile) Begin
+                    Move aMsgs[i].sFileName to sFile
+                    Move (rfReadEncodedFileAsStringArray(sFile)) to asLines
+                End
+                Move Blank to Finding
+                Move aMsgs[i].iLine to iLine
+                Move "" to sLine
+                If (iLine >= 1 and iLine <= SizeOfArray(asLines)) ;
+                    Move asLines[iLine - 1] to sLine
+                Move ("DS" + String(aMsgs[i].iErrorNo)) to Finding.sRule
+                Move aMsgs[i].iErrorNo                   to Finding.iDSNumber
+                Move (RelativePath(Self, sFile, sHome))  to Finding.sFile
+                Move iLine                               to Finding.iLine
+                Move aMsgs[i].sErrorTxt                  to Finding.sSymbol
+                Move (CategoryName(Self, aMsgs[i].eScanCategory)) to Finding.sCategory
+                Move aMsgs[i].sScanFn                    to Finding.sRefactorFn
+                Move aMsgs[i].sScanHint                  to Finding.sHint
+                Move (NormalisedLine(Self, sLine))       to Finding.sText
+                Move Finding to aOut[SizeOfArray(aOut)]
+            End
+        Loop
+        Get NumberedFindings aOut to aOut
+        Function_Return aOut
+    End_Function
+
+    /* PURE. Marks each finding bNew when asBaseline (fingerprints) does not hold it, and returns how many are.
+       iGone: the baseline's fingerprints that no finding has any more - fixed, or their lines changed. */
+    Function MarkNewFindings tCIScanFinding[] ByRef aFindings String[] asBaseline Integer ByRef iGone Returns Integer
+        String[] asSorted asNow
+        Integer i iLast iNew
+
+        Move (SortArray(asBaseline)) to asSorted
+        Move 0 to iNew
+        Move (SizeOfArray(aFindings) - 1) to iLast
+        For i from 0 to iLast
+            Move (BinarySearchArray(aFindings[i].sFingerprint, asSorted) = -1) to aFindings[i].bNew
+            If (aFindings[i].bNew = True) ;
+                Increment iNew
+            Move aFindings[i].sFingerprint to asNow[i]
+        Loop
+        Move (SortArray(asNow)) to asNow
+        Move 0 to iGone
+        Move (SizeOfArray(asSorted) - 1) to iLast
+        For i from 0 to iLast
+            If (BinarySearchArray(asSorted[i], asNow) = -1) ;
+                Increment iGone
+        Loop
+        Function_Return iNew
+    End_Function
+
+    // PURE. The baseline that accepts these findings.
+    Function BaselineFor tCIScanFinding[] ByRef aFindings String sWorkspace String sCreated Returns tCIScanBaseline
+        tCIScanBaseline Baseline
+        Integer i iLast
+
+        Move CI_CIScanVersion to Baseline.iVersion
+        Move sCreated         to Baseline.sCreated
+        Move sWorkspace       to Baseline.sWorkspace
+        Move (SizeOfArray(aFindings) - 1) to iLast
+        For i from 0 to iLast
+            Move aFindings[i].sFingerprint to Baseline.aFindings[i].sFingerprint
+            Move aFindings[i].sRule        to Baseline.aFindings[i].sRule
+            Move aFindings[i].sFile        to Baseline.aFindings[i].sFile
+            Move aFindings[i].iLine        to Baseline.aFindings[i].iLine
+            Move aFindings[i].sSymbol      to Baseline.aFindings[i].sSymbol
+            Move aFindings[i].sText        to Baseline.aFindings[i].sText
+        Loop
+        Function_Return Baseline
+    End_Function
+
+    // PURE. A path as a file URI ("file:///E:/My%20Ws/"), with the three characters a URI must not carry raw.
+    Function FileUri String sPath Returns String
+        Move (Replaces("%", sPath, "%25")) to sPath
+        Move (Replaces(" ", sPath, "%20")) to sPath
+        Move (Replaces("#", sPath, "%23")) to sPath
+        Move (Replaces("\", sPath, "/")) to sPath
+        If (Left(sPath, 1) = "/") ;
+            Function_Return ("file://" + sPath)
+        Function_Return ("file:///" + sPath)
+    End_Function
+
+    // PURE. A relative file name as a SARIF uri: the same escapes as FileUri, nothing in front.
+    Function _RelativeUri String sFile Returns String
+        Move (Replaces("%", sFile, "%25")) to sFile
+        Move (Replaces(" ", sFile, "%20")) to sFile
+        Move (Replaces("#", sFile, "%23")) to sFile
+        Function_Return sFile
+    End_Function
+
+    // PURE. A finding's SARIF level: Explain is a note, a finding a converter or a review can act on a warning.
+    Function SarifLevel String sCategory Returns String
+        If (sCategory = "Explain" or sCategory = "Unknown") ;
+            Function_Return "note"
+        Function_Return "warning"
+    End_Function
+
+    // PURE. What a finding's SARIF result says: the symbol, the modern way, and the function that converts it.
+    Function SarifMessage tCIScanFinding Finding Returns String
+        String sText
+        Move Finding.sSymbol to sText
+        If (Trim(Finding.sHint) <> "") ;
+            Move (sText + " - " + Trim(Finding.sHint)) to sText
+        If (Trim(Finding.sRefactorFn) <> "") ;
+            Move (sText + " DFRefactor converts it: " + Trim(Finding.sRefactorFn) + ".") to sText
+        Function_Return sText
+    End_Function
+
+    /* PURE. The SARIF 2.1.0 log of the findings: one rule per DS number found, one result per finding, its file
+       relative to SRCROOT (sHome), its fingerprint, and "new" or "unchanged" against the baseline. */
+    Function SarifFor tCIScanFinding[] ByRef aFindings String sHome Returns tSarifLog
+        tSarifLog Log
+        tSarifRun Run
+        tSarifRule Rule BlankRule
+        tSarifResult Res BlankRes
+        String[] asRuleIds
+        Integer i iLast
+
+        Move "2.1.0" to Log.version
+        Move "DFRefactor" to Run.tool.driver.name
+        Move "https://nilssve.github.io/DfRefactor/" to Run.tool.driver.informationUri
+        Move (FileUri(Self, vFolderFormat(sHome))) to Run.originalUriBaseIds.SRCROOT.uri
+        Move (SizeOfArray(aFindings) - 1) to iLast
+        For i from 0 to iLast
+            If (SearchArray(aFindings[i].sRule, asRuleIds) = -1) Begin
+                Move aFindings[i].sRule to asRuleIds[SizeOfArray(asRuleIds)]
+                Move BlankRule to Rule
+                Move aFindings[i].sRule        to Rule.id
+                Move aFindings[i].sSymbol      to Rule.name
+                Move aFindings[i].sSymbol      to Rule.shortDescription.text
+                Move aFindings[i].sHint        to Rule.fullDescription.text
+                Move (SarifLevel(Self, aFindings[i].sCategory)) to Rule.defaultConfiguration.level
+                Move aFindings[i].sCategory    to Rule.properties.category
+                Move aFindings[i].sRefactorFn  to Rule.properties.refactorFunction
+                Move Rule to Run.tool.driver.rules[SizeOfArray(Run.tool.driver.rules)]
+            End
+            Move BlankRes to Res
+            Move aFindings[i].sRule to Res.ruleId
+            Move (SarifLevel(Self, aFindings[i].sCategory)) to Res.level
+            Move (SarifMessage(Self, aFindings[i])) to Res.message.text
+            Move (_RelativeUri(Self, aFindings[i].sFile)) to Res.locations[0].physicalLocation.artifactLocation.uri
+            Move "SRCROOT" to Res.locations[0].physicalLocation.artifactLocation.uriBaseId
+            Move aFindings[i].iLine to Res.locations[0].physicalLocation.region.startLine
+            Move aFindings[i].sFingerprint to Res.partialFingerprints.dfrefactorHitV1
+            Move (If(aFindings[i].bNew, "new", "unchanged")) to Res.baselineState
+            Move Res to Run.results[SizeOfArray(Run.results)]
+        Loop
+        Move Run to Log.runs[0]
+        Function_Return Log
+    End_Function
+
+    // Writes a JSON object to sFile as UTF-8, pretty, with no BOM (a BOM breaks ParseUtf8 on the way back in).
+    Function _WriteJsonObject Handle hoJson String sFile Returns Boolean
+        UChar[] ucJson
+        Integer iCh
+
+        Set peWhiteSpace of hoJson to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoJson to ucJson
+        Get rfOpenOutput sFile to iCh
+        If (iCh < 0) ;
+            Function_Return False
+        Write channel iCh ucJson
+        Send rfCloseOutput iCh
+        Function_Return True
+    End_Function
+
+    Function WriteReport tCIScanReport Report String sFile Returns Boolean
+        Handle hoJson
+        Boolean bOK
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson Report
+        Get _WriteJsonObject hoJson sFile to bOK
+        Send Destroy of hoJson
+        Function_Return bOK
+    End_Function
+
+    Function WriteSarif tSarifLog Log String sFile Returns Boolean
+        Handle hoJson
+        Boolean bOK
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson Log
+        Get _WriteJsonObject hoJson sFile to bOK
+        Send Destroy of hoJson
+        Function_Return bOK
+    End_Function
+
+    Function WriteBaseline tCIScanBaseline Baseline String sFile Returns Boolean
+        Handle hoJson
+        Boolean bOK
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson Baseline
+        Get _WriteJsonObject hoJson sFile to bOK
+        Send Destroy of hoJson
+        Function_Return bOK
+    End_Function
+
+    /* The baseline's fingerprints, and sCreated when it was written. bFound False when there is no such file;
+       sWhyNot says why a file that is there could not be read (not JSON, or another layout) - the caller must not
+       take that for "no findings accepted", which would fail every build on an old workspace for a reason nobody
+       could see. */
+    Function BaselineFingerprints String sFile Boolean ByRef bFound String ByRef sCreated String ByRef sWhyNot Returns String[]
+        Handle hoJson
+        tCIScanBaseline Baseline
+        String[] asOut asNone
+        Integer i iLast
+        Boolean bThere
+
+        Move False to bFound
+        Move "" to sCreated
+        Move "" to sWhyNot
+        File_Exist sFile bThere
+        If (bThere = False) ;
+            Function_Return asNone
+        Move True to bFound
+        Get rfParseJsonFile sFile to hoJson
+        If (hoJson = 0) Begin
+            Move ("the baseline file is not JSON: " + sFile) to sWhyNot
+            Function_Return asNone
+        End
+        Set pbRequireAllMembers of hoJson to False
+        Get JsonToDataType of hoJson to Baseline
+        Send Destroy of hoJson
+        If (Baseline.iVersion <> CI_CIScanVersion) Begin
+            Move ("the baseline file has layout " + String(Baseline.iVersion) + ", this program reads " + String(CI_CIScanVersion) + " - write it again with /baseline: " + sFile) to sWhyNot
+            Function_Return asNone
+        End
+        Move Baseline.sCreated to sCreated
+        Move (SizeOfArray(Baseline.aFindings) - 1) to iLast
+        For i from 0 to iLast
+            Move Baseline.aFindings[i].sFingerprint to asOut[i]
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* The result file a build reads beside the exit code, as /bm writes its own: STATUS=SUCCESS when the scan
+       passed (exit 0), STATUS=FAILED otherwise, the exit code, the time, and the summary. "" = none asked for. */
+    Procedure WriteResultFile String sPath Integer iExitCode String sFinished String sSummary
+        String sOut sCRLF
+        Integer iCh
+
+        If (Trim(sPath) = "") ;
+            Procedure_Return
+        Move (Character(13) + Character(10)) to sCRLF
+        Move ("STATUS=" + (If(iExitCode = CI_CIScanPass, "SUCCESS", "FAILED")) + sCRLF) to sOut
+        Move (sOut + "ExitCode=" + String(iExitCode) + sCRLF) to sOut
+        Move (sOut + "Finished=" + sFinished + sCRLF) to sOut
+        Move (sOut + sCRLF + "Summary:" + sCRLF + sSummary + sCRLF) to sOut
+        Get rfOpenOutput sPath to iCh
+        If (iCh < 0) ;
+            Procedure_Return
+        Write channel iCh sOut
+        Send rfCloseOutput iCh
+    End_Procedure
+
+End_Class

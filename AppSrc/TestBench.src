@@ -20,12 +20,18 @@
 //
 //****************************************************************************
 Use DFAllEnt.pkg
-Use cRDCCJCommandBarSystem.pkg
 Use File_dlg.pkg
 Use gFormatNumbers.pkg
+Use cRDCCJCommandBarSystem.pkg
 Use vwin32fh.pkg
-Use RefactorConstants.h.pkg 
-//Use cEncodingHelpers.pkg
+Use RefactorConstants.h.pkg
+// Shared files (cWSTextBox, cCmdLinkButton, SelectWorkspace) ask for theme colours through these.
+// This build never seeds giFTThemeMode, so they return the original dark constants - no change.
+Use FTThemeColors.pkg
+// Both are needed by the "Write catalogues..." tool item below, which sits ABOVE the point where
+// oMainRefactorObjects pulls the funclib chain in - RefClass needs the class defined by then.
+Use cSelectFolderDialog.pkg      // picking the Lib folder to read
+Use cDfLanguageFile.pkg          // parsing DataFlex.lng
 
 // Uncomment thie define statement to show a "Theme selector" combobutton and
 // a "Snap Shot" camera iton in the toolbar.
@@ -87,8 +93,10 @@ Object oApplication is a cRefactorApplication
 
         Get psHome of (phoWorkspace(Self)) to sHome
         Set psHomeTarget to sHome
-        Move (vFolderFormat(sHome)) to sHome
-        Move (sHome + String(CS_SWSFile)) to sSWSFile
+        // OwnSwsFile, not home + CS_SWSFile: on DF26 the constant says "DFRefactor.sws" and the
+        // workspace is DFRefactorFlexTron.sws - the fixed name alone opened TestBench with
+        // "Filename missing: E:\DfRefactor\DFRefactor.sws" (Nils 2026-08-16).
+        Get OwnSwsFile to sSWSFile
         Set psSWSFile to sSWSFile
 
         // TestBench has no target-workspace selector, so the Set psSWSFile
@@ -100,9 +108,15 @@ Object oApplication is a cRefactorApplication
         // seed BOTH pOrgWS (in case End_Construct_Object captured emptiness)
         // and pTargetWS = self, so refactor functions find TestBench's own
         // files. In TestBench the program's own workspace IS the target.
-        Get CapturePhoWorkspace to SelfWS
+        Get CapturephoWorkspace to SelfWS
         Set pOrgWS    to SelfWS
         Set pTargetWS to SelfWS
+        /* The tSwsFile forms of the same two, from the same moment. TestBench's own workspace IS
+           the target, so both are re-read here: RefreshOwnSws for pOwnSws, and RefreshCurrentSws
+           for pCurrentSws now that psSWSFile above points at this workspace. Without these, the
+           compile helpers - which now take tSwsFile - would be handed a struct nobody filled. */
+        Send RefreshOwnSws
+        Send RefreshCurrentSws
     End_Procedure
 
     Procedure Set psExpFileJson String sJsonFile
@@ -172,18 +186,68 @@ Object oApplication is a cRefactorApplication
         End
     End_Procedure
 
+    Procedure StartRefactoreCode
+        String sLegacyFileName sRefactoredFileName
+        Handle hoLegacyEditor hoRefactoredEditor
+        Integer iRetval
+        Boolean bOK
+        tRefactorFiles RefactorFiles
+        tSwsFile OrgWS
+
+        Move False to Err
+        // RefactorTestBench compiles the test program in DFRefactor's
+        // own workspace, so pass pOrgWS regardless of any user-selected
+        // target. (DeleteCompileErrorsFile removes BOTH suffix candidates.)
+        Get pOwnSws of ghoApplication to OrgWS
+        Get DeleteCompileErrorsFile of ghoApplication CS_TestProgram OrgWS to bOK
+        If (bOK = False) Begin
+            Get YesNo_Box "Could not delete the compiler's error file. Continue?" to iRetval
+            If (iRetval <> MBR_Yes) Begin
+                Procedure_Return
+            End
+        End 
+        Send CloseCompileErrorDialog of (Client_Id(phoMainPanel(ghoApplication)))
+        Get phoEditorRefactored of ghoApplication     to hoRefactoredEditor
+        Send Request_Clear of hoRefactoredEditor
+
+        Get phoEditorLegacy     of ghoApplication     to hoLegacyEditor
+        Get psCodeFile          of hoLegacyEditor     to sLegacyFileName 
+
+        Get psCodeFile          of hoRefactoredEditor to sRefactoredFileName
+        // We need to copy the legacy file to the refactor file before we start our work,
+        // because else the ghoEngine would overwrite the sLegacyFileName with
+        // changes:
+        Move (vCopyFile(sLegacyFileName, sRefactoredFileName)) to bOK
+        Set psCurrentSourceFileName of ghoApplication to sRefactoredFileName
+        
+        Get CollectFileData of ghoApplication (oFolderSelDtl_DD(Self)) to RefactorFiles
+        If (Err = True) Begin
+            Procedure_Return
+        End
+
+        // Start the Engine!
+        Set peRunOrigin of ghoEngine to eRunTestBench
+        Send StartEngine of ghoEngine RefactorFiles hoRefactoredEditor
+        // Reload the refactored file into the editor. This is necessary for
+        // eOtherFunctionAll functions (e.g. cDbGridTocDbCJGrid) which write
+        // their output directly to disk and bypass the in-memory editor content.
+        // For all other function types this is a harmless reload of the same content.
+        Send LoadFile of hoRefactoredEditor sRefactoredFileName
+        // Save the result
+        Send SaveFile of hoRefactoredEditor
+    End_Procedure
+
     // NOTE: DeleteCompileErrorsFile / CompileProgram moved to cCompileMixin.pkg
     //       (imported by cRefactorApplication) so DFRefactor can share them.
     //       The old TestErrorFile/CompileErrorFileForProgram name PREDICTION was
     //       removed 2026-06-11 - the .err is resolved by EXISTENCE instead
     //       (ResolveCompiledFile), whichever bitness suffix the compiler wrote.
-
     Procedure CompileRefactoredCode
         String sAppSrc sErrorText sTestErrFile
         Boolean bIsRefactoring bOK
         Integer iLines
         Handle ho
-        tWorkspacePaths OrgWS
+        tSwsFile OrgWS
 
         Get pbIsRefactoring to bIsRefactoring
         If (bIsRefactoring = True) Begin
@@ -201,7 +265,7 @@ Object oApplication is a cRefactorApplication
         // TestBench compiles the refactored sample against DFRefactor's
         // own workspace, so use pOrgWS (target may be selected for a
         // different purpose; we want this compile to land here).
-        Get pOrgWS to OrgWS
+        Get pOwnSws to OrgWS
         Get DeleteCompileErrorsFile CS_TestProgram OrgWS to bOK
         If (bOK = False) Begin
             Send Info_Box "The old compiler error file could not be deleted! Cannot continue compiling."
@@ -233,9 +297,9 @@ Object oApplication is a cRefactorApplication
     // The sProgram param should be the name of the DF program to be run with NO extenstion.
     Procedure RunDFProgram String sProgram
         String sExePath
-        tWorkspacePaths OrgWS
+        tSwsFile OrgWS
 
-        Get pOrgWS of ghoApplication to OrgWS
+        Get pOwnSws of ghoApplication to OrgWS
         // Resolve the actual compiled .exe by existence + the target program's own
         // <program>.cfg suffix (DFRefactor=x64, TestBench/DFUnit=64). NEVER decide the
         // bitness from #IFDEF Is$Win64 - that is THIS program's build bitness, not the
@@ -243,7 +307,7 @@ Object oApplication is a cRefactorApplication
         // "x64", so the old code looked for a non-existent DFRefactor64.exe).
         Get ResolveProgramExe of ghoApplication sProgram OrgWS to sExePath
         If (sExePath = "") Begin
-            Send Info_Box ("Could not find the compiled program in:\n" + ('"' + vFolderFormat(OrgWS.sPrograms) + '"') + "\nMake sure it compiled for the expected 32-/64-bit platform.")
+            Send Info_Box ("Could not find the compiled program in:\n" + ('"' + vFolderFormat(PrimaryPrograms(ghoApplication, OrgWS)) + '"') + "\nMake sure it compiled for the expected 32-/64-bit platform.")
             Procedure_Return
         End
         Runprogram Background sExePath
@@ -267,12 +331,12 @@ Object oApplication is a cRefactorApplication
         String  sFileName sInitialFolder
         String[] asFiles
         Handle ho hoEditor
-        tWorkspacePaths OrgWS
+        tSwsFile OrgWS
 
         Move (phoOpenSourceFileDialog(Self)) to ho
         Set Filter_String of ho to (CS_SourceCodeFilters+"|All Files (*.*)|*.*")
-        Get pOrgWS of ghoApplication to OrgWS
-        Move OrgWS.sAppSrc to sInitialFolder
+        Get pOwnSws of ghoApplication to OrgWS
+        Get PrimaryAppSrc of ghoApplication OrgWS to sInitialFolder
         Set Initial_Folder of ho to sInitialFolder
         Set MultiSelect_State of ho to False
         
@@ -297,6 +361,7 @@ Object oApplication is a cRefactorApplication
     
 End_Object
 
+// Includes automatic database update logic:
 Use DoDatabaseUpdateStuff.pkg
 
 Use cRDCTooltipController.pkg
@@ -756,6 +821,137 @@ Object oMain is a Panel
             
         End_Object
         
+        /* WRITE THE LANGUAGE CATALOGUES for one DataFlex version, chosen by hand.
+
+           A DEV tool, which is why it lives in the TestBench and not in the product. The running
+           application never needs it: it reads the install directly, and the install is always
+           there when a target exists (psTargetDfVersion has a single setter and it derives from the
+           selected compiler's own path). This exists to put catalogues under version control so
+           they can be DIFFED - what DF 27 adds, retires or re-pairs against DF 25 is a question
+           about the release, and two files in git answer it in one command.
+
+           THE VERSION IS PICKED, NOT GUESSED (Nils 2026-08-01). Any installed Lib folder will do,
+           including one that is not this session's target - which is the entire point when the DF 27
+           alpha lands and nothing is targeting it yet. The version comes from the chosen PATH, so
+           what is written is named after what was read. */
+        Object oWriteCatalogues_ToolItem is a cCJMenuItem
+            Set psCaption to "Write catalogues..."  
+            Set psImage to "WriteJson.ico"
+            Set psToolTip to "Read a DataFlex version's Lib folder and write its language catalogues to Data"
+            Set psDescription to "Writes DfVersion-BuiltIns-<ver>.json and DfVersion-Language-<ver>.json from a chosen install's Lib folder"
+            Set peControlStyle to xtpButtonIconAndCaption
+            Set pbControlBeginGroup to True
+
+            Procedure OnExecute Variant vCommandBarControl
+                Handle ho hoLang
+                String sLib sVer sLst sLng sData sOut sStamp sMsg sRoot sPkg
+                String[] asLines
+                tBuiltInFunc[] aFuncs
+                tDfLanguage Lang
+                Boolean bExists bOK
+                Integer iBuilt iKw iPairs
+
+                /* The reader is created ONCE, up front: it owns the Lib-path derivation as well as
+                   the parse, and asking anything else for LanguageFilePathFor is an "Invalid
+                   message" at runtime, not a compile error - the message id exists, the object just
+                   does not implement it. */
+                Get Create (RefClass(cDfLanguageFile)) to hoLang
+
+                // Open the picker on the CURRENT target's Lib folder - the likeliest answer, and it
+                // saves browsing from the drive root every time.
+                Get psTargetPkgFolder of ghoApplication to sLib
+                If (sLib <> "") ;
+                    Get LanguageFilePathFor of hoLang sLib to sLng        // <root>\Lib\DataFlex.lng
+                If (sLng <> "") ;
+                    Move (Left(sLng, (RightPos("\", sLng) - 1))) to sLib
+                Get Create (RefClass(cSelectFolderDialog)) to ho
+                Get SelectFolder of ho "Select a DataFlex version's Lib folder" sLib to sLib
+                Send Destroy of ho
+                If (sLib = "") Begin
+                    Send Destroy of hoLang
+                    Procedure_Return
+                End
+
+                Move (vFolderFormat(sLib)) to sLib
+                Get DFVersionFromPath of ghoApplication sLib to sVer
+                If (Trim(sVer) = "") Begin
+                    Send Destroy of hoLang
+                    Send Info_Box ("No DataFlex version could be read from that path:" * sLib * "- expected a folder under a 'DataFlex <version>' install.")
+                    Procedure_Return
+                End
+
+                Move (sLib + CS_InstallGlobalFunctionsLst) to sLst
+                Move (sLib + CS_InstallLanguageFile)       to sLng
+                Get vFilePathExists sLst to bExists
+                If (bExists = False) Begin
+                    Get vFilePathExists sLng to bExists
+                    If (bExists = False) Begin
+                        Send Destroy of hoLang
+                        Send Info_Box ("Neither" * CS_InstallGlobalFunctionsLst * "nor" * CS_InstallLanguageFile * "is in" * sLib + " - is that a Lib folder?")
+                        Procedure_Return
+                    End
+                End
+
+                Send Cursor_Wait of (Cursor_Control(Self))
+                Get psDataPath of (phoWorkspace(ghoApplication)) to sData
+                Move "" to sMsg
+
+                // The built-ins, straight through the funclib's own parser and serializer.
+                Get vFilePathExists sLst to bExists
+                If (bExists = True) Begin
+                    Move (rfReadEncodedFileAsStringArray(sLst)) to asLines
+                    Get _BuiltInFuncsFromLines of ghoFuncLib asLines to aFuncs
+                    Move (SizeOfArray(aFuncs)) to iBuilt
+                    Move (String(rfFileDate(sLst)) + "|" + String(rfFileSizeLive(sLst))) to sStamp
+                    Get BuiltInFuncsCacheJsonPathFor of ghoFuncLib sVer to sOut
+                    Send WriteBuiltInFuncsCacheTo of ghoFuncLib aFuncs sStamp sOut
+                    Move (sMsg + String(iBuilt) + " built-in functions -> " + sOut + "\n") to sMsg
+                End
+
+                // The grammar, through the one reader for that file.
+                Get vFilePathExists sLng to bExists
+                If (bExists = True) Begin
+                    Move (rfReadEncodedFileAsStringArray(sLng)) to asLines
+                    Get ParseLines of hoLang asLines to Lang
+                    Move (SizeOfArray(Lang.asKeywords))   to iKw
+                    Move (SizeOfArray(Lang.asScopeStart)) to iPairs
+                    Move (String(rfFileDate(sLng)) + "|" + String(rfFileSizeLive(sLng))) to sStamp
+                    Move (vFolderFormat(sData) + (Replace(".json", CS_DfLanguageCacheJson, ("-" + sVer + ".json")))) to sOut
+                    Get WriteCatalogueJson of hoLang Lang sStamp sOut to bOK
+                    If (bOK = True) ;
+                        Move (sMsg + String(iKw) + " keywords, " + String(iPairs) + " scope pairs -> " + sOut + "\n") to sMsg
+                    Else ;
+                        Move (sMsg + "Could not write " + sOut + "\n") to sMsg
+                End
+
+                /* AND THE Pkg WALK - TypeDefs, ObsoleteScan and the Global-function names.
+
+                   These belong here for the same reason as the two above: every one of them is a
+                   fact about a DataFlex VERSION, read from that version's own install, and none of
+                   them changes unless the install does. The product produces them too, but only
+                   ever for the version it is targeting; this produces them for the version that was
+                   PICKED, which is the whole difference (Nils 2026-08-01).
+
+                   Lib and Pkg are siblings, so the Pkg folder comes from the same install root the
+                   Lib folder was chosen from - no second question to the user. Silent: the walk's
+                   progress bar belongs to a run, and this is a deliberate one-off. */
+                Move (Left(sLib, (Length(sLib) - 1))) to sRoot          // drop the trailing slash
+                Move (Left(sRoot, (RightPos("\", sRoot) - 1))) to sRoot // ...and the "Lib" leaf
+                Move (vFolderFormat(sRoot) + "Pkg") to sPkg
+                If (rfDirectoryExists(sPkg) = True) Begin
+                    Send WalkInstallPackagesFor of ghoFuncLib sPkg sVer True True True False
+                    Move (sMsg + "Pkg walk -> TypeDefs-" + sVer + ".json, ObsoleteScan-" + sVer ;
+                          + ".json, GlobalFuncNames-" + sVer + ".json\n") to sMsg
+                End
+                Else ;
+                    Move (sMsg + "No Pkg folder beside that Lib folder (" + sPkg + ") - skipped the package walk.\n") to sMsg
+
+                Send Destroy of hoLang
+                Send Cursor_Ready of (Cursor_Control(Self))
+                Send Info_Box ("DataFlex" * sVer * "catalogues written:\n\n" + sMsg)
+            End_Procedure
+        End_Object
+
         Object oSave_ToolItem is a cCJSaveMenuItem
             Set peControlStyle to xtpButtonIconAndCaption
             Set pbControlBeginGroup to True
@@ -778,8 +974,8 @@ Object oMain is a Panel
                 Boolean bChangedLegacy bChangedRefactored
 
                 Get DEOInformation (&hoServer) (&bHasRecord) (&bChanged) (&bHasIndex) to bIsDeo
-                Get CM_IsModified of (phoEditorLegacy(ghoApplication))     to bChangedLegacy
-                Get CM_IsModified of (phoEditorRefactored(ghoApplication)) to bChangedRefactored
+                Get IsModified of (phoEditorLegacy(ghoApplication))     to bChangedLegacy
+                Get IsModified of (phoEditorRefactored(ghoApplication)) to bChangedRefactored
                 
                 Function_Return (bChanged = True or bChangedLegacy = True or bChangedRefactored = True)
             End_Function
@@ -816,7 +1012,7 @@ Object oMain is a Panel
         End_Object
 
         Object oRedo_MenuItem is a cCJMenuItem
-            Set psDescription to "Redo last editor action (Ctrl+Z)"
+            Set psDescription to "Redo last editor action (Ctrl+Y)"
             Set psToolTip to "Redo"
             Set psImage to "ActionRedo.ico"
             Set pbActiveUpdate to True
@@ -855,15 +1051,14 @@ Object oMain is a Panel
             Set pbActiveUpdate to True
 
             Procedure OnExecute Variant vCommandBarControl
-                Integer iRetval
                 Boolean bIsWhiteSpace
                 Handle hoEditor
                 
                 Get phoEditorLegacy of ghoApplication to hoEditor
-                Get CM_IsWhitespaceDisplayEnabled of hoEditor to bIsWhiteSpace
-                Get CM_EnableWhitespaceDisplay of hoEditor (not(bIsWhiteSpace)) to iRetval
+                Get IsWhitespaceVisible of hoEditor to bIsWhiteSpace
+                Send ShowWhitespace of hoEditor (not(bIsWhiteSpace))
                 Get phoEditorRefactored of ghoApplication to hoEditor
-                Get CM_EnableWhitespaceDisplay of hoEditor (not(bIsWhiteSpace)) to iRetval
+                Send ShowWhitespace of hoEditor (not(bIsWhiteSpace))
             End_Procedure
             
             Function IsEnabled Returns Boolean
@@ -917,9 +1112,9 @@ Object oMain is a Panel
                 
                 Get phoEditorLegacy of ghoApplication to hoEditor
                 Get pbToggleScopeBlocks to bMode
-                Send ToggleScopeBlocks of hoEditor (not(bMode))
+                Send FoldAllScopes of hoEditor (not(bMode))
                 Get phoEditorRefactored of ghoApplication to hoEditor
-                Send ToggleScopeBlocks of hoEditor (not(bMode))
+                Send FoldAllScopes of hoEditor (not(bMode))
                 Set pbToggleScopeBlocks to (not(bMode))
             End_Procedure
 
@@ -952,11 +1147,11 @@ Object oMain is a Panel
             
             Procedure OnExecute Variant vCommandBarControl
                 Send Activate_oRefactorTestBench of (Client_Id(ghoCommandBars)) 0
-                Send RefactorCode of (phoRefactorView(ghoApplication))
+                Send StartRefactoreCode of ghoApplication
             End_Procedure
 
             Function IsEnabled Returns Boolean  
-                // Don't think we need this, better use the same logic as the oRefactor_btn button.
+                // Don't think we need this, better to use the same logic as the oRefactor_btn button.
 //                String sViewName sObjectName
 //                Move (Name(phoRefactorView(ghoApplication))) to sViewName
 //                Move (Name(Focus(Desktop))) to sObjectName
@@ -991,8 +1186,8 @@ Object oMain is a Panel
                 If (pbIsRefactoring(ghoApplication) = True) Begin
                     Function_Return False
                 End
-                Get SC_LineCount of (phoEditorLegacy(ghoApplication)) to iLegacyLines
-                Get SC_LineCount of (phoEditorRefactored(ghoApplication)) to iRefactorLines
+                Get DocumentLineCount of (phoEditorLegacy(ghoApplication)) to iLegacyLines
+                Get DocumentLineCount of (phoEditorRefactored(ghoApplication)) to iRefactorLines
                 Function_Return (iLegacyLines > 1 and iRefactorLines > 1)
             End_Function
 
@@ -1017,7 +1212,7 @@ Object oMain is a Panel
                 If (pbIsRefactoring(ghoApplication) = True) Begin
                     Function_Return False
                 End
-                Get SC_LineCount of (phoEditorRefactored(ghoApplication)) to iLines
+                Get DocumentLineCount of (phoEditorRefactored(ghoApplication)) to iLines
                 Function_Return (iLines > 1)
             End_Function
             
@@ -1036,9 +1231,9 @@ Object oMain is a Panel
             Procedure OnExecute Variant vCommandBarControl
                 String sTestErrFile
                 Boolean bActive
-                tWorkspacePaths OrgWS
+                tSwsFile OrgWS
 
-                Get pOrgWS of ghoApplication to OrgWS
+                Get pOwnSws of ghoApplication to OrgWS
                 // Resolve the .err the compiler ACTUALLY wrote (cfg-driven suffix,
                 // either bitness) - never predict the name (see CompileRefactoredCode).
                 Get ResolveCompiledFile of ghoApplication CS_TestProgram OrgWS "err" to sTestErrFile
@@ -1056,11 +1251,11 @@ Object oMain is a Panel
             Function IsEnabled Returns Boolean
                 String sTestErrFile
                 Integer iLines
-                tWorkspacePaths OrgWS
+                tSwsFile OrgWS
 
-                Get pOrgWS of ghoApplication to OrgWS
+                Get pOwnSws of ghoApplication to OrgWS
                 Get ResolveCompiledFile of ghoApplication CS_TestProgram OrgWS "err" to sTestErrFile
-                Get SC_LineCount of (phoEditorRefactored(ghoApplication)) to iLines
+                Get DocumentLineCount of (phoEditorRefactored(ghoApplication)) to iLines
                 Function_Return (sTestErrFile <> "" and iLines > 1)
             End_Function
 
@@ -1162,10 +1357,10 @@ Object oMain is a Panel
             Procedure OnExecute Variant vCommandBarControl
                 String sPath sFile
                 Handle hoEditor
-                tWorkspacePaths OrgWS
+                tSwsFile OrgWS
 
-                Get pOrgWS of ghoApplication to OrgWS
-                Move OrgWS.sAppSrc to sPath
+                Get pOwnSws of ghoApplication to OrgWS
+                Get PrimaryAppSrc of ghoApplication OrgWS to sPath
                 Get phoEditorLegacy of ghoApplication to hoEditor
                 Get psCodeFile of hoEditor to sFile
 
@@ -1226,14 +1421,14 @@ Object oMain is a Panel
         Procedure CompileRunProgram String sProgram 
             Boolean bOK
             String sErrorText
-            tWorkspacePaths WS
+            tSwsFile WS
             
             Move (Lowercase(sProgram) contains ".src") to bOK
             If (bOK = False) Begin
                 Append sProgram ".src"
             End
             // Compile program:
-            Get pOrgWS of ghoApplication to WS
+            Get pOwnSws of ghoApplication to WS
             Get CompileProgram of ghoApplication sProgram WS (&sErrorText) to bOK
             If (bOK = False) Begin
                 Send Info_Box sErrorText
@@ -1298,6 +1493,24 @@ Object oMain is a Panel
 
         End_Object
 
+        /* The same Compiler Settings dialog the main program's flows use (CompilerSetup.dg,
+           SysFile-backed, so the choice is shared with DFRefactor) - until now TestBench could
+           only CONSUME the setting, and a wrong or missing compiler could not be fixed without
+           starting the main program (Nils 2026-08-28). */
+        Object oCompilerSetup_Menuitem is a cCJMenuItem
+            Set psCaption to "&Compiler Settings"
+            Set psToolTip to "Compiler settings"
+            Set psDescription to "Select the compiler and its options for Test Compile"
+            Set psImage to "CompileProjectSetup.ico"
+            Set peControlStyle to xtpButtonIcon
+
+            Procedure OnExecute Variant vCommandBarControl
+                Forward Send OnExecute vCommandBarControl
+                Send Popup of (oCompilerSetup_dg(Client_Id(ghoCommandBars)))
+            End_Procedure
+
+        End_Object
+
         Object oScintillaEditorSettings_Mentuitem is a cCJMenuItem
             Set psCaption to "E&ditor Settings"
             Set psToolTip to "Scintilla editor settings"
@@ -1341,13 +1554,13 @@ Object oMain is a Panel
             End_Object
 
             Object oSuggestion_MenuItem is a cCJMenuItem
-                Set psTooltip to "Suggest"
+                Set psToolTip to "Suggest"
                 Set psDescription to "Suggest a feature, or report a bug..."
                 Set psImage to "Suggestion.ico"
                 Set pbControlBeginGroup to True
 
                 Procedure OnExecute Variant vCommandBarControl
-                    Runprogram Shell Background "https://github.com/NilsSve/DfRefactor/issues"
+                    Runprogram Shell Background "https://github.com/NilsSve/DfRefactor/issues/new/choose"
                 End_Procedure
 
             End_Object
@@ -1361,7 +1574,7 @@ Object oMain is a Panel
 
                 // Default action when clicking the drop-down button.
                 Procedure OnExecute Variant vCommandBarControl
-                    Runprogram Shell Background "https://www.rdctools.com/DFRefactor/index.html"
+                    Runprogram Shell Background "https://www.rdctools.com/HTMLHELPDFRefactor/index.html"
                 End_Procedure
 
                 Object oHelpMenuItemLocal is a cCJHelpMenuItem
@@ -1372,7 +1585,7 @@ Object oMain is a Panel
                     Set psCaption to "Online HTML Help"
                     Set psImage to "ActionHelpInternet.ico"
                     Procedure OnExecute Variant vCommandBarControl
-                        Runprogram Shell Background "https://www.rdctools.com/DFRefactor/index.html"
+                        Runprogram Shell Background "https://www.rdctools.com/HTMLHELPDFRefactor/index.html"
                     End_Procedure
 
                 End_Object
@@ -1401,9 +1614,12 @@ Object oMain is a Panel
         End_Object
 
         Object oStatusBar is a cCJStatusBar
-            Set StatusBar_Id to Self
+            Set Statusbar_Id to Self
             Set psIdleText to "No Action"
 
+            // NOTE (2026-07-26): as in DFRefactor.src - and UNLIKE DFRefactorFT.src - StatusText
+            // here writes to pane 1, so the view name on pane 2 is already separated from it.
+            // Do not "align" the three layouts without checking which pane StatusText uses.
             Object oStatusPane1 is a cCJStatusBarPane
                 Set piID to sbpIDIdlePane
                 Set pbStyleStretch to True
@@ -1480,11 +1696,12 @@ Object oMain is a Panel
         // *** Other program files: ***
 //        Use Dd_debug.dg
         Use ScintillaParameters.dg
+        Use cRefactorEditorSettings.pkg   // JSON-backed settings: repoints ghoEditorProperties (must follow the editor chain)
         Use CompilerOutput.dg
-//        Use ModAnalyzer.dg          // .err-triage panel + ActivateModAnalyzer/CloseModAnalyzer globals
         Use EngineErrorLog.dg
         Use EngineLogFile.dg
         Use ProgramSetup.dg
+        Use CompilerSetup.dg
         Use ShowOtherLogFiles.dg
           
         // Function maintenance is not needed anymore.

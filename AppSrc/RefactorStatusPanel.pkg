@@ -65,7 +65,7 @@
 // Get/Set Action_Text  - updates the action area
 // Get/Set Button_Text  - updates the button area
 //
-// Get/Set Allow_cancel_state - determines if panel can be canceled
+// Get/Set Allow_Cancel_State - determines if panel can be canceled
 // Send EnableCancelButton - code you should provide to enable/disable cancel button
 //
 // ghoStatusPanel - global handle that points to the standard status panel.
@@ -78,9 +78,8 @@ Use RefactorConstants.h.pkg
     Move 0 to ghoEngine
 #ENDIF
 
-Register_Function TimeSpanToString TimeSpan tsTotalTime Returns String
-
 Use Windows.pkg
+Use RDCTimeSpan.pkg              // RDCTimeSpanToClock - the elapsed-time clock (RDCToolsLib)
 #IFNDEF ghoStatusPanel
     Global_Variable Handle ghoStatusPanel // will contain the ID of the global StatusPanel object
     Move 0 to ghoStatusPanel
@@ -108,6 +107,32 @@ Object oRefactorStatusPanel is a cProcessStatusPanel
     // throttle UpdateTimeSpan to ~1Hz despite Set Action_Text firing per line.
     // Value 0 means "force next update to paint" (set by Start_StatusPanel).
     Property Integer piLastTimeSpanUpdate 0
+
+    /* WALL-CLOCK PAINT GATE for tight per-item loops (Nils 2026-07-26).
+
+       A loop that repaints AND pumps the message queue once per item pays far more for the UI than
+       for the work. The Deep Scan's per-file block ran FOUR pumps for every file - Caption_Text and
+       TableName_Text each pump, then an explicit PumpMsgQueue, then Check_StatusPanel's
+       ProcessEvents - i.e. ~6,700 pumps on a 1,686-file workspace, nearly all of them wrapped around
+       a cache hit that costs microseconds. That is why the whole cycle got slower the moment the
+       scan became part of every Check.
+
+       Callers ask this FIRST and do the expensive part only when it answers True, so the UI cost is
+       bounded by TIME (a few paints a second) instead of by item count - and it self-tunes: a fast
+       loop paints rarely, a slow one still paints often enough to look alive and to dispatch Cancel.
+       Returns True on the first call so the panel paints immediately; reset by Start_StatusPanel. */
+    Define CI_PanelPaintMs for 200
+    Property Integer piLastPanelPaint 0
+
+    Function PanelPaintDue Returns Boolean
+        Integer iNow iLast
+        Move (GetTickCount()) to iNow
+        Get piLastPanelPaint to iLast
+        If (iLast <> 0 and (iNow - iLast) < CI_PanelPaintMs) ;
+            Function_Return False
+        Set piLastPanelPaint to iNow
+        Function_Return True
+    End_Function
 
     Set Location to 1 2
 
@@ -164,7 +189,7 @@ Object oRefactorStatusPanel is a cProcessStatusPanel
         Set Label to C_$Cancel
 
         Procedure OnClick 
-            Send Close_panel
+            Send Close_Panel
         End_Procedure
 
     End_Object
@@ -288,8 +313,21 @@ Object oRefactorStatusPanel is a cProcessStatusPanel
         Function_Return (Label(oTitleTxt))
     End_Function
 
+    // FIELD CONVENTIONS (Nils 2026-07-16): TableName_Text = table names AND file names -
+    // especially full paths, oTableNameTxt is the MULTI-LINE box; Message_Text = the refactor
+    // function currently in action; Action_Text (= Update_StatusPanel) = source-LINE-level
+    // texts. TableName_Text pumps like every base setter (Caption/Title/Message/Action all
+    // ProcessEvents in cProcessStatusPanel) so a loop that only updates the file line still
+    // paints AND dispatches the Cancel click - it was the one field that did not, which made
+    // per-file loops that used it look frozen.
     Procedure Set TableName_Text String sText
         Set Label of oTableNameTxt to sText
+        Send ProcessEvents
+        // Per-FILE loops (Deep Scan, the whole-file report functions) update ONLY this field +
+        // Caption - never Message/Action, the clock's other drivers - so the panel's Elapsed
+        // Time froze at its initial 00:00:00 paint (Nils 2026-07-17, the LegacyApp2 scan). Drive
+        // the clock here too; the ~1Hz throttle inside keeps the per-file cost nil.
+        Send UpdateTimeSpan
     End_Procedure
 
     Function TableName_Text Returns String
@@ -380,46 +418,15 @@ Object oRefactorStatusPanel is a cProcessStatusPanel
         Set Enabled_State of oStopButton to bEnable
     End_Procedure
 
-    // This is duplicating the same function in cRefactorEngine.pkg
-    // Makes it easier to use StatusPannel without the depency of that class.
-    Function TimeSpanToString TimeSpan tsTime Returns String
-        Integer iDays iHours iMinutes iSeconds iMilliseconds
-        String  sTime
-
-        Move "" to sTime
-        Move (SpanDays(tsTime))    to iDays
-        Move (SpanHours(tsTime))   to iHours
-        Move (SpanMinutes(tsTime)) to iMinutes
-        Move (SpanSeconds(tsTime)) to iSeconds
-        Move (SpanMilliSeconds(tsTime)) to iMilliSeconds
-        If (iDays > 0) Begin   // Don't show days if it is zero
-            Move (String(iDays) + ":") to sTime
-        End
-        If (iHours < 10) Begin
-            Move (sTime+"0") to sTime
-        End
-        Move (sTime + String(iHours) + ":") to sTime
-        If (iMinutes < 10) Begin
-            Move (sTime + "0") to sTime
-        End
-        Move (sTime + String(iMinutes) + ":") to sTime
-        If (iSeconds < 10) Begin
-            Move (sTime + "0") to sTime
-        End
-        // Zero-pad ms to 3 digits so 1.007s renders as "01.007", not "01.7".
-        Move (sTime + String(iSeconds) + "." + Right("000" + String(iMilliseconds), 3)) to sTime
-
-        Function_Return sTime
-    End_Function
-
    // Called by Set Message_Text and Set Action_Text on every text update,
    // which happens once per refactored line in the engine's tight loop.
    // Throttling to ~1Hz keeps the format work + redraw cheap and stops the
    // seconds field flickering rapidly.
    Procedure UpdateTimeSpan
         DateTime dtExecStart dtExecCurrent
+
         TimeSpan tsTotalTime
-        Integer iHours iMinutes iSeconds iDays iNow iLast
+        Integer iNow iLast
         String sTotalTime
 
         Get pdtExecStart to dtExecStart
@@ -440,21 +447,18 @@ Object oRefactorStatusPanel is a cProcessStatusPanel
         Move (CurrentDateTime()) to dtExecCurrent
         Move (dtExecCurrent - dtExecStart) to tsTotalTime
 
-        // Wall-clock display: HH:MM:SS only. Ms is too jittery for a
-        // human-watched timer; the engine's end-of-run summary still uses
-        // TimeSpanToString and shows ms there.
-        Move (SpanDays(tsTotalTime))    to iDays
-        Move (SpanHours(tsTotalTime))   to iHours
-        Move (SpanMinutes(tsTotalTime)) to iMinutes
-        Move (SpanSeconds(tsTotalTime)) to iSeconds
-        Move "" to sTotalTime
-        If (iDays > 0) Begin
-            Move (String(iDays) + ":") to sTotalTime
-        End
-        Move (sTotalTime + Right("0" + String(iHours),   2) + ":" + ;
-                           Right("0" + String(iMinutes), 2) + ":" + ;
-                           Right("0" + String(iSeconds), 2)) to sTotalTime
+        // Wall-clock display: HH:MM:SS only. Ms is too jittery for a human-watched timer; the
+        // engine's end-of-run summary shows them (RDCTimeSpanToString).
+        Get RDCTimeSpanToClock tsTotalTime to sTotalTime
         Set Value of oElapsedTime to ("Elapsed Time:" * sTotalTime)
+        // PAINT IT NOW (Nils 2026-07-25, ChangeCollidingMethodName): every driver of this clock
+        // pumps BEFORE calling us - Message_Text/Action_Text via their Forward, TableName_Text via
+        // its own ProcessEvents - so the value set on the line above waited for the NEXT driver
+        // call to reach the screen. A per-FILE loop over big files (or any long stretch between two
+        // panel updates) therefore showed a clock frozen one update behind. Pump here, AFTER the
+        // paint, so the seconds land immediately; the 1Hz throttle above bounds the cost to one
+        // pump per second no matter how often the drivers fire.
+        Send ProcessEvents
    End_Procedure
 
    // Reset clock state so each new run measures from its own start.
@@ -463,6 +467,7 @@ Object oRefactorStatusPanel is a cProcessStatusPanel
    Procedure Start_StatusPanel
         Set pdtExecStart           to (NullDateTime())
         Set piLastTimeSpanUpdate   to 0
+        Set piLastPanelPaint       to 0    // first PanelPaintDue of a new run paints at once
         Send UpdateTimeSpan
         Forward Send Start_StatusPanel
    End_Procedure

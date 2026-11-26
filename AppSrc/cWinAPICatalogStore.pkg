@@ -1,0 +1,187 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cWinAPICatalogStore
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-26
+//
+// Description : The Windows API catalogues as editable JSON: loads Data\WinAPICatalog.json
+//               and Data\WinAPIStructCatalog.json over the compiled-in seed. The seed is the
+//               floor - a missing or unreadable file degrades to the seed, never to a broken
+//               tool. Carries the load/refresh latch and the lookups the funclib consumes.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use RefactorFileIO.pkg   // rfOpenInput / rfOpenOutput / Read_Block - the same channel I/O the rules JSON uses
+Use cJsonObject.pkg
+
+/*  cWinAPICatalogStore - the Windows API catalogues as editable JSON.
+
+    THE COMPILED SEED IS THE FLOOR, the JSON is where the catalogue GROWS. WinAPICatalog.inc and its
+    two siblings are still #Included into cBaseFuncLib and still ship in the exe; this only decides
+    which rows the funclib ends up holding. A missing or unreadable file therefore degrades to
+    "the seed", never to a broken tool - which is why the seed was not simply replaced.
+
+    WHY IT HAD TO BECOME EDITABLE. The catalogue's only real problem is size: 56 API entries against
+    the 1,310 distinct entry points found across the workspaces on C:. Adding entries must cost an
+    edit, not a build, or it will not happen.
+
+    ONE LOADER FOR THREE CATALOGUES, because all three are String[] of "|"-packed rows. What differs
+    is how many leading fields make a row's IDENTITY - dll|entry for an API, the NAME alone for a
+    struct or a bitness split - so that count is a parameter.
+
+    THE MERGE RULE IS THE POINT, and it differs from DeepScanRules.json. There a user contributes a
+    TOGGLE, merged across by DS number. Here a user contributes whole ROWS, so on a version bump the
+    seed replaces the rows it owns (a corrected prototype must actually reach an existing install)
+    and every row the seed does NOT own is carried across. Without that, a version bump would delete
+    a user's additions silently - not noticed until something quietly stopped converting.
+
+    ALL PATHS ARE EXPLICIT PARAMETERS so the unit tests never touch the real files, exactly as
+    cDeepScanner does.
+*/
+// A row's identity: its first iKeyFields "|"-separated fields, lowercased. Two rows with the same key are
+// the same entry however their payload differs, which is what lets a seed row replace a user's stale copy of
+// it while leaving a genuinely new row alone. The one rule - the store's merge test exercises it through
+// _RowKey below, the harvester's merge (cWin32ProjectionHarvester) calls it directly.
+Function WinApiRowKey Global String sRow Integer iKeyFields Returns String
+    String sOut sRest
+    Integer i iPos
+
+    Move "" to sOut
+    Move sRow to sRest
+    For i from 1 to iKeyFields
+        Move (Pos("|", sRest)) to iPos
+        If (iPos = 0) Begin
+            If (sOut = "") ;
+                Function_Return (Lowercase(Trim(sRest)))
+            Function_Return (Lowercase(sOut + sRest))
+        End
+        Move (sOut + Left(sRest, iPos)) to sOut
+        Move (Right(sRest, (Length(sRest) - iPos))) to sRest
+    Loop
+    Function_Return (Lowercase(sOut))
+End_Function
+
+Class cWinAPICatalogStore is a cObject
+
+    // Why the last load returned nothing, or "" when it was fine. Read by the caller so an empty
+    // catalogue can announce itself instead of passing for "nothing to convert".
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Property String psLastProblem ""
+    End_Procedure
+
+    /* DFRefactor's OWN Data folder - pOrgWS, never pTargetWS. These catalogues are knowledge about
+       Windows, not about the workspace being refactored, so one copy serves every target. Returns
+       "" when the app has no resolved own-workspace yet (which happens during keyword-init on a
+       fresh start); the caller reads that as "no JSON layer" and uses the seed. */
+    Function CatalogJsonPath String sFileName Returns String
+        String sData
+        Handle hoWS
+
+        If (ghoApplication = 0) ;
+            Function_Return ""
+        // phoWorkspace, NOT pOrgWS. Both name DFRefactor's own Data folder, but pOrgWS lives on
+        // cRefactorApplication only - and the DFUnit runner is built on plain cApplication, where
+        // reading it raises err 98. This resolver has to answer in both, so it uses the accessor
+        // both have; it is the same one ModAnalyzerRecipesJsonPath reads for the same reason.
+        Get phoWorkspace of ghoApplication to hoWS
+        If (hoWS = 0) ;
+            Function_Return ""
+        Get psDataPath of hoWS to sData
+        If (Trim(sData) = "") ;
+            Function_Return ""
+        Function_Return (vFolderFormat(sData) + sFileName)
+    End_Function
+
+    // The rule WinApiRowKey states, as the method the merge test exercises.
+    Function _RowKey String sRow Integer iKeyFields Returns String
+        Function_Return (WinApiRowKey(sRow, iKeyFields))
+    End_Function
+
+    Function _ReadCatalogFile String sPath Returns tWinAPICatalogFile
+        Handle hoJson
+        tWinAPICatalogFile TheFile
+
+        Get rfParseJsonFile sPath to hoJson
+        If (hoJson <> 0) Begin
+            Get JsonToDataType of hoJson to TheFile
+            Send Destroy of hoJson
+        End
+        Function_Return TheFile
+    End_Function
+
+    Procedure WriteCatalogAtVersion String[] asRows String sPath Integer iVersion
+        Handle hoJson
+        UChar[] ucJson
+        Integer iCh
+        tWinAPICatalogFile TheFile
+
+        If (Trim(sPath) = "") ;
+            Procedure_Return
+        Move iVersion to TheFile.iVersion
+        Move asRows   to TheFile.asRows
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson TheFile
+        Set peWhiteSpace of hoJson to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoJson to ucJson
+        Send Destroy of hoJson
+        Get rfOpenOutput sPath to iCh
+        If (iCh < 0) ;
+            Procedure_Return
+        Write channel iCh ucJson
+        Send rfCloseOutput iCh
+    End_Procedure
+
+    Procedure WriteCatalog String[] asRows String sPath
+        Send WriteCatalogAtVersion asRows sPath CI_WinAPICatalogVersion
+    End_Procedure
+
+    /* The rows every consumer reads. THE FILE IS THE ONLY COPY - there is no compiled seed behind
+       it any more, and that single fact shapes everything below.
+
+       WHY NO SEED. The catalogue is hand-curated data, not logic, and it exists to be EXTENDED
+       without a rebuild. Keeping a compiled copy as well would have meant two tracked originals
+       that drift, and worse: on a version bump the seed would replace a row the user had edited,
+       which is the feature fighting itself. Git is the source of truth, and it holds a tracked
+       .json exactly as well as it held a .inc (Nils, 2026-08-26).
+
+       SO IT NEVER REWRITES THE FILE ON A VERSION MISMATCH. With a seed, a bump meant "reseed and
+       merge". With none, an older iVersion means only that the file predates a format change -
+       and rewriting it from nothing would destroy the very rows it is asked to load. Old rows are
+       returned as they are; migrating a format is a deliberate act, not a side effect of reading.
+
+       A MISSING OR UNREADABLE FILE IS REPORTED, not shrugged off. It degrades safely - every
+       converter refuses an API it cannot find - but silently, and "no conversions" reads exactly
+       like "nothing needed converting". psLastProblem carries the reason so a caller can say it. */
+    Function LoadCatalog String sPath Returns String[]
+        tWinAPICatalogFile TheFile
+        String[] asNone
+        Boolean bExists
+
+        Set psLastProblem to ""
+        If (Trim(sPath) = "") Begin
+            Set psLastProblem to "No workspace resolved yet, so no catalogue path could be built."
+            Function_Return asNone
+        End
+        Get vFilePathExists sPath to bExists
+        If (bExists = False) Begin
+            Set psLastProblem to ("Catalogue file not found: " + sPath ;
+                + " - every API lookup will come back empty until it is restored.")
+            Function_Return asNone
+        End
+        Get _ReadCatalogFile sPath to TheFile
+        If (SizeOfArray(TheFile.asRows) = 0) Begin
+            Set psLastProblem to ("Catalogue file holds no rows (unreadable or empty): " + sPath)
+            Function_Return asNone
+        End
+        If (TheFile.iVersion <> CI_WinAPICatalogVersion) ;
+            Set psLastProblem to ("Catalogue file is format version " + String(TheFile.iVersion) ;
+                + ", this build expects " + String(CI_WinAPICatalogVersion) ;
+                + " - rows loaded as they are; the file is NOT rewritten, it is the only copy.")
+        Function_Return TheFile.asRows
+    End_Function
+
+End_Class

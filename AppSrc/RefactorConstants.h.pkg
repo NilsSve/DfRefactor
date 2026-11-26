@@ -18,6 +18,7 @@
  OUT of or IN CONNECTION WITH THE SOFTWARE or THE Use OR OTHER DEALINGS IN THE
  SOFTWARE.
 */
+Use VDFBase.pkg    // C_NewLine - the system CRLF; DFRefactor's own duplicates retired 2026-08-28
 Use Windows.pkg
 Use DFClient.pkg
 
@@ -49,12 +50,40 @@ CONSOLE_FONTSIZE 12 8
     Move 0 to ghoCompilerOutputDock
 #ENDIF
 
+// Monotonic compile "generation" - bumped by TestCompileFT.StartCompile on every compile. Stamped into the
+// Compiler Output grid's view signature (psLoadedViewSig) so a RECOMPILE always yields a different signature
+// than the pre-recompile capture: the highlight keeper then correctly SKIPS restoring the old selection (a
+// stale warning) and lets the loader's own positioning stand (error-summary top / first error). Without it,
+// two compiles of the same program share the file-path signature and a recompile looks like a tab-swap.
+#IFNDEF ghiCompileGen
+    Global_Variable Integer ghiCompileGen
+    Move 0 to ghiCompileGen
+#ENDIF
+
+// True once a compile has left output (.prn/.err) to analyze; gates the dashboard guided tile's Analyze
+// step the same way the Test Compile bar's bHaveOutput does (the dashboard can't see the bar's panel-local
+// paths). Published from the bar's ActionButtonsHtml; RESET on every workspace change - a fresh workspace
+// has nothing compiled yet, so only Compile should light. (Nils 2026-07-12.)
+#IFNDEF ghbHaveCompileOutput
+    Global_Variable Boolean ghbHaveCompileOutput
+    Move False to ghbHaveCompileOutput
+#ENDIF
+
 // Handle of the Modernization Analyzer dock (oModAnalyzer_dg), set when it is shown.
 // Lets the earlier-Used CompilerOutput.dg / TestCompileFT.dg hide it (one-at-a-time docks)
 // without naming oModAnalyzer_dg directly, since that object is Used later.
 #IFNDEF ghoModAnalyzerDock
     Global_Variable Handle ghoModAnalyzerDock
     Move 0 to ghoModAnalyzerDock
+#ENDIF
+
+// FT only: handle of the Manual Changes AREA (oManualArea, ManualChangesFT.dg) - the third bottom tab, a
+// worklist of what the refactoring functions DECLINED to do. Deliberately separate from the Analyzer grid:
+// "what did the compiler find?" and "what is left for me to do?" are different questions, and any converter
+// can push a row here without knowing where the grid lives.
+#IFNDEF ghoManualChangesDock
+    Global_Variable Handle ghoManualChangesDock
+    Move 0 to ghoManualChangesDock
 #ENDIF
 
 // FT only: handle of the merged bottom dock (oOutputDock_dg, OutputDockFT.dg) that hosts both the Compiler
@@ -89,13 +118,19 @@ End_Struct
 // Meta-data tag type. Used when parsing RegisterInterface message.
 Enum_List
     Define eMethodType  for 0
-    Define eSummaryText for 1
-    Define eEnumList    for 2
-    Define eInitValue   for 3
-    Define eHelpTopic   for 4
-    Define ePrivate     for 5    // { Private = True } meta-tag; sets Functions.bPrivate
-    Define eModRecipe   for 6    // { ModRecipe = "msg# | match-text | [category]" } - maps a compiler message to this function
-    Define eFnGroup     for 7    // { FnGroup = Modernization | Cleanup } - groups the function in the Select Functions picker
+    Define eSummaryText 
+    Define eEnumList    
+    Define eInitValue   
+    Define eHelpTopic   
+    Define ePrivate         // { Private = True } meta-tag; sets Functions.bPrivate
+    Define eModRecipe       // { ModRecipe = "msg# | match-text | [category]" } - maps a compiler message to this function
+    Define eFnGroup         // { FnGroup = Modernization | Cleanup } - groups the function in the Select Functions picker
+    Define eNoDoc           // { NoDoc = True } - keep the function OUT of the generated help. It stays fully
+                            //   available in the program; only the manual skips it. See bNoDoc below.
+    Define eFnFamily        // { FnFamily = <name> } - functions doing the SAME job on different keywords are
+                            //   rendered as ONE table in the generated help instead of a run of
+                            //   near-identical sections. Free text; the generator groups by exact
+                            //   match, so a typo shows up as a family of one in its log.
 End_Enum_List
 
 Struct tFuncEnumList
@@ -120,8 +155,14 @@ Struct tFuncLib
     Boolean bFuncEnumList       // True if the FuncEnumList struct contains data.
     tFuncEnumList FuncEnumList
     Boolean bPrivate            // True when the function carries a { Private = True } meta-tag.
+    String sFnFamily            // { FnFamily } value, or blank. Members of a family share one
+                                // table in the generated function help. A family must not span
+                                // MethodTypes - the tables are rendered per page.
+    Boolean bNoDoc              // True when the function carries a { NoDoc = True } meta-tag: the
+                                // generated function help skips it. Independent of bPrivate, but a
+                                // private function is skipped too - it is not part of the shipped set.
     String[] asModRecipe        // Raw { ModRecipe } tag values (msg# | match-text | [category]); one per compiler message this function fixes.
-    Integer eFunctionGroup      // { FnGroup } value: eFnGroupOther(0) / eFnGroupModernization(1) / eFnGroupCleanup(2). Groups the Select Functions picker. Mirrors eFunctionType.
+    Integer eFunctionGroup      // { FnGroup } value: eFnGroupOther(0) / eFnGroupModernization(1) / eFnGroupCleanup(2) / eFnGroupUnicode64(3). Groups the Select Functions picker. Mirrors eFunctionType.
 End_Struct
 
 // One legacy "Type ... End_Type" definition captured from a (usually system) package - the type
@@ -135,7 +176,7 @@ End_Struct
 // packages normally change only on a DataFlex version bump, but an in-place update (same version
 // folder) can revise them too - so sPkgNewest stamps the newest *.pkg write time captured at scan
 // time and the cache self-invalidates when a package is later found newer (see _PkgScanIsStale).
-// Keyed by the target DF version in the filename (Data\TypeDefs-<ver>.json); iVersion is the cache
+// Keyed by the target DF version in the filename (Data\DfVersion-TypeDefs-<ver>.json); iVersion is the cache
 // FORMAT version - bump CI_TypeDefsCacheVersion to force a reseed if the extraction/format changes.
 Struct tTypeDefCacheFile
     Integer iVersion
@@ -143,14 +184,143 @@ Struct tTypeDefCacheFile
     tTypeDef[] aDefs
 End_Struct
 
+// Cache file shape for the install-package Global-function-name catalogue (see
+// CS_GlobalFuncNamesCacheJson). Same iVersion + sPkgNewest watermark scheme as tTypeDefCacheFile.
+Struct tGlobalFuncNamesCacheFile
+    Integer iVersion
+    String sPkgNewest
+    String[] asNames
+End_Struct
+
+/* ONE BUILT-IN GLOBAL FUNCTION, read from the install's own Lib\GlobalFunctions.lst.
+
+   These are the functions the COMPILER implements - Abs, Trim, Cast, Character, If, Eval, the whole
+   DateGet / DateSet family - and they are declared in no .pkg source anywhere. That is why the
+   Pkg-source walk behind tGlobalFuncNamesCacheFile above cannot see them: measured 2026-08-01, it
+   finds 2 of the 85. Two catalogues, two different populations, and neither is a substitute for the
+   other (see the 4390 "cannot see runtime globals" rule).
+
+   Signature and return type come along for free because the .lst carries them:
+       Abs: (Real rValue) [Real]
+   They are kept as WRITTEN rather than parsed into parts - nothing consumes them yet, and inventing
+   a parameter model before there is a reader would be guessing at the shape it needs. */
+Struct tBuiltInFunc
+    String sName          // the function name, as the install spells it
+    String sParams        // the parameter list as written, e.g. "(Real rValue)" - "()" when none
+    String sReturns       // the return type as written, e.g. "Real" - blank if the line omits it
+End_Struct
+
+/* The per-target-version cache of the above. iVersion is this file's SCHEMA; sSourceStamp is the
+   .lst's own last-write + size, which is exact and cheap - unlike the Pkg walk's watermark, there is
+   only ever one file to stamp. */
+Struct tBuiltInFuncsCacheFile
+    Integer iVersion
+    String sSourceStamp
+    tBuiltInFunc[] aFuncs
+End_Struct
+
+/* One NAMED ERROR NUMBER of the target DataFlex, read from <install>\Pkg\errornum.inc:
+       #REPLACE DFERR_REC_NOT_FOUND                             25
+   'Error 25' and 'Error DFERR_REC_NOT_FOUND' are the same error - the name is a #REPLACE of the number -
+   so ChangeErrorNumberToName can rename one to the other and nothing an error handler sees changes.
+   Every install from 18.1 to 27.0 names each number once (measured 2026-10-23: 380 names on 18.1, 392
+   on 26.0), and later releases only ADD names - which is why the catalogue is per target version. */
+Struct tErrorName
+    Integer iNumber
+    String sName
+End_Struct
+
+// The per-target-version cache of the above - the same iVersion + sSourceStamp scheme as
+// tBuiltInFuncsCacheFile (one install file, stamped by last-write + size).
+Struct tErrorNamesCacheFile
+    Integer iVersion
+    String sSourceStamp
+    tErrorName[] aNames
+End_Struct
+
+/* THE LANGUAGE ITSELF, read from the target install's Lib\DataFlex.lng - the file the Studio lexes
+   with, so this is what DataFlex says DataFlex is.
+
+   asScopeStart / asScopeEnd are PARALLEL and unsorted: entry i of one closes with entry i of the
+   other. That pairing is the reason to read this file at all. The funclib's own pasScopeStart /
+   pasScopeEnd are sorted sets for fast lookup and CANNOT carry it - sorting either array destroys
+   the correspondence - so the pairs live here and travel separately.
+
+   The pairing is not one-to-one in either direction: Begin closes with End, Loop OR Until, so the
+   same opener appears three times with three different partners. Any matcher has to allow a set of
+   partners per opener, never a single lookup. */
+Struct tDfLanguage
+    String[] asKeywords
+    String[] asOperators
+    String[] asScopeStart
+    String[] asScopeEnd
+    String[] asMetaTags
+End_Struct
+
+Struct tDfLanguageCacheFile
+    Integer iVersion
+    String sSourceStamp
+    tDfLanguage Language
+End_Struct
+
+// One byte-buffer usage CLUSTER for TypeToStructReport's Tier-1 auto-convert feasibility grading:
+// within ONE scope (a procedure/function, or "(file)" for a file-scope buffer), ONE String buffer
+// variable used AS one Type via the legacy accessors (ZeroType / Put / GetBuff / ...). An empty
+// asBlockers = every use of this buffer is mechanically rewritable to a Struct local (the Tier-1
+// subset a future converter could auto-apply); otherwise each blocker names the exact reason +
+// line, so the developer knows why that cluster stays a hand-migrate. Built per file by
+// _TypeClustersFromLines (cRefactorFuncLib).
+Struct tTypeBufferCluster
+    String sTypeName
+    String sFile
+    String sScope           // Procedure/function name the buffer lives in; "(file)" = file-scope buffer.
+    String sBuffer
+    Integer iFirstLine      // First accessor line binding the buffer to the Type (1-based).
+    Integer iBindings       // Number of accessor lines in the cluster.
+    String[] asBlockers     // Empty = AUTO-CONVERTIBLE.
+    /* The EXACT lines the grading looked at - the String declaration and every accessor of this
+       buffer - 1-BASED, like iFirstLine above. Returned so that a CONVERTER rewrites precisely
+       what was graded: re-deriving the scope in a second walk is how the two would drift apart,
+       and the grader has these numbers already (Nils 2026-08-31, Tier 2).
+       iDeclLine is -1 when no declaration was found in scope - itself a blocker. */
+    Integer   iDeclLine
+    Integer[] aiAccLines
+End_Struct
+
+// One row of the FloatingPopupMenu -> cCJContextMenu emitter's model (_CJPopupBlockToContextMenu,
+// cRefactorFuncLib): an ITEM with its caption, message, explicit target, tooltip and whether a
+// separator precedes it; or a COMMENT / BLANK line carried where it stood. A separator is not a row -
+// it flags the next item and takes a legacy item index, which iItemIx keeps for the Shadow_State
+// translation of the Popup override.
+Struct tCJPopupRow
+    String  sKind       // ITEM | COMMENT | BLANK
+    String  sCap        // the legacy caption, accelerator included
+    String  sMsg        // the bare message (no Msg_ prefix)
+    String  sTarget     // the 'to <target>' clause, or ""
+    String  sTip        // Status_Help
+    String  sRaw        // a COMMENT's text
+    Boolean bGroup      // a separator precedes this item
+    Integer iItemIx     // the legacy item index (0-based, separators count); -1 for a non-item
+End_Struct
+
 // --- .err analysis track: compiler-error triage (see cModAnalyzer.pkg) ---
 // eCategory ranks how a parsed .err error can be handled. Phase 1 only classifies
 // and explains (read-only); Suggest / AutoFix drive the later apply phases.
 Enum_List
-    Define eModUnknown      for 0   // No recipe yet - review manually.
-    Define eModExplain      for 1   // Explain only; manual fix (needs judgement).
-    Define eModSuggest      for 2   // A concrete fix can be suggested (Phase 2).
-    Define eModAutoFix      for 3   // An existing refactor function already fixes it.
+    Define eModUnknown      for 0  // No recipe yet - review manually.
+    Define eModExplain             // Explain only; manual fix (needs judgement).
+    Define eModSuggest             // A concrete fix can be suggested (Phase 2).
+    Define eModAutoFix             // An existing refactor function already fixes it.
+End_Enum_List
+
+/* WHY a reported construct is not on the line the compiler pointed at (MacroExpansionCause). The
+   analyzer used to call every one of these "inside macro expansions"; on WinServ most were object
+   declarations, where the construct lives in the CLASS. Unknown is a real answer - the row then shows
+   the line instead of naming a cause nobody established. (2026-08-19) */
+Enum_List
+    Define eMacroCauseUnknown for 0 // cannot tell from the line - show the line itself
+    Define eMacroCauseClass         // "Object X is a <Class>" - the construct is in that class
+    Define eMacroCauseMacro         // the line invokes a command/macro whose body carries it
 End_Enum_List
 
 Struct tModAnalyzer
@@ -163,7 +333,391 @@ Struct tModAnalyzer
     String sRefactorFn      // Refactor function that addresses it ("" if none / Explain-only).
 End_Struct
 
-Define CR_LF for (Character(13) + Character(10))
+// --- Deep Scan track: source-driven obsolete-symbol scanner (see cDeepScanner.pkg) ---
+// The compiler warns about only a fraction of the retired language surface - most obsolete
+// commands/symbols either fail hard or compile SILENTLY (If Not, Chain, the Reg_* family...).
+// Deep Scan finds them by scanning the SOURCE against a catalog seeded from the docs'
+// "Obsolete Commands, Functions & Other Symbols" list. eDSKind picks the detection rule -
+// context matters: Left/Mid/Pos/Trim are obsolete only as COMMANDS (the functions are modern),
+// EQ/GE/IN only inside command-syntax comparisons, Not only in the two-word If form.
+Enum_List
+    Define eDSCommandPos    for 0   // Symbol opens the code line (1- or 2-word token).
+    Define eDSAnywhere              // Whole-word match anywhere in the CODE (comments/literals never).
+    Define eDSConditionLine         // Whole-word match, but only on an If/Else/While/Until line.
+    Define eDSIfNot                 // The two-word legacy negation: 'If Not <operand>'.
+    Define eDSOnDispatch            // 'On <expr> Gosub/Goto ...' (the On Error form is its own rule).
+    Define eDSUseNoExt              // 'Use <name>' whose filename lacks a '.' extension (msg 4535).
+    Define eDSClassDecl             // 'Object <n> is a <Class>' OBJECT declaration (msg 4537 family) -
+                                    // the anchor makes common-word class names (List, Grid, Edit)
+                                    // unambiguous, and the grid/timer converters can transform it.
+    Define eDSClassSubclass         // 'Class <n> is a <Class>' SUBCLASS definition. A row here needs its own decision,
+                                    // because rewriting a class definition can break every instance built on its
+                                    // legacy API: an Explain with no converter, a Suggest where the class swap
+                                    // is near pure (Edit, dbEdit, WinReport), an Auto-fix for the grid family.
+    Define eDSReplaceConst          /* '#REPLACE <name> <value>' where <name> is NOT a DataFlex
+                                       keyword - i.e. the CONSTANT-like use that 'Define name for
+                                       value' can actually express.
+
+                                       The rule used to match every #REPLACE line and assert the
+                                       Define rewrite as its headline. Nils's counter-example
+                                       (2026-07-28) settles it: '#REPLACE End_Procedure
+                                       End_Procedure_Profiler' substitutes a LANGUAGE KEYWORD, and
+                                       Define creates a named constant - it cannot redefine
+                                       End_Procedure. Replacing a keyword is definitionally a macro,
+                                       never a constant, so _IsKeyWord is an exact discriminator
+                                       rather than a heuristic. */
+    Define eDSUseContains           /* 'Use <name>' whose FILENAME contains the token - a whole
+                                       PACKAGE FAMILY, matched where it enters the program.
+
+                                       Added 2026-08-09 for Crystal Reports, which arrives under 14
+                                       different package names across the DF18/DF19 trees
+                                       (crystalreport.pkg, cCrystal.pkg, rcCrystalReport.pkg,
+                                       cCrystalDbAutoConnect.pkg, crystalrep2.pkg, ...) in 339 Use
+                                       lines. Enumerating them as 14 eDSAnywhere rules would be
+                                       brittle in both directions: it misses the next wrapper
+                                       somebody writes, and it says nothing when a name changes.
+
+                                       The USE LINE is the right anchor rather than the call sites:
+                                       retiring Crystal is a per-FILE decision about a dependency,
+                                       so one finding where the dependency enters beats hundreds on
+                                       every method that touches it. */
+    /* External_Function whose parameter or return TYPES disagree with the Windows SDK - an
+       Integer where the API takes a pointer, which on x64 compiles clean and truncates the
+       address at run time.
+
+       THE ONLY KIND THAT NEEDS MORE THAN ITS OWN LINE. A declaration is routinely spread over
+       ";"-continued lines, and the types live on the continuations, so this one joins forward
+       before it judges. Every other kind reads a single line and always will.
+
+       It answers by asking ConvertWinAPIDeclarationTypes' OWN decision function, so the grid
+       and the fix cannot disagree: if the rule reports it, the converter changes it. */
+    Define eDSApiDeclTypes
+    /* External_Function bound to an ANSI "...A" entry point whose WIDE twin the catalogue holds -
+       the A-to-W migration GuardAnsiExternalFunctionWithWide performs (original kept for older
+       releases, W declaration for the Unicode ones). Reads past its own line like eDSApiDeclTypes,
+       and skips declarations already inside a version guard or IS$WIN64 region. */
+    Define eDSAnsiApiWide
+    Define eDSReplaceCommand        /* The legacy Replace COMMAND: 'Replace <find> In <var> With <new>'
+                                       (first occurrence, in place) - optionally behind a one-line
+                                       'If (...)' guard. Its own 'in' keyword baited the IN-comparison
+                                       rule (DS 9041) into routing it at ChangeInToContains, which
+                                       correctly no-ops - six auto-fixable lines parked in "needs hand
+                                       migration" on a real 19.1 workspace (2026-08-29). Matched as:
+                                       bounded 'replace' NOT followed by '(' (that is the modern
+                                       Replace() function), with bounded 'in' and 'with' following.
+                                       Routes to ChangeReplaceCommandToFunction. */
+    Define eDSTokenPrefix           /* A whole token whose NAME BEGINS WITH the rule token - the
+                                       vendor-NAMESPACE shape, where one prefix owns a family of
+                                       symbols too large and too version-dependent to enumerate.
+
+                                       eDSAnywhere cannot express it. It matches whole words, so
+                                       the token "xtpreport" never sees
+                                       xtpReportThemeVisualStudio2012Light - which is how the
+                                       CodeJock rename went undetected in a source lane that
+                                       already carried a rule for it (2026-08-30).
+
+                                       The boundary is checked at the START of the token only
+                                       (_FindKeywordPos with bWholeWord False), never at its end -
+                                       that is the point. Use it ONLY for a token that is a vendor
+                                       namespace: an ordinary word as a prefix would match every
+                                       identifier that merely opens with it. */
+    /* A legacy Type byte-buffer whose Type DataFlex has REPLACED with a shipped Struct, where
+       the whole cluster verifiably converts. Reads past its own line - see _RuleMatchesLine. */
+    Define eDSTypeToWinStruct
+    /* A legacy Win32 Type byte-buffer that ChangeExternalFunctionCallers can actually convert -
+       the whole cluster, verified by RUNNING the converter on a copy of the file and reporting
+       only the lines it removed. See _RuleMatchesLine for why the run itself is the predicate
+       here rather than a WhyNot function of its own.
+
+       A cluster the run DECLINES raises one Explain row per Type, on its first accessor, with
+       the run's own note as the hint - the reason is read back from the run, never re-derived
+       (2026-09-13).
+
+       (15 briefly held a Tier-3 "add a Struct beside a user-declared Type" kind on 2026-09-01,
+       withdrawn unbuilt the same day when ChangeExternalFunctionCallers turned out to do that job
+       already, and better - it emits the SDK's own layout, alignment members included. Nothing
+       shipped with the old meaning.) */
+    Define eDSWin32BufferConvertible
+    Define eDSUnpairedWarningsOff      /* 'CompilerWarnings Off' with no 'CompilerWarnings On' after
+                                         it in the same file. Reads past its own line, like the
+                                         External_Function kinds - the line is only a finding because of
+                                         what does NOT follow it. Measured against DF26: 'Suspend' is
+                                         one-way but dies with the file that issued it, while 'Off' is a
+                                         plain switch that does NOT, so an unclosed one silences every
+                                         file compiled after this one - a library's consumers included. */
+    Define eDSImageOption              /* a word after a legacy report image's NAME, on its name line
+                                          ('/Body Resident' - DS 9233). The scan blanks every image line
+                                          for the other kinds, because an image's words are its name and
+                                          its text, never code; this kind alone reads the raw name line,
+                                          swept by _SweepImageNameRules. */
+    Define eDSSubclassObject           /* 'Object <n> is a <Class>' where <Class> is the workspace's own
+                                          subclass of a legacy grid that ConvertGridSubclassToCodeJock
+                                          converts in place (2026-10-04). The family's object rule
+                                          (eDSClassDecl) steps back for such an object, so it is listed
+                                          once - under the rule whose converter will convert it. */
+    Define eDSPointerStringMove        /* 'Move <a> to <b>' between a Pointer/Address and a String -
+                                          compile error 4539 (2026-10-20). Only the method's declarations
+                                          tell a pointer from a string, so this kind is never matched per
+                                          line: the rule's converter (UnicodePointerToString or
+                                          UnicodeStringToPointer) runs once over a copy of the file, and
+                                          each line it would rewrite is a row (cDeepScanner._PointerMoveHits). */
+    Define eDSErrorNumber              /* The Error command with a literal number - 'Error 42', 'If (x) Error 300'
+                                          (2026-10-23). The target DataFlex's errornum.inc decides: DS 9244 takes the
+                                          numbers DataFlex names. Of the others DS 9252 takes the ones with their own
+                                          text and DS 9245 keeps the rest (2026-11-05). Scan and fix share the decision
+                                          functions (cRefactorFuncLib._ErrorCommandNumber, _MadeUpErrorWhyNot). */
+    Define eDSSelfObjectRef            /* '(oName(Self))' where the file declares 'Object oName is a'
+                                          (2026-10-23, DS 9246). Which names are objects is a fact about the
+                                          whole file, so - like eDSPointerStringMove - this kind is never
+                                          matched per line: RemoveSelfFromObjectReferences runs once over a
+                                          copy of the file and each line it would change is a row
+                                          (cDeepScanner._SelfObjectRefHits). */
+    Define eDSObsoleteMethodTarget     /* 'Procedure Foo for DFDesktop / Desktop / BaseClass' (2026-10-23,
+                                          DS 9247 / 9248). The rule's token says which: "dfdesktop" takes
+                                          DFDesktop, "desktop" takes Desktop and BaseClass. One decision for
+                                          scan and fix (cRefactorFuncLib._ObsoleteMethodTarget). */
+    Define eDSObsoleteClassName        /* One of VdfBase.pkg's 27 old class names in a class position - 'is a',
+                                          a method header's 'for', RefClass(), U_ (2026-10-23, DS 9249). One
+                                          decision for scan and fix (cRefactorFuncLib._ObsoleteClassNameAt). */
+    Define eDSFieldMainIndex           /* Field_Main_Index (2026-10-23): the rule with a converter takes the calls
+                                          (DS 9250), the rule without one an augmentation (DS 9251). One decision
+                                          for scan and fix (cRefactorFuncLib._FieldMainIndexUse). */
+    Define eDSLegacyWorkspaceRead      /* 'Get <name> of ghoWorkspace to <dest>', the retired Workspc.pkg global (2026-11-05):
+                                          a name with a modern property is DS 9253's row, any other name DS 9254's. One
+                                          decision for scan and fix (cRefactorFuncLib._LegacyWorkspaceRead). */
+End_Enum_List
+
+// First Deep Scan pseudo message number (iDSNumber below). DS numbers live far above the real
+// compiler-message range, so "iMsgNumber >= CI_DeepScanFirstDSNumber" identifies a Deep Scan
+// recipe/row wherever only the recipe is at hand (the analyzer's source-guard machinery).
+Define CI_DeepScanFirstDSNumber for 9001
+// A Deep Scan RULE that fires this many times in one Check collapses into one summary row
+// (ModAnalyzerFT _CountScanFloods) - the scan-lane twin of the compiler's 4544/4390 flood at 100.
+Define CI_DSFloodThreshold          for 100
+
+Struct tDeepScanRule
+    String  sSymbol         // Display name (e.g. "Left command").
+    String  sToken          // Match token(s), LOWERCASE (eDSCommandPos allows a two-word token).
+    Integer eDSKind         // One of the eDS* detection kinds above.
+    Integer eCategory       // Reuses the eMod* triage categories.
+    String  sRefactorFn     // Refactor function that converts it ("" = hint-only).
+    String  sHint           // One-line modern replacement (from the docs harvest).
+    Boolean bEnabled        // False = shipped dormant (common-word tokens too noisy to scan by default).
+    Integer iDSNumber       // STABLE pseudo message number (9001+, assigned by seed position in
+                            // AddDSRule) - doubles as the recipe key so Deep Scan rows classify/plan
+                            // like compiler messages, and as the ignore-list key. The seed is
+                            // APPEND-ONLY: never insert/reorder rules, or standing ignores shift.
+End_Struct
+
+Struct tDeepScanHit
+    Integer iLine           // 1-based source line of the finding.
+    String  sSymbol
+    Integer eCategory
+    String  sRefactorFn
+    String  sHint
+    Integer iDSNumber       // The matching rule's stable pseudo message number.
+End_Struct
+
+// Deep Scan report filename (written to the backup folder, like the Gosub/Goto report).
+Define CS_DeepScanReportLogFile for "DeepScanReport.log.txt"
+
+// The editable Deep Scan rules JSON (DFRefactor's OWN Data folder - the catalog is global, not
+// per-target-workspace). CI_DeepScanRulesVersion is the SEED version: bump it whenever the
+// built-in catalog changes (new rules, re-routed functions) so existing files reseed - the
+// user's per-rule Enabled toggles are MERGED ACROSS by iDSNumber (which is why the seed is
+// append-only). The rules file is what the per-rule enable UI edits.
+Define CS_DeepScanRulesJson     for "DeepScanRules.json"
+/* The Windows API catalogues as EDITABLE JSON, in DFRefactor's OWN Data folder beside
+   DeepScanRules.json - the same place, resolved the same way (pOrgWS, never the target).
+
+   WHY EDITABLE AT ALL. The catalogue's problem is that it has to GROW: 56 API entries against the
+   1,310 distinct entry points a scan of the workspaces found. Data entry that costs a recompile
+   does not happen, so the compiled seed becomes the floor and the JSON is where entries are added.
+
+   NOT keyed by target DataFlex version, unlike ModAnalyzerRecipes-<ver>.json. These hold SDK
+   prototypes, which do not vary by DataFlex release; the question that DOES vary - "does this
+   target already ship it?" - is answered live by the install scan. */
+Define CS_WinAPICatalogJson       for "WinAPICatalog.json"
+Define CS_WinAPIStructCatalogJson for "WinAPIStructCatalog.json"
+// The corpus scan of every workspace's External_Function entry points (AppSrc, tracked) - the
+// harvest tool's intersection source.
+Define CS_WindowsAPICorpusJson    for "WindowsAPI.json"
+Define CS_WinAPIBitnessSplitJson  for "WinAPIBitnessSplit.json"
+/* Bump to reseed the JSON from the compiled seed. User-ADDED rows survive the reseed (that is the
+   whole difference from DeepScanRules.json, which merges only a toggle); rows the seed itself
+   ships are replaced by it, so a corrected prototype actually reaches an existing install. */
+Define CI_WinAPICatalogVersion    for 1
+/* Fewest members a legacy Type must declare before WinAPIStructNameByMemberShape will identify it
+   by its member names alone, and before a short Type can become the whole struct its name found.
+   Measured against the live catalogue (2026-11-04, 12,787 structs): below four the shapes are small
+   and generic ({version, unionName1}, {id, value, valueSize}, {numEntries, table}); at four and above,
+   4,792 of 5,491 shapes belong to one struct. Raising this trades reach for certainty; lowering it
+   starts matching structs that merely happen to look alike. */
+Define CI_WinAPIShapeMatchMinMembers for 4
+Define CI_DeepScanRulesVersion  for 107   // v107: DS 9221 no longer offers an A/W pair whose raw-memory arguments differ in C type between the arms (GetComputerNameA PSTR vs ...W PWSTR) or that passes an address in an Integer where the wide twin marshals text - the catalogue now carries a "// ptrs:" tail (2026-11-21). v106: DS 9253 and 9254 join the seed: reads of the retired ghoWorkspace global, which only a compile brought out until now. v105: DS 9204, the WinReport subclass row, edited in place: it now carries RefactorWinReportTocWinReport2 as a Suggest, like the Edit and dbEdit subclass rows, and that function now gives a converted Class its Use even in a file with no Use at all (Nils 2026-11-05). v104: DS 9252 appended: an Error command with a made-up number and its own text is Auto-fix (ChangeErrorNumberToGenericError, Nils 2026-11-05), and DS 9245 keeps only what that declines, each row saying why. v103: no rule text changed - a MATCHER answer moved, so this is the cache flush. DS 9225 runs the converter on a copy, and with a run file list every method a file defined looked called from another file, so a buffer crossing methods was refused in a real run and in a Check after one: the first live run of SYSTRAY_NOTIFY (Nils 2026-11-05). v102: no rule text changed - a MATCHER answer moved, so this is the cache flush. DS 9225 runs the converter on a copy, and the struct catalogue now holds every struct the Windows metadata names, not only those an API prototype names: NMLISTVIEW, LVITEMA, LVHITTESTINFO, TVITEMA and the rest that travel through SendMessage. So tNM_LISTVIEW, tLV_ITEM and tLVHITTESTINFO take Windows' 64-bit layout instead of their own member types, and a C-flavoured row (NMSELCHANGE) nests the shipped structs instead of one Integer each (2026-11-04). v101: no rule text changed - a MATCHER answer moved, so this is the cache flush. DS 9225 runs the converter on a copy, and the converter now follows a buffer across methods in one file (a Function returning it and the variables receiving it, an uncalled method's String parameter), and writes a tail member with no shipped struct as the bytes it takes up, so SYSTRAY_NOTIFY turns from an Explain row into an Auto-fix (Nils 2026-11-05). v100: no rule text changed - a MATCHER answer moved, so this is the cache flush. DS 9225 runs the converter on a copy, and the converter now takes a Type that writes out what its Windows struct nests (tMSG's ptX and ptY for MSG's POINT pt, WIN32_FIND_DATA's FILETIMEs as six DWords) and a dotted Type the catalogue does not know (Field tLVHITTESTINFO.PT.x), so those Explain rows turn into Auto-fix (Nils 2026-11-04). v99: no rule text changed - a MATCHER answer moved, so this is the cache flush. DS 9225 runs the converter on a copy, and the converter now starts from the calls: a buffer handed to an API parameter the catalogue says takes a struct (the new "// args:" tail) proves which struct the Type is, so a Type that lists only that struct's first members (tagMENUITEMINFO, 11 of MENUITEMINFOA's 12) turns from an Explain row into an Auto-fix; a command split over ";" lines no longer refuses its cluster (Nils 2026-11-04). v98: DS 9246 ((Self) in an object reference) PROMOTED in place to Auto-fix and switched ON (Nils 2026-10-30). It shipped OFF and as Review at v93 until a live run; the 2026-10-24 one on a workspace copy changed 10,960 references, every line as an independent model predicted, with the same compiler errors and warnings before and after. A saved file older than v98 holds the old OFF as a default, not a choice, so the toggle merge lets the seed's ON stand there (cDeepScanner._SeedSwitchedOnAfterFile). v97: no rule text changed - a MATCHER answer moved, so this is the cache flush. The scan's masking pass is the file walk every lane now reads (cRefactorLexer's ScanSourceFile): an @"... / @SQL"... / @'... / @SQL'... string over several lines is text up to its first closing quote, and the code after that quote is code (measured on DataFlex 26). The pass knew only """ strings, so 'Object oX is a DFPanel' or DFTrue in an @-string's text raised a row whose fix would change the string (2026-10-29). v96: no rule text changed - a MATCHER answer moved, so this is the cache flush. A DF 23 multi-line string's body and closing line are text to the scan's masking pass, and its opening line counts only up to the """ - the rule the tokenizer and the whole-file converters now share (_MultiLineStringOpens / _MultiLineStringCloses, measured on DataFlex 26), so 'Object oX is a DFPanel' or DFTrue inside a { Description = """ ... """ } block or a 'Set psHtml to """' string no longer raises a row whose fix would change the string (2026-10-24). v95: no rule text changed - a MATCHER answer moved, so this is the cache flush. The old-class-name rule's pre-check (DS 9249) looked for the text "is a", so 'is  a DFPanel' (two spaces) or a tab before the article raised no row while ChangeObsoleteClassNames fixed the line (Nils 2026-10-24). v94: five rules appended, phase 2 of the migration-chapter gaps (Nils 2026-10-23), the old names taken from DataFlex's own Pkg\VdfBase.pkg (27 '#Replace U_<old> U_<new>' lines, the same on 18.1, 19.1 and 26) and each rename measured exact by a probe on DataFlex 26. DS 9247 'for DFDesktop' -> the Desktop keyword and DS 9248 'for Desktop' / 'for BaseClass' -> 'for cObject' (Auto-fix: the new ChangeObsoleteMethodTarget, kind eDSObsoleteMethodTarget; the parameter Desktop writes the keyword instead). DS 9249 an old class name after 'is a', a method header's 'for', in RefClass() or as U_<old> (Auto-fix: the new ChangeObsoleteClassNames, kind eDSObsoleteClassName; the row names the new class). DS 9250 a Field_Main_Index call (Review: the new ChangeFieldMainIndexToFileFieldIndex) and DS 9251 an augmentation of it (Explain), kind eDSFieldMainIndex. v93: five rules appended for gaps found in the DataFlex docs' "Migrating Older Applications" chapter (Nils 2026-10-23). DS 9242 / 9243 DFTrue and DFFalse (Auto-fix: ChangeDfTrueDfFalse, made word-aware for them - it rewrote 'bDfTrueSet' and missed DFTrue inside an expression). DS 9244 an Error command with a number DataFlex names (Auto-fix: the new ChangeErrorNumberToName, names from the target's errornum.inc) and DS 9245 one it does not name (Explain), on the new kind eDSErrorNumber. DS 9246 (oName(Self)) -> (oName), Review and shipped OFF, on the new kind eDSSelfObjectRef: the new Tidy Up function RemoveSelfFromObjectReferences runs over a copy of the file and its changed lines are the rows. v92: two rules appended - the pointer/string Moves of compile error 4539 (Auto-fix: UnicodePointerToString, UnicodeStringToPointer), a new kind (eDSPointerStringMove) that lists the lines the converter itself would rewrite (Nils 2026-10-20, the Test Bench's Analyze). v91: three rules appended - the obsolete Incr, Decr and Sub commands in command position (Auto-fix: ChangeIncrToIncrement, ChangeDecrToDecrement, ChangeSubToSubtract). They had compiler recipes only, so a scan never listed them (Nils 2026-10-20, the Test Bench's Analyze). v90: no rule text changed - a MATCHER answer moved, so this is the cache flush. An Else in front of Indicate, Ind or a bracket no longer hides the line from the command-position and condition rules: 'Else Indicate X False' raised no row, and the converter had written it as 'Move (False) to gbX', the Else gone (Nils 2026-10-06, "fix the Else case too"). ChangeLegacyIndicators now converts the statement after an Else as it would convert it alone and puts the Else back in front. v89: no rule text changed - a MATCHER answer moved, so this is the cache flush. A '[bracket]' in front of Ind, Indicate's obsolete spelling, no longer hides the line from the Ind command rule (DS 9033) - what v74 did for Indicate. '[ found] ind found as <a> eq <b>' raised no row while a bare 'ind ...' did, and a run turned the line into 'If (found) ind found as (<a> eq <b>) to'; ChangeLegacyIndicators now takes Ind wherever a command stands (GitHub 2026-10-06, a DataFlex 3.2 program). v88: wording only - the hints of the 'ANSI External_Function (wide twin available)' and 'Win32 Type buffer (SDK struct available)' rules no longer say "your ANSI declaration" / "your Type" / "your own member names" (Nils 2026-10-05: user-facing text never calls the code the reader's - it is often a consultant on somebody else's codebase). No category, converter or match changed. v87: the FloatingPopupMenu SUBCLASS rule (DS 9229) offers ConvertPopupMenuSubclassToCodeJock, for review (Nils 2026-10-05: "Couldn't we provide a refactoring function for FloatingPopupMenu ...?" - the one popup row a workspace had left, an empty subclass filled through Add_Item at run time). The scan asks the converter about each such class and keeps the offer only where it converts; elsewhere the row is an explanation with the converter's reason. DS 9230 (dbFloatingPopupMenu subclass) is unchanged. v86: wording only - a class the workspace declares is a "workspace subclass" in every hint, never "your own subclass" (Nils 2026-10-05: "it is often consultants working with somebody else's codebase ... or subclasses written some 20 years ago"): the grid subclass rules (DS 9198-9200), the subclass-object rules (DS 9234-9236), the dbEdit / Edit subclass rules and the learned-subclass match note. No category, converter or match changed. v85: hint text only - the three grid subclass rules (DS 9198-9200) and the three subclass-object rules (DS 9234-9236) name the object converter ConvertGridSubclassToCodeJock runs itself (RefactorDbGridTocDbCJGrid / RefactorDbListTocDbCJGridPromptList / RefactorGridToCJGrid), because a plan listing that one function over every object file read as a mistake (Nils 2026-10-05). No category, converter or match changed. v84: THE GRID SUBCLASSES ARE OFFERED (Nils 2026-10-04: "Why on earth are all grid conversions degraded to hand migration???" - a workspace whose 2,110 grids are all objects of its own subclasses had every one of them in the hand band, because the converter for them, ConvertGridSubclassToCodeJock, was only named in hint text). Three APPENDED rules, DS 9234-9236 - dbGrid / Grid / dbList subclass object, Auto-fix through that converter, on the new kind eDSSubclassObject - and the three subclass (class line) rules DS 9198-9200 carry it too, edited in place. Both only where the converter says it will convert the class (the scan asks it once per learned subclass and Check - cDeepScanner.JudgeGridSubclasses - and the answers ride the cache fingerprint); a class it cannot convert keeps its Explain rows, which now say why. v83: no rule added - the dbGrid / Grid / dbList SUBCLASS hints edited in place, and the note an object matched through a learned subclass carries (_SubclassMatchNote), both name ConvertGridSubclassToCodeJock: it ports such a class IN PLACE and converts every object of it (Nils 2026-10-04, "build 1, 2, 3 and 4"). A List subclass keeps the by-hand advice. Without this bump a scanned file keeps its old note. v82: no rule text changed - a MATCHER answer moved, so this is the cache flush. A hit inside a #COMMAND body (the ToANSI / ToOEM calls, CS_DSMacroSafeTokens) is Explain with no function: it had been capped at Review with UnicodeOemAnsiFunctions still named, a rule from before the engine stopped changing macro code (2026-09-07), so a plan offered the function and the run changed nothing - "0 lines Renamed" (Nils 2026-10-04). Without this bump a scanned file keeps its old Review row. v81: the GRID CONVERSIONS ARE AUTO-FIX - DS 9190 (dbGrid class), DS 9191 (Grid class) and DS 9193 (List class) promoted Review -> Auto-fix in place, beside DS 9192 (dbList class), Auto-fix since v3 (Nils 2026-10-03). Since v80 an EMPTY run converts the plain class only and a subclass object's row is Explain, so what these rows run is a fixed transform. v80: no rule added - the four grid/list SUBCLASS rule hints rewritten in place, and a MATCHER answer moved: an object matched through a learned subclass of dbGrid / Grid / dbList / List is now Explain with no function, because the four converters leave such an object as it is under an EMPTY parameter (Nils 2026-10-03, "a subclass can't be blindly swapped for a CodeJock grid class without first have converted the cEntryGrid subclass"). A workspace's swap had lost what its subclasses add - grid anchoring, label translation, row methods the program called - in 2,126 objects. The hints and the note say to port the subclass first and then name both in the parameter. v79: one APPENDED rule, DS 9233 - the 'Resident' option on a legacy report image's name line ('/Body Resident'), Auto-fix via RemoveResidentImageOption - plus the eDSImageOption kind it matches on. The option only kept an image in memory in character mode; a DataFlex 26 report whose image still carries it crashes or prints useless output (Nils 2026-10-03), and the compiler says nothing about it, so the scan is the only lane that can offer the fix. The rule reads the image name line itself, which every other rule is kept away from. v78: no rule text changed - a MATCHER answer moved, so this is the cache flush. DS 9188 (Use without file extension) no longer flags 'Use UI', the DataFlex character-mode base, which AddUseFileExtension now leaves as it is: DataFlex 26 has that base under no name, so the extension gained nothing, and the line should stay what the character-mode compiler was given (Nils 2026-09-23, "I don't think there ever was an UI.pkg" - a Check had turned 'use ui' into 'use ui.pkg'). Without this bump a scanned file kept its row, offering a fix the converter now refuses. v77: no rule text changed - a converter's ANSWER moved, so this is the cache flush. ChangeLegacyIndicators now takes 'Ind <indicator> [as] <condition>' - Indicate's obsolete spelling, which dafmac.pkg expands to Indicate - so DS 9033 (Ind command) rows convert instead of sitting under "macro Ind - not yours to change" (Nils 2026-09-20; the analyzer's indicator guard counts an 'ind' command line as carrying the construct in the same change). v76: no rule text changed - a MATCHER answer moved, so this is the cache flush. The If-Not rule (DS 9043) no longer fires when the word after Not is a legacy file-test COMMAND - 'If not Status <file> stmt' and the Else If form: Status takes a file argument and is not a Boolean, the converter declines it (2026-09-19), and the line compiles clean on DataFlex 26 (measured with a probe program; the workspace listing drew no error on it), so the row it raised - 'not auto-fixable in this exact shape, fix it by hand' - asked for a fix the line does not need. Without this bump the scanned files kept that row through a fresh Check, which is exactly how it was found (Nils 2026-09-20). v75: two APPENDED rules, DS 9231 DF_DATE_4_STATE and DS 9232 DF_EPOCH_VALUE, and the DF_SYSDATE_4_STATE rule re-pointed: CommentOutSysdate4State grew into the old Studio's Y2K triplet and became CommentOutLegacyDateAttributes. VdfBase.pkg has set all three since DataFlex 12 (True / True / 30), so a program's own line is redundant only when it repeats that - the converter comments out DF_SYSDATE_4_STATE in any shape (a no-op), DF_DATE_4_STATE only 'to True' and DF_EPOCH_VALUE only 'to 30', and leaves an override (the old template's own 'DF_DATE_4_STATE to False') or a Get verbatim for the dry-run to hand to Explain (Nils 2026-09-18). v74: no rule text changed - a MATCHER answer moved, so this is the cache flush. A '[bracket]'-prefixed Indicate ('[found] indicate found as (a eq b)') is now in command position for the Indicate rule, and an 'Indicate <x> as <condition>' line - bracketed or not - is a condition line for the comparison rules. Both had read '[found]' as word 1, so the bracket-Indicate form the converter rewrites raised NO row: a 2005-era file's two ';'-continued pairs were invisible, and once its other rows were spent the plan was empty (Nils 2026-09-17, "did not suggest any refactoring plan"). v73: no rule text changed - a MATCHER answer moved, so this is the cache flush. DS 9221 now declines an A/W pair whose two arms take DIFFERENT STRUCTURES. SHFileOperationA and SHFileOperationW both declare "Pointer lpFileOp", so the arity check and the pointer-vs-marshal check both pass and the row was offered as an Auto-fix - but the catalogue records one taking SHFILEOPSTRUCTA and the other SHFILEOPSTRUCTW. Swapping the entry point is one line; the structure the CALL SITE fills is not, and the converter cannot see those sites, so the emitted wide arm would receive an ANSI layout. It compiles; it is wrong only when it runs. Measured over Data/WinAPICatalog.json: 367 of 2,069 A/W pairs differ this way (365 the clean ...A -> ...W shape, 2 - tACMFORMATDETAILSW - differing without following the convention, which is why the test is "the refs differ" and not "the wide ref ends in W"), and the scan raised 15 live Auto-fix rows on exactly that shape across the E: test workspaces (SHFileOperationA x3, FindNextFileA x4, InsertMenuItemA x2, PrintDlgA x2, PageSetupDlgA x2, GetVersionExA, PrintDlgExA). The other 1,702 pairs are untouched: a row with no "// refs:" tail says nothing about the structures it takes, and refusing on silence would decline them all. The bare-export gate (ends-in-"a") stays shut - Shell_NotifyIcon would pair straight into this shape. v72: the two SUBCLASS hints (DS 9229/9230) stop promising a listing the scan does not produce. They opened "Objects of this subclass are listed as FloatingPopupMenu objects", but _SubclassLearningToken learns subclasses for dbgrid/grid/dblist/list/dbedit/edit/dftimer/winreport ONLY - floatingpopupmenu and dbfloatingpopupmenu are not among them, so such a subclass is never learned and its objects are never listed. Found on a workspace where the only instance is built dynamically, Get Create (RefClass(cTreeViewPopupMenu)), which no 'is a' detector could have seen either; the class there is an empty pass-through whose two overrides only Forward, yet the port is still a decision rather than a rename, because cCJContextMenu has no Add_Item and that workspace adds its items at run time (Nils 2026-09-16, asking why the Class line gets no Run refactor plan button). An AutoFix promise the plan run cannot keep is what the eDSClassDecl / eDSClassSubclass split was made to avoid; a hint that promises a LISTING the scan never makes is the same defect one step further out. No category, converter or match changed. v71: DS 9082 (Ifchange command) carries its own converter, ChangeIfchangeCommandToAttribute, and stays REVIEW (Nils 2026-09-15, 'yes, build the Ifchange converter as Review'). It had routed to the LegacyDbApiReport worksheet with no function since the catalog was seeded. Review because the rewrite is a 1-to-3 line expansion that declares a local in the user's method - nothing else in this family writes a declaration - and because it has never run against a real site: the command appears in no workspace to hand, and the bar for promoting a rule here has been a measured live run. The VALUES are measured, later the same day: FMAC settles that the command is not an attribute read at all (two dedicated opcodes, one per argument shape, answering through indicator 122 - which is why the compiler reports 4533 plus TWO 4538s on such a line), so a probe read both forms against one table's buffer after Clear, after Find, after a field write and after writing the original value back - 0/0, 0/0, 1/1, 1/1, equal on every row including the last, where the flag stays set because the buffer was written. So the rewrite preserves the condition; what is left to check is the declaration it adds, which is a human's job. v70: three rules carry their own converter and three hints were simply WRONG (Nils 2026-09-15, asking why obsolete Database-API symbols come with no auto-fixable suggestion). DS 9085 Get_Current_Lockcount -> ChangeGetCurrentLockcountToAttribute, Auto-fix: a probe on the DF26 x64 runtime read the count through the command and through DF_TRAN_COUNT with nothing held, inside one Lock, inside two and after unwinding - 0/0, 1/1, 2/2, 0/0 - and FMAC gives the command no WarningEx, so the scan is the ONLY lane it can ever be offered in. DS 9089 / 9090 Get_FileList / Set_FileList -> ChangeFileListCommandToAttribute, Auto-fix: FMAC expands both macros to the GET_/SET_ATTRIBUTE DF_FILELIST_NAME form, so the conversion is what the compiler already does; the legacy shape takes no 'to', which the converter inserts. The three corrected hints: DS 9084 Size_of_Field is a legacy Type MEMBER's byte size (Dll.pkg declares it and says 'Use Structs'), not a database field length, so it routes to TypeToStructReport instead of the DB worksheet; DS 9088 Get_Number_Format returns a format CODE where DF_DECIMAL_SEPARATOR returns the separator CHARACTER (measured, 1 against 44), so the old hint promised a swap the values do not support; and DS 9094 DF_FILE_PRIMARY_INDEX_TRIGGER is a Boolean whose replacement is a four-value enum - False is RIM_NONE, but True meant a trigger fills the column, which is RIM_EXTERNAL, not the 1 a rename would leave - so it stays Review and the hint now says why. v69: DS 9086 (Get_date_format) carries its own converter, ChangeGetDateFormatToAttribute, Auto-fix - it had routed to the LegacyDbApiReport worksheet as Suggest since v70 of the recipes. Auto-fix without a live run, deliberately: the rewrite is a leading-keyword swap, and a runtime probe on DF26 x64 read DF_DATE_FORMAT through both forms at each of its three values and got the same number every time (Nils 2026-09-15, asking for the converter). v68: DS 9227/9228 PROMOTED Review -> Auto-fix in place after Nils's live runs (2026-09-13, "Nice, that works well"); the subclass rows 9229/9230 stay Explain. v67: no rule text changed - a MATCHER answer moved. A line under ChangeFloatingPopupMenuToCodeJock's own refusal marker is no longer silenced on sight: the scan asks the converter again, and an object the converter takes by now raises its row (the first live run's marker had silenced the afternoon's converter, Nils 2026-09-13). v66: DS 9227-9230 - the legacy right-click menu. 'Object x is a FloatingPopupMenu' / 'dbFloatingPopupMenu' rows route to ChangeFloatingPopupMenuToCodeJock (Suggest, like the other class converters); the SUBCLASS forms are Explain rows, as the whole family is. v65: no rule text changed - DS 9225's ANSWER moved and its PRE-GATE widened. The Win32 buffer converter now rewrites Put_String and GetBuff_String, the two accessors for a Type's fixed text field, faithful to what they measurably do on DF26 x64: Put_String copies min(len, n) bytes and zero-fills the rest of the field, GetBuff_String hands back exactly n bytes with the nulls kept - so the emitted form is the MemCopy DataFlex's own Font_dlg.pkg uses, a byte-capped copy after a zero-fill from the buffer's never-written twin, and an n-byte read into a pre-sized String ('Move sText to B.m' compiles and faults at run time with 4381; PointerToString reads past a full member). A wide member (Short[n]) or a one-byte Char refuses with the reason. The pre-gate admits a line whose first word is put_string / getbuff_string, so a buffer reached only that way is examined at all (Nils 2026-09-13: 'the same should be true for all legacy Type def commands'). v64: no rule text changed - the ANSWER of DS 9225 moved again, so this is the cache flush. The converter it asks now takes a buffer bound to a ONE-FIELD Type - Dftypes.pkg's tDWORD and tHANDLE, one field each and no tWin twin, which PASS 2 had refused for ever as 'no modern struct' - by retyping the buffer to the field's scalar: ZeroType becomes Move 0, Put and GetBuff become plain Moves, AddressOf stays, no twin and no Use. The shape is an API asked for one number back through a byte buffer (Nils 2026-09-13, an HtmlHelp init procedure in a test workspace: 'those commands should never be used, that is the goal'). v63: no rule text changed - the ANSWER of DS 9225 moved, twice, so this is the cache flush. The converter it asks now takes a Type whose buffer is handed STRAIGHT to a declared API's Pointer parameter (the argument becomes AddressOf) and rewrites Size_of_Field on the Type to SizeOfType - the line that would otherwise have left the emitted file uncompilable - while Offset_of_Field refuses with the line; and a Type the run declines now raises ONE Explain row carrying the run's own reason, where before it raised nothing and the file's only offer was Ignore (Nils 2026-09-13, a 1999 systray experiment in a test workspace whose 16 report rows offered no way forward). v62: no rule text changed - this is the CACHE FLUSH for a catalogue fact. DS 9219 asks the converter, the converter asks the WinAPI catalogue, and the catalogue's answer for a BARE entry point is no longer a spelling rule (append "a", then "w") but a row measured against the dll: 128 bare exports that really are their ...A entry gained one, and the ones that are the WIDE twin (ReplaceFile, ILCreateFromPath, IsLFNDrive) or their own code (PlaySound, the tapi32 family) deliberately did not - those declarations now find nothing and are left alone instead of being judged by ANSI types. The scan cache fingerprints on this version plus the rules JSON and knows nothing about the catalogue, so without this bump every file already scanned keeps its old 9219 verdict for ever - the 2026-07-31 lesson (Nils 2026-09-12, asking why a bare External_Function got no auto-fix offer). v61: six rules PROMOTED Review -> Auto-fix in place (Nils 2026-09-11: 'what is suggested are genuinely Auto-fix functions'): Indicate command (DS 9032), #REPLACE directive (9059), Cmdline command (9060), Strmark variable (9160), External_Function 64-bit types (9219) and ANSI External_Function (wide twin available) (9221). Measured first on a real workspace, each converter run on an in-memory copy of every file it had hits in and the copy re-scanned: every hit cleared except 13 of 530 Indicate lines, which the line converter's own dry-run hands back to Explain. The whole-file converters get no such dry-run - VerifyAutoFix keeps them rather than guess - so each of those had to clear all of its hits, and did (the ANSI guard once given the version the app takes from the loaded workspace). NOT promoted: Indicator command (9031) - it matches a DECLARATION, which ChangeIndicatorToBoolean converts, not ChangeLegacyIndicators; Ind command (9033) - no hit to measure; Set_Date_Attribute (9030) - commenting out epoch_value changes how 2-digit years are read, and the three attributes come as a triplet in one file, so a plan run over any of them reaches the epoch line too. v60: one APPENDED rule, DS 9226 - an unpaired 'CompilerWarnings Off' - plus the eDSUnpairedWarningsOff kind it matches on. It is the one suppression mistake that fails silently and travels: Off does not end with its file the way Suspend does, so a missing 'On' mutes every file compiled afterwards, in this workspace and in anything that uses it as a package. Explain-only - where the muted region was meant to end is a human decision, and closing it at end-of-file would be a guess (2026-09-09). v59: a MATCHER change, so the bump is the cache flush, not a rule edit - Deep Scan's GUARD A now recognises 'CompilerWarnings Off' / 'On' as the muted region it always meant to honour. It had been written against 'CompilerWarnings Suspend' .. 'Resume', and Resume is not DataFlex at all (Error 4345), so the un-latch could never fire while the form the DF26 install actually uses - Off/On, 27 times each against four bare Suspends - was scanned in full. Measured the same day: Suspend is one-way and dies with the file that issued it; an unpaired Off does not, it silences everything compiled after it (2026-09-09). v58: the 'Gosub Return' rule carries its converter (ChangeReturnToGosubReturn, Auto-fix). Return is the DataFlex 1 spelling of Gosub_Return and the compiler's own message says so, so the swap is a rename rather than a change of behaviour - and it is what lets ConvertGosubToProcedure see a subroutine's exits at all, since that converter reads Gosub_Return and treats a block with none as falling through (2026-09-09). The rule keeps its command-position kind, which is also the converter's own gate, so the grid and the fix cannot drift apart; the 'Gosub command' rule still points at the report for the structural work. v57: the '#REPLACE directive' hint is cut from 600 characters to 108. The rule-selection grid shows the hint, and its tooltip wraps at 250 pixels, so 600 characters became a ~17-line tooltip that ran off the screen - and a NARROWER tooltip would only have made it taller. The full reasoning lives in the converter's { Description } and in the block comment above _ReplaceDirectiveValueKind, which is where it belongs (2026-09-08; the rule hints' median is 41 characters). v56: the '#REPLACE directive' rule carries its converter (ChangeReplaceDirectiveToDefine, Review) and its value test now takes a negative number, measured convertible: '#REPLACE name value' becomes 'Define name for value' with the value left in its own column, while the two shapes that only look convertible - inside an Enum_List, and an unquoted value with spaces - get a TODO marker with the reason (2026-09-08). v55: the strmark / strlen rules carry their converters (ChangeStrMarkToExpression / ChangeStrLenToExpression, Review): a read of a string command's side product becomes the expression the command left, a scratch use a local, and what cannot be derived gets a TODO marker with the reason - the function forms never set the two variables, so the command converters had been leaving such reads silently stale (2026-09-08). v54: the dbEdit / Edit SUBCLASS rules carry their converter (Suggest), so the plan runs it on the file that declares the subclass - the base line converts and the objects follow (2026-09-07; a plan over the objects' files had reported 0 converted). v53: an EMPTY grid-converter parameter now reaches the subclasses the scan learned, for all four families (the funclib hands the converters the learned set - Nils 2026-09-05, "a legacy grid should be handled the same way as a legacy dbgrid"); the subclass hints and the match note say so. v52 (same day): the Grid / List subclass hints and the match note say the truth - those two converters map an EMPTY parameter to the PLAIN class (cCJGrid ends in "grid", cDbCJGridPromptList in "list"), so a subclass must be named, one per run; dbGrid / dbList keep the wide EMPTY (any class whose name ends in the token). v51 (same day) had promised the wide EMPTY for all four; a plan run with empty fields converted 0 Grid subclass objects and showed it. v50: the object-declaration rules match the workspace's own subclasses of the legacy classes (a learned set, folded into the cache fingerprint) and the subclass rules' hints say the objects convert (a workspace 2026-09-04: 455 subclass grid objects in 243 uncompiled files were invisible to both lanes). v49: _TypeDeclaringMember now counts only BARE Field declarations. A qualified one declares tBeta.dwSize and leaves dwSize undeclared, so it can never be what a bare "At dwSize" names - counting it made the guard refuse a file that was never ambiguous, and refuse it silently, since an unbound buffer just leaves its Type looking unused. The matcher reaches this through the vanish check, so a cached file could hold a 9225 verdict the current code would not give; a code-only change cannot move the fingerprint on its own, which is the v48 lesson (2026-09-02).
+// v47: no rule TEXT changed - the CACHE and the PRE-GATE are what moved. The two AutoFix buffer rules now admit a line whose first word is filltype/put/getbuff, not only zerotype, so a file that zeroes its buffer by hand is examined at all; and the converter behind them widened twice (a catalogue miss falls back to the author's own member types; the unprefixed "Field x"/"At x" form and the <Type>_SIZE symbol are now recognised). DS 9225 detects a convertible Win32 buffer by RUNNING the converter on a copy, so widening the converter (a catalogue miss now falls back to the author's own member types) changes that rule's ANSWER without changing its definition. The scan cache fingerprints on version + JSON(rules), so an unchanged rules blob means no flush and every previously-scanned file keeps its stale "nothing here" entry (Nils 2026-09-01).
+// v46: DS 9226 REMOVED. A one-field Type is not a different KIND of thing to the reader - every legacy Type wants modernising, and the Type/Field/End_Type rules already say so through the report. The Explain row added a second row asserting it was special, whose only affordance was Ignore, which is the shape this board keeps retiring (Nils 2026-09-01). 9226 is free again.
+                                         // v45: DS 9226 (removed at v46), and the MATCHER change that stays: _AccessorTypeBuffer strips a package qualifier ("Dates$SystemTime.iHour"), so clusters graded against an impossible Type name are graded against the real one.
+                                         // v44: a MATCHER change, not a rule change - DS 9225 asks the converter, and the converter now refuses a Type whose nested member has no shipped tWin twin (it used to emit "POINT pt", which nothing declares). Fewer lines convert, so fewer rows fire, and a cache keyed on v43 would keep offering the ones that no longer do.
+                                         // v43: DS 9225 - the legacy Win32 Type buffer ChangeExternalFunctionCallers can convert. That converter shipped 2026-08-30 with NO rule offering it, so a workspace whose buffers it converts perfectly saw only "run the report". The rule runs the converter on a copy of the file and reports the lines it removed, so a row cannot promise a Run that comes back "0 lines".
+                                         // v42: the withdrawn Tier-3 pair (DS 9225/9226) removed again; never released.
+                                         // v40/v41: DS 9225 (then 9225/9226) - the Tier-3 pair. Never released.
+                                         // v39: DS 9224 - the legacy Type byte-buffer that DataFlex has replaced with a shipped tWin<X> Struct, routed to ChangeLegacyTypeToWinStruct. Fires only where the converter's own _WinStructClusterWhyNot says it would act, so the row cannot offer a Run the run refuses.
+                                         // v36: the Replace-command rule (DS 9041 stops claiming its 'in'), and the API rules go hands-off inside conditional variant arms.
+                                         // v25: one APPENDED rule - Crystal Reports, Explain-only (support dropped; the reports move to another product, so no refactor can carry them) - plus the new eDSUseContains kind it matches on
+                                         // v15: #REPLACE rule narrowed to CONSTANT uses (keyword substitutions are macros)
+                                         // v2: + "Use without file extension" (4535, Nils's paytype.DD miss)
+                                         // v3: + the eight obsolete-class rules (4537 family source-side)
+                                         // v4: class rules split Object-form (convertible) vs Class-form
+                                         // v5: Sysdate + Sysdate4 both route to ChangeSysdate (-> CurrentDateTime()); Sysdate promoted Explain->AutoFix
+                                         // v6: 9 dev-only/char-mode relics route to CommentOutObsoleteDevCommands (Explain->Suggest)
+                                         // v7: 9 Database-API commands route to LegacyDbApiReport worksheet (Explain->Suggest)
+                                         // v8: 16 Registry/profile/INI commands route to LegacyRegistryReport worksheet (Explain->Suggest)
+                                         // v9: 25 Embedded SQL commands route to LegacySqlReport worksheet (Explain->Suggest)
+                                         // v10: Chain->ChangeChainToRunprogram (AutoFix), DF_SYSDATE_4_STATE->CommentOutSysdate4State (AutoFix)
+                                         // v11: Set_dfpath->LegacyDfPathReport worksheet (Explain->Suggest)
+                                         // v12: Call->ChangeCallToSend (AutoFix); 11 field entry-options->LegacyFieldOptionsReport (Explain->Suggest)
+                                         // v13: 4 DB-file constants/vars (Fieldindex/Filenumber/DF_FILE_PRIMARY_INDEX_TRIGGER/DF_FILE_TRANSLATE_OEM_TO_ANSI) folded into LegacyDbApiReport (Explain->Suggest)
+                                         //     subclass definitions (Explain - converters refuse those)
+                                         // v14: Get_File_Exists (Get-call form) -> ChangeGetFileExistsToFileExist (AutoFix)
+
+// The rules-file payload: a seed-version stamp + the rows.
+// One packed catalogue as persisted: the rows exactly as the seed packs them, plus the seed
+// version that wrote them. Rows stay PACKED strings rather than a typed struct per catalogue -
+// three catalogues share one loader that way, and the packing is already the in-memory shape.
+Struct tWinAPICatalogFile
+    Integer iVersion
+    String[] asRows
+End_Struct
+
+Struct tDeepScanRulesFile
+    Integer iVersion
+    tDeepScanRule[] aRules
+End_Struct
+
+// Deep Scan per-file result cache (Nils 2026-07-16): the scan -> Run Fix Plan -> re-scan
+// convergence loop used to re-read + re-scan EVERY file each pass, though between passes
+// only the files the plan run (or a Studio edit) actually wrote can produce different
+// hits - ScanLines is a pure per-file function of (file contents, rules). One entry per
+// scanned file; an entry stays valid while the file's last-write time AND size are
+// unchanged (nothing rewinds a live source's mtime - the only rfSetFileLastWriteTime
+// caller touches BACKUP copies) under the SAME rules fingerprint. Owned by the dashboard
+// view (DashboardFT.vw pDeepScanCache) and threaded ByRef through
+// cDeepScanner.ValidateScanCache / ScanFileCached.
+//
+// PERSISTED since 2026-07-28 (Nils: "even if no changes was made to the source, it still
+// runs a full scan each time" - the cache was session-lifetime, so every program start paid
+// a cold scan of the whole workspace). See tDeepScanCacheFile below. NOTE the key is
+// deliberately last-write + size, NOT a content hash: a hash would have to READ every file,
+// which is the very cost the cache exists to avoid, while mtime + size come from the
+// directory entry alone.
+Struct tDeepScanFileCacheEntry
+    String   sFileLow           // Lower-cased full path - the cache key.
+    DateTime dtLastWrite        // rfFileDate at scan time.
+    Integer  iFileSize          // rfFileSizeLive at scan time (belt for a same-ms rewrite).
+    tDeepScanHit[] aHits        // The ScanLines result for that (file, rules) state.
+End_Struct
+
+// The whole cache: rules fingerprint + parallel path/entry arrays. asPathsLow mirrors
+// aEntries[].sFileLow so the per-file lookup is ONE native SearchArray call over a plain
+// String[], not an interpreted comparator loop over the struct array.
+Struct tDeepScanCache
+    String   sRulesFingerprint  // JSON of the rules array the entries were scanned under.
+    String[] asPathsLow         // Parallel to aEntries.
+    tDeepScanFileCacheEntry[] aEntries
+End_Struct
+
+/* The on-disk form, per workspace: Data\DeepScanCache-<wskey>.json, keyed by the same folded
+   .sws path as LastPlan / ModProgress / Ignored (AnalyzeSnapshotKey). asPathsLow is NOT stored -
+   it is a lookup index derived from aEntries on load, so persisting it would double the paths
+   for nothing.
+
+   THREE things invalidate it, and all three are cheap: a version mismatch (struct changed),
+   a rules-fingerprint mismatch (ValidateScanCache already clears on this), and per file the
+   existing last-write + size test. A file the cache has never seen simply scans normally.
+
+   SIZE, measured on the WinServ workspace 2026-07-28 before building this: ~1,686 files and
+   1,764 deep-scan hits, so roughly 270 KB of clean-file entries plus ~390 KB of hits - about
+   0.7 MB, against a LastPlan for the same workspace already at 2.3 MB. Parsing that is far
+   cheaper than re-reading and re-lexing 1,686 files.
+
+   PRIVACY: the filename folds the .sws path, so it names the workspace - and those are customer
+   workspaces. Gitignored with LastPlan* / ModProgress* / Ignored*. Never commit one. */
+Struct tDeepScanCacheFile
+    Integer  iVersion
+    String   sRulesFingerprint
+    /* THE SCOPE THIS CACHE WAS PRODUCED FROM - every folder handed to the scan, and the ones
+       that yielded no source file. A cache records WHAT it holds; without the scope it cannot
+       say what it does NOT hold, and a ticked folder contributing zero files was invisible
+       until it was found by diffing this file against the compile scope by hand
+       (Nils 2026-08-31, E:\WebAppSrc\AppSrc: 152 packages, 0 scanned). */
+    String[] asScopeFolders
+    String[] asEmptyFolders
+    tDeepScanFileCacheEntry[] aEntries
+End_Struct
+
+// Bump when tDeepScanFileCacheEntry / tDeepScanHit / tDeepScanCacheFile change shape - a stale
+// file is then dropped rather than misread into the wrong fields.
+#IFNDEF CI_DeepScanCacheVersion
+Define CI_DeepScanCacheVersion for 2   // v2: asScopeFolders / asEmptyFolders - the cache now records the scope it came from
+Define CS_DeepScanCacheJson    for "DeepScanCache.json"
+#ENDIF
+
+/* The hint the analyzer gives a warning whose construct is NOT on the reported line - it sits inside
+   a macro / #COMMAND expansion, and the compiler reports every USE of that macro. Shared so the
+   findings board can recognise the family without matching prose (Nils 2026-07-28).
+
+   WHY THEY ARE STATED ONCE AND NOT LISTED: "I actually think it is fine with legacy code there and
+   we should just ignore them altogether. There are macro commands in the system PKG folder as well
+   ... If somebody really wants to fix code in a macro command, they need to be super knowledgable
+   about macro code, something most developers are not." On WinServ this family was 579 rows across
+   542 files - every one of them pointing at a use site where nothing can be done, for a fix that
+   lives in one definition and that almost nobody should attempt. */
+#IFNDEF CS_ModMacroExpansionHint
+Define CS_ModMacroExpansionHint for "Not fixable on this line - the obsolete construct is inside a macro/command. Fix it at the definition."
+// The general advice for compile error 52 "(operator)" - the seed's own words until 2026-09-05, now
+// what VerifyAutoFix says for a 52 that is not the wrapped-command shape SplitCommandOutOfCondition repairs.
+Define CS_ModExpr52Hint for "Malformed expression the compiler cannot parse (operator) - often a stray operator or a '()' on a Get form ('Get Func() to var' should be 'Get Func to var'). Fix in source; not an automated refactor."
+// The generic 4328 advice - the seed's own words, and since 2026-09-14 also what VerifyAutoFix says for a
+// type-name-cast row whose line carries no such call (Guard F): a plain undefined symbol reads as one.
+Define CS_Mod4328Hint for "Undefined symbol - a missing DB field/table, a legacy Type member accessed as a Struct (Type->Struct migration, e.g. tRect.left), a source typo, or a TYPE NAME used as a conversion function, which DF26 refuses: Handle(x), Pointer(x), Boolean(x), DateTime(x) and UChar(x) all become Cast(x, Type) - and there the message names the type's INTERNAL name (LONGPTR for Handle, ADDRESS for Pointer), so the symbol it complains about may appear nowhere in the source. Check the flagged LINE before hunting for a missing field."
+
+#ENDIF
+
+/* How many of those findings the board will open a file for, to read what actually caused them.
+   A RUNAWAY GUARD, not a display limit - and it must stay far above any real workspace, because
+   what it skips cannot be attributed and therefore cannot be silenced as DataFlex's own. It was
+   200, which is below a single real case: Nils's WinServ raises 533, so 333 went unexamined and
+   were then described as findings whose "cause could not be read off the line" - a statement
+   nobody had checked. Whatever this bound skips is now counted and stated as unexamined instead.
+   2026-08-19. */
+#IFNDEF CI_ModCauseReadCap
+Define CI_ModCauseReadCap for 20000
+#ENDIF
+
+// RELEASE GATE (Nils 2026-07-10): Deep Scan ships in ALPHA 4. This constant is the runtime MASTER SWITCH -
+// every DS touchpoint (dashboard chip + gear, the chip belt, the Test Compile bar, the control's pbVisible,
+// and the DS recipe seeding in cModAnalyzer) keys off it. Currently TRUE (Deep Scan visible for dev toward
+// Alpha 4); it was flipped OFF for the Alpha 3 packaging on 2026-07-12 and flipped back ON afterwards.
+// *** TO FREEZE Deep Scan OFF for a release build - TWO items (flip both back after packaging): ***
+//   (1) this constant -> False (hides the chip/scan/recipe seeding; the code stays COMPILED in, just hidden);
+//   (2) bump CI_ModAnalyzerRecipeVersion (cModAnalyzer.pkg) so every already-seeded recipe table reseeds
+//       and the DS recipes (which ride BuildDefaultRecipes behind this gate) drop out.
+// Do NOT re-publish DeepScanObsoleteSymbols: it stays { Published = False } PERMANENTLY by design -
+// Deep Scan is a DEDICATED flow (dashboard button -> RunDeepScan -> cDeepScanner directly), NOT a
+// manual-picker refactor function; a report-only entry in the function list just duplicates the button
+// and confuses the user (Nils 2026-07-12). It carries no {ModRecipe}, so unpublishing has no effect
+// on the recipe table.
+Define CB_DeepScanEnabled for True
+
+// The Test Compile bar's Analyze Source and Run Plan buttons, and its tail's pointer "run the fix plan from the
+// guided dashboard" (TestCompileFT.dg). False since 2026-10-12 (Nils: "I don't think that we ever use the
+// buttons ... we might want to use them later, but for now how about make them invisible?", then "Always hide
+// the controls"). Nothing is removed: True brings the three back, and the tail back to the end of the strip.
+// While it is False, an Analyze Source run outside a guided Check has no button on that bar to run its plan -
+// so the Manual board's pill "Analyze this file for a fix plan" follows this switch too (cFTManualBoard.pkg).
+Define CB_TestCompilePlanButtons for False
+
 // Filename for the editable recipe JSON. Lives in DFRefactor's OWN Data folder - it's data,
 // and global to DFRefactor (not per-target-workspace).  
 // It is used as a base name for the file. In function RecipeJsonPath (cModAnalyzer.pkg),
@@ -171,15 +725,60 @@ Define CR_LF for (Character(13) + Character(10))
 // its own unique json file.
 Define CS_ModAnalyzerRecipesJson for "ModAnalyzerRecipes.json"
 
+// Power script file automatically generated to the Programs folder when the
+// ComdLineIniFileExporterFT dialog is used to export .ini data.
+Define CS_Run_DFRefactor_ps1     for "Run-DFRefactor.ps1"
+
 // Base name for the TypeToStructReport install-package Type catalogue cache (the target DF version
-// is appended -> Data\TypeDefs-<ver>.json). CI_TypeDefsCacheVersion is the cache FORMAT version:
+// is appended -> Data\DfVersion-TypeDefs-<ver>.json). CI_TypeDefsCacheVersion is the cache FORMAT version:
 // bump it to invalidate every cached catalogue at once (e.g. if _TypeDefsFromLines changes).
 // v2 added sPkgNewest (the install-package change watermark).
-Define CS_TypeDefsCacheJson      for "TypeDefs.json"
+Define CS_TypeDefsCacheJson      for "DfVersion-TypeDefs.json"
 Define CI_TypeDefsCacheVersion   for 2
 
+// Base name for the install-package GLOBAL-FUNCTION-NAME catalogue cache (target DF version appended
+// -> Data\DfVersion-GlobalFuncs-<ver>.json), the third product of the SHARED install-Pkg walk. It is the
+// set of Global Function/Procedure names the target DataFlex SHIPS, so the guided findings list can flag a
+// user "backport" global function whose name is now native (error 4390). Bump the FORMAT version to
+// reseed if _GlobalFuncNamesFromLines changes. Same sPkgNewest watermark scheme as the Type cache.
+// 2 = a global Set procedure goes by its two-word name, "Set <name>" (2026-11-02).
+Define CS_GlobalFuncNamesCacheJson    for "DfVersion-GlobalFuncs.json"
+Define CI_GlobalFuncNamesCacheVersion for 2
+
+/* The compiler's own built-in globals, per target version: Data\DfVersion-BuiltIns-<ver>.json, read from
+   <install>\Lib\GlobalFunctions.lst.
+
+   PER VERSION even though the file has not changed in years - it is byte-identical from 20.1 to 25.0
+   (measured 2026-08-01), so today every one of these files would hold the same 85 entries. Keyed by
+   version anyway for two reasons: it costs nothing, matching what DfVersion-GlobalFuncs-<ver>.json already
+   does; and DF 27 is the release where that stops being true. A runtime moving to a browser engine
+   and to Mac/Linux is exactly the kind of shift that adds and retires built-ins, and a per-version
+   file records that WITHOUT a code change - the wrong moment to discover a single shared catalogue
+   is the moment two supported versions disagree.
+
+   Bump CI_BuiltInFuncsCacheVersion when this STRUCT changes (a new field, a different parse), not
+   when DataFlex ships - a new DataFlex version writes its own file. */
+Define CS_BuiltInFuncsCacheJson       for "DfVersion-BuiltIns.json"
+Define CI_BuiltInFuncsCacheVersion    for 1
+
+// The install file the above is built from - always <install root>\Lib\<this>.
+Define CS_InstallGlobalFunctionsLst   for "GlobalFunctions.lst"
+
+/* The target version's NAMED ERROR NUMBERS: Data\DfVersion-ErrorNames-<ver>.json, read from
+   <install>\Pkg\errornum.inc (2026-10-23, for the Deep Scan rules DS 9244 / 9245 and
+   ChangeErrorNumberToName). Bump CI_ErrorNamesCacheVersion when tErrorNamesCacheFile or the parse
+   changes - a new DataFlex version writes its own file. */
+Define CS_ErrorNamesCacheJson         for "DfVersion-ErrorNames.json"
+Define CI_ErrorNamesCacheVersion      for 1
+Define CS_InstallErrorNumInc          for "errornum.inc"
+
+// The Studio's own language definition, and the per-target-version catalogue built from it.
+Define CS_InstallLanguageFile         for "DataFlex.lng"
+Define CS_DfLanguageCacheJson         for "DfVersion-Language.json"
+Define CI_DfLanguageCacheVersion      for 1
+
 // Base name for the RAW install-package obsolete-warning scan cache (the target DF version is
-// appended -> Data\ObsoleteScan-<ver>.json). This is the product of the SHARED install-Pkg walk
+// appended -> Data\DfVersion-ObsoleteScan-<ver>.json). This is the product of the SHARED install-Pkg walk
 // (cRefactorFuncLib: WalkInstallPackages / InstallScanRecipes) that feeds BOTH the ModAnalyzer recipe
 // scan and the TypeToStructReport Type catalogue in ONE pass. cModAnalyzer reads it back and merges
 // it with its built-in defaults into the editable ModAnalyzerRecipes-<ver>.json. Split out from the
@@ -187,13 +786,13 @@ Define CI_TypeDefsCacheVersion   for 2
 // packages. CI_ObsoleteScanVersion is the scan FORMAT version - bump it if _ObsoleteRecipesFromLines
 // changes. v2 added sPkgNewest (the install-package change watermark). Reuses the tModRecipeFile
 // wrapper struct (below).
-Define CS_ObsoleteScanJson       for "ObsoleteScan.json"
+Define CS_ObsoleteScanJson       for "DfVersion-ObsoleteScan.json"
 Define CI_ObsoleteScanVersion    for 2
 
 // The recipe set as it lives in that JSON: a version stamp + the rows. cModAnalyzer treats the
 // JSON as the canonical source (falling back to BuildDefaultRecipes if absent); the higher of
 // the JSON version / built-in CI_ModAnalyzerRecipeVersion wins and reseeds the ModAnalyzer table.
-// Also wraps the raw ObsoleteScan-<ver>.json, where sPkgNewest stamps the newest install *.pkg
+// Also wraps the raw DfVersion-ObsoleteScan-<ver>.json, where sPkgNewest stamps the newest install *.pkg
 // write time at scan time (the change watermark; see _PkgTimeStamp). The editable recipe JSON
 // leaves sPkgNewest blank - it is consulted only for the raw install-scan cache.
 Struct tModRecipeFile
@@ -235,6 +834,86 @@ Struct tAnalyzeRollup
     Integer iWarnTotal
 End_Struct
 
+// ---- Modernization progress history (per-workspace burn-down) ----------------------------------
+// A TIME SERIES of analyze snapshots (unlike tAnalyzeSnapshot's latest-only registry slot and the
+// latest-only saved plan): one entry appended per analyze so the user can watch errors + warnings fall
+// across Compile->Analyze->Run cycles. Appended by cRefactorApplication.AppendModProgressEntry - de-duped
+// vs the last entry, so a re-analyze with unchanged counts adds no flat row. Persisted per-workspace as
+// Data\ModProgress-<wskey>.json (ModProgressJsonPath, mirroring SavedPlanJsonPath). Reset clears the file.
+// Bump CI_ModProgressVersion if tModProgressEntry / tModProgressFile change (a stale file is then dropped).
+// DEEP SCAN rides the SAME history (Nils 2026-07-16): a scan lap appends under the reserved series
+// label below (sProgram = "Deep Scan" - never a real .src name, so no collision). Same-label rows
+// form their own burn-down series: the Progress tile's delta/cycle logic and the History modal's
+// trend already match rows BY sProgram, so the scan -> Run Fix Plan -> re-scan loop burns down
+// exactly like a compile cycle with no struct or version change. For a scan row iWarn = the finding
+// count (scan rows tally as warnings everywhere in the analyzer UI) and iErr = 0.
+Define CS_ModProgressJson    for "ModProgress.json"
+Define CI_ModProgressVersion for 1
+/* THE STORED KEY. Its VALUE IS ON DISK - it is the sProgram written into every scan lap in
+   Data\ModProgress-<wskey>.json, and both the tile's delta/cycle logic and the History modal's
+   trend match rows BY sProgram. Rename the literal and every workspace's recorded scan history
+   splits into a "before" series and an "after" series that never join up again. So it stays
+   "Deep Scan" for good, whatever the UI happens to call the feature this year - which is exactly
+   why the DISPLAY text is a separate constant below (renamed to "Analyze Source" 2026-08-10). */
+Define CS_ModProgressDeepScanLabel for "Deep Scan"
+// What the user SEES for that series - the tile, the History modal's trend line, its Program
+// column and the text export. Free to change; never compared against, never written to disk.
+Define CS_ModProgressScanSeriesText for "Analyze Source"
+
+Struct tModProgressEntry
+    String  sDate        // ISO date + time the analyze ran
+    String  sProgram     // the program (.src) these counts are for - or CS_ModProgressDeepScanLabel
+    String  sDfVersion   // target DataFlex version at the time
+    /* The PLATFORM the measured build targeted - "x64" / "x86", and "" for a Deep Scan row
+       (a source scan is not platform-specific) and for every entry written before this field
+       existed. Deliberately NOT guarded by a CI_ModProgressVersion bump: the reader discards
+       the whole history on a version mismatch, and pbRequireAllMembers is False, so an older
+       file simply parses with this empty and keeps its entries. 2026-08-20. */
+    String  sPlatform
+    /* TWO NUMBERS, SPLIT 2026-09-15 (Nils, after an Analyze Source over a workspace he had just
+       compiled clean: "the stats for 'Warn' shows 796, which is simply not true ... 796 scan
+       findings, but that is not the same as warnings"). One field used to carry both, so a scan
+       lap's findings were reported as warnings, and a compile lap that had pending findings merged
+       into it counted those as warnings too. The burn-down MAGNITUDE is the sum of the two, which
+       is exactly what the single field held, so no existing trend or sparkline moves.
+
+       Deliberately NOT guarded by a CI_ModProgressVersion bump, for the reason sPlatform gives
+       above: pbRequireAllMembers is False, so an older file parses with iScan 0 and keeps every
+       entry. ReadModProgress then back-fills what is recoverable - see ModProgressCounts.pkg,
+       which owns that rule and the naming rule with it. */
+    Integer iWarn        // compiler warning messages (a Deep Scan row: 0 - the compiler said nothing)
+    Integer iScan        // source-scan findings, which the compiler never reports
+    Integer iErr         // compiler error messages (a Deep Scan row: 0)
+    Integer iAuto        // analyzer auto-fixable rows
+    Integer iSuggest     // analyzer rows to review
+End_Struct
+
+/* THE COMPILED-SCOPE CACHE, ON DISK (2026-08-20). Opening WinServ cost 14.1s, of which 11.2s was
+   rebuilding two things that only change when the program is recompiled: the scope file list
+   (parsed out of a 71 MB .prn, 3.7s) and the class/macro definition index (1035 files read into
+   733,386 String[] elements, 7.5s). Both were cached in properties, which die with the process -
+   so every session paid it again, and the log showed the misses as "had=[]", an EMPTY property
+   rather than a changed key. Keyed by the .prn's identity (path|size|write time), so a recompile
+   invalidates it and nothing else does. */
+Struct tScopeIndexFile
+    Integer  iVersion
+    String   sStamp        // "<prn path>|<size>|<write time>" this was built from
+    String[] asScopeFiles  // the compiled set, from the .prn's Including-file lines
+    String[] asIdxKey      // "c|<name>" / "m|<name>", lowercased
+    String[] asIdxParent   // the class's parent, lowercased ("" for a macro)
+    String[] asIdxSite     // "<file>|<line>"
+End_Struct
+#IFNDEF CI_ScopeIndexVersion
+Define CI_ScopeIndexVersion for 1
+Define CS_ScopeIndexJson    for "ScopeIndex.json"
+#ENDIF
+
+// The history file payload: a version stamp + the ordered entries (oldest first).
+Struct tModProgressFile
+    Integer iVersion
+    tModProgressEntry[] aEntries
+End_Struct
+
 // ---- Saved "last refactoring plan" -------------------------------------------------------------
 // The full Modernization-Analyzer triage from the LAST analyze, frozen so it can be VIEWED again
 // later (the Modernize tile's "View last plan" link re-loads it into the read-only analyzer grid).
@@ -245,7 +924,7 @@ End_Struct
 // the dashboard's fast-read cue; both are written together from the same numbers so they can't drift).
 // Bump CI_SavedPlanVersion if tSavedPlanRow / tSavedPlan change, so a stale file is detected + dropped.
 Define CS_SavedPlanJson    for "LastPlan.json"
-Define CI_SavedPlanVersion for 1
+Define CI_SavedPlanVersion for 3   // v3: + tSavedPlan.aFloods (a collapsed scan rule's FILE LIST rides with the plan, 2026-08-16). v2: + tSavedPlan.bDeepScan (Deep Scan now writes the shared LastPlan too)
 
 // One frozen analyzer row. Named fields (NOT the grid's column-id-indexed sValue[]) so the JSON is
 // decoupled from the grid layout; the viewer maps these back onto its columns on load. iLine is the
@@ -261,18 +940,323 @@ Struct tSavedPlanRow
     String  sFn             // refactor function name(s), "" for explain / manual
 End_Struct
 
+/* A COLLAPSED scan rule, for the PLAN (2026-08-16). A rule that fires >= CI_DSFloodThreshold times
+   in a Check is shown as ONE summary row (ModAnalyzerFT paiDSFlood*), and the plan is built FROM
+   THE ROWS - so on the first live run the row's single sFile was all the plan got, and a rule with
+   22,000 findings advanced by ONE FILE per Check (Nils, WinServ: "never shows more than 12 at a
+   time ... the Refactoring plan should apply them to *all* files involved"). The row stays one row;
+   THIS carries the files it stands for. Persisted with the plan so a restored plan reaches as far
+   as a live one; ExpandFloodFilesIntoPlan (cModAnalyzer) folds it into tModRefactorPlan.asFiles.
+   sFirstFile is the row's own file - the ignore key the row is dismissed under. */
+Struct tSavedPlanFlood
+    Integer  iDSNumber       // the rule's DS pseudo message number (9001+)
+    String   sSymbol         // the rule's symbol, e.g. "EQ comparison"
+    String   sFn             // the converter the summary row names ("" = nothing to run)
+    String   sFirstFile      // the summary row's sFile (ignore key = sFirstFile + "DS <n>")
+    String[] asFiles         // EVERY distinct file the rule fired in
+End_Struct
+
+/* One FLOODING scan rule as tallied over a run's messages (cModAnalyzer.TallyScanFloods, 2026-08-16):
+   how often it fired, in how many distinct files, the first finding (the summary row's file/line),
+   the rule's symbol, and EVERY distinct file - in first-seen order. Not persisted (tSavedPlanFlood
+   is the plan-side shape); the analyzer grid maps this onto its paiDSFlood* properties. */
+Struct tDSFloodTally
+    Integer  iDSNumber      // the flood KEY: the DS number, NEGATED for the hits whose own verdict dropped the
+                            // rule's converter (cModAnalyzer.DSFloodKey, 2026-10-03)
+    Integer  iCount
+    Integer  iFiles
+    String   sFirstFile
+    Integer  iFirstLine
+    String   sSymbol
+    String   sFirstHint     // the FIRST finding's own hint (its scan verdict) - what a negative flood's row says
+    String[] asFiles
+End_Struct
+
 // The saved-plan file payload: a version stamp, the run context, the headline stats, and the rows.
 Struct tSavedPlan
     Integer iVersion
     String  sDate           // ISO yyyy-mm-dd the analyze ran (mirrors tAnalyzeSnapshot.sDate)
     String  sWorkspace      // the .sws this plan was built for
     String  sDfVersion      // target DataFlex version at build time
-    String  sSourcePrn      // the .prn / .err it was parsed from
-    Integer iWarn           // headline stats (same four as tAnalyzeSnapshot)
+    String  sSourcePrn      // the .prn / .err it was parsed from ("" for a Deep Scan - see bDeepScan)
+    String  sSourcePrnStamp // PROVENANCE (2026-08-17): sSourcePrn's last-write time + size when the plan was
+                            // written (cModAnalyzer.SourcePrnStamp). ReadSavedPlan refuses a compile plan whose
+                            // .prn is gone, unstamped, or stamped differently - a recreated workspace at the SAME
+                            // path inherits the old copy's LastPlan (the key is the path), and a copied .prn made
+                            // the old Check read as this copy's. "" for a Deep Scan.
+    Boolean bDeepScan       // True = a DEEP SCAN wrote this plan (not a compile+analyze). Same LastPlan file
+                            // serves both, latest writer wins; provenance labels the dashboard foot + drives
+                            // the ghiLastPlan* restore (compile stats stay on the registry snapshot).
+    Integer iWarn           // headline stats (same four as tAnalyzeSnapshot; for a Deep Scan iWarn = finding count, iErr = 0)
     Integer iErr
     Integer iAuto
     Integer iSuggest
     tSavedPlanRow[] aRows
+    tSavedPlanFlood[] aFloods   // v3: the collapsed scan rules' file lists (see tSavedPlanFlood)
+End_Struct
+
+// ---- Analyzer "ignore" list ------------------------------------------------------------------
+// Rows the user dismissed with Ignore. A report-only recipe (e.g. TypeToStructReport for W 4532)
+// makes NO source change, so its warning - and its grid row - return on every analyze pass; this
+// lets the user retire one for good. Keyed by (file + message token) - exactly one grid row, so
+// ignoring it suppresses all its occurrences (the "(xN)") and survives line shifts. Persisted
+// per-workspace (cModAnalyzer IgnoredJsonPath -> Data\Ignored-<wskey>.json, mirroring the saved plan).
+Define CS_IgnoredJson    for "Ignored.json"
+Define CI_IgnoredVersion for 1
+
+Struct tModIgnore
+    String sFile        // full source path as the grid shows it
+    String sMsg         // message token as shown, e.g. "W 4532"
+End_Struct
+
+// The ignore-list file payload: a version stamp + the rows.
+Struct tModIgnoreFile
+    Integer iVersion
+    tModIgnore[] aRows
+End_Struct
+
+/* ONE WORKSPACE COPY STANDING IN FRONT OF A SHIPPED FILE - the rows behind the board's overriding-copies
+   line, the report's PART 3 and the Rename dialog (cShadowedPackageFiles, RetireShadowsFT.dg). TWO kinds.
+   From 2026-09-15 to 2026-10-05 the second was eShadowPool, EVERY copy of a file one of the workspace's own
+   packages or libraries ships; Nils took it out again: "It is actually perfectly OK with duplicate
+   filenames, as long as they are not a DataFlex system package." Since 2026-11-12 the second is much
+   narrower (cShadowedPackageFiles.FailingPackageCopies): a copy THIS build compiled in place of the file of
+   a package that has errors in the same build. A workspace's leftover LANGUAGE.PKG did that to VDFQuery20 -
+   76 errors in the package's files, and nothing on the board pointed at the copy. */
+Enum_List
+    Define eShadowInstall for 0   // the file ships with DataFlex itself (the install's Pkg folder)
+    Define eShadowFailingPackage  // a package checkout ships it, and that package has errors in this build
+End_Enum_List
+
+Struct tShadowCopy
+    String  sLeaf      // the file name as the disk spells it
+    String  sPath      // the workspace's own copy - the one a rename moves aside
+    String  sShipped   // the file it stands in front of: the install's, or the package's
+    String  sSource    // where sShipped lives, for a sentence: "DataFlex", or the package's name
+    Integer eKind      // eShadowInstall or eShadowFailingPackage
+    Integer iClass     // 0 = this build compiled sPath in place of sShipped; 1 = the build did not read sPath
+    Boolean bSame      // sPath and sShipped hold the same bytes - the one case a rename loses nothing
+    Boolean bAlways    // a NAMED file that must always be suggested for rename even though it DIFFERS
+                       // (IsAlwaysRetireFile) - it starves the shipped file rather than forking it
+    Boolean bTicked    // the dialog's answer: rename this one (starts as bSame or bAlways)
+    Boolean bKept      // the user's recorded decision: keep this one - off the line, listed by the kept chip
+    Integer iPackageErrors // eShadowFailingPackage: the errors this build reported in that package's files
+    Boolean bAddsNothingUsed // DIFFERENT, but nothing in the workspace uses a name it adds - ticked like an
+                             // identical copy (cShadowedPackageFiles.MarkCopiesThatAddNothingUsed, 2026-11-12)
+End_Struct
+
+/* THE COPIES THE USER DECIDED TO KEEP, so the line stops offering them.
+
+   Nils 2026-09-15, after the per-file dialog: "one conundrum on what to do with files that were NOT
+   ticked? I choosed one file to be unticked and that makes the 'Rename them...' button to stick,
+   until all files have been renamed." An unticked copy still shadows the shipped file, so the line
+   is right to keep naming it - but a copy the user has COMPARED and judged to be their fork needs a
+   way to say so that the board respects. This record is that way, and it is EXPLICIT: written only
+   by the dialog's "keep the rest" button, never inferred. (The exception list dropped earlier the
+   same day was the inference - a copy found live again after a rename - and a Revert produces that
+   shape too; nothing but a decision produces this one.) Reversible from the line's "N kept" chip.
+
+   Keyed by full PATH, in DFRefactor's own Data folder as Data\KeptShadows-<wskey>.json - never in
+   the target workspace, per the per-workspace-state rule; the .sws path is folded into the name
+   like the analyzer's ignore list. */
+Define CS_KeptShadowsJson    for "KeptShadows.json"
+Define CI_KeptShadowsVersion for 1
+
+/* THE FILES A REFACTORING PLAN RAN ON AND LEFT AS THEY WERE (2026-11-12), per workspace in
+   Data\PlanNoOps-<wskey>.json - see cPlanNoOps.pkg. A row holds while its file keeps sStamp. */
+Define CS_PlanNoOpsJson    for "PlanNoOps.json"
+Define CI_PlanNoOpsVersion for 1
+// The package ChangeExternalFunctionCallers writes into the workspace's AppSrc folder for a legacy Type that DataFlex's
+// Dftypes.pkg declares and DataFlex ships no Struct for (DEVMODE, DEVNAMES): the Struct, copied member for member, that
+// each converted file Uses (cRefactorFuncLib _DfTypesStructNameFor, 2026-11-13).
+Define CS_DfTypesStructsPkg for "DfTypesStructs.pkg"
+
+Struct tPlanNoOp
+    String   sFile      // the file, lowercased
+    String   sStamp     // its last-write time and size when the run left it (PlanNoOpFileStamp)
+    String[] asFns      // the functions the plan ran on it, lowercased
+End_Struct
+
+Struct tPlanNoOpFile
+    Integer     iVersion
+    tPlanNoOp[] aRows
+End_Struct
+
+/* THE CI SCAN (2026-11-20): DFRefactorFT /scan <ini> runs Analyze Source read-only, writes its findings as JSON
+   and SARIF, and compares their fingerprints with a baseline - cCIScan.pkg says how. /baseline accepts today's
+   findings. [Scan Section] in the INI may name the three files; each defaults to the INI's own name with
+   .findings.json, .findings.sarif or .baseline.json in place of .ini. */
+Define CS_CmdLineScan              for "/scan"
+Define CS_CmdLineScanBaseline      for "/baseline"
+Define CS_CmdIniScanSection        for "Scan Section"
+Define CS_CmdIniScanBaselineFile   for "Baseline File"
+Define CS_CmdIniScanJsonFile       for "Json File"
+Define CS_CmdIniScanSarifFile      for "Sarif File"
+Define CI_CIScanVersion            for 1
+// The exit codes: no new findings, new findings, the scan could not run.
+Define CI_CIScanPass               for 0
+Define CI_CIScanNewFindings        for 1
+Define CI_CIScanError              for 2
+
+/* THE TECHSTACK READINESS TOPICS (2026-11-20, cRefactorFuncLib._TechStackTopics holds their text). Positions in
+   the report's parallel arrays, in report order; CI_TSTopicCount stays last. */
+Enum_List
+    Define CI_TSOpen for 0
+    Define CI_TSRelate
+    Define CI_TSServerFile
+    Define CI_TSMakeFile
+    Define CI_TSFileNumber
+    Define CI_TSMainFile
+    Define CI_TSValidate
+    Define CI_TSFieldValidate
+    Define CI_TSEntryItem
+    Define CI_TSTableCommand
+    Define CI_TSHttpTransfer
+    Define CI_TSWindowsUI
+    Define CI_TSComActiveX
+    Define CI_TSSoap
+    Define CI_TSExternalFunction
+    Define CI_TSStringToBoolean
+    Define CI_TSTopicCount
+End_Enum_List
+
+Struct tCIScanFinding
+    String  sFingerprint    // cCIScan.Fingerprint: the rule, file, text and occurrence - never the line number
+    String  sRule           // "DS9086"
+    Integer iDSNumber
+    String  sFile           // relative to the workspace's home folder, "/" between folders
+    Integer iLine
+    String  sSymbol
+    String  sCategory       // Auto-fix, Review or Explain
+    String  sRefactorFn     // the function that converts it, "" when none does
+    String  sHint
+    String  sText           // the line as cCIScan.NormalisedLine leaves it
+    Integer iOccurrence     // 1, 2 ... among the findings of one rule with the same text in one file
+    Boolean bNew            // the baseline does not hold it
+End_Struct
+
+Struct tCIScanReport
+    Integer iVersion
+    String  sWorkspace
+    String  sCreated
+    String  sBaselineFile
+    Boolean bBaselineFound
+    Integer iFilesScanned
+    Integer iFindings
+    Integer iNew
+    Integer iGone           // in the baseline, and not found any more
+    Integer iExitCode
+    tCIScanFinding[] aFindings
+End_Struct
+
+Struct tCIScanBaselineRow
+    String  sFingerprint
+    String  sRule
+    String  sFile
+    Integer iLine           // where it was when the baseline was written - for a person; the match ignores it
+    String  sSymbol
+    String  sText
+End_Struct
+
+Struct tCIScanBaseline
+    Integer iVersion
+    String  sCreated
+    String  sWorkspace
+    tCIScanBaselineRow[] aFindings
+End_Struct
+
+/* SARIF 2.1.0, as much of it as the CI scan fills. The member names are SARIF's own keys: DataTypeToJson writes
+   them as they are declared here, case and all. */
+Struct tSarifText
+    String text
+End_Struct
+
+Struct tSarifConfig
+    String level
+End_Struct
+
+Struct tSarifRuleProps
+    String category
+    String refactorFunction
+End_Struct
+
+Struct tSarifRule
+    String          id
+    String          name
+    tSarifText      shortDescription
+    tSarifText      fullDescription
+    tSarifConfig    defaultConfiguration
+    tSarifRuleProps properties
+End_Struct
+
+Struct tSarifDriver
+    String       name
+    String       informationUri
+    tSarifRule[] rules
+End_Struct
+
+Struct tSarifTool
+    tSarifDriver driver
+End_Struct
+
+Struct tSarifArtifactLocation
+    String uri
+    String uriBaseId
+End_Struct
+
+Struct tSarifRegion
+    Integer startLine
+End_Struct
+
+Struct tSarifPhysicalLocation
+    tSarifArtifactLocation artifactLocation
+    tSarifRegion           region
+End_Struct
+
+Struct tSarifLocation
+    tSarifPhysicalLocation physicalLocation
+End_Struct
+
+Struct tSarifFingerprints
+    String dfrefactorHitV1
+End_Struct
+
+Struct tSarifResult
+    String             ruleId
+    String             level
+    tSarifText         message
+    tSarifLocation[]   locations
+    tSarifFingerprints partialFingerprints
+    String             baselineState
+End_Struct
+
+Struct tSarifUriBase
+    String uri
+End_Struct
+
+Struct tSarifUriBases
+    tSarifUriBase SRCROOT
+End_Struct
+
+Struct tSarifRun
+    tSarifTool     tool
+    tSarifUriBases originalUriBaseIds
+    tSarifResult[] results
+End_Struct
+
+Struct tSarifLog
+    String      version
+    tSarifRun[] runs
+End_Struct
+
+Struct tKeptShadow
+    String sPath        // full path of the copy the user keeps - the key
+    String sLeaf        // its file name, for the dialogs
+End_Struct
+
+Struct tKeptShadowFile
+    Integer iVersion
+    tKeptShadow[] aRows
 End_Struct
 
 // Aren't modern DD classes named o<tablename>_DataDictionary ?
@@ -299,9 +1283,10 @@ End_Enum_List
 // "Run source:" in the summary log, so a saved summary says WHAT kicked it off.
 Enum_List
     Define eRunManual    for 0 // user-selected functions + files ("Start Refactoring")
-    Define eRunPlan      for 1 // analyzer "Refactor Plan" (Auto Select from Analyze)
+    Define eRunPlan      for 1 // analyzer "Refactor Plan" from a COMPILE+ANALYZE cycle
     Define eRunBatch     for 2 // headless command-line (/bm) run
     Define eRunTestBench for 3 // the interactive Test Bench (LegacyCode.pkg)
+    Define eRunDeepScan  for 4 // "Refactor Plan" whose rows came from a DEEP SCAN (not compile+analyze)
 End_Enum_List
 
 Enum_List
@@ -334,39 +1319,57 @@ Enum_List
     Define eFnGroupOther          for 0   // Unclassified / no { FnGroup } tag.
     Define eFnGroupModernization  for 1   // Brings legacy code up to current DataFlex.
     Define eFnGroupCleanup        for 2   // Tidies or removes.
+    Define eFnGroupUnicode64      for 3   // 64-bit + Unicode migration readiness (reports + fixes). Tag text: Unicode64.
 End_Enum_List
 
 // "No FnGroup filter / all groups" sentinel (mirrors eAllFunctions for the Type filter). NOT a real group
 // value - used by SelectFunctionsFT's FnGroup constraint + the dashboard's Manual tile (vs Cleanup).
 Define eFnGroupAll for (-1)
 
+/* WHICH BOARD THE USER IS WORKING ON (piLastBoardView, cRefactorApplication) - so a screen that is
+   not a board can offer the way BACK to the right one (Nils 2026-08-07, the Editor crumb).
+
+   Each board stamps this in its own Activate, which makes it a fact rather than a guess: the
+   alternative signals all answer a different question. pbGuidedSurfaceUsed is sticky-once-guided
+   and never names the Manual board; pbWorkspaceMode is about single-file vs workspace; and
+   pbGuidedTidyUpRun is a one-shot about a particular run.
+
+   Defaults to eBoardGuided - the trail is the startup destination and the board the Start Center's
+   guided lane opens, so it is the right answer before any board has been entered. */
+Define eBoardGuided  for 1   // oDashboard_vw  - the guided trail ("Dashboard (WIP)")
+Define eBoardManual  for 2   // oManualDashboard_vw - the manual flow's board
+Define eBoardCockpit for 3   // oDashboard_vw       - the original split board, on the way out
+
+/* ...AND WHICH FULL-SCREEN SURFACE THE USER CAME FROM (piLastSurface, cRefactorApplication) - a
+   SUPERSET of the eBoard values above, so one Case ladder reads both (Nils 2026-08-09, the Select
+   Folders / Select Functions crumbs).
+
+   WHY NOT piLastBoardView, which already exists and looks like the same question: it cannot tell
+   "no board has been entered yet" from "the guided board is current", because eBoardGuided is its
+   default. The Editor could live with that - it is only ever reached FROM a board. Select Folders
+   is also reached from the START CENTER (opening or copying a workspace that ends up with no
+   folders selected lands there), and on that route the crumb must go back to the Start Center, not
+   to a trail the user never opened.
+
+   Stamped by the four surfaces' own Activate, so it is a fact rather than a guess - and it is
+   right by construction for the routes that have no board of their own: the toolbar's Select
+   Folders / Select Functions items and the Test Compile dock's, because a DOCK is not a surface
+   and never overwrites the stamp of the board behind it.
+
+   Defaults to the Start Center: that is where a session begins, and it reproduces exactly what the
+   two crumbs did before this existed. */
+Define eSurfaceStartCenter for 0   // oStartCenter_vw - the pre-workspace screen
+
 Define CS_FnGroupOther           for "Other"
 Define CS_FnGroupModernization   for "Modernization"
-Define CS_FnGroupCleanup         for "Cleanup"
-
-// { FnGroup } enum <-> text converters (mirrors cModAnalyzer's CategoryText). Used INSTEAD of an
-// implicit 'Move a name-string into an Integer' resolution, which turns a non-Define string into 0
-// and faults under DF26 - see _ParameterIsEnum in cBaseFuncLib. Global so both the meta-tag parser
-// (cRefactorFuncLib ParseComment) and the Functions DD value-table can reach them.
-Function FnGroupText Global Integer eGroup Returns String
-    If (eGroup = eFnGroupModernization) ;
-        Function_Return CS_FnGroupModernization
-    If (eGroup = eFnGroupCleanup) ;
-        Function_Return CS_FnGroupCleanup
-    Function_Return CS_FnGroupOther
-End_Function
-
-// Resolve a { FnGroup } meta-tag's text (e.g. "Modernization") to its enum value, case-insensitively.
-// Unknown / blank -> eFnGroupOther (0), the same default an untagged function gets.
-Function FnGroupValue Global String sText Returns Integer
-    String sTrim
-    Move (Trim(Lowercase(sText))) to sTrim
-    If (sTrim = Lowercase(FnGroupText(eFnGroupModernization))) ;
-        Function_Return eFnGroupModernization
-    If (sTrim = Lowercase(FnGroupText(eFnGroupCleanup))) ;
-        Function_Return eFnGroupCleanup
-    Function_Return eFnGroupOther
-End_Function
+// Display text for eFnGroupCleanup - renamed "Cleanup" -> "Tidy Up" (Nils 2026-07-16) so the
+// function grid / filter wording matches the dashboard's Tidy Up tile. The TAG spelling stays
+// { FnGroup = Cleanup } (every function header + old JSON exports keep working): FnGroupValue
+// accepts BOTH this display string and the "Cleanup" tag alias - the Unicode64 pattern below.
+Define CS_FnGroupCleanup         for "Tidy Up"
+// Display text for eFnGroupUnicode64. The TAG spelling is { FnGroup = Unicode64 } (clean meta-tag
+// text); FnGroupValue accepts BOTH this display string and the "Unicode64" tag alias.
+Define CS_FnGroupUnicode64       for "x64 + Unicode"
 
 // Indicator names the indicator-refactoring functions (ChangeLegacyIndicators /
 // ChangeSquareBracketsIndicators) must NOT bare-ify - they have no valid modern bare form.
@@ -583,25 +1586,81 @@ Struct tSwsPackage
     String              sLicense        // License identifier (e.g. "MIT")
     String              sLicenseFile    // Path to a license file
     String              sVersion        // Package version string ("1.2.3" or built from {major,minor,revision})
+    // The DataFlex releases this package supports - its own claim, and the only sound basis for
+    // judging a package against a target. Strings, not numbers: see the note in ReadSwsJsonFile.
+    String              sDfMin          // "df-min", "" when the package does not say
+    String              sDfMax          // "df-max", "" when the package does not say
     String[]            asIncludeFiles  // Glob patterns of files to include in the package
     String[]            asExcludeFiles  // Glob patterns of files to exclude from the package
     tSwsInstallItem[]   aInstall        // Files to install (string or object)
     tSwsHtmlInclude[]   aHtmlIncludes   // HTML include entries
 End_Struct
 
-// Complete in-memory representation of a DataFlex 26+ JSON .sws workspace file.
+/* Which on-disk shape a .sws has. An ENUM rather than a Boolean (Nils 2026-08-05): "bIsJson = False"
+   reads as an assertion about JSON when what is meant is "it is INI", and a third format would have
+   nowhere to go.
+
+   The DF26 Studio converts a WORKSPACE .sws to JSON when migrating; LIBRARY .sws files stay INI
+   (verified 2026-08-05: 1 JSON to 103 INI under DF26). Both formats are therefore live at once, and
+   which one a file has is a property of the FILE, never of the DataFlex version. */
+Enum_List
+    Define eSwsIni   for 0
+    Define eSwsJson  for 1
+    /* THERE IS NO FILE - which is NOT "the old format", however convenient that was to return.
+       SwsFormatOf answered eSwsIni for a missing or empty path, so the Libraries dialog dimmed
+       Add Package / Browse Packages AND offered to "Convert to JSON now" a file that was not
+       there (Nils 2026-08-30, on the Alpha 5 package). Same failure shape the pOwnSws guard was
+       written for: absence reported as a value. Callers testing "<> eSwsJson" keep working -
+       missing is correctly not-JSON - but anything that WORDS the answer must tell the two
+       apart. */
+    Define eSwsMissing for 2
+    /* THE FILE IS THERE AND IS NEITHER: it carries git conflict markers ('<<<<<<< ' at the start of
+       a line), an unfinished merge committed as it stood. df-cli reads such a library .sws, says
+       "Config file is not in ini format", refuses the whole chain - and, started without its output
+       redirected, waits until killed (measured 2026-09-14, on a real library repository whose five
+       .sws files have all carried the markers since 2024). Its own answer, so the chain walk and the
+       Libraries dialog can NAME the file instead of blaming "a reference that does not resolve". */
+    Define eSwsConflict for 3
+End_Enum_List
+
+/* ---- RESOLVED AT RUNTIME, not read from the file ------------------------------------------
+   Everything above describes the .sws's CONTENTS; these five describe where it sits and what
+   its relative paths resolve to. They live here rather than in a second struct beside it,
+   because a second struct modelling the same workspace is exactly how tWorkspacePaths came to
+   exist - and how the multi-path arrays above ended up being discarded at [0] to fit it.
+
+   Kept as one clearly-marked group so nobody mistakes them for fields the file declares:
+   a .sws never states its own home, and asking it to would be circular. */
+Struct tRuntimePaths
+    String sSwsPath       // Full path of the .sws itself
+    String sHome          // Workspace home (the folder the .sws sits in, or the .ws Home=)
+    String sWsConfigFile  // Full path of the legacy .ws, "" for a JSON workspace that carries its paths inline
+    String sFilelistName  // DF_FILELIST_NAME as resolved
+    String sOpenPath      // DF_OPEN_PATH composite at capture time
+End_Struct
+    
+/* Complete in-memory representation of a DataFlex .sws workspace file, either format.
+  
+   FORMAT + PARSE STATE, decided once at the boundary so nothing downstream sniffs the file.
+   bParsed is not decoration: "read, and genuinely empty" and "never read" look identical in
+   every other field, and confusing them is what made the Libraries tile report "declares no
+   libraries" for a workspace that declared six. Test it before concluding anything from an
+   empty list. */
 Struct tSwsFile
+    Integer          eSwsFormat                  // eSwsIni / eSwsJson
+    Boolean          bParsed                     // False = never read, or unreadable
     String           sWorkspaceName              // "workspaceName" (defaults to filename if absent)
     String           sDfVersion                  // "df" — target DataFlex version, kept as String to dodge the locale decimal-separator trap (successful-parse sentinel: <> "")
     String           sDescription                // Short description (required for packages)
     Boolean          bNoUpdateHtml               // "no-update-html"
     Boolean          bNoHtmlIncludeVersioning    // "no-html-include-versioning"
     tSwsPaths        Paths                       // Source and data path configuration
-    tSwsDependency[] aDependencies               // Workspace dependencies (string or object)
+    tSwsDependency[] aDependencies               // Workspace dependencies (libraries)
     tSwsOverride[]   aOverrides                  // Overrides (only root-workspace overrides take effect)
-    tSwsProject[]    aProjects                   // Project entries (string or object)
+    tSwsProject[]    aProjects                   // Project entries (Program files)
     tSwsStudio       Studio                      // DataFlex Studio settings
     tSwsPackage      Package                     // Package/library distribution metadata
+    tRuntimePaths    RuntimePaths                // Resolved at runtime - contrast Paths above, which is what the FILE declares
 End_Struct
 
 #IFNDEF cx_DbSelect_All    
@@ -642,6 +1701,7 @@ Struct tRefactorSettings
     Boolean bCountSourceLines           // If we should only count source lines (all other functions will be ignored).
     Boolean bReadOnly                   // Run through the selected refactor functions but *do not* make changes to any source file.
     Boolean bWorkspaceMode              // If true all files that matches the selected file filter and selected folders will be affected by refactoring functions.
+    Boolean bCharacterMode              // The main program is a character-mode program (Use UI, no Windows base): converters that rewrite Windows UI objects are skipped (2026-09-20).
     Boolean bShowStartQuestion          // Should the engine show a question before starting the refactoring process
     Boolean bShowSummary                // Should the log/summary dialog be dispalyed automatically after the engine is finished.
     //
@@ -678,6 +1738,89 @@ Enum_List
     Define MLS_SQLDoubleQuote   // SQL-style string with double quotes
     Define MLS_SQLTripleQuote   // SQL-style string with triple quotes
 End_Enum_List
+
+// What a line of a file is (tLineInfo.eKind): the file walk's answer, cRefactorLexer's ScanSourceFile - the
+// one walk behind _CodeOnlyFileLines, KeptTextFlags, the macro-code guard and the Deep Scan's masking. Macro
+// code is not a kind: eMacro says which, on top (MC_ below).
+Enum_List
+    Define LK_Code              // code
+    Define LK_StringOpener      // opens a DF 23 multi-line string: its code stands before the opening quote(s)
+    Define LK_StringText        // a multi-line string's text
+    Define LK_StringCloser      // closes the string: its code stands after the closing quote(s)
+    Define LK_Header            // a #HEADER region line, #HEADER and #ENDHEADER included
+    Define LK_BlockComment      // a DF 23 /* */ block comment line
+    Define LK_Image             // a legacy report image line
+End_Enum_List
+
+// What macro code a line is, for the same walk (tLineInfo.eMacro): none, a directive line ('!...'), or a line of
+// a #COMMAND..#ENDCOMMAND or a #DATA..#ENDDATA block, both ends included. Macro code is never refactored.
+Enum_List
+    Define MC_None
+    Define MC_Directive
+    Define MC_CommandBlock
+    Define MC_DataBlock
+End_Enum_List
+
+// One line, read once by the lexer's line scanner (cRefactorLexer's ScanSourceLine). Positions are those of the
+// line; 0 means none.
+Struct tLineScan
+    // Where the string open at the line's start ends: its closing quote (the first of a """ closer's three).
+    Integer iCloseAt
+    // The string open at the line's end, and where its opening quote stands (the first of a """ opener's three).
+    String  sOpenOut
+    Integer iOpenAt
+    // Where a "//" end comment starts, where a "/*" opens a block comment - outside every string, before any
+    // "//" - and where the first "*/" stands that ends one. A block comment ends at its first "*/", quotes or not
+    // (measured on DataFlex 26), so one open at the line's start (sOpenIn "/*") ends at the line's first "*/",
+    // wherever it stands. A "*/" outside every string and comment counts too.
+    Integer iCommentAt
+    Integer iBlockStartAt
+    Integer iBlockEndAt
+    // A block comment is still open at the line's end.
+    Boolean bBlockOpenOut
+    // Only when asked for (bCode): the line's code - every string's content blanked with the quotes kept, the end
+    // comment cut, a block comment blanked with its markers (one left open cut, as an end comment is), and on a
+    // closing line the string's or the comment's text blank too - every position still that of the line.
+    String  sCode
+End_Struct
+
+// One line of a file, as the lexer's file walk reads it (cRefactorLexer's ScanSourceFile).
+Struct tLineInfo
+    Integer eKind       // what the line is: LK_
+    Integer eMacro      // what macro code it is: MC_
+    String  sOpenIn     // the multi-line string open at the line's start ("" none, '"""', '"' or "'")
+    String  sOpenOut    // and at its end
+    Integer iCloseAt    // the line's tLineScan.iCloseAt: where the string open at its start ends
+    Integer iOpenAt     // the line's tLineScan.iOpenAt: where the string open at its end opened
+    Boolean bBlockOpenIn // a block comment is open at the line's start: the line is comment to its first "*/"
+End_Struct
+
+// The sentinels the whole-file functions see instead of the lines no function may change (cRefactorFuncLib's
+// macro-code guard and MaskKeptText): macro code, and a multi-line string's text or a #HEADER line.
+Define CS_MacroSentinel for "//@@DFRefactorMacroCode:"
+Define CS_KeptTextSentinel for "//@@DFRefactorKeptText:"
+// The token for the text on an @-string's opening or closing line, which holds code too (MaskKeptText): it
+// stands in for the text only, so it holds no quote and no '//', and it ends in "@@" so that 1 is not 12.
+Define CS_KeptPartSentinel for "@@DFRefactorKeptPart:"
+// What every sentinel line starts with.
+Define CS_SentinelStart for "//@@DFRefactor"
+
+// What cRefactorFuncLib's MaskForTransform masked, for UnmaskAfterTransform to put back: the text lines and parts
+// (MaskKeptText's asSaved / aiIndex) and the macro lines (MaskFlaggedLines'), each with its count.
+Struct tWholeFileMask
+    String[]  asText
+    Integer[] aiText
+    Integer   iText
+    String[]  asMacro
+    Integer[] aiMacro
+    Integer   iMacro
+End_Struct
+
+// One name the code of a file uses, and that file (cRefactorFuncLib's _NameReaderIndex).
+Struct tNameReader
+    String  sWord       // UPPERCASE
+    Integer iFile       // the file's index in the file list indexed
+End_Struct
 
 { EnumList = "eSingleQuotes, eDoubleQuotes" }
 Enum_List
@@ -754,6 +1897,7 @@ Struct tTokenizer
     Boolean bIsComment                  // If the source code line starts with "//"
     Boolean bIsInDF23MultiLineComment   // For DF 23 and up. New comment syntax: Start = /* and End = */
     Boolean bHasEndSemiColon            // If the line ends with a semi-colon (;), indicating there is more code on next line.
+    Boolean bIsContinuationLine         // The PREVIOUS physical line ended with ';' - this line continues its statement (2026-09-17).
     Boolean bIsInDF23MultiLineString    // DF23 -> can e.g. be an SQL statement over several lines. Will not be acted on by the Tokenizier.
     Boolean bIsInFunction               // Are we in a function declaration
     Boolean bIsInProcedure              // Are we in a procedure declaration
@@ -814,10 +1958,25 @@ End_Struct
     Define clProgramIconBg          for (RGB(43, 59, 83))       // HTML #2B3B53
 #ENDIF
 
-#IFNDEF CI_DarkTheme
-    Define clDarkTheme for (RGB(36,36,36)) 
-    Define clDarkThemeText for clWhite
+// The FlexTron dark colours - clDarkTheme, clDarkThemeText, clDarkViewBg and clDarkWebBg - live in
+// FTConstants.h.pkg since 2026-09-23, with the rest of the FlexTron theme.
+
+// On_Key constant for Ctrl+Shift+Tab. Guarded copies remain in cRefactorScintillaEditor.pkg for
+// programs that pull that package in without this header.
+#IFNDEF C_CtrlShiftTab
+    Define C_CtrlShiftTab for 7170
 #ENDIF
+
+// The FlexTron theme values (CI_FTTheme*), giFTThemeMode and where the theme choice is saved
+// (CS_FTThemeSection / CS_FTTheme) live in FTConstants.h.pkg since 2026-09-23.
+
+// piActiveView of ghoApplication - which editing surface the user is on. Set by the folder and
+// editor views, read by the .src programs' key handling. Both DFRefactor.src and DFRefactorFT.src
+// carried an identical copy of this Enum_List until 2026-08-13.
+Enum_List
+    Define CI_CleanupSource
+    Define CI_CodeIndenter
+End_Enum_List
 
 // *** Command Line interface ***
 //     Paramaters can be passed on the command line in any order
@@ -848,17 +2007,44 @@ Define CS_CmdLineBatch2             for "/batch"           // Automatically and 
 // Instead of using flags CS_CmdLineFileNameX and CS_CmdLineFoldersX, an ini-file can be used.
 // This is particullary useful if used together in a build process.
 // Note: Settings above will be ignored if a "CS_CmdIniFileName" file is specified on the command line.
+/* THE documented batch switch, and it takes the ini-file: "/bm <ini>". These two lived in
+   cRefactorApplication.pkg, referenced by NOTHING, while the parser accepted only /c -c
+   --console - so the generated wrapper, CLAUDE.md and these constants all agreed with each
+   other and none of them agreed with the code. Moved here, beside the switches they belong
+   with, and wired into the parser (Nils 2026-08-03). */
+Define CS_BatchModeShort            for "/bm"
+Define CS_BatchModeLong             for "/batch_mode"
+// Accepted but no longer advertised - superseded by /bm, kept so existing scripts still run.
 Define CS_CmdConfigFile1            for "/c"
 Define CS_CmdConfigFile2            for "-c" 
 Define CS_CmdConfigFile3            for "--console"
 
 // This is the default ini-file name, but it can be named anything.
-Define CS_CmdIniFileName            for "CmdLineData.ini"
+Define CS_CmdIniFileName            for "DFRefactor.ini"     // exported as DFRefactor_<workspace>.ini
 // *** End Command Line Interface ***
 
 // *** "DFRefactorCmdLine.ini" Sections ***
 Define CS_CmdIniSWSFileSection      for "SWS File Section"
 Define CS_CmdIniSWSFile             for "SWS File Name"
+
+/* [Help] - written FIRST so it lands at the top of a newly exported INI (Nils 2026-08-03:
+   "I had to run the program with -h to read what param to use"). Nothing READS these keys;
+   they exist so the file explains itself to whoever opens it next, which for a build INI is
+   usually not the person who exported it.
+
+   A section rather than ";" comment lines because cIniFile writes through the Windows
+   WritePrivateProfileString API, which can only author Key=Value pairs - it physically
+   cannot write a standalone comment. */
+Define CS_CmdIniHelpSection         for "Help"
+Define CS_CmdIniHelpSyntax          for "Syntax"
+Define CS_CmdIniHelpSwitches        for "Switches"
+Define CS_CmdIniHelpResult          for "Result"
+Define CS_CmdIniHelpWrapper         for "Wrapper"
+Define CS_CmdIniHelpCreatedBy       for "Created by"
+Define CS_CmdIniHelpSwitchesText    for "/bm <ini file> runs it headless. A bare file name is resolved against the program's Programs folder; otherwise give a full path. Run the exe with /h for the full list."
+Define CS_CmdIniHelpResultText      for "The run writes STATUS=SUCCESS or STATUS=FAILED to the file named in [Result Section], and exits with code 0 on success, 1 on failure."
+Define CS_CmdIniHelpWrapperText     for "The _RUN.ps1 file written beside this INI on export runs the line above and reads the result file back."
+Define CS_CmdIniHelpCreatedByText   for "This file was created with the DFRefactor program's Export dialog (main toolbar). Re-export to refresh it."
 
 Define CS_CmdIniUserSection         for "User Name Section"
 Define CS_CmdIniUserName            for "User Name"
@@ -871,6 +2057,8 @@ Define CS_CmdIniFileFilterSection   for "File Filter Section"
 Define CS_CmdIniFileFilters         for "File Filters"          // A comma separated list with file extensions. E.g. *.src,*.vw,*.dd
 Define CS_CmdIniFunctionSection     for "Functions Section"     // Section for selection of refactoring functions to use.
 Define CS_CmdInitFunction           for "Function Name"         // Similar to CS_CmdIniFolderName.
+Define CS_CmdIniResultSection       for "Result Section"        // Optional: where a headless run writes its outcome (a robust complement to the process exit code).
+Define CS_CmdIniResultFile          for "Result File Name"      // Full path. The build deletes it before the run, then reads STATUS=SUCCESS|FAILED after (missing file = the run crashed/hung).
 
 // *** End "DFRefactorCmdLine.ini" Sections ***
 //
@@ -889,11 +2077,243 @@ Define CS_GridFontSize              for "GridFontSize"
 Define CS_GridTheme                 for "GridTheme"
 Define CS_GridCaptionColor          for "GridCaptionColor"
 Define CS_TabPosition               for "TabPosition"
+// cRDCModalPanel's End_Construct_Object grows the panel by this many units to make room for
+// the CodeJock status bar it builds there. A child anchored anAll stretches to the panel's
+// bottom edge and swallows that strip, so such a child must be re-sized AFTER the forward.
+Define CI_ModalStatusBarUnits       for 8
+
+/* CS_PaletteCssLink, CS_PageFitCssLink and CS_PillsCssLink - the library's style sheets, as a fragment links them
+   - are Library-RDCFlexTron's own (FTConstants.h.pkg) since DFRefactor's pin moved to 0.9.1 (2026-09-29); they were
+   copied here until then. A fragment is its own document and does not inherit application.css, so it links them
+   itself, CS_PaletteCssLink first. */
+/* The two dashboard boards - step strip, cards, chips, findings list. Was 107 lines of DataFlex
+   inside DashboardFT.vw building one <style> block; 108 rules, not one of them interpolated.
+   Returned by TileCss AFTER CS_PaletteCssLink, so a tile rule still overrides a shared one exactly
+   as the inline block did - link order is what preserves that. */
+Define CS_TilesCssLink              for '<link rel="stylesheet" href="CssStyle/tiles.css">'
+// The Libraries dialog and the Modernization progress panel. Same reasoning as the boards: the
+// rules were static, so they are files now. Both linked AFTER CS_PaletteCssLink by their caller.
+Define CS_LibrariesCssLink          for '<link rel="stylesheet" href="CssStyle/libraries.css">'
+Define CS_ModProgressCssLink        for '<link rel="stylesheet" href="CssStyle/modprogress.css">'
+
+/* THE FINDINGS RENDER CONTEXT.
+
+   FindingsListHtml fills four bands - breaks-the-build, auto-fixable, needs-review, by-hand - and
+   the 266-line block that builds one row touches nearly all of it. Passing that as parameters came
+   to 31 (5 in, 26 by reference), which is not a signature anyone can read or get right.
+
+   The member names are EXACTLY the local names they replace, so introducing this was a rename the
+   compiler could check rather than a rewrite anyone had to review.
+
+   The last two groups are the subtle part: those values are carried BETWEEN rows. asCallLines is
+   the payload of the cache whose key is sCallFile - on a cache hit it is read without being
+   written, so making it a per-row local would have silently emptied the cache. asBuiltins is the
+   memoised native-function catalogue (re-fetching it per row was measured at 2.8 seconds once),
+   asCallPairs and asObjNames dedupe across rows, and iCallReads is the read budget - reset it per
+   row and the cap never trips. None of that would have failed a compile. */
+
+/* What ONE program's LAST build left behind, read off its compile artifacts (cCompileMixin
+   .ProjectBuildHealth). A Check compiles ONE program, so the board's verdict about "the compiler"
+   used to be a statement about one project silently presented as one about the workspace (Nils
+   2026-08-29: two E 4539 in a pool package of a program the Check never compiled, and
+   "Nothing left to fix ... the compiler is clean"). This is the evidence the verdict now cites for
+   the OTHER projects: their freshest .err (errors counted with the canonical parser), else their
+   .prn (built, no errors recorded), else an .exe ALONE (CI_BuildHealthExeOnly - an exe says nothing
+   about when or where it was built; Nils 2026-09-03: 20 WinServ programs whose only artifact was a
+   32-bit exe from 2021 read as "all built clean on their last builds" in a DF26 migration that had
+   never compiled one of them), else nothing (never built here - NOT the same as clean). */
+Define CI_BuildHealthNeverBuilt for 0
+Define CI_BuildHealthClean      for 1
+Define CI_BuildHealthErrors     for 2
+Define CI_BuildHealthExeOnly    for 3
+
+/* How many failing projects the board's other-projects line NAMES before it starts counting.
+   A .sws project list is a workspace's whole history - 134 entries on one legacy workspace - so a
+   line that names every project it has something to say about is a wall of file names, not a
+   finding (Nils 2026-08-30). Six is what fits one readable sentence; the remainder is counted in
+   words of its own so the cap can never be mistaken for the whole list. */
+Define CI_OtherProjHealthNameCap for 6
+
+Struct tProjectBuildHealth
+    String  sProgram        // the project source name as the .sws lists it ("SetupDataFolders.src")
+    Integer eState          // CI_BuildHealth*
+    Integer iErrors         // parsed error count when eState = CI_BuildHealthErrors
+    String  sWhen           // write time of the artifact the state was read from ("" when never built)
+    DateTime dtWhen         // the same write time as a DateTime - oldest/newest comparisons across projects
+End_Struct
+
+// How many halting files the board's FlexCOM halt banner offers a button for; the rest are counted,
+// and the banner says where they are listed (DashboardFT.vw: _FlexComHaltHtml).
+Define CI_FlexComHaltChips          for 6
+
+Struct tFindingsCtx
+    // True when the scan found a FlexCOM-era proxy (DS 9220): the engine will refuse every
+    // write-run, so the board must lead with the HALT and not offer the plan.
+    Boolean bFlexComHalt
+    // True when the Review band's plan row stands above the bands (DashboardFT.vw: _AddPlanLeadRows). Every
+    // band then starts closed (_AppendBands).
+    Boolean bPlanOnTop
+    // The files behind that halt, in row order, and the line in each that uses FlexCOM.pkg. The
+    // banner names them, so nobody has to find their rows (DashboardFT.vw: _NoteFlexComHaltFile).
+    String[]   asHaltFile
+    Integer[]  aiHaltLine
+    String     sBreak
+    String     sAuto
+    String     sReview
+    String     sHand
+    String     sBreakAct
+    String     sAutoLead          // Auto-fixable rows that LEAD their band - the grid subclass rows (DashboardFT.vw: LeadsAutoBand)
+    String     sPeekBreak
+    String     sPeekAuto
+    String     sPeekReview
+    String     sPeekHand
+    Integer    iBreak
+    Integer    iAuto
+    Integer    iReview
+    Integer    iHand
+    Integer    iReviewRun
+    Integer    iReviewReport      // Review rows whose only function is a REPORT - work the tool can still do, but not a plan run
+    /* The Check-done dialog's split (2026-09-04): it is built from THESE, the same counts the bands
+       are built from, so it can never describe a board other than the one behind it. LegacyApp: the
+       dialog said "for some, a report can list every place first" over a Review band holding ten
+       obsolete-package rows and no report at all - the 69 report rows were hidden by Ignore, and
+       the dialog had no number for hidden rows. */
+    Integer    iReviewPkg         // Review rows that are obsolete-package rows re-pointed at a Use line (judge + dismiss)
+    Integer    iHiddenReport      // DISMISSED rows whose function is a report the tool could still run
+    Integer    iHiddenFn          // DISMISSED rows that carry any function at all (converter or report)
+    String     sRow
+    String[]   asRevFn
+    String[]   asRevHint
+    String[]   asRevRows
+    Integer[]  aiRevCount
+    String[]   asHandFn
+    String[]   asHandHint
+    String[]   asHandRows
+    Integer[]  aiHandCount
+    /* The hand band's PACKAGE groups (2026-10-04): an obsolete install package whose Use is there for
+       the workspace's own subclass of one of its classes (cModAnalyzer.PackageKeptBySubclass). Keyed and
+       dismissed per package file like asRevPkgKey below (kind U), never by message: "Ignore all" on a
+       W 4536 message group would hide every obsolete package, the ones still to check included. */
+    String[]   asHandPkgKey
+    String[]   asHandPkgHint
+    String[]   asHandPkgRows
+    Integer[]  aiHandPkgCount
+    /* The Review band's OTHER dismissal tally, keyed by the install PACKAGE's file name rather
+       than by a refactor function. An obsolete-package row re-pointed at the user's own Use line
+       carries no converter - deliberately, since obsolete does not mean unused - so the
+       function-keyed tally skipped it and it had no dismissal at all: reviewed, understood, and
+       back again every Check (Nils 2026-08-30). Keyed per package, not per message: the 4536
+       family's other members may well have a real fix. */
+    String[]   asRevPkgKey
+    String[]   asRevPkgHint
+    String[]   asRevPkgRows
+    Integer[]  aiRevPkgCount
+    String[]   asAutoFiles
+    String[]   asReviewFiles
+    Handle     hoCall
+    String[]   asBuiltins
+    String[]   asCallLines
+    String     sCallFile
+    Integer    iCallKind
+    Integer    iCallReads
+    String[]   asCallPairs
+    String[]   asObjNames
+    /* Legacy-grid context for the E 4379 rows (2026-09-04): the files the plan offers
+       RefactorDbGridTocDbCJGrid for, and the workspace's own "Class X is a dbGrid" subclass names
+       the scan flagged - both lowercased, both gathered once per render by _CollectLegacyGridFacts
+       and read by _LegacyGridNote (DashboardFT). */
+    String[]   asGridConvFiles
+    String[]   asLegacyGridClasses
+    String     sBadge
+    String     sDot
+    /* The OUTSIDE band (2026-08-29): findings in files DFRefactor will not write, previously only
+       counted in a header chip. Pool-package rows (a DfPkg checkout / the df-cli package cache /
+       a VCS read-only copy) are AGGREGATED per package below and listed read-only with fix-upstream
+       framing - a pool package can hold ERRORS that break the very build the board just analyzed
+       (the Base64Functions E 4539s, 2026-08-29), and a board that hides an error cannot be trusted by
+       arithmetic alone. DataFlex-install rows stay set aside (Nils 2026-07-28: "no point at all to
+       list system/native DataFlex packages") EXCEPT a 4536 package self-deprecation, which is
+       re-pointed at the workspace's own Use line (the one place the user CAN act). */
+    String     sOutside
+    String     sPeekOutside
+    Integer    iOutside          // rows LISTED in the band (one per package/file group)
+    Integer    iOutsideErr       // grid rows with a compile ERROR inside those groups
+    Integer    iSysListed        // grid System rows consumed into the band OR mapped to a Use line
+    String[]   asOutKey          // group key: lowercased package folder, else the file path
+    String[]   asOutName         // display name: package, else the file leaf
+    String[]   asOutFile         // first flagged site - the row's jump target
+    Integer[]  aiOutLine
+    Integer[]  aiOutErr          // COMPILER error messages in the group (a folded row counts its "(xN)")
+    Integer[]  aiOutWarn         // COMPILER warning messages in the group, same rule
+    /* Deep Scan findings counted SEPARATELY, never added to the warnings (Nils 2026-08-30: "14?
+       Have they been counted twice?" - they had been). The two lanes routinely describe the SAME
+       source lines: the compiler's W 4534 and DS 9207 both fire on every ToANSI call, so one file
+       with seven of them arrived as 7 + 7. A single total cannot be honest about that overlap, so
+       the row states each lane and asserts no sum. */
+    Integer[]  aiOutScan
+    String[]   asOutSample       // first "leaf (ln) <msg>" of the group, for the row text
+    /* The row names the FILE as well as the package, and counts MESSAGES rather than rows (Nils
+       2026-08-30: "does not show the correct file ... AND the number of occasions is 7", against a
+       row reading "VDFQuery20   2 warning(s)" over one file holding seven). asOutLeaf is the first
+       offending file, asOutSeen the "|"-joined lowercase leaves so a second file is recognised,
+       aiOutFiles how many distinct ones - one file gets NAMED, several get counted. */
+    String[]   asOutLeaf
+    String[]   asOutSeen
+    Integer[]  aiOutFiles
+    /* Findings already counted, as "<file>|<msg>|<line cell>". A message matching SEVERAL
+       function-bearing recipes yields ONE GRID ROW PER CANDIDATE CONVERTER, each carrying the full
+       occurrence count - and for a System row, whose function name is stripped, those rows are
+       indistinguishable. 4534 "use of ToANSI" matches two (UnicodeOemAnsiFunctions and
+       ChangeOemFileCommands), so seven findings arrived as two identical rows of seven and were
+       counted as fourteen (Nils 2026-08-30: "Still counting double?"). Which converter MIGHT fix a
+       line does not change how many findings there are. */
+    String[]   asOutRowKey
+    /* The macro/class CAUSE groups behind the "reported away from the construct" rows (2026-09-02,
+       lifted out of FindingsListHtml's locals when the per-row attribution became its own
+       procedure): one group per named cause, each keeping its first site so the row can link
+       somewhere. Filled by _AttributeMacroCause per row, rendered by _CauseGroupRowsHtml after the
+       loop. iMacro counts every such row; iCauseReads / iCauseCapped are the runaway guard and
+       what it skipped - said, never relabelled. */
+    String[]   asCauseKey
+    String[]   asCauseName
+    String[]   asCauseFile
+    Integer[]  aiCauseKind
+    Integer[]  aiCauseLine
+    Integer[]  aiCauseCount
+    Integer    iMacro
+    Integer    iCauseReads
+    Integer    iCauseCapped
+    /* Per-render copies of the two view memos the row loop consults (2026-09-02): the compiled-copy
+       index (_ShadowNoteForFile, every row) and the 4536 Use-site index (_UseSiteForPackage). Each
+       is loaded from the view's properties ONCE per render, the first time a row asks, because a
+       property Get copies the whole array - per row that was ~290k string copies on a 1993-row
+       list. A new tFindingsCtx per render means a render after a recompile sees the new stamp. */
+    Boolean    bShadowLoaded
+    String[]   asShadowLeaf
+    String[]   asShadowBuilt
+    String     sShadowProgram
+    Boolean    bUseLoaded
+    String[]   asUseKey
+    String[]   asUseVal
+End_Struct
+
+// The combo text for the CI_FTTheme* values (FTConstants.h.pkg), in ProgramSetupFT. Constants
+// because the value->text and text->value mappings sit in two functions, and a typo in one of
+// them would silently select the wrong theme.
+Define CS_FTThemeDarkText           for "Dark"
+Define CS_FTThemeLightText          for "Light"
+Define CS_FTThemeSystemText         for "Follow Windows"
+// RETIRED 2026-08-12 - nothing reads or writes this any more. The Test Compile bar pins itself to
+// xtpBarBottom at design time (TestCompileFT.dg); its Program Setup control is gone. Kept as a
+// DEFINITION only so the registry value of the same name, still sitting under
+// HKCU\Software\RDC Tools International\DFRefactor\<ver>\Settings on every existing install, can
+// still be recognised by whoever finds it.
 Define CS_ModernizePanelPosition    for "ModernizePanelPosition"
 Define CS_BottomDockHeight          for "BottomDockHeight"
 Define CS_StarZenSourceExplorer     for "StarZenSourceExplorer"
 Define CS_FileCompareProgram        for "FileCompareProgram"
 Define CS_ToolbarIconSize           for "ToolbarIconSize"
+Define CS_ToolbarButtonStyle        for "ToolbarButtonStyle"   // show or hide the toolbar text (peToolbarButtonStyle)
 Define CS_GridRowBackgroundColor    for "GridRowBackgroundColor"
 Define CS_MaxBlankLineSize          for "MaxBlankLineSize"
 Define CS_SplitByPreference         for "SplitByPreference"
@@ -905,6 +2325,8 @@ Define CS_WorkspacePaths            for "WorkspacePaths"
 Define CS_ConfigFile                for "ConfigFile"
 Define CS_WorkspaceRecentKey        for "Recent"
 Define CS_AnalyzeSnapshotKey        for "AnalyzeSnapshot"   // registry section: per-workspace last-analyze counts (FT dashboard)
+Define CS_WorkspaceCopyOfKey        for "WorkspaceCopyOf"   // registry section: a copy DFRefactor made -> its original + the day (RecordWorkspaceCopy)
+Define CS_WorkspaceCopiedToKey      for "WorkspaceCopiedTo" // registry section: an original -> the latest copy DFRefactor made of it + the day
 // Per-workspace "last compiled program" (CS_Settings section, value-name = prefix + .sws path). Set by the
 // Test Compile program combo; read by WriteAnalyzeSnapshot to tag the snapshot with WHICH program it is for.
 // Promoted here from TestCompile(FT).dg so cRefactorApplication can read it (was a local Define in both docks).
@@ -948,15 +2370,116 @@ Define CS_UnicodeWin64ReportLogFile for "UnicodeWin64ReportExternalFunction.log.
 Define CS_Win64PointerTruncationLogFile for "Win64PointerTruncation.log.txt"
 Define CS_Win64StructPaddingLogFile for "Win64StructPadding.log.txt"
 Define CS_TypeToStructReportLogFile for "TypeToStructReport.log.txt"
+Define CS_GosubGotoReportLogFile    for "GosubGotoReport.log.txt"
+Define CS_LegacyDbApiReportLogFile  for "LegacyDbApiReport.log.txt"
+Define CS_TechStackReadinessLogFile for "TechStackReadinessReport.log.txt"
+Define CS_LegacyRegistryReportLogFile for "LegacyRegistryReport.log.txt"
+Define CS_LegacySqlReportLogFile    for "LegacySqlReport.log.txt"
+Define CS_ReturnMismatchReportLogFile for "FunctionReturnMismatchReport.log.txt"
+// The calls ChangeAmbiguousCallToGet declined, written on request so the remaining hand work can be
+// picked up later, shared, or done by someone else - the findings list's clickable rows only last as
+// long as this session's analysis.
+Define CS_AmbiguousCallsToFixLogFile for "AmbiguousCallsToFix.log.txt"
+
+// One Function / Property / Register_Function declaration, harvested by FunctionReturnMismatchReport
+// (cRefactorFuncLib._NameDeclsFromLines). DataFlex message names are workspace-global - every
+// declaration REGISTERS a return type on the shared message id, and when two registrations
+// disagree, every expression-style call of that name is ambiguous under DF 25/26's stricter
+// expression typing (error 4544; DF 19.1 resolved it silently). sReturnType is "(untyped)" when
+// the declaration carries no Returns clause - part of the same ambiguity class.
+// _OverloadedState: how a NAME's declarations use the Overloaded token. Mixed is not a
+// nuance - it is DataFlex error 4390 "this method was previously defined as non-overloaded",
+// a build break in its own right, so it must not be folded in with either of the others.
+Define CI_OverloadNone  for 0   // no declaration carries the token - a 4544 is possible
+Define CI_OverloadAll   for 1   // every one does - the compiler resolves by parameter count
+Define CI_OverloadMixed for 2   // some do, some do not - error 4390, not 4544
+
+Struct tNameDecl
+    String  sName        // as written at the declaration
+    String  sKind        // "Function" / "Property" / "Register_Function"
+    String  sReturnType  // Returns type (Function/Register_Function) or the Property type
+    String  sFile        // declaring file (full path)
+    Integer iLine        // 1-based line number
+    Boolean bGlobal      // Global keyword, Register_Function, or declared at file level (depth 0)
+    Boolean bOverloaded  // the Overloaded token. DataFlex overloads on PARAMETER COUNT, so an
+                         // overloaded name can hold several return types legally - it cannot 4544.
+    String  sCondPath    // the #IF / #ELSE arms enclosing the declaration, outermost first, as
+                         // "<block>:<arm>/<block>:<arm>" ("" at file level). Two declarations of one
+                         // name in sibling arms of one block are ONE declaration - only one arm ever
+                         // compiles (2026-09-20; see _CollapseConditionalArms in cRefactorFuncLib).
+End_Struct
+// The character-mode inventory (2026-09-20): what a DataFlex 3.x / console-mode program carries
+// that DataFlex 26 has no equivalent for, counted by CharacterModeInventoryReport. iFiles = files
+// with at least one site.
+Struct tCharModeInventory
+    Integer iImages       // /name ... /* images (screen layouts; print images in a Windows program)
+    Integer iScreenCmds   // screen / keyboard commands at command position (Page, Accept, Entry, Gotoxy ...)
+    Integer iUiObjects    // objects of the character-mode UI classes (Entry_Form, Entry_List, Menu, Query ...)
+    Integer iKeyprocs     // Keyproc handlers
+    Integer iFiles
+End_Struct
+Define CS_CharModeInventoryLogFile  for "CharacterModeInventory.log.txt"
+Define CI_CharModeReportCap         for 40      // sites listed per file before "... and N more"
+Define CS_ShadowedPackagesLogFile   for "ShadowedPackageFiles.log.txt"
+// The illustrated walkthrough behind the Add package dialog's Help button. Ships in DFRefactor's
+// OWN AppHtml folder (the packager copies that folder whole), and opens in the default browser.
+Define CS_ApGuideFile               for "AddPackageFromGitHub.html"
+Define CS_LegacyDfPathReportLogFile for "LegacyDfPathReport.log.txt"
+Define CS_WinApiCallSiteLogFile     for "WinApiCallSiteReport.log.txt"
+Define CS_LegacyFieldOptionsReportLogFile for "LegacyFieldOptionsReport.log.txt"
+
+// FunctionHelpGen service-program output: one markdown file per { MethodType }, plus a log
+// naming what was written and what was left out. The folder sits under the workspace home.
+Define CS_FunctionHelpFolder        for "FunctionHelp"
+Define CS_FunctionHelpLogFile       for "FunctionHelpGen.log.txt"
+
+// MetaTagHealthReport thresholds for a triple-quoted meta-tag value, e.g. { Description = ... }.
+// MEASURED against df-cli 1.0.0 (DF 26 GA) on 2026-08-23 by compiling generated probes: a block of
+// 2216 characters compiles and 2217 does not. Over the limit the compiler does not report an error
+// - it dies with an access violation, so the build prints "Rebuilding X ..." and then NOTHING, exits
+// 0, and leaves a ZERO-BYTE .err file. CI_MetaTagCrashChars is that measured cliff (2 characters of
+// slack); CI_MetaTagMaxSafeChars is the budget we ask maintainers to stay inside so that adding one
+// more sub-tag later cannot push a function over. Re-measure when the DataFlex major version changes.
+// Full rules: the header comment of oRefactorFuncLib.pkg.
+Define CI_MetaTagMaxSafeChars       for 2000
+
+Define CI_MetaTagCrashChars         for 2215
+
+// Obsolete packages the DataFlex compiler flags 4536 as "obsolete ... can be removed / just comment
+// out the Use statement" - a PURE removal (their functionality is now in FMAC / the runtime, so no
+// code breaks). CommentOutObsoletePackageUse comments out 'Use <one-of-these>'. LOWERCASE basenames,
+// comma-separated (matched case-insensitively). Only genuinely-removable packages belong here - NOT
+// the "Use cX class instead" ones (those need a code change, not a removal), and NOT func.pkg (its
+// functions have alternatives that must be adopted first). (Nils 2026-07-09: Case.mac - Case is in FMAC.)
+Define CS_RemovableObsoletePackages for "case.mac,dfbase.pkg,winbase.pkg,destobj.pkg,dfcmbfrm.pkg,dfradio.pkg,dflblmx.pkg,dftabdg.pkg"
 
 // Careful, these cannot end on a semicolumn as you will introduce variable type equal to ""
-Define CS_VarTypes                  for "indicator;string;integer;number;date;datetime;boolean;handle;real;variant;timespan;rowid;decimal;bigint;uchar;address;char;currency;dword;float;pointer;short;time;ubigint;ushort;wstring;longptr;ulongptr;uinteger;xmlhandle"
+// CS_VarTypes RETIRED 2026-08-04 - the list now lives in AppSrc/LocalVariableTypes.inc,
+// one type per line, spliced into cBaseFuncLib._CreateLocalVariableTypes.
 Define CS_LowercaseAlphabet         for "abcdefghijklmnopqrstuvwxyz"
 Define CS_U                         for (Character(94))  // Circumflex
 Define CS_D                         for (Character(124)) // Vertical bar
 Define CS_E                         for (Character(126)) // Tilde
 Define CS_S                         for (Character(32))  // Space
 Define CS_ValidLeftCharacters       for ("()[];,&+-*<>= " + Character(9)) // Character 9=tab char //"()[];,.&+-*<>= "
+
+/* C prototype -> External_Function (cRefactorUtilities.CDeclarationToDataFlex).
+
+   The DLL is a PLACEHOLDER, and deliberately one that does NOT compile. A C prototype
+   does not carry the exporting DLL, so the converter cannot know it; guessing kernel32
+   would produce a declaration that compiles and then fails at run time, which is the one
+   outcome worse than not compiling. This way the user cannot ship it by accident.
+
+   The two lists are pipe-delimited and matched as "|word|", so a word is matched whole
+   and a new entry is a one-word edit. Lower case - the caller lowercases before testing. */
+Define CS_CDeclDllPlaceholder       for "<SET-THE-DLL>.dll"
+Define CS_CDeclHandleTypes          for "|handle|hwnd|hdc|hmenu|hinstance|hmodule|hbitmap|hicon|hcursor|hbrush|hpen|hfont|hrgn|hkey|hglobal|hlocal|hfile|haccel|hgdiobj|hpalette|hthread|hprocess|"
+/* NOTE what is NOT here: the bare IN / OUT / OPTIONAL macros of the old SDK headers.
+   They are legal PARAMETER NAMES too ("int in, int out"), and eating a name silently
+   turns the type into the name - a wrong declaration that still compiles. The SAL forms
+   this actually meets today (_In_, _Out_opt_) are caught by the underscores-both-ends
+   rule in _StripCNoise instead, which cannot collide with an identifier. */
+Define CS_CDeclNoiseWords           for "|winapi|apientry|callback|winapiv|ntapi|stdcall|__stdcall|__cdecl|cdecl|__fastcall|__declspec|far|near|extern|struct|enum|union|class|"
 Define CS_CommentSymbol             for ("//")
 Define CS_ImageNameStart            for "/"
 Define CS_ImageNameEnd              for "/*"
@@ -976,22 +2499,147 @@ Define CS_StudioEditorSettingsExtra for "(Will be applied when indenting code)"
 Define CS_IdleText                  for "Idle..."
 Define CS_WorkingText               for "Working..."
 Define CS_ReadyText                 for "Ready!"
+Define CS_AnalyzerNoItems           for "No warnings or errors to analyse"
 
 Define CS_Default_Dialog_Caption    for "Select a source file"
 Define CS_Folder_Dialog_Caption     for "Select a Filename - Only the foldername will be returned"
 Define CS_Default_Filter_String     for "All Files *.*|*.*|Programs *.src|*.src|Views *.vw|*.vw|Report Views *.rv|*.rv|Selection Lists *.sl|*.sl|Packages *.pkg|*.pkg"
 Define CS_Folder_Filter_String      for "All files|*.*"
 
+
+/* HTML ENTITIES BY NAME (Nils 2026-08-25) - CS_EmDash, CS_MidDot, CS_Nbsp, CS_Ellipsis, CS_Check, CS_RArrow,
+   CS_Times, CS_Bullet, and CS_WarnSign, CS_PlayTriangle, CS_UpTriangle, CS_DownTriangle - are Library-RDCFlexTron's
+   own (FTConstants.h.pkg) since DFRefactor's pin moved to 0.9.1 (2026-09-29), as are CS_NlEntity, CS_AposEntity
+   and the whole tags (CS_DivOpen, CS_DivEnd, CS_SpanOpen, CS_SpanEnd, CS_ParaOpen, CS_ParaEnd, CS_Br). */
+/* THE GLYPHS, BY WHAT THEY MEAN (Nils 2026-08-25: "Can you tell me what the #9888 is?").
+
+   A numeric character reference is a character written by its decimal codepoint, so the file can
+   stay single-byte. It also tells the reader nothing: &#9888; is a warning triangle and &#10697;
+   is the glyph on the version row, and no amount of staring at the number says so. The generic ones
+   (CS_WarnSign and the triangles) are Library-RDCFlexTron's now; these are the Libraries dialog's.
+
+   THE VARIATION SELECTOR IS FOLDED IN. &#65038; (U+FE0E) is not a character - it forces the glyph
+   before it to render as monochrome TEXT rather than as a colour emoji. Three of these need it and
+   were written as a pair at every call site, which is a pairing to get wrong. It lives in the
+   constant now, so a caller cannot separate them. */
+Define CS_LicenceGlyph              for "&#9878;&#65038;"    // U+2696 scales - the Libraries licence row
+Define CS_GearGlyph                 for "&#9881;&#65038;"    // U+2699 gear - the DataFlex versions row
+Define CS_PublisherGlyph            for "&#128100;&#65038;"  // U+1F464 bust - the publisher row
+Define CS_VersionGlyph              for "&#10697;"           // U+29C9 two joined squares - the version row
+Define CS_CommitGlyph               for "&#9673;"            // U+25C9 fisheye - a pinned git commit
+Define CS_RequiresGlyph             for "&#8618;"            // U+21AA hooked arrow - "brings these with it"
+
+/* THE CLICK IDS THAT CROSS A FILE BOUNDARY (2026-08-25).
+
+   A data-ServerOnClick id is a contract between the markup that emits it and the OnClick that
+   answers it. Where both halves sit in one file, the literal is fine - the two are a screen apart
+   and a typo shows the moment you click. These ten do NOT: the shared tile builders emit them and
+   the boards answer them, so a typo in either half is a button that does nothing, with no error
+   anywhere and nothing in a log.
+
+   Named where the id is ONE user action wherever it appears - "compare" opens the same comparison
+   whichever screen offers it, so BackupFilesFT and EditorViewFT share the constant even though
+   each also answers its own button.
+
+   NOT named: the same word used for something else. FTDashIcons selects a glyph with
+   If (sName = "compare"), which is a different thing that happens to be spelled alike, and it keeps
+   its literal. The rule is the contract, not the spelling - only a data-ServerOnClick id and the
+   OnClick that answers it are substituted here. */
+Define CS_IdCompare                 for "compare"        // cFTTileMarkup   -> the boards
+Define CS_IdHistory                 for "history"        // cFTTileMarkup   -> DashboardFT
+Define CS_IdReadLog                 for "readlog"        // cFTTileMarkup   -> both boards
+Define CS_IdReadOtherLogs           for "readotherlogs"  // cFTTileMarkup   -> both boards
+Define CS_IdSetup                   for "setup"          // cFTTileMarkup   -> both boards
+Define CS_IdUndo                    for "undo"           // cFTTileMarkup   -> both boards
+Define CS_IdFnLib                   for "fnlib"          // cFTTileMarkup   -> ManualDashboard, StartCenter
+Define CS_IdSelFolders              for "folders"        // cFTManualBoard  -> ManualDashboard, CmdLineIniFileExporter
+Define CS_IdSelFunctions            for "functions"      // cFTManualBoard  -> ManualDashboard, CmdLineIniFileExporter
+Define CS_IdSelFile                 for "file"           // cFTManualBoard  -> ManualDashboard
+Define CS_IdScanFile                for "scanfile"       // cFTManualBoard  -> ManualDashboard (single-file mode: Analyze this file)
+
+/* DFREFACTOR'S OWN GLYPHS (2026-09-29, the RDCFlexTron pin move to 0.9.1): SVG files in AppHtml\FTGlyphs, which
+   the library's FTAppGlyphs.pkg reads when the program starts (SeedFTAppGlyphs, FTThemeSeed.pkg) and draws like its
+   own CS_Glyph* glyphs - by DashIcon, IconLabel and the ftg- classes. The file name is the glyph's name.
+
+   They replace the CS_Ico* names, the stems of the <img> files in AppHtml\Svg (removed) that IconLabel drew until 0.9.0 - in
+   the one fixed grey they were drawn in, barely there on the light theme. Every other icon of that set is a library
+   glyph that draws the same thing: Close and Cancel the x of CS_GlyphClose, Proceed the tick of CS_GlyphCheck,
+   Clear CS_GlyphEraser, Rescan CS_GlyphRefresh, Scan CS_GlyphScan, Plan CS_GlyphPlan, and the selection four
+   CS_GlyphSelectAll, CS_GlyphSelectNone, CS_GlyphInvert and CS_GlyphHierarchy. These six are DFRefactor's own.
+   The folder also keeps compileroutput.svg, the master of the Output tab's glyph, which OutputDockFT.dg inlines. */
+Define CS_GlyphCompile                   for "compile"     // Test Compile's run button - amber, keeps its colours
+Define CS_GlyphAnalyze                   for "analyze"     // a page under a magnifier - Test Compile's Analyze
+Define CS_GlyphModernize                 for "modernize"   // two bent arrows - the editor's Show Compile pane until 2026-10-12; nothing draws it now
+Define CS_GlyphCompilePane               for "compilepane" // a window with a pane along its foot - the editor's Show Compile pane, as the class
+                                                           // ftg-compilepane; a copy of Bitmaps\CompilePane.svg, the toolbar item's own artwork
+Define CS_GlyphToggle                    for "toggle"      // a switch - the analyzer's Toggle Explain
+Define CS_GlyphManual                    for "manual"      // an open hand - the Manual Dashboard; traced from Bitmaps\Dk\Manual.ico,
+                                                           // the toolbar button's own artwork, so the Start Center lane matches it
+
+/* THE THIRD-PARTY LINKS on the Program Settings dialog, as complete anchors.
+
+   A constant rather than a builder because these live in BOTH twins - ProgramSetup.dg for the
+   plain build and ProgramSetupFT.dg for FlexTron - and the plain one must not reach into an FT
+   package. RefactorConstants is Used by every program, so it is the one place both can share.
+
+   That sharing is the point: four URLs written out twice each is four chances to update one twin
+   and not the other, with nothing to notice until a user clicks a dead link. cLinkLabel takes the
+   whole anchor as its Label, so the constant holds the whole anchor. */
+Define CS_LinkStarzen            for '<A href="http://www.starzen.com/products/dataflex-tools/dataflex-source-code-browser">Starzen.com</A>'
+Define CS_LinkBeyondCompare      for '<A href="http://www.scootersoftware.com">Beyond Compare</A>'
+Define CS_LinkWinMerge           for '<A href="http://www.winmerge.org">WinMerge</A>'
+Define CS_LinkAraxisMerge        for '<A href="http://www.araxis.com/merge">Araxis Merge</A>'
 Define CS_BackupFolder              for "DFRefactor_Backup"
-Define CS_NoFolderList              for (".|..|.svn|.git|.hg|apphtml|data|bitmaps|help|idesrc|programs|.cab|install")
-//Define CS_NoFolderList              for (".|..|.svn|.git|.hg|apphtml|data|bitmaps|help|idesrc|programs|.cab|install" + "|" + CS_BackupFolder)
+// The DataFlex online help. Trailing slash included so callers just append a path or "?q=".
+Define CS_DfDocsRootUrl             for "https://docs.dataflex.dev/"
+// The JSON-backed editor settings (cRefactorEditorSettings.pkg). Lives in Data\ beside the
+// other JSON configs; Programs\ScintillaEdit.ini is only ever READ once, as migration source.
+Define CS_ScintillaSettingsJson     for "ScintillaEdit.json"
+/* THE OLD STUDIO'S SOURCE MARKERS - the whole lines RemoveOldStudioMarkers (CleanupRefactorFunctions.inc) removes,
+   as one "|"-fenced list: a line is tested with one Pos on "|" + line + "|", exact and case-sensitive, as the
+   twenty-three Case branches it replaced were. The "//AB/ " line PREFIX is tested in the function itself. */
+Define CS_OldStudioMarkerLines      for "|//AB-IgnoreStart|//AB-IgnoreEnd|//AB-StoreStart|//AB-StoreEnd|//AB-StoreTopStart|//AB-StoreTopEnd|//AB-PanelStoreTopStart|//AB-PanelStoreTopEnd|//AB-PanelStoreStart|//AB-PanelStoreEnd|//AB-ClientStoreTopStart|//AB-ClientStoreTopEnd|//AB-ClientStoreStart|//AB-ClientStoreEnd|//AB-DDOStart|//AB-DDOEnd|//AB-MenuPackage|//AB-End|//AB-ToolbarPackage|//AB-ViewStart|//AB-ViewEnd|//AB-StatusBarPackage|//IDE-FileType=ftApplication|"
+
+// ---- Editor-settings JSON shape (cRefactorEditorSettings.pkg) --------------------------------
+// A generic, lossless serialization of cIniProperties' tag store. One value's "\n"-joined
+// sub-parts (the convention the language keyword lists use) become a REAL JSON array - that
+// split is the whole readability win over the ini ("nearly impossible to decipher",
+// Nils 2026-07-26). Nested structs rather than jagged String[][]s so DataTypeToJson stays on
+// well-trodden ground.
+Struct tRefEdSetValue
+    String[] asParts        // the value, split on the LITERAL 2-char "\n" join; single-part = [value]
+End_Struct
+
+Struct tRefEdSetRow
+    tRefEdSetValue[] aValues
+End_Struct
+
+Struct tRefEdSetTag
+    String  sTag
+    Boolean bMulti
+    tRefEdSetRow[] aRows    // single tags: exactly one row
+End_Struct
+
+Struct tRefEdSetFile
+    Integer iFormatVersion
+    String  sNote
+    tRefEdSetTag[] aTags
+    String[] asUnusedLines  // forward-compat: lines/tags this build does not register survive verbatim
+End_Struct
+// Folder NAMES (any path segment, case-insensitive) that are never walked for source, never offered
+// in the folder list and never counted as workspace source: the framework and data folders - and, from
+// 2026-08-18, "dfpkg": DataFlex 26's checkout of a workspace's git package dependencies
+// (<home>\DfPkg\<Owner>_<Name>-<commit>\...), every file read-only, pinned to a commit - a system
+// folder like the install's Pkg tree, per Nils ("handled just like the other DataFlex system files").
+// A Re-scan Folders drops rows already discovered under one of these names (RemoveSystemFolders).
+Define CS_NoFolderList              for (".|..|.svn|.git|.hg|apphtml|data|bitmaps|help|idesrc|programs|.cab|install|dfpkg")
 Define CS_DefaultSourceFolders      for "appsrc|ddsrc|libraries|pkg"
 Define CS_LF                        for (Character(10))
 Define CS_CR                        for (Character(13))
-Define CS_CRLF                      for (Character(13) + Character(10))
+// CRLF is VDFBase's C_NewLine (Used at the top of this file) - ONE system definition for the
+// whole product; the local C_NewLine/C_NewLine duplicates retired 2026-08-28 (Nils).
 Define CS_DirSeparator              for (SysConf(SYSCONF_DIR_SEPARATOR))
 Define CI_EOL                       for 2048
-
 
 // Note: the "Visual" will automatically be replace if a more recent DF version is used.
 Define CS_StudioPath                for "Software\Data Access Worldwide\Visual DataFlex Tools\"
@@ -1023,32 +2671,26 @@ Define CS_TestErrFile    for "CompiledRefactoredCode"
 Define CS_DFCompiler     for "DFCompiler"
 Define CS_Build_Options  for "Build_Options"
 
-#IF (!@ < 260)
-    Define CS_Compiler    for "DFCompConsole.exe"
-    Define CS_CompOptions for "-x -ce1fwv2i0r" // Note: The "c" makes the comiler to always recompile the program.
-#ELSE
-    Define CS_Compiler    for "df-cli.exe"
-    Define CS_CompOptions for "--rebuild --force --write-errors --verbose"
-#ENDIF
+/* THE TWO COMPILER FAMILIES WANT DIFFERENT FLAGS, and which set a user needs is a property of
+   the COMPILER THEY SELECT - never of the DataFlex that built DFRefactor. CS_CompOptions below
+   was version-keyed on !@ until the DF26-only trim (2026-09-16) and is right only as the
+   FIRST-RUN default; using it to answer "what should the options be for this compiler" broke
+   the moment DFRefactor itself started being built under DF26 - selecting a DF25 DfCompConsole
+   then filled the field with df-cli flags (Nils 2026-08-20). The compiler-setup dialogs use
+   these two instead. */
+Define CS_CompOptionsDfCli   for "--rebuild --force --write-errors --verbose"
+Define CS_CompOptionsConsole for "-x -ce1fwv2i0r"   // "c" = always recompile the program.
+
+Define CS_Compiler    for "df-cli.exe"
+Define CS_CompOptions for "--rebuild --force --write-errors --verbose"
 
 Define CS_Splitters      for "Splitters"
 Define CS_TestBenchViewSplitterPos for "TestBenchViewSplitterPos"
 Define CS_PlanDialogSplitterPos    for "PlanDialogSplitterPos"
 
-#IF (!@ = 230)
-    Define CS_SWSFile    for "DFRefactor23.0.sws"
-#ENDIF
-#IF (!@ = 240)
-    Define CS_SWSFile    for "DFRefactor24.0.sws"
-#ENDIF
-#IF (!@ = 250)
-    Define CS_SWSFile    for "DFRefactor25.0.sws"
-#ENDIF
-#IF (!@ = 260)
-    Define CS_SWSFile    for "DFRefactor.sws"
-#ENDIF
+Define CS_SWSFile    for "DFRefactor.sws"
     
-Define CS_DFUnitTest     for "DFUnit_TestRunner"
+Define CS_DFUnitTest     for "UnitTests"
 Define CS_DFRefactor     for "DFRefactor"
 Define CS_LegacyCode     for "LegacyCode.pkg"
 Define CS_RefactoredCode for "RefactoredCode.pkg"
@@ -1057,6 +2699,11 @@ Define CS_ExportJsonFile for "ExportJsonFile"
 Define CS_ImportJsonFile for "ImportJsonFile"
 Define CS_ShowQuestion   for "ShowQuestion"
 Define CS_ShowSummary    for "ShowSummary"
+// The user's "never pick" list - function names joined by ';' (cRefactorApplication.NeverPickFunctions).
+Define CS_NeverPickFunctions for "NeverPickFunctions"
+// Ask each remote what is newer when a workspace is opened. Default ON; the switch is the
+// Program Settings checkbox, and PackageUpdateCheckEnabled (cDfCliPackages.pkg) reads it.
+Define CS_CheckPackageUpdates for "CheckPackageUpdatesOnOpen"
 
 // Refactor Testing program:
 Define CS_Trim           for "Trim"    
@@ -1103,6 +2750,7 @@ Define CS_Found          for "Found"
 Define CS_Finderr        for "Finderr"
 Define CS_Err            for "Err"
 Define CS_Sysdate4       for "Sysdate4"
+Define CS_Sysdate        for "Sysdate"
 Define CS_Constrain      for "Constrain"
 Define CS_Until          for "Until"
 Define CS_Reread         for "Reread"
@@ -1117,7 +2765,7 @@ Define CS_Procedure      for "Procedure"
 Define CS_ProcedureEnd   for "End_Procedure"
 Define CS_Contains       for "contains"
 Define CS_Select         for "Select"
-// The guarded SELECT-macro definition line AddUseOldFMACCommands splices into modernised files (the indented
+// The guarded SELECT-macro definition line DefineSelectMacro splices into modernised files (the indented
 // #Replace inside an #IFNDEF SELECT / #ENDIF block). The '!C' part is built from Character() codes on PURPOSE:
 // |!C is a DataFlex compile-time auto-increment COUNTER, so a literal "|!C" in our OWN source would be
 // evaluated here (to "|17", "|18", ...) instead of stored as text. Building "!" + "C" via Character keeps the
@@ -1180,6 +2828,317 @@ Struct tFixtureLocation
     String sFileName
 End_Struct
 
+/* ---- Shared-library inventory (Nils 2026-07-31) --------------------------------------------
+   A workspace's [Libraries] entries point at OTHER workspaces - vwin32fh, VDFQuery, SigCJ,
+   DUF, RDCToolsLib, DFAbout... - which are maintained upstream and must never be refactored
+   in place. A copy inside a workspace is downstream of a repo, so editing it forks the
+   library: the next update either clobbers the edits or conflicts with them. That holds for
+   Nils's OWN libraries too - RDCToolsLib is fixed in Library-RDCToolsLib and re-released, not
+   in a customer's copy of it.
+
+   The verdict is only meaningful against the TARGET DataFlex version (psTargetDfVersion), not
+   the workspace's current one: upstream libraries carry only the two current majors, so for a
+   workspace still on 19.1 "you are behind" would be a false alarm. The question this answers
+   is "to move THIS workspace to DF <target>, what is the state of its libraries". */
+Enum_List
+    Define eLibUnknown        for 0   // not determined (no target version given, unreadable .sws)
+    Define eLibMatchesTarget  for 1   // the referenced .sws already IS the target version
+    Define eLibRetargetLocal  for 2   // a sibling .sws in the same folder matches the target
+    Define eLibNoLocalBuild   for 3   // nothing local for the target - needs an upstream copy
+    /* The entry points at a .sws that is NOT THERE. Not a verdict about a library at all - it is a
+       fact about the workspace file, and it outranks every verdict above because nothing can be
+       said about a library that could not be read.
+
+       It exists because leaving such an entry out was a silent undercount: WorkspaceLibraryInventory
+       keeps only entries it can resolve, so a workspace declaring six libraries with two missing
+       reported four, and every count downstream - the tile, the report footer - agreed with each
+       other and with nothing on disk. Only the ALL-missing case was ever noticed (2026-08-05).
+       WorkspaceLibraryEntries returns these rows; WorkspaceLibraryInventory still filters them out
+       for the callers that genuinely need a resolvable .sws. */
+    Define eLibNotFound       for 4   // the referenced .sws does not exist
+    /* A DF26 REGISTRY PACKAGE, which is not a .sws at all and cannot be judged like one. Its
+       DataFlex compatibility is the df-min/df-max range in its own package block, not a
+       [Properties] Version=, so answering "no 26.0 build here" about one would be a confident wrong
+       answer about a thing we have not read. Stated as its own kind until that range is parsed. */
+    Define eLibPackage        for 5   // a DataFlex system package - version pinned in the entry itself
+    /* A package whose own df-min/df-max range does NOT cover the target. Its own claim about which
+       DataFlex releases it supports, so this is a real verdict rather than an inference - which is
+       exactly why eLibPackage stays for the case where the range cannot be read: a package that has
+       not said is not the same as one that has said no. */
+    Define eLibPackageMismatch for 6  // installed, but it does not support the target release
+    /* THE FILE IS THERE BUT CANNOT BE READ AS A WORKSPACE FILE - git conflict markers, see
+       eSwsConflict (2026-09-14). Like eLibNotFound a fact about a file rather than a verdict about
+       a library: it outranks the version verdicts, counts as attention, and stops the chain walk
+       from descending into it. bFound stays True - the file IS there - so "not there" wording never
+       sends the reader looking for a folder that exists. */
+    Define eLibUnreadable     for 7   // the referenced .sws exists but carries git conflict markers
+End_Enum_List
+
+/* WHERE A WORKSPACE STOPPED CARRYING ITS VERSION IN ITS FILENAME (Nils 2026-08-14).
+
+   Up to DataFlex 25 the convention was to say the version in the name - "DFRefactor25.0.sws",
+   "Acme-UMS_VDF_DF25.0.sws" - because nothing else in the workspace did. From DataFlex 26 the
+   workspace states it itself ("df": 26.0 inside the JSON .sws) and libraries/packages are resolved
+   by the package handler rather than by a versioned filename. A "_DF26.0" suffix would then restate
+   what the file already says, and - worse - could come to CONTRADICT it, because the suffix is
+   frozen at copy time while the "df" value is what the tooling actually reads.
+
+   This repo is its own evidence: DFRefactor25.0.sws carries the version, DFRefactorFlexTron.sws
+   does not.
+
+   Compared against cLibraryInventory's _VersionKey, which is (major * 1000) + minor - locale-safe,
+   because "26.0" parsed as a number is at the mercy of the OS decimal separator (see the note on
+   tWorkspace.sDfVersion). 26000 is therefore _VersionKey("26.0"). */
+Define CI_DfUnversionedSwsFrom for 26000   // _VersionKey("26.0") - at or above this, no _DF<ver> suffix
+
+/* RUNNING A CONSOLE TOOL THAT MIGHT ASK A QUESTION (Nils 2026-08-14, from a real hang).
+
+   "Make a workspace copy" froze: the copy finished, the status panel closed, and the cursor span
+   for ever. df-cli had been handed a workspace it could not load and was sitting on
+
+       Failed to load workspace. Would you like to attempt a repair? (y/n):
+
+   - on a console that was HIDDEN, so nobody could answer it. Eight minutes in it had used 0.03s of
+   CPU on one thread with no network: not working, waiting. RDCRunProgramWait waits with
+   WaitForSingleObject(hProcess, -1), an INFINITE wait, so the app waited with it.
+
+   RDCRunProgramBounded (cRDCAsyncProcess.pkg) is the bounded runner - and its deadline is the part that
+   holds. CREATE_NO_WINDOW was believed to make a prompt fail instead of block; re-measured on
+   2026-09-14 it does not: df-cli started with nothing redirected waits on that question until the
+   deadline kills it. What makes the same failure exit at once is REDIRECTING ITS OUTPUT - the
+   cmd.exe wrapper DfCliCaptureIn builds - so a tool that might ask runs through that, and the
+   deadline catches anything that still stalls. Two negative sentinels rather than a bare Boolean,
+   so the message a user reads can say WHICH happened. */
+// CI_RDCRunToolFailedToStart / CI_RDCRunToolTimedOut - the bounded runner's answers - are the RDC Windows
+// library's (cRDCAsyncProcess.pkg, 1.0.6).
+Define CI_DfCliConvertTimeoutSecs for 120  // generous: a real convert of a large workspace is seconds
+// A package install CLONES - minutes on a large repository, so far more generous than a convert.
+Define CI_DfCliPackageTimeoutSecs for 600
+
+// How deep a library chain is walked. Libraries declare libraries; 4 is what the Libraries report
+// has always used, and the copy's pre-convert check uses the same number so the two surfaces cannot
+// disagree about what the workspace "declares".
+Define CI_LibraryTreeMaxDepth for 4
+// How many package manifests one graph walk may expand before it stops. A package graph is a
+// handful of entries; this exists only so two manifests that name each other cannot spin the
+// walk for ever - see ExpandPackageGraph.
+Define CI_PackageGraphMaxWalk for 64
+// How many lines of a fetched README a package-details box will show. It is a message box,
+// not a document viewer, and a README can run to hundreds of lines.
+Define CI_DetailsMaxLines for 120
+
+/* WHAT ONE ENTRY IN A DEPENDENCY LIST ACTUALLY IS (DF26).
+
+   Under DataFlex 26 the JSON "dependencies" array is a UNION, and only one of its three shapes is a
+   path. Verified 2026-08-12 against a real workspace:
+
+       "DataFlex-dev/Web UI FlexTron#1.0.51"          <repo>/<Name>#<version>  - DataFlex system package
+       "../WebAppSrc/StudioLibrary/WebAppSrc.sws"     a .sws PATH, as every INI [Libraries] entry is
+       { "source": <git url>, "version": …, "sws": … } a git/file object
+
+   Treating all three as paths is how a package-based workspace came to render every package as
+   "not found - nothing is at that path". Every INI entry is eDepPath, so nothing about the classic
+   case changes. */
+/* One row of "df-cli package search" output. sName is the "<repo>/<Name>" pair WITHOUT a version -
+   the install string is sName + "#" + sVersion, which is exactly the form a dependencies entry
+   takes. The search is scoped by the workspace's own DataFlex version, so every hit is one this
+   workspace can actually use. */
+Struct tPackageHit
+    String sName          // "DataFlex-dev/Web UI FlexTron"
+    String sPublisher     // "DataFlex-dev"
+    String sVersion       // "1.0.51" - the newest the registry offers for this workspace
+    String sDescription
+End_Struct
+
+Enum_List
+    Define eDepPath    for 0   // a .sws path - relative to the workspace home, or absolute
+    Define eDepPackage for 1   // a DataFlex system package string, resolved from the global package cache
+    Define eDepGit     for 2   // the object form: a git URL with a version and optional .sws
+End_Enum_List
+
+Struct tLibraryInfo
+    String   sName            // display name (the library's folder, skipping generic containers)
+    String   sFolder          // folder holding the referenced .sws
+    String   sRefSwsFile      // the .sws this workspace's [Libraries] actually points at
+    String   sRefVersion      // its own [Properties] Version= - NEVER parsed from the filename
+    String[] asAvailVersions  // DataFlex versions offered by CONSUMABLE .sws files in sFolder
+    String   sTargetSwsFile   // the consumable .sws matching the target version ("" = none)
+    Integer  eStatus          // one of the eLib* values above
+    String   sRawEntry        // the [Libraries] value AS WRITTEN - the only thing the .sws holds
+    Boolean  bFound           // did sRefSwsFile resolve to a file on disk?
+    /* THE CHAIN. A library declares libraries of its own, and its Version= describes ITSELF and
+       nothing below it - which is how a workspace ends up compiling 19.1 library code into a DF26
+       build with every visible row reading fine. Found on E:\WinServ 2026-08-12: one declared
+       library, WebAppSrc-Library-DF250.sws, Version=25.0, all SEVEN of its own dependencies on
+       DF191. The workspace's own dialog showed one row and said nothing.
+
+       Filled by WorkspaceLibraryTree / LibraryEntriesTree only; the flat readers leave them 0/"".
+       iDepth 0 = declared by the workspace itself, 1+ = declared by the library named in
+       sDeclaredBy. The three iChain* fields describe a row's OWN children, so they are meaningful
+       on any row that has them. */
+    Integer  eKind            // one of the eDep* values - what this entry IS before it is resolved
+    Integer  iDepth           // 0 = the workspace declares it; 1+ = a library above it does
+    String   sDeclaredBy      // display name of the library declaring this row ("" at depth 0)
+    /* The .sws FILE that declares this row - "" at depth 0, where the workspace declares it.
+
+       The name above says WHO declares an entry; this says WHERE, which is what a caller needs to
+       edit it. Removing a nested entry means rewriting the library .sws that lists it, and
+       resolving that from the name afterwards is guesswork - two libraries can share a display
+       name, and after the flat list is sorted the parent is no longer the row above. Stamped
+       while the walker still knows it. */
+    String   sDeclaredBySws
+    // A PACKAGE's supported DataFlex range, read from its own cached df.sws. Empty for a library,
+    // and empty for a package that is not installed - there is no file to read it from.
+    String   sDfMin
+    String   sDfMax
+    Integer  iChainCount      // libraries THIS one declares
+    Integer  iChainBehind     // ...of which this many declare a version older than this row's own
+    String   sChainOldest     // the oldest version among them ("" = none readable)
+End_Struct
+
+/* One DIRECT dependency on a library: a workspace source file naming one of that library's packages
+   in a Use statement. Direct only, deliberately (Nils 2026-08-01) - a file that Use's vwin32fh
+   itself is the user's problem, while one that gets it through VDFQuery is VDFQuery's, and counting
+   them together would both overstate the work and point at the wrong files. */
+Struct tLibraryUsage
+    String   sLibName         // the library depended on (tLibraryInfo.sName)
+    String   sFile            // the consuming source file, full path
+    Integer  iLine            // 1-based line carrying the Use
+    String   sPackage         // the package named there, as written
+End_Struct
+
+/* A library .sws HEADER that has to be written for the target DataFlex version, because the library
+   ships none.
+
+   Sound for a VERSION-TRANSPARENT library, which is the common case: one codebase with compile-time
+   conditionals, where the several .sws files are Studio workspace headers rather than code variants
+   (vwin32fh's DF25.0 and DF26.0 headers point at the SAME config.ws, and upstream's own DF26 support
+   was a commit titled "adding a df26 sws file"). Synthesising one is therefore exactly what the
+   library author would have done.
+
+   NOT sound for a library whose CODE differs per release - SigCJ is bound to a CodeJock version. The
+   header will let the workspace open and the compiler will then say so, which is a better failure
+   than a workspace that cannot be opened at all - but it IS a claim being made on the library's
+   behalf, so every synthesised header is reported rather than made quietly. */
+// One file the copy has to write. The whole list is computed up front so the copy can show real
+// progress and be cancelled between files, rather than disappearing into one folder for a minute.
+Struct tCopyPair
+    String sSource
+    String sDest
+End_Struct
+
+Struct tLibrarySwsToAdd
+    String sLibName       // display name of the library
+    String sTemplateFile  // full path of the .sws copied as the template (the referenced one)
+    String sNewFile       // full path of the .sws to create
+    String sVersion       // the version to write into its [Properties]
+End_Struct
+
+/* ---- Migration copy scope (cWorkspaceCopyPlan) --------------------------------------------------
+   One candidate folder for the "copy this workspace to a new location" step of a DataFlex-version
+   migration. The copy is what makes the migration a DERIVATION rather than an in-place mutation:
+   the original keeps compiling and running while the copy is retargeted.
+
+   WHY A ROW SET AND NOT A FOLDER TREE. Measured on a real 19.1 workspace 2026-08-05: the folders
+   the workspace DECLARES total 978 MB / 3,199 files, while the home directory holds 6,540 MB /
+   12,965 files. The extra 5.5 GB is historical debris - six dead "Data - *" / "DataNils" copies
+   that a plain recursive walk cannot tell apart from the live Data folder. Only the workspace's own
+   configuration knows which one is real, so the rows are built from THAT and the rest is offered
+   separately, unticked. */
+Enum_List
+    Define eCopyConfig         for 0   // the .sws / .ws configuration files themselves
+    Define eCopySource         for 1   // AppSrcPath, DdSrcPath, IdeSrcPath
+    Define eCopyData           for 2   // DataPath - the database; the bulk of a real workspace
+    Define eCopyOutput         for 3   // ProgramPath. NOT optional: it holds the .ws config itself
+    Define eCopyResource       for 4   // BitmapPath, HelpPath, AppHtmlPath
+    Define eCopyLibrary        for 5   // a folder reached from the .sws [Libraries] chain
+    Define eCopyDeclaredOther  for 6   // a declared *Path key this build does not model
+    Define eCopyUndeclared     for 7   // a folder under home that nothing references
+    Define eCopyExcluded       for 8   // backup trees / VCS metadata - never copied
+    Define eCopyStudio         for 9   // IdeSrcPath - Studio project files, NOT application source
+    Define eCopyAdded          for 10  // added by hand in the dialog (Ins / Add Folder)
+End_Enum_List
+
+Struct tCopyItem
+    String   sKey        // the .ws key that declared it ("AppSrcPath"); "" when not declared
+    String   sName       // display name (the folder leaf, or the library name)
+    String   sPath       // resolved absolute folder path
+    Integer  eRole       // one of the eCopy* values above
+    Boolean  bDeclared   // named by the workspace configuration (vs found on disk)
+    Boolean  bExists     // a declared path may legitimately be ABSENT - a state, not an error
+    Boolean  bIsLink     // junction/symlink: copying THROUGH it would duplicate and fork the target
+    Boolean  bOutsideHome // declared, but resolves outside the workspace home - real, and common in
+                          // older workspaces (AppSrcPath=C:\Program Files (x86)\... was found in the
+                          // wild). Copied, but worth saying out loud, because such a path does NOT
+                          // travel with a copy unless the new .ws is rewritten.
+    Boolean  bSelected   // the default answer, which is what most users will accept unchanged
+    Boolean  bMeasured   // False until MeasureCopyItem has run - sizes are off the render path
+    Number   nBytes
+    Integer  iFiles
+End_Struct
+
+// What one source line does to a legacy string-command variable (strmark / strlen), as read by
+// ChangeStrMarkToExpression / ChangeStrLenToExpression (cRefactorFuncLib, _StrVarLineInfo).
+Struct tStrVarLineInfo
+    Boolean bSets          // the line leaves a NEW value in the variable (a producer, or a write to it)
+    Boolean bOpaque        // that value is one no expression can state (Sysdate, File_Size, Page, Index_Def)
+    Boolean bWrite         // '... to strmark' - the variable is the line's destination
+    Boolean bReads         // the variable is read on the line (a whole-word token that is not the destination)
+    Boolean bConsumes      // a count-less Left / Right / Mid / Pad: the command TAKES its count from the variable
+    Boolean bModifies      // Increment / Decrement of the variable (read-modify-write)
+    Boolean bReorderOnly   // the value exists only BEFORE the line runs (Replace changes the very string it searched)
+    Boolean bHasPrefix     // something precedes the command keyword (a one-line If, an [indicator] guard)
+    Boolean bFunctionForm  // a converted command - Move (Pos(..)) / Move (Replace(..)) - which never sets it at run time
+    String  sCommand       // the producing command, lowercased ("pos", "replace", "left", ...)
+    String  sExpr          // the expression the variable equals after the line, as source text ("" = unknown)
+    String  sExprMasked    // the same with string literals masked (for the operand checks)
+End_Struct
+
+// The operands of one legacy string command, as _StrVarParseCommand / _StrVarFunctionForm read them.
+Struct tStrVarOperands
+    String sNeedle         // Pos / Replace / Insert: the searched or inserted text; Left / Right / Mid / Pad: the source string
+    String sHay            // Pos: the searched string; Replace / Insert: the variable that is changed
+    String sArg            // the count (Left / Right / Pad), the length (Mid), the position (Insert)
+    String sArg2           // Mid: the start position
+    String sNeedleMasked   // the same four with string literals masked
+    String sHayMasked
+    String sArgMasked
+    String sArg2Masked
+End_Struct
+
+/* Folder names that are containers, not the library's identity: vwin32fh's .sws lives in
+   "vwin32fh\StudioLibrary\", so the leaf folder would name every such library "StudioLibrary"
+   (and did, in the 2026-07-30 survey - 293 references collapsed onto that one word). */
+Define CS_LibGenericFolders         for "studiolibrary|library|libraries|studio"
+
+/* Deep Scan rule TOKENS that stay live inside a '#COMMAND .. #ENDCOMMAND' body, where the scanner
+   otherwise skips every line (see the macro latch in ScanLines).
+
+   The blanket skip protects rules that match COMMAND SYNTAX: a macro body is full of command-shaped
+   lines carrying '!' argument tokens, and offering to rewrite those produced auto-fix rows a plan
+   run could never clear. That reasoning does not extend to a rule matching a FUNCTION NAME whose
+   fix is a pure rename - ToANSI(x) -> Utf8ToAnsi(x) is safe wherever it appears, including on an
+   argument like '!1', which the rename carries through untouched.
+
+   It matters because a workspace's own output commands would otherwise hide their conversion calls
+   from BOTH lanes at once: the compiler reports 4534 at the command's call sites and never in its
+   body, and the scan skipped the body. Keep this list to rules whose match and whose rewrite are
+   both independent of the surrounding statement syntax.
+
+   REPORTED, NOT OFFERED (2026-10-04): since 2026-09-07 the engine never changes macro code (Nils: "no
+   macro code should ever be refactored"), so these hits are Explain rows with no function - the
+   rename is the user's to make by hand. They had been Review rows naming UnicodeOemAnsiFunctions,
+   which a plan run then left untouched ("0 lines Renamed"). */
+Define CS_DSMacroSafeTokens         for "toansi|tooem"
+
+/* .sws ROLE markers. A library folder holds several .sws files per version with different
+   jobs - Nils's own convention is "RDCToolsLibDev25.0.sws" (for developing the library) beside
+   "RDCToolsLibLibrary25.0.sws" (for consuming it), and SigCJ ships Classes / Demo / Wrapper.
+   Only the consumable one may be offered as a retarget destination: matching on version alone
+   picks the right version and the wrong role. Exclusion, not a required "library" marker -
+   DFAbout25.0.sws and DFUnit-25.0.sws carry no role word at all. */
+Define CS_LibNonConsumableMarkers    for "dev|demo|sample|example|test|wrapper"
+
 Define CS_FunctionLibraryFile       for "oRefactorFuncLib.pkg"
 Define CS_UnitTestsFile             for "oUnit_Tests.pkg"
 Define CS_UnitTestsTokenizerFunc    for "Tokenizer"
@@ -1187,3 +3146,41 @@ Define CS_ImportBackupFolder        for "ImportBackup"
 Define CS_FunctionLibraryStart      for "Object oRefactorFuncLib is a cRefactorFuncLib"
 Define CS_Comment1                  for '// NOTE: Do *not* add any code after this "End_Object"!'
 Define CS_Comment2                  for '//       It will be removed by the Export/Import logic.'
+
+/* THE BOARDS' DEFERRED-ACTION SELECTORS - which view/flow an armed timer should run.
+
+   Lived inside DashboardFT.vw (the split cockpit board) until 2026-08-10, which was fine only
+   while that board was the one place they were used. It never was: ManualDashboardFT.vw,
+   TestCompileFT.dg, ModProgressHistoryFT.dg and DFRefactorFT.src all read them, so retiring the
+   cockpit took eleven of them out from under the manual board and the build stopped. They belong
+   here, with the rest of the shared constants.
+
+   Guarded so the retired board can be Use'd again for a look without a duplicate-define. */
+#IFNDEF CI_DashSingleFile
+Enum_List
+    Define CI_DashSingleFile      for 1   // Single file -> SelectSourceFile (file dialog -> load -> EditorView)
+    Define CI_DashFunctions               // Manual / Cleanup -> function grid (SelectFunctions)
+    Define CI_DashTestCompile             // Modernize -> Test Compile dock
+    Define CI_DashSelectWorkspace         // Workspace banner -> pop the .sws Open dialog + load it
+    Define CI_DashLoadRecent              // Recent-workspaces chip -> load the clicked recent .sws (no dialog)
+    Define CI_DashRefreshTiles            // OnPostInitialize / dashboard re-entry -> repaint all live tiles (post-mount)
+    Define CI_DashSelectFolders           // "Selected" card folders pill -> jump to the Select Folders view
+    Define CI_DashSelectFunctions         // "Selected" card functions pill -> jump to the Select Functions view
+    Define CI_DashCompilerSetup           // "Target DataFlex version" tile -> pop the Compiler Settings modal
+    Define CI_DashLibraries               // "Target DataFlex version" tile, Libraries chip -> the library report
+    Define CI_DashEditor                  // "Selected" card file pill (single-file mode) -> jump to the editor
+    Define CI_DashRemoveRecent            // Recent chip's "x" -> remove that .sws from the saved recent list
+    Define CI_DashViewPlan                // Modernize tile "View last plan" link -> re-open the saved plan read-only
+    Define CI_DashStartRefactor           // Action row -> run the selected functions now (manual run; same as the Start Refactoring toolbar item)
+    Define CI_DashReadLog                 // Action row -> open the run summary log file (Send ShowLogFile)
+    Define CI_DashReadOtherLogs           // Action row -> open the eOther_Function logs list (Send ShowOtherLogFiles)
+    Define CI_DashUndo                    // Action row -> open the Undo Refactoring (restore-from-backup) dialog
+    Define CI_DashRunPlan                 // Action row -> Run Modernization Plan: open the saved plan in the Refactoring Plan dialog (review -> run)
+    Define CI_DashCompare                 // Action row -> Compare before/after of the last run via the external file-compare tool (psFileCompareApp)
+    Define CI_DashReassertPlanTab         // View-last-plan follow-up: re-assert the Analyzer tab once the merged dock's WebView2 tab strip is warm (cold-show race left "Output" lit)
+    Define CI_DashViewProgress            // Progress tile / cycle-strip pill -> pop the Modernization Progress History modal (burn-down table + trend + Reset)
+    Define CI_DashDeepScan                // Guided-strip Deep Scan chip -> scan the selected source folders for obsolete symbols (no compile) -> Analyzer tab
+    Define CI_DashDeepScanRules           // The gear next to the Deep Scan chip -> the per-rule enable dialog (which symbols the scan searches for)
+    Define CI_DashBrowseFunctions         // Function-library tile figure -> Select Functions in BROWSE mode (group-filtered, NO Run button)
+End_Enum_List
+#ENDIF

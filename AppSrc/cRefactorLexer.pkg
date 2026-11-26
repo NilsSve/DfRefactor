@@ -31,7 +31,7 @@
          HandleMultiLineString and _ChangeLegacyIndicators_Sub.
      Also owns the lexer-state properties used by the tokenizer at compile
      time via function-style accessor: pbIsInPage, pbIsInDF23MultiLineComment,
-     pbInCommand, pbInProcedure, pbInFunction, pbInClass, pbInStruct,
+     pbInCommand, pbInHeader, pbInProcedure, pbInFunction, pbInClass, pbInStruct,
      pbInObject, piMultiLineStringType. Refactoring functions in
      cRefactorFuncLib consume the tokenizer output via the pTokenizer
      property (declared on cBaseFuncLib).
@@ -42,12 +42,44 @@ Use cRefactorUtilities.pkg
 
 // State enumeration for the _OverstrikeStrings character-scan loop. Guarded
 // so re-includes from other packages won't clash with these values.
-#IFDEF eOverstrikeStateOutside
-#ELSE
+#IFNDEF eOverstrikeStateOutside
     Define eOverstrikeStateOutside       for 0
     Define eOverstrikeStateInDoubleQuote for 1
     Define eOverstrikeStateInSingleQuote for 2
 #ENDIF
+
+/* THE LINE-BY-LINE GUARD, which twenty-eight refactoring functions open with.
+
+   "This line is not code a converter should touch": it is already emitted, it is inside a
+   command, it is an image line, or it is a variable declaration. Four terms, and getting one
+   of them wrong in one of twenty-eight places is a bug that shows up in one workspace only.
+
+   ByRef, and that matters: tTokenizer carries asLineTokens, so by value this would COPY a
+   string array on every line of every file for every function. ByRef passes a reference and
+   the struct is never written to here.
+
+   A Define was tried first and cannot work: DataFlex resolves a Define at its own definition
+   site, so an expression naming a local fails there with error 4328 - it is not a lazy text
+   macro.
+
+   GLOBAL, and that is a measured decision, not a style one. As a class function the call sites
+   read LineIsNotCode(Self, &TokenizerData) - an object message send, and this guard is evaluated
+   once per selected line-by-line converter per source line: about thirteen million dispatches over
+   a 1,379-file workspace. WinServ's first DF26 sweep took 42:29 against 27:35 for the same run on
+   2026-08-18, with the per-function line counts identical to within one line and 362 FEWER files
+   of grid conversion - so the extra quarter of an hour was not extra work. A global function is a
+   direct call with no receiver and no message lookup, and this one reads nothing but its argument,
+   so it never needed an object in the first place.
+
+   NOT every guard in the engine is this one. Thirteen others test a SUBSET (bLineIsReady
+   alone, or without bIsVariableDeclaration) and four add a FIFTH term (bHasEndSemiColon,
+   bIsInStruct). Those are different conditions that merely look alike, and they keep their own
+   expressions. */
+Function LineIsNotCode Global tTokenizer ByRef TokenizerData Returns Boolean
+    Function_Return (TokenizerData.bLineIsReady = True or TokenizerData.bIsInCommand = True or ;
+        TokenizerData.bIsInImage = True or TokenizerData.bIsVariableDeclaration = True)
+End_Function
+
 
 Class cRefactorLexer is a cRefactorUtilities
     Procedure Construct_Object
@@ -60,17 +92,410 @@ Class cRefactorLexer is a cRefactorUtilities
         Property Boolean pbIsInPage False
         Property Boolean pbIsInDF23MultiLineComment False
         Property Boolean pbInCommand False
+        Property Boolean pbInHeader False
         Property Boolean pbInProcedure False
         Property Boolean pbInFunction False
         Property Boolean pbInClass False
         Property Boolean pbInStruct False
         Property Boolean pbInObject False
         Property Integer piMultiLineStringType MLS_None
+        // True when the line the Tokenizer read last is a multi-line string's text or a #HEADER region line
+        // (2026-10-29), a line wholly inside a block comment or a report image's text (2026-10-30): the engine
+        // hands such a line to no line function, as it does macro code.
+        Property Boolean pbKeepLineAsWritten False
+        // True when the line the Tokenizer read last opened a multi-line string (2026-10-29): the engine
+        // re-tokenizes a line a fix changed, and an @-string's opening line read again opens it again - it holds
+        // the string's quote, so it would otherwise read as the string's closing line.
+        Property Boolean pbLastLineOpenedString False
     End_Procedure
 
     // ====================================================================
     // Comment & string-literal detection (cluster 2)
     // ====================================================================
+
+    /* THE LINE SCANNER AND THE FILE WALK (2026-10-29) - how every lane reads the lines of a DataFlex source: where a
+       DF 23 multi-line string, an end comment, a DF 23 block comment, a legacy report image, a #HEADER region and
+       macro code begin and end.
+
+       ScanSourceLine reads ONE line in one pass, told which multi-line string is open at its start, and answers
+       every question about the line at once (tLineScan, RefactorConstants.h.pkg). ScanSourceFile walks a file's
+       lines in order, one ScanSourceLine each, and says what each line is (tLineInfo): the one walk behind the
+       macro-code guard (MacroCodeFlags, and cRefactorFuncLib's masking), the whole-file functions' kept text
+       (KeptTextFlags, MaskKeptText, _CodeOnlyFileLines), the Deep Scan's masking pass and the line pass's
+       look-ahead (_SideProductsReadBelow). The Tokenizer reads its lines through ScanSourceLine too, and the line
+       checks call it (_CodeOnlyLine, EndComment, _IsDF23CommentStart, _MultiLineStringOpens ...), so every lane
+       reads a line the same way. Both keep their state in their locals and parameters, none in properties, so a
+       caller that reads only some lines cannot leave them stale.
+
+       MULTI-LINE STRINGS, measured on DataFlex 26 with compile probes (2026-10-24 and 2026-10-29):
+       - a """ string's opener ENDS its line and its closer STARTS its line - text after an opener or before a
+         closer is error 4346 - and it opens after any statement ('Set psHtml to """', 'Function_Return """',
+         'Move ("""', '{ Description = """');
+       - an @-string - @"...", @SQL"...", @'...' and @SQL'...' - may run over several lines, and it ends at its
+         FIRST closing quote, in the middle of a line too: the rest of that line is code. Nothing escapes that
+         quote ("" and \" both end the string), so a line of its text never holds one;
+       - a #COMMAND, #DATA or #REPLACE line in a string's text is text: the compiler defines nothing from it.
+       A string left open across lines is named by its delimiter: "" none, '"""' a """ string, '"' or "'" an
+       @-string. */
+
+    /* One pass over sLine, the multi-line string sOpenIn open at its start ("" for none):
+       - inside a """ string the line ends it when it starts with """, and then opens nothing more; inside an
+         @-string, at the first closing quote - a line without it is text, whole;
+       - inside a block comment (sOpenIn is its opening marker), at the line's first closing marker, wherever it
+         stands - a line without one is comment, whole;
+       - the rest of the line is code. Its quotes are walked in order, "..." and '...' each running to their own
+         closing quote (DataFlex has no escape for either), and a "//" outside every string ends the walk: the
+         rest is the end comment. A block comment opened before it runs to its FIRST closing marker, quotes or
+         not (measured on DataFlex 26 - an apostrophe in a comment's text used to hide that marker, and every line
+         below read as comment, 2026-10-30), and the walk goes on after the marker; with none, the rest of the
+         line is the comment (bBlockOpenOut). A comment's text opens no string and holds no end comment, and it
+         is no code: sCode blanks it, markers too, and cuts the line where a comment is left open;
+       - the line opens a """ string when it ENDS with a """ that stands outside every string before it ('""""'
+         and '"TO"""' end in a string's own closing quote and an empty string) and does not start with one (that
+         is a closer); it opens an @-string when the string still open at its end began with @" / @' / @SQL" /
+         @SQL'. A directive line ('#...') opens none.
+       A tab counts as a space. A line with no quote and no slash costs no character loop. bCode asks for sCode
+       too. */
+    Function ScanSourceLine String sLine String sOpenIn Boolean bCode Returns tLineScan
+        tLineScan Scan
+        String sCh sNext sQuote sRest sRestSp
+        Integer i iLen iStart iFirst iLast iTriple iQuoteAt iAt
+        Boolean bAt bTriple bNoOpen
+
+        Move "" to Scan.sOpenOut
+        Move "" to Scan.sCode
+        If (bCode = True) ;
+            Move sLine to Scan.sCode
+        Move (Length(sLine)) to iLen
+        Move 1 to iStart
+        Move False to bNoOpen
+
+        // Inside a block comment: its first closing marker ends it, wherever it stands
+        If (sOpenIn = "/*") Begin
+            Move (Pos("*/", sLine)) to Scan.iBlockEndAt
+            If (Scan.iBlockEndAt = 0) Begin
+                Move True to Scan.bBlockOpenOut
+                If (bCode = True) ;
+                    Move (Repeat(" ", iLen)) to Scan.sCode
+                Function_Return Scan
+            End
+            Move (Scan.iBlockEndAt + 2) to iStart
+            If (bCode = True) ;
+                Move (Repeat(" ", (iStart - 1)) + Mid(sLine, iLen, iStart)) to Scan.sCode
+        End
+        // Inside a multi-line string: where does it end?
+        Else If (sOpenIn <> "") Begin
+            If (sOpenIn = '"""') Begin
+                If (Left(Trim(Replaces((Character(9)), sLine, " ")), 3) = '"""') ;
+                    Move (Pos('"""', sLine)) to Scan.iCloseAt
+                Move True to bNoOpen
+            End
+            Else ;
+                Move (Pos(sOpenIn, sLine)) to Scan.iCloseAt
+            If (Scan.iCloseAt = 0) Begin
+                Move sOpenIn to Scan.sOpenOut
+                If (bCode = True) ;
+                    Move (Repeat(" ", iLen)) to Scan.sCode
+                Function_Return Scan
+            End
+            Move (Scan.iCloseAt + Length(sOpenIn)) to iStart
+            If (bCode = True) ;
+                Move (Repeat(" ", (iStart - 1)) + Mid(sLine, iLen, iStart)) to Scan.sCode
+        End
+
+        // The code from iStart on. No quote and no block comment opening: the first "//" and "*/" are the answer,
+        // no walk needed.
+        Move (Mid(sLine, iLen, iStart)) to sRest
+        If (Pos('"', sRest) = 0 and Pos("'", sRest) = 0 and Pos("/*", sRest) = 0) Begin
+            If (Pos("/", sRest) = 0) ;
+                Function_Return Scan
+            Move (Pos("//", sRest)) to iAt
+            If (iAt > 0) Begin
+                Move (iAt + iStart - 1) to Scan.iCommentAt
+                If (bCode = True) ;
+                    Move (Left(Scan.sCode, (Scan.iCommentAt - 1))) to Scan.sCode
+            End
+            Move (Pos("*/", sRest)) to iAt
+            If (iAt > 0 and Scan.iBlockEndAt = 0 and (Scan.iCommentAt = 0 or (iAt + iStart - 1) < Scan.iCommentAt)) ;
+                Move (iAt + iStart - 1) to Scan.iBlockEndAt
+            Function_Return Scan
+        End
+
+        // Where a string can open: not on a directive line, and a """ only at the end
+        Move (Replaces((Character(9)), sRest, " ")) to sRestSp
+        Move (iStart + Length(sRestSp) - Length(LTrim(sRestSp))) to iFirst
+        Move (iStart - 1 + Length(RTrim(sRestSp))) to iLast
+        If (Mid(sLine, 1, iFirst) = "#") ;
+            Move True to bNoOpen
+        Move 0 to iTriple
+        If (bNoOpen = False and (iLast - 2) > iFirst) Begin
+            If (Mid(sLine, 3, (iLast - 2)) = '"""' and Mid(sLine, 3, iFirst) <> '"""') ;
+                Move (iLast - 2) to iTriple
+        End
+
+        Move "" to sQuote
+        Move 0 to iQuoteAt
+        Move False to bAt
+        Move False to bTriple
+        Move iStart to i
+        While (i <= iLen)
+            Move (Mid(sLine, 1, i)) to sCh
+            If (sQuote <> "") Begin
+                If (sCh = sQuote) ;
+                    Move "" to sQuote
+                Else If (bCode = True) ;
+                    Move (Overstrike(" ", Scan.sCode, i)) to Scan.sCode
+            End
+            Else Begin
+                If (i = iTriple) Begin
+                    Move True to bTriple
+                    Move '"""' to Scan.sOpenOut
+                    Move i to Scan.iOpenAt
+                End
+                If (sCh = '"' or sCh = "'") Begin
+                    Move sCh to sQuote
+                    Move i to iQuoteAt
+                    Move False to bAt
+                    If (i > 1) Begin
+                        If (Mid(sLine, 1, (i - 1)) = "@") ;
+                            Move True to bAt
+                    End
+                    If (i > 4) Begin
+                        If (Uppercase(Mid(sLine, 4, (i - 4))) = "@SQL") ;
+                            Move True to bAt
+                    End
+                End
+                Else If (sCh = "/" or sCh = "*") Begin
+                    Move (Mid(sLine, 1, (i + 1))) to sNext
+                    If (sCh = "/" and sNext = "/") Begin
+                        Move i to Scan.iCommentAt
+                        If (bCode = True) ;
+                            Move (Left(Scan.sCode, (i - 1))) to Scan.sCode
+                        Move iLen to i      // the rest is the end comment
+                    End
+                    Else If (sCh = "/" and sNext = "*") Begin
+                        // A block comment: to its first closing marker, quotes or not, and the walk goes on after it
+                        If (Scan.iBlockStartAt = 0) ;
+                            Move i to Scan.iBlockStartAt
+                        Move (Pos("*/", Mid(sLine, iLen, (i + 2)))) to iAt
+                        If (iAt = 0) Begin
+                            Move True to Scan.bBlockOpenOut
+                            If (bCode = True) ;
+                                Move (Left(Scan.sCode, (i - 1))) to Scan.sCode
+                            Move iLen to i      // the rest is the comment
+                        End
+                        Else Begin
+                            Move (i + 1 + iAt) to iAt
+                            If (Scan.iBlockEndAt = 0) ;
+                                Move iAt to Scan.iBlockEndAt
+                            If (bCode = True) ;
+                                Move (Overstrike(Repeat(" ", (iAt + 2 - i)), Scan.sCode, i)) to Scan.sCode
+                            Move (iAt + 1) to i
+                        End
+                    End
+                    Else If (sCh = "*" and sNext = "/") Begin
+                        If (Scan.iBlockEndAt = 0) ;
+                            Move i to Scan.iBlockEndAt
+                    End
+                End
+            End
+            Increment i
+        Loop
+        If (bTriple = False and sQuote <> "" and bAt = True and bNoOpen = False) Begin
+            Move sQuote to Scan.sOpenOut
+            Move iQuoteAt to Scan.iOpenAt
+        End
+        Function_Return Scan
+    End_Function
+
+    // The end comment ScanSourceLine found on sLine, as the Tokenizer keeps it: from its "//" to the end of the
+    // line, the trailing blanks off; "" for none.
+    Function _ScannedEndComment String sLine tLineScan Scan Returns String
+        If (Scan.iCommentAt = 0) ;
+            Function_Return ""
+        Function_Return (RTrim(Mid(sLine, Length(sLine), Scan.iCommentAt)))
+    End_Function
+
+    // Old DF syntax that used "pages", e.g. "/MyPage"
+    // A report-image page marker ("/PageName"). Match AFTER leading whitespace: real report
+    // images sit INDENTED inside the report object, and the old column-1-only test missed every
+    // one of them - so the page never opened and its "/*" terminator was then mis-read as a DF23
+    // block-comment START that, with no "*/" after it, sticks ON to end-of-file and makes EVERY
+    // converter skip the real code below the image (Nils 2026-07-11: wp_tidsstamptest.rv -
+    // Sysdate4 + operators past the image never converted while Deep Scan still flagged them). A
+    // '/' followed by a LETTER is unambiguously an image label: no DataFlex statement starts with
+    // '/', a '//' comment has '/' as its 2nd char, and a '/*' has '*' - none are letters. Here in
+    // the lexer since 2026-10-29, beside the file walk that reads it.
+    Function IsImageStart String sLine Returns Boolean
+        String sTrim sChar
+        Move (LTrim(sLine)) to sTrim
+        If (Left(sTrim, 1) <> CS_ImageNameStart) ;
+            Function_Return False
+        Move (Mid(sTrim, 1, 2)) to sChar
+        If (sChar = "") ;
+            Function_Return False
+        Function_Return (CS_LowercaseAlphabet contains Lowercase(sChar))
+    End_Function
+
+    // Old DF syntax that used "pages". To mark end of a page these two characters were used: "/*"
+    // Indentation-tolerant to match IsImageStart (Nils 2026-07-11).
+    Function IsImageEnd String sLine Returns Boolean
+        Function_Return (Left(LTrim(sLine), 2) = CS_ImageNameEnd)
+    End_Function
+
+    /* THE FILE WALK. What each line of asCode is (tLineInfo), the lines read in order with one ScanSourceLine each:
+       - eKind: a multi-line string's opening line, text or closing line, a #HEADER region line, a block-comment
+         line (the line that opens one whole), a report-image line, or code; bBlockOpenIn says a block comment is
+         open at the line's start;
+       - eMacro: macro code - a #COMMAND..#ENDCOMMAND or a #DATA..#ENDDATA block, both ends included and left open
+         to the end of the file as the compiler reads it, or a directive line ('!...'). Case-insensitive.
+       A STRING'S TEXT IS NEVER A DIRECTIVE (measured on DataFlex 26): a #COMMAND, #DATA or #ENDCOMMAND line there
+       is text - it opens or ends no block - while a directive line there still counts, as the compiler reads the
+       exclamation mark even inside a string, and a block the string stands in runs on. Elsewhere a directive is
+       macro code wherever it stands - in a block comment, a report image or a #HEADER region too - and macro lines
+       move the walk on as any other line does, as they move the Tokenizer on: a string opened in a macro body is
+       followed there too. A block comment's or a report image's text opens no string, so a commented-out opener
+       cannot hide the code after it, and a block comment ends at its first closing marker, quotes or not. */
+    Function ScanSourceFile String[] ByRef asCode Returns tLineInfo[]
+        tLineInfo[] aInfo
+        tLineInfo Info
+        tLineScan Scan
+        String sOpen sTrim sLow sBang
+        Integer i iLast iBlock
+        Boolean bInBlock bInImage bInHeader
+
+        Move (SizeOfArray(asCode) - 1) to iLast
+        If (iLast < 0) ;
+            Function_Return aInfo
+        Move (ResizeArray(aInfo, (iLast + 1))) to aInfo
+        Move (Character(33)) to sBang
+        Move "" to sOpen
+        Move MC_None to iBlock
+        Move False to bInBlock
+        Move False to bInImage
+        Move False to bInHeader
+        For i from 0 to iLast
+            Move LK_Code to Info.eKind
+            Move MC_None to Info.eMacro
+            Move sOpen to Info.sOpenIn
+            Move 0 to Info.iCloseAt
+            Move 0 to Info.iOpenAt
+            Move bInBlock to Info.bBlockOpenIn
+            Move (Trim(Replaces((Character(9)), asCode[i], " "))) to sTrim
+            If (sOpen <> "") Begin
+                // A multi-line string's text, or its closing line
+                Get ScanSourceLine asCode[i] sOpen False to Scan
+                If (Scan.iCloseAt > 0) Begin
+                    Move LK_StringCloser to Info.eKind
+                    Move Scan.iCloseAt to Info.iCloseAt
+                    Move Scan.iOpenAt to Info.iOpenAt
+                End
+                Else ;
+                    Move LK_StringText to Info.eKind
+                Move Scan.sOpenOut to sOpen
+                Move iBlock to Info.eMacro
+                If (iBlock = MC_None and Left(sTrim, 1) = sBang) ;
+                    Move MC_Directive to Info.eMacro
+            End
+            Else Begin
+                // Macro code
+                Move "" to sLow
+                If (Left(sTrim, 1) = "#") ;
+                    Move (Lowercase(Left(sTrim, 11))) to sLow
+                If (iBlock <> MC_None) Begin
+                    Move iBlock to Info.eMacro
+                    If ((iBlock = MC_CommandBlock and sLow = "#endcommand") or (iBlock = MC_DataBlock and Left(sLow, 8) = "#enddata")) ;
+                        Move MC_None to iBlock
+                End
+                Else If (Left(sLow, 8) = "#command") Begin
+                    Move MC_CommandBlock to Info.eMacro
+                    Move MC_CommandBlock to iBlock
+                End
+                Else If (sLow = "#data" or Left(sLow, 6) = "#data ") Begin
+                    Move MC_DataBlock to Info.eMacro
+                    Move MC_DataBlock to iBlock
+                End
+                Else If (Left(sTrim, 1) = sBang) Begin
+                    Move MC_Directive to Info.eMacro
+                End
+                // What the line is
+                If (bInImage = True) Begin
+                    Move LK_Image to Info.eKind
+                    If (IsImageEnd(Self, asCode[i])) ;
+                        Move False to bInImage
+                End
+                Else If (bInBlock = True) Begin
+                    Move LK_BlockComment to Info.eKind
+                    Get ScanSourceLine asCode[i] "/*" False to Scan
+                    Move Scan.bBlockOpenOut to bInBlock
+                End
+                Else If (bInHeader = True) Begin
+                    Move LK_Header to Info.eKind
+                    If (_IsHeaderEnd(Self, asCode[i])) ;
+                        Move False to bInHeader
+                End
+                Else If (IsImageStart(Self, asCode[i])) Begin
+                    Move LK_Image to Info.eKind
+                    Move True to bInImage
+                End
+                Else If (_IsHeaderDeclaration(Self, asCode[i])) Begin
+                    Move LK_Header to Info.eKind
+                    Move True to bInHeader
+                End
+                Else Begin
+                    Get ScanSourceLine asCode[i] "" False to Scan
+                    If (Scan.iBlockStartAt > 0) Begin
+                        Move LK_BlockComment to Info.eKind
+                        Move Scan.bBlockOpenOut to bInBlock
+                    End
+                    Else If (Scan.sOpenOut <> "") Begin
+                        Move LK_StringOpener to Info.eKind
+                        Move Scan.sOpenOut to sOpen
+                        Move Scan.iOpenAt to Info.iOpenAt
+                    End
+                End
+            End
+            Move sOpen to Info.sOpenOut
+            Move Info to aInfo[i]
+        Loop
+        Function_Return aInfo
+    End_Function
+
+    // One Boolean per line of the file walk aInfo: True = macro code (eMacro).
+    Function MacroCodeFlagsOf tLineInfo[] ByRef aInfo Returns Boolean[]
+        Boolean[] abFlags
+        Integer i iLast
+
+        Move (SizeOfArray(aInfo) - 1) to iLast
+        If (iLast < 0) ;
+            Function_Return abFlags
+        Move (ResizeArray(abFlags, (iLast + 1))) to abFlags
+        For i from 0 to iLast
+            Move (aInfo[i].eMacro <> MC_None) to abFlags[i]
+        Loop
+        Function_Return abFlags
+    End_Function
+
+    /* One Boolean per line of asCode: True = macro code - a #COMMAND..#ENDCOMMAND body including both ends, a
+       #DATA..#ENDDATA block including both ends, or a directive line - as the file walk reads it (ScanSourceFile):
+       case-insensitive, a block left open runs to the end of the file as the compiler reads it, and a #COMMAND or
+       #DATA line in a multi-line string's text opens no block. The macro-code guard's answer (cRefactorFuncLib). */
+    Function MacroCodeFlags String[] ByRef asCode Returns Boolean[]
+        tLineInfo[] aInfo
+        Boolean[] abFlags
+
+        Get ScanSourceFile (&asCode) to aInfo
+        Get MacroCodeFlagsOf (&aInfo) to abFlags
+        Function_Return abFlags
+    End_Function
+
+    // True when the CODE of sLine starts with the exclamation mark - a raw compiler directive. Indentation
+    // (spaces and tabs) is skipped; a comment about a directive ('// !A ...') is not one.
+    Function IsMacroDirectiveLine String sLine Returns Boolean
+        String sCode
+        Move (Trim(Replaces(Character(9), sLine, " "))) to sCode
+        Function_Return (Left(sCode, 1) = Character(33))
+    End_Function
 
     // DF 23 block-style multi-line comment (slash-star opens, star-slash closes).
     // Just fill the line with hash-marks (#) and return.
@@ -97,78 +522,40 @@ Class cRefactorLexer is a cRefactorUtilities
         Function_Return sOverstrikeLine
     End_Function
 
-    // New DF 23 comment syntax.
+    // Is a block comment open at the end of sLine, with one open at its start (bOpenAtStart) or not? The line
+    // scanner's reading (ScanSourceLine): a block comment ends at its first "*/", quotes or not.
+    Function _BlockCommentOpenAtEnd String sLine Boolean bOpenAtStart Returns Boolean
+        tLineScan Scan
+        String sOpenIn
+
+        Move "" to sOpenIn
+        If (bOpenAtStart = True) ;
+            Move "/*" to sOpenIn
+        Get ScanSourceLine sLine sOpenIn False to Scan
+        Function_Return Scan.bBlockOpenOut
+    End_Function
+
+    // New DF 23 comment syntax: does the block comment open at the line's start end on it? At its first "*/",
+    // wherever that stands - quotes in a comment protect nothing (measured on DataFlex 26: "the framework's DOM
+    // ... */" kept every line below a comment until 2026-10-30) - unless the code after it opens another one.
+    // Callers pass the RAW line, before string overstriking.
     Function _IsDF23CommentEnd String sOverstrikeLine Returns Boolean
-        Boolean bOK
-        Integer iPos iPos2
-        String  sMasked
+        Boolean bOpen
 
-        // Ignore a "*/" that sits inside a string literal: callers pass the RAW line here,
-        // before string overstriking, so mask quoted content first (see _IsDF23CommentStart).
-        Get _MaskQuotedContent sOverstrikeLine to sMasked
-        Move 0 to iPos2
-        Move False to bOK
-        Move (Pos(CS_DF23CommentEnd, sMasked)) to iPos
-        If (iPos <> 0) Begin
-            Move (Pos(CS_CommentSymbol, sMasked))  to iPos2
-            If (iPos2 <> 0) Begin
-                Move (iPos < iPos2) to bOK
-            End
-            Else Begin
-                Move True to bOK
-            End
-        End
-        Function_Return bOK
+        Get _BlockCommentOpenAtEnd sOverstrikeLine True to bOpen
+        Function_Return (bOpen = False)
     End_Function
 
-    // New DF 23 comment syntax.
+    // New DF 23 comment syntax: a "/*" outside every string literal, before any "//". The Tokenizer calls this
+    // on the RAW line, BEFORE _OverstrikeStrings masks string content - without the quotes walked an in-string
+    // "/*" (an HTTP "*/*" accept header) OPENED a block comment, and with no real "*/" after it every later line
+    // read as a comment and EVERY refactor skipped it (Nils 2026-06-11, `Set psAcceptTypes of h to "*/*"` in
+    // wslibrary.pkg). The line scanner's reading (ScanSourceLine), the one every lane reads.
     Function _IsDF23CommentStart String sOverstrikeLine Returns Boolean
-        Integer iPos iPos2
-        Boolean bFound
-        String  sMasked
+        tLineScan Scan
 
-        // Ignore a "/*" that sits inside a string literal (e.g. an HTTP "*/*" accept header).
-        // The Tokenizer calls this on the RAW line, BEFORE _OverstrikeStrings masks string
-        // content - so without this an in-string "/*" falsely OPENS a block comment, and with no
-        // real "*/" after it pbIsInDF23MultiLineComment sticks ON to end-of-file: every later
-        // line is then treated as a comment and EVERY refactor skips it. (Nils 2026-06-11, found
-        // as `Set psAcceptTypes of h to "*/*"` in wslibrary.pkg silently killing all refactors
-        // below it.)
-        Get _MaskQuotedContent sOverstrikeLine to sMasked
-        Move False to bFound
-        Move (Pos(CS_DF23CommentStart, sMasked)) to iPos
-        Move (Pos(CS_CommentSymbol, sMasked))    to iPos2
-        If (iPos > 0) Begin
-            If (iPos2 = 0) Begin
-                Move True to bFound
-            End
-            Else If (iPos2 > 0 and iPos < iPos2) Begin
-                Move True to bFound
-            End
-        End
-        Function_Return bFound
-    End_Function
-
-    // It is assumed that blank and commented lines has been checked prior
-    // using this function.
-    // It will return True if the source line contains any of the DF23's new multi-line string starts.
-    Function _IsDF23String tTokenizer ByRef TokenizerData Returns Boolean
-        Integer iPos
-        Boolean bFound
-        String sOverStrikeLine
-
-        Move TokenizerData.sOverstrikeLine to sOverStrikeLine
-        // First check for tripple double-quotes:
-        Move (Pos('"""', sOverstrikeLine) <> 0) to bFound
-        // Second check is for "@" type multi-line string:
-        // (We have passed a sOverStrike string, thus the quotes surrounding
-        // that string constant has been replaced with "_" and/or "+" characters.)
-        If (bFound = False) Move (Pos('@"',  sOverstrikeLine) <> 0) to bFound
-        If (bFound = False) Move (Pos("@'",  sOverstrikeLine) <> 0) to bFound
-        If (bFound = False) Move (Pos("@_",  sOverstrikeLine) <> 0) to bFound
-        If (bFound = False) Move (Pos("@+'", sOverstrikeLine) <> 0) to bFound
-        If (bFound = False) Move (Pos(Lowercase("@SQL"), Lowercase(sOverstrikeLine)) <> 0) to bFound
-        Function_Return bFound
+        Get ScanSourceLine sOverstrikeLine "" False to Scan
+        Function_Return (Scan.iBlockStartAt > 0)
     End_Function
 
     Function _IsDoubleQuoteStart String sOverstrikeLine Returns Boolean
@@ -198,90 +585,47 @@ Class cRefactorLexer is a cRefactorUtilities
         Function_Return iQuotes
     End_Function
 
-    // It is assumed that blank and commented lines has been checked prior
-    // to using this function.
-    // It will return True if the "sOverStrikeLine" parameter contains the DF23's new string's end,
-    // which can be three """ characters and a 'to' keyword.
-    // If not found it returns false.
-    Function _IsMultiLineStringEnd String sLine Returns Boolean
-        Integer iStringType
+    /* DF 23 MULTI-LINE STRING DELIMITERS - the line scanner's (ScanSourceLine, above), which the
+       tokenizer (below), the file walk (ScanSourceFile) and with it the whole-file functions, the Deep Scan and the
+       macro-code guard all read, measured on DataFlex 26 (2026-10-24 and 2026-10-29): a """ opener ends its line
+       and a closer starts its line; an @-string ends at its first closing quote. */
+    Function _MultiLineStringOpens String sLine Returns Boolean
+        tLineScan Scan
 
-        Get piMultiLineStringType to iStringType
-        Case Begin
-            Case (iStringType = MLS_TripleQuote)
-                Function_Return (Pos('"""', sLine) > 0)
-            Case (iStringType = MLS_AtQuote)
-                Function_Return (Right(sLine, 1) = '"')
-            Case (iStringType = MLS_AtQuoteOpen)
-                Function_Return (Right(sLine, 1) <> '"')
-            Case (iStringType = MLS_SQLTripleQuote)
-                Function_Return (Pos('"""', sLine) > 0)
-            Case (iStringType = MLS_SQLDoubleQuote)
-                Function_Return (Right(sLine, 1) = '"')
-            Case (iStringType = MLS_SQLSingleQuote)
-                Function_Return (Right(sLine, 1) = "'")
-        Case End
-
-        Function_Return False
+        Get ScanSourceLine sLine "" False to Scan
+        Function_Return (Scan.sOpenOut = '"""')
     End_Function
 
-    // It is assumed that blank and commented lines has been checked prior
-    // using this function.
-    // It will return True if the "sLine" parameter contains any of the DF23's new string's start,
-    // or if it is a "classic" multi-line string ending with a semi-colon (;).
-    // Else it returns False.
-    Function _IsMultiLineStringStart tTokenizer ByRef TokenizerData Returns Boolean
-        Integer iPos
-        Boolean bFound
-        String sLine sSource
+    Function _MultiLineStringCloses String sLine Returns Boolean
+        tLineScan Scan
 
-        Get _IsDF23String (&TokenizerData) to bFound
-        If (bFound = False) Begin
-            Function_Return False
+        Get ScanSourceLine sLine '"""' False to Scan
+        Function_Return (Scan.iCloseAt > 0)
+    End_Function
+
+    // The closing quote of an open @-string of the piMultiLineStringType iType: '"' for @"... and @SQL"...,
+    // "'" for @'... and @SQL'...; "" for a """ string or none.
+    Function _AtStringQuote Integer iType Returns String
+        If (iType = MLS_AtQuote or iType = MLS_SQLDoubleQuote) ;
+            Function_Return '"'
+        If (iType = MLS_SQLSingleQuote) ;
+            Function_Return "'"
+        Function_Return ""
+    End_Function
+
+    // The piMultiLineStringType of the string sOpen (the line scanner's delimiter, tLineScan.sOpenOut) that the line
+    // sOverstrikeLine opens.
+    Function _StringTypeOf String sOpen String sOverstrikeLine Returns Integer
+        If (sOpen = '"""') Begin
+            If (Right(Uppercase(sOverstrikeLine), 7) = '@SQL"""') ;
+                Function_Return MLS_SQLTripleQuote
+            Function_Return MLS_TripleQuote
         End
-
-        // On the first line, to the right of the """, should be only white space.
-        Move False to bFound
-        Move (Trim(Lowercase(TokenizerData.sOverstrikeLine))) to sLine
-
-        Move (Pos('"""', sLine)) to iPos
-        If (iPos <> 0) Begin
-            Move (Mid(sLine, Length(sLine), iPos)) to sSource
-            Move (sSource = '"""') to bFound
-            If (bFound = True) Begin
-                Move (Trim(Lowercase(sLine)) contains "move ") to bFound
-                If (bFound = True) Begin
-                    Function_Return True
-                End
-            End
-        End
-
-        Move (Pos('@"', sLine)) to iPos
-        // Check for a 'Move' command
-        If (iPos <> 0) Begin
-            Move (Trim(Lowercase(sLine)) contains "move ") to bFound
-            If (bFound = True) Begin
-                Function_Return True
-            End
-        End
-
-        // Check for a @SQL multi-line string start. Can exist without a 'Move' command.
-        Move (Pos('@sql"', sLine)) to iPos
-        If (iPos = 0) Begin
-            Move (Pos('@sql"""', sLine)) to iPos
-        End
-        If (iPos = 0) Begin
-            Move (Pos("@sql'", sLine)) to iPos
-        End
-        Move (iPos <> 0) to bFound
-
-        // Finally check that this is not a multi-line string on ONE line.
-        If (bFound = True) Begin
-            Get TrimInsideSpaces sLine to sLine
-            Move (Pos('""" to', sLine) = 0) to bFound
-        End
-
-        Function_Return bFound
+        If (sOpen = "'") ;
+            Function_Return MLS_SQLSingleQuote
+        If (sOpen = '"') ;
+            Function_Return MLS_SQLDoubleQuote
+        Function_Return MLS_None
     End_Function
 
     // ====================================================================
@@ -290,6 +634,7 @@ Class cRefactorLexer is a cRefactorUtilities
 
     Function _CollectTokenizerFromProperties tTokenizer TokenizerData Returns tTokenizer
         Integer iType
+
         Get pbInCommand                    to TokenizerData.bIsInCommand
         Get pbIsInPage                     to TokenizerData.bIsInImage
         Get pbInFunction                   to TokenizerData.bIsInFunction
@@ -298,6 +643,10 @@ Class cRefactorLexer is a cRefactorUtilities
         Get pbInStruct                     to TokenizerData.bIsInStruct
         Get pbInObject                     to TokenizerData.bIsInObject
         Get pbIsInSemiColonMultiLineString to TokenizerData.bHasEndSemiColon
+        // The same carried flag, kept under its own name: bHasEndSemiColon is overwritten further
+        // down with THIS line's ending, so a converter that must know whether this line CONTINUES
+        // the previous one (ChangeLegacyIndicators' split Indicate) reads this one instead.
+        Get pbIsInSemiColonMultiLineString to TokenizerData.bIsContinuationLine
         Get pbIsInDF23MultiLineComment     to TokenizerData.bIsInDF23MultiLineComment
         Get piMultiLineStringType          to iType
         Move (iType <> MLS_None)           to TokenizerData.bIsInDF23MultiLineString
@@ -345,7 +694,7 @@ Class cRefactorLexer is a cRefactorUtilities
 
         Boolean bInDF23MultiLine bIsSqlSingleFlavored
         Integer iType iLength iString iSingleQuotes iDoubleQuotes iSemiColonScanState
-        String  sContent sOverwrite
+        String  sContent sOverwrite sQuote
 
         Move eOverstrikeStateOutside to iStartState
 
@@ -365,6 +714,19 @@ Class cRefactorLexer is a cRefactorUtilities
 
         // Was the open multi-line started with an @SQL'...' marker (single-quote flavored)?
         Move (iType = MLS_SQLSingleQuote) to bIsSqlSingleFlavored
+
+        // AN @-STRING'S CLOSING LINE (2026-10-29): its text runs to the FIRST closing quote - nothing escapes it,
+        // measured on DataFlex 26 - so the scan starts inside the string whatever else the line holds; counting
+        // the quotes (below) read 'World" + "x") to s' as code from its first character. Its text lines do not
+        // come here: the Tokenizer returns them first.
+        Get _AtStringQuote iType to sQuote
+        If (sQuote <> "" and Pos(sQuote, sText) > 0) Begin
+            If (sQuote = "'") ;
+                Move eOverstrikeStateInSingleQuote to iStartState
+            Else ;
+                Move eOverstrikeStateInDoubleQuote to iStartState
+            Function_Return False
+        End
 
         Get _NumberOfStringQuotes sText eSingleQuotes to iSingleQuotes
         Get _NumberOfStringQuotes sText eDoubleQuotes to iDoubleQuotes
@@ -487,6 +849,12 @@ Class cRefactorLexer is a cRefactorUtilities
         If (iStartState = eOverstrikeStateOutside) Begin
             If (not(sText contains '"') and not(sText contains "'")) Begin
                 Set piSemiColonStringScanState to eOverstrikeStateOutside
+                // Tabs -> single space here too (the slow char-scan below does this; the header promises
+                // it). Without it a quote-free line kept embedded tabs, so "Move Src<TAB>to Dest" tokenised
+                // as one glued "Src<TAB>to" - "to" was never seen as the keyword and an indicator-prefixed
+                // Move mangled to "Move (Src<TAB>to)" (destination dropped).
+                If (sText contains (Character(9))) ;
+                    Move (Replaces((Character(9)), sText, CS_S)) to sText
                 Function_Return sText
             End
         End
@@ -497,11 +865,13 @@ Class cRefactorLexer is a cRefactorUtilities
         Move 0 to iStart
         For iChar from 1 to iLength
             Move (Mid(sText, 1, iChar)) to sChar
-            // Tab characters become a single space (preserves char positions).
+            // Tab characters become a single space IN THE MASK (preserves char positions). sChar keeps
+            // the tab: inside a literal it is the literal's own text and goes into sContent as it is.
+            // It was swapped for the space as well, so a line rebuilt from its tokens wrote 'Move "a b"'
+            // for 'Move "a<TAB>b"' (2026-09-23). Outside a literal sChar is only compared with a quote.
             If (sChar = Character(9)) Begin
                 Move (Overstrike(CS_S, sText, iChar)) to sText
                 Move True to bChanged
-                Move CS_S to sChar
             End
 
             Case Begin
@@ -690,14 +1060,47 @@ Class cRefactorLexer is a cRefactorUtilities
         Function_Return sLine
     End_Function
 
+    // The index of the expression whose span holds iPos, -1 when none does. Both are positions on the
+    // masked line: a string constant's iStartPos, and an expression's once _SplitSourceLineToTokens has
+    // re-found it there. Tells a literal that goes back with its expression from one that goes back to
+    // a token of its own.
+    Function _ExpressionAtPos Integer iPos tExpression[] aExpressions Returns Integer
+        Integer iCount iLast
+
+        Move (SizeOfArray(aExpressions) - 1) to iLast
+        For iCount from 0 to iLast
+            If (iPos >= aExpressions[iCount].iStartPos and iPos < (aExpressions[iCount].iStartPos + aExpressions[iCount].iLength)) Begin
+                Function_Return iCount
+            End
+        Loop
+        Function_Return -1
+    End_Function
+
+    // Where an expression's placeholder sits GLUED behind something in sToken - the expression followed
+    // a name or a literal with no space, 'sndAlias||||', '"logo"|||||||' - or 0. The run of CS_D must be
+    // exactly sReplace's length, with another character before it (so never at position 1: a token that
+    // STARTS with the placeholder is the caller's other case) and after it or the token's end.
+    Function _GluedPlaceholderPos String sToken String sReplace Returns Integer
+        Integer i iLen iLast
+
+        Move (Length(sReplace)) to iLen
+        Move (Length(sToken) - iLen + 1) to iLast
+        For i from 2 to iLast
+            If (Mid(sToken, iLen, i) = sReplace and Mid(sToken, 1, (i - 1)) <> CS_D and Mid(sToken, 1, (i + iLen)) <> CS_D) Begin
+                Function_Return i
+            End
+        Loop
+        Function_Return 0
+    End_Function
+
     // Splits up the tokens/elements of the input string into two string arrays, but without indentation and end comment.
     // The line will be broken up by spaces " ", *except* for expressions. Each expression will exist as a
     // separate member/item.
     Function _SplitSourceLineToTokens tTokenizer ByRef TokenizerData Returns tTokenizer
-        String sOverstrikeLine sItem sReplace sOrg sOverWrite sExpression sToken sSuffix
+        String sOverstrikeLine sReplace sOrg sOverWrite sExpression sToken sSuffix sPrefix
         String[] asLineTokens
-        Integer iSize iSizeSC iCount iCountSC iItem iPos iString iStringConstantSize iToken iTokenSize
-        Boolean bFound
+        Integer iSize iSizeSC iCount iCountSC iItem iPos iString iStringConstantSize iToken iTokenSize iSameMask iHolder iGlued
+        Boolean bFound bFilled
         tExpression[] aExpressions aExpressionsEmpty
         tExpression Expression
         tQuotedString[] asStringConstant
@@ -786,7 +1189,17 @@ Class cRefactorLexer is a cRefactorUtilities
             End
         Loop
 
-        // If there are any string constants, replace the overstriked value with the original text string:
+        // If there are any string constants, put each one back on its own token. The constants are in line
+        // order; a masked token OUTSIDE the expressions takes the next constant that lies outside them too
+        // (a position check - the expressions' text is still masked here) and has the token's own mask
+        // ("^^" = a two-character "..." literal). Passed over on the way: a constant INSIDE an expression -
+        // it goes back with the expression, below - and an empty "" or '', which is never masked, so its
+        // token asks for nothing. Until 2026-09-23 exactly ONE inside constant was passed over and the mask
+        // was not compared: 'if ((P eq "TP") or (P eq "WA")) move "C" to P' wrote move "WA", and
+        // 'Showln "" "Hello"' wrote Showln "" "" (Nils). The mask is replaced IN the token, so a ';' glued to
+        // the literal stays, and the token is filled until no mask is left: two literals glued together,
+        // "a""b", are one token. Should nothing qualify - positions that do not line up - the first
+        // constant with the same mask is taken, and failing that the next in line, whole token, as before.
         Move (SizeOfArray(TokenizerData.asStringConstant)) to iSizeSC
         If (iSizeSC <> 0) Begin
             Decrement iSizeSC
@@ -796,29 +1209,39 @@ Class cRefactorLexer is a cRefactorUtilities
             For iCount from 0 to iSize
                 Move asLineTokens[iCount] to sToken
                 Get _IsOverwriteValue sToken to bFound
-                // Also check that the asStringConstant content is not part of an expression.
-                // Use position-based check: content-based check is unreliable here because Step 4
-                // hasn't run yet, so aExpressions[i].sExpression still contains overstrike chars.
-                If (bFound = True and iCountSC <= iSizeSC) Begin
-                    Move TokenizerData.asStringConstant[iCountSC].sContent to sItem
-                    Move (SizeOfArray(aExpressions) - 1) to iPos
+                Move False to bFilled
+                While (bFound = True and iCountSC <= iSizeSC)
                     Move -1 to iItem
-                    If (iPos >= 0) Begin
-                        For iString from 0 to iPos
-                            If (iItem = -1 and ;
-                                TokenizerData.asStringConstant[iCountSC].iStartPos >= aExpressions[iString].iStartPos and ;
-                                TokenizerData.asStringConstant[iCountSC].iStartPos < (aExpressions[iString].iStartPos + aExpressions[iString].iLength)) Begin
+                    Move -1 to iSameMask
+                    For iString from iCountSC to iSizeSC
+                        If (iItem = -1 and (sToken contains TokenizerData.asStringConstant[iString].sOverwrite)) Begin
+                            If (iSameMask = -1) Begin
+                                Move iString to iSameMask
+                            End
+                            Get _ExpressionAtPos TokenizerData.asStringConstant[iString].iStartPos aExpressions to iHolder
+                            If (iHolder = -1) Begin
                                 Move iString to iItem
                             End
-                        Loop
+                        End
+                    Loop
+                    If (iItem = -1) Begin
+                        Move iSameMask to iItem
                     End
-                    If (iItem <> -1 and iCountSC < iSizeSC) Begin
-                        Increment iCountSC
-                        Move TokenizerData.asStringConstant[iCountSC].sContent to sItem
+                    If (iItem <> -1) Begin
+                        Move (Replace(TokenizerData.asStringConstant[iItem].sOverwrite, sToken, TokenizerData.asStringConstant[iItem].sContent)) to sToken
+                        Move True to bFilled
+                        Move (iItem + 1) to iCountSC
+                        Get _IsOverwriteValue sToken to bFound
                     End
-                    Move sItem to asLineTokens[iCount]
-                    Increment iCountSC
-                End
+                    Else Begin
+                        If (bFilled = False) Begin
+                            Move TokenizerData.asStringConstant[iCountSC].sContent to sToken
+                            Increment iCountSC
+                        End
+                        Move False to bFound
+                    End
+                Loop
+                Move sToken to asLineTokens[iCount]
             Loop
         End
 
@@ -848,9 +1271,45 @@ Class cRefactorLexer is a cRefactorUtilities
                         End
                     Loop
                 End
+                // Last: the placeholder GLUED behind a name or a literal - 'sndAlias('S', '*')', 'Send
+                // AssignFormula of hoReport "logo"('"1"')'. Such a token was never found, and the placeholder
+                // was written out; with a literal in front, that literal used to take the whole token back and
+                // the argument vanished from the line (2026-09-23, 26 lines in 670,000 of real code).
+                Move 0 to iGlued
+                If (iItem = -1) Begin
+                    Move (SizeOfArray(asLineTokens) - 1) to iTokenSize
+                    For iToken from 0 to iTokenSize
+                        If (iItem = -1) Begin
+                            Get _GluedPlaceholderPos asLineTokens[iToken] sReplace to iGlued
+                            If (iGlued > 0) Begin
+                                Move iToken to iItem
+                            End
+                        End
+                    Loop
+                End
                 If (iItem <> -1) Begin
-                    // Capture any trailing characters beyond the placeholder (e.g. trailing ')').
-                    Move (Replace(sReplace, asLineTokens[iItem], "")) to sSuffix
+                    // Capture any characters before (glued) and beyond the placeholder (e.g. trailing ')').
+                    Move "" to sPrefix
+                    If (iGlued > 0) Begin
+                        Move (Left(asLineTokens[iItem], (iGlued - 1))) to sPrefix
+                        Move (Mid(asLineTokens[iItem], Length(asLineTokens[iItem]), (iGlued + Length(sReplace)))) to sSuffix
+                    End
+                    Else Begin
+                        Move (Replace(sReplace, asLineTokens[iItem], "")) to sSuffix
+                    End
+                    // Step past the constants that lie BEFORE this expression: the loose ones went back to
+                    // their own tokens above, an earlier expression's went back with it. Without this the
+                    // first of them was taken for this expression's (Nils 2026-09-23): 'Send Info_Box "AB"
+                    // (sA eq "CD")' pasted "AB" into the condition, and with "CDE" the masks no longer
+                    // matched, nothing went back, and (sA = "^^^") was written out. An expression that was
+                    // not re-found on the line (iStartPos 0) passes nothing over - as before.
+                    Move True to bFound
+                    While (bFound = True and iString <= iStringConstantSize)
+                        Move (TokenizerData.asStringConstant[iString].iStartPos < aExpressions[iCount].iStartPos) to bFound
+                        If (bFound = True) Begin
+                            Increment iString
+                        End
+                    Loop
                     If (iString <= iStringConstantSize) Begin
                         Move TokenizerData.asStringConstant[iString].sOverwrite to sOverWrite
                         Move (Pos(sOverWrite, aExpressions[iCount].sExpressionOS)) to iPos
@@ -886,8 +1345,8 @@ Class cRefactorLexer is a cRefactorUtilities
                             Move sExpression to aExpressions[iCount].sExpression
                         End
                     End
-                    // Restore expression text plus any trailing characters that were beyond the placeholder.
-                    Move (aExpressions[iCount].sExpression + sSuffix) to asLineTokens[iItem]
+                    // Restore expression text plus any characters that were before and beyond the placeholder.
+                    Move (sPrefix + aExpressions[iCount].sExpression + sSuffix) to asLineTokens[iItem]
                 End
             Loop
         End
@@ -1022,6 +1481,35 @@ Class cRefactorLexer is a cRefactorUtilities
     // Statement-position extractors (consumed by Tokenizer in Batch C)
     // ====================================================================
 
+    // The 1-based position of sWord as a whole word OUTSIDE every parenthesis of sLine; 0 when there is none
+    // (_LeftCommand, 2026-10-31). A name holds '#', '$', '@' and '.' as well as what _FindKeywordPos calls a word: the
+    // command 'close' stood inside the variable 'close#', and 'if close# close file#' became 'if Begin' (2026-11-02).
+    Function _WordPosAtParenDepthZero String sLine String sWord Returns Integer
+        String sNameChars sBefore sAfter
+        Integer iAt iLeft iRight
+
+        Move (Character(35) + "$@.") to sNameChars
+        Move 1 to iAt
+        Repeat
+            Get _FindKeywordPos sLine sWord True iAt to iAt
+            If (iAt > 0) Begin
+                Get _NumberOfParanthesis (Left(sLine, (iAt - 1))) (&iLeft) to iRight
+                Move "" to sBefore
+                If (iAt > 1) ;
+                    Move (Mid(sLine, 1, (iAt - 1))) to sBefore
+                Move (Mid(sLine, 1, (iAt + Length(sWord)))) to sAfter
+                If (sBefore <> "" and Pos(sBefore, sNameChars) > 0) ;
+                    Move -1 to iRight
+                If (sAfter <> "" and Pos(sAfter, sNameChars) > 0) ;
+                    Move -1 to iRight
+                If (iLeft = iRight) ;
+                    Function_Return iAt
+                Move (iAt + Length(sWord)) to iAt
+            End
+        Until (iAt = 0)
+        Function_Return 0
+    End_Function
+
     Function _LeftCommand tTokenizer ByRef TokenizerData Integer eCommandNumber Returns tToken
         Integer iSize iCount iItem iCommand iNumber
         String[] asScopeStart asScopeEnd asCommands
@@ -1067,7 +1555,12 @@ Class cRefactorLexer is a cRefactorUtilities
 
         If (iItem <> -1 and iCommand <> -1) Begin
             Move TokenizerData.asLineTokens[iCommand] to Data.sCode
-            Move (Pos(Data.sCode, TokenizerData.sOverstrikeLine)) to Data.iStartPos
+            /* A WHOLE WORD OUTSIDE ANY PARENTHESIS (2026-10-31). A plain Pos found the command 'Open' inside the
+               variable 'bOpen', and SplitInlineIfElseLine split 'If (not(bOpen)) Open hTable' into 'If (not( Begin'
+               / 'bOpen)) Open hTable' / 'End'. The plain Pos stays for a token that is no word. */
+            Get _WordPosAtParenDepthZero TokenizerData.sOverstrikeLine Data.sCode to Data.iStartPos
+            If (Data.iStartPos = 0) ;
+                Move (Pos(Data.sCode, TokenizerData.sOverstrikeLine)) to Data.iStartPos
         End
         Function_Return Data
     End_Function
@@ -1319,10 +1812,37 @@ Class cRefactorLexer is a cRefactorUtilities
     // Legacy indicator rewriter (helper for ChangeLegacyIndicators)
     // ====================================================================
 
+    // Negate a loop-back condition to the post-test 'Until (...)' EXIT condition for a '[cond] Loop' conversion.
+    // A legacy '[cond] Loop' jumps back to Repeat WHILE cond, so the modern equivalent is 'Repeat ... Until
+    // (Not(cond))' - NOT a bare 'Loop' (which drops the exit test and spins forever; LegacyApp files.nui
+    // '[~seqeof] loop'). The input is the ALREADY parenthesised loop-back condition (the bracket pass resolved
+    // '~' to Not):
+    //   '(Not(seqeof))'  ([~seqeof] loop)  -> '(seqeof)'         (the double negative collapses)
+    //   '(bRunning)'     ([bRunning] loop) -> '(Not(bRunning))'
+    // Shared by both loop-collapse sites: _ChangeLegacyIndicators_Sub (below) and FixIndicatorsLoopRepeatCommand.
+    Function _NegateLoopBackCondition String sCond Returns String
+        String sInner
+
+        Move (Trim(sCond)) to sCond
+        If (sCond = "") ;
+            Function_Return ""
+        // Unwrap ONE outer parenthesis layer: '(expr)' -> 'expr' - when that pair holds the whole condition: '(A) or (B)'
+        // is two groups (2026-11-01, _IsSingleParenGroup).
+        If (_IsSingleParenGroup(Self, sCond) = True) ;
+            Move (Trim(Mid(sCond, (Length(sCond) - 2), 2))) to sCond
+        // Already negated as 'Not(x)' -> its negation is just 'x' (collapse Not(Not(x)) -> x) - when that Not covers the
+        // whole condition: 'Not(A) and Not(B)' negates A alone, and its negation is no '(A) and Not(B)'.
+        If (Lowercase(Left(sCond, 4)) = (Lowercase(CS_Not) + "(") and _IsSingleParenGroup(Self, Mid(sCond, Length(sCond), 4)) = True) Begin
+            Move (Trim(Mid(sCond, (Length(sCond) - 5), 5))) to sInner   // text inside Not( ... )
+            Function_Return ("(" + sInner + ")")
+        End
+        Function_Return ("(" + CS_Not + "(" + sCond + "))")
+    End_Function
+
     Function _ChangeLegacyIndicators_Sub tTokenizer TokenizerData String sOverStrikeLine Boolean ByRef bChanged Returns String
         String sToken sLine sMove sIf sTo sFirstCmd sSecondCmd sFirstBoolean sSecondBoolean
         Integer iItem iSize iPos iCount iLeftParanthesis iRightParanthesis
-        Boolean bHasIf bHasMove bHasTo bIndicateCmd
+        Boolean bHasIf bHasMove bHasTo bIndicateCmd bToPart
         tExpression Expression
 
         // Guard against a tokenless line (asLineTokens[0] would fault err 4509). The caller normally ensures a
@@ -1430,62 +1950,69 @@ Class cRefactorLexer is a cRefactorUtilities
                         Move False to bHasMove // tracks whether the (indicator and expression) wrapper has been emitted
                         For iCount from (iItem +1) to iSize
                             Move TokenizerData.asLineTokens[iCount] to sToken
+                            Move False to bToPart
                             If (Lowercase(sToken) = lowercase(CS_To) or Lowercase(sToken) = Lowercase(CS_As)) Begin
                                 Move iSize to iCount // We're out of here.
+                                /* THE "TO" PART BELOW WRITES IT (2026-10-31). The word was appended here as well, so
+                                   '[~X] If a eq 0 Set Field_Changed_Value Field T.F to v' came out as '... T.F to to
+                                   v' (error 4393). When that part has a destination to write, the word is left to it. */
+                                Move (TokenizerData.BooleanIndicator.AsBoolean.sCode <> "" or TokenizerData.BooleanIndicator.ToBoolean.sCode <> "") to bToPart
                             End
-                            If (SizeOfArray(TokenizerData.aExpressions) <> 0) Begin
-                                // Find expression by sExpression field only (SearchArray compares all struct fields):
-                                Move -1 to iItem
-                                Move (SizeOfArray(TokenizerData.aExpressions)) to iPos
-                                Decrement iPos
-                                For iLeftParanthesis from 0 to iPos
-                                    If (TokenizerData.aExpressions[iLeftParanthesis].sExpression = sToken) Begin
-                                        Move iLeftParanthesis to iItem
-                                        Move iPos to iLeftParanthesis  // break
-                                    End
-                                Loop
-                                If (iItem <> -1) Begin
-                                    If (Lowercase(sToken) = Lowercase(CS_In)) Begin
-                                        Move CS_Contains to sToken
-                                    End
-                                    If (sLine <> "") Begin
-                                        // Non-expression tokens precede the expression — wrap all together:
-                                        If (sSecondBoolean = "") Begin
-                                            Append sOverStrikeLine " (" (String(sFirstBoolean)) " and (" (Trim(sLine)) " " sToken "))"
+                            If (bToPart = False) Begin
+                                If (SizeOfArray(TokenizerData.aExpressions) <> 0) Begin
+                                    // Find expression by sExpression field only (SearchArray compares all struct fields):
+                                    Move -1 to iItem
+                                    Move (SizeOfArray(TokenizerData.aExpressions)) to iPos
+                                    Decrement iPos
+                                    For iLeftParanthesis from 0 to iPos
+                                        If (TokenizerData.aExpressions[iLeftParanthesis].sExpression = sToken) Begin
+                                            Move iLeftParanthesis to iItem
+                                            Move iPos to iLeftParanthesis  // break
+                                        End
+                                    Loop
+                                    If (iItem <> -1) Begin
+                                        If (Lowercase(sToken) = Lowercase(CS_In)) Begin
+                                            Move CS_Contains to sToken
+                                        End
+                                        If (sLine <> "") Begin
+                                            // Non-expression tokens precede the expression — wrap all together:
+                                            If (sSecondBoolean = "") Begin
+                                                Append sOverStrikeLine " (" (String(sFirstBoolean)) " and (" (Trim(sLine)) " " sToken "))"
+                                            End
+                                            Else Begin
+                                                Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " (String(sSecondBoolean)) " and (" (Trim(sLine)) " " sToken "))"
+                                            End
+                                            Move "" to sLine
                                         End
                                         Else Begin
-                                            Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " (String(sSecondBoolean)) " and (" (Trim(sLine)) " " sToken "))"
+                                            If (sSecondBoolean = "") Begin
+                                                Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " sToken ")"
+                                            End
+                                            Else Begin
+                                                Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " (String(sSecondBoolean)) " and " sToken ")"
+                                            End
                                         End
-                                        Move "" to sLine
+                                        Move True to bHasMove  // wrapper has been emitted
                                     End
                                     Else Begin
-                                        If (sSecondBoolean = "") Begin
-                                            Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " sToken ")"
+                                        If (bHasMove = False) Begin
+                                            // Before first expression — accumulate for possible prefix wrapping:
+                                            If (sLine = "") Begin
+                                                Move sToken to sLine
+                                            End
+                                            Else Begin
+                                                Append sLine " " sToken
+                                            End
                                         End
                                         Else Begin
-                                            Append sOverStrikeLine " (" (String(sFirstBoolean)) " and " (String(sSecondBoolean)) " and " sToken ")"
+                                            // After expression wrapper — append remaining tokens directly:
+                                            Append sOverStrikeLine " " sToken
                                         End
                                     End
-                                    Move True to bHasMove  // wrapper has been emitted
                                 End
                                 Else Begin
-                                    If (bHasMove = False) Begin
-                                        // Before first expression — accumulate for possible prefix wrapping:
-                                        If (sLine = "") Begin
-                                            Move sToken to sLine
-                                        End
-                                        Else Begin
-                                            Append sLine " " sToken
-                                        End
-                                    End
-                                    Else Begin
-                                        // After expression wrapper — append remaining tokens directly:
-                                        Append sOverStrikeLine " " sToken
-                                    End
+                                    Append sOverStrikeLine " " sToken
                                 End
-                            End
-                            Else Begin
-                                Append sOverStrikeLine " " sToken
                             End
                         Loop
                         // If pre-expression tokens were collected but no expression was found, append them:
@@ -1548,6 +2075,18 @@ Class cRefactorLexer is a cRefactorUtilities
                     End
                     Append sOverStrikeLine " " sToken
                 End
+                // '[cond] Loop' is a conditional loop-BACK; its modern form is the post-test 'Until (Not(cond))',
+                // NOT a bare 'Loop' (which loses the exit test -> infinite loop; LegacyApp files.nui '[~seqeof] loop'
+                // -> 'Until (seqeof)' after the double-negative collapse). A bare 'Loop' with no indicator stays.
+                // Two booleans, '[A B] Loop' / '[A] [B] Loop', loop back while BOTH hold (2026-11-01): the first alone
+                // was the exit test, and '[Found] [~Ok] Loop' ended its loop on Found alone.
+                Else If (TokenizerData.BooleanIndicator.FirstBoolean.sCode <> "") Begin
+                    Get _ConstructDoubleBooleanExpression TokenizerData to sToken
+                    If (sToken = "") ;
+                        Move TokenizerData.BooleanIndicator.FirstBoolean.sCode to sToken
+                    Get _NegateLoopBackCondition sToken to sToken
+                    Move (CS_Until * sToken) to sOverstrikeLine
+                End
                 Case Break
 
             Case (TokenizerData.BooleanIndicator.FirstBoolean.sCode <> "")
@@ -1574,10 +2113,14 @@ Class cRefactorLexer is a cRefactorUtilities
                         Move TokenizerData.asLineTokens[iItem] to sFirstCmd
                 End
                 Append sOverstrikeLine CS_S sFirstCmd
-                Move 1 to iItem
-                If (TokenizerData.BooleanIndicator.FirstBoolean.bHasNot = True) Begin
-                    Increment iItem
-                End
+                // Find the command's index directly. The old 'iItem = 1 (+1 if negated)' assumed the negation
+                // adds a token ([Not X] = two tokens), but the tilde form [~X] is ONE token - so for
+                // '[~seqeof] increment rval#' iItem over-shot to 'rval#' and the arg loop below dropped it,
+                // emitting 'If (Not(seqeof)) increment' (#$ ARGUMENT REQUIRED -> control-block cascade; LegacyApp
+                // files.nui). SearchArray is token-structure-agnostic, so it is correct for [Not X] AND [~X].
+                Move (SearchArray(sFirstCmd, TokenizerData.asLineTokens, Desktop, RefFunc(DFSTRICMP))) to iItem
+                If (iItem = -1) ;
+                    Move 1 to iItem
                 If (iSize > iItem) Begin
                     Increment iItem
                     While (iItem <= iSize)
@@ -1621,19 +2164,31 @@ Class cRefactorLexer is a cRefactorUtilities
     // Tokenizer orchestrator (MAIN PUBLIC MESSAGE of this layer)
     // ====================================================================
 
-    // Tokenizer helper function for multiline strings.
-    Function HandleMultiLineString tTokenizer TokenizerData Returns tTokenizer
+    // Tokenizer helper function for multiline strings. LineScan is the Tokenizer's scan of the line (ScanSourceLine)
+    // from the string open at its start, so the line is not read again here.
+    Function HandleMultiLineString tTokenizer TokenizerData tLineScan LineScan Returns tTokenizer
         Boolean bFound
-        Integer iStartPos iEndPos
+        Integer iStartPos iEndPos iType
 
         // Check if currently processing a multi-line string
-        If (piMultiLineStringType(Self) <> MLS_None) Begin
-            // Check if the current line ends the multi-line string
-            Get _IsMultiLineStringEnd TokenizerData.sOverstrikeLine to bFound
+        Get piMultiLineStringType to iType
+        If (iType <> MLS_None) Begin
+            // Does the line end it? A """ string on a line that starts with """, an @-string at its FIRST closing
+            // quote, wherever that stands (measured 2026-10-29 - an @-string used to end only on a line that ENDED
+            // in its quote, so 'World" to sText' left it open and the code after it read as text)
+            If (iType = MLS_AtQuoteOpen) ;
+                Move (Right(TokenizerData.sOverstrikeLine, 1) <> '"') to bFound
+            Else ;
+                Move (LineScan.iCloseAt > 0) to bFound
             If (bFound) Begin
-                // End of multi-line string found, reset state
+                // End of multi-line string found, reset state - unless the code after an @-string's closing
+                // quote opens the next string (a """ closer opens none)
                 Set piMultiLineStringType to MLS_None
                 Move False to TokenizerData.bIsInDF23MultiLineString
+                If (_AtStringQuote(Self, iType) <> "" and LineScan.sOpenOut <> "") Begin
+                    Set piMultiLineStringType to (_StringTypeOf(Self, LineScan.sOpenOut, TokenizerData.sOverstrikeLine))
+                    Move True to TokenizerData.bIsInDF23MultiLineString
+                End
                 Move True to TokenizerData.bLineIsReady
                 Function_Return TokenizerData
             End
@@ -1641,24 +2196,18 @@ Class cRefactorLexer is a cRefactorUtilities
             Else Begin
                 Move True to TokenizerData.bIsInDF23MultiLineString
                 Move True to TokenizerData.bLineIsReady
+                Set pbKeepLineAsWritten to True
                 Function_Return TokenizerData
             End
         End
         Else Begin
-            Get _IsMultiLineStringStart (&TokenizerData) to bFound
-            If (bFound) Begin
-                If (Right(Uppercase(TokenizerData.sOverstrikeLine), 7) = '@SQL"""') Begin
-                    Set piMultiLineStringType to MLS_SQLTripleQuote
-                End
-                Else If (TokenizerData.sOverstrikeLine contains '@"') Begin
-                    Set piMultiLineStringType to MLS_SQLDoubleQuote
-                End
-                Else If (TokenizerData.sOverstrikeLine contains "@'") Begin
-                    Set piMultiLineStringType to MLS_SQLSingleQuote
-                End
-                Else Begin
-                    Set piMultiLineStringType to MLS_TripleQuote
-                End
+            /* Does this line open one? The line scanner says (ScanSourceLine, measured on DataFlex 26): a line
+               that ENDS in a """ outside every string, or one that leaves an @"... / @SQL"... / @'... / @SQL'...
+               string open at its end - after any statement, not only a Move. Until 2026-10-29 an @" string opened
+               only after a Move or through a second test further down (both gone), and an @' string not at all. */
+            If (LineScan.sOpenOut <> "") Begin
+                Set piMultiLineStringType to (_StringTypeOf(Self, LineScan.sOpenOut, TokenizerData.sOverstrikeLine))
+                Set pbLastLineOpenedString to True
                 Move True to TokenizerData.bIsInDF23MultiLineString
                 Move False to TokenizerData.bLineIsReady
                 Function_Return TokenizerData
@@ -1671,41 +2220,12 @@ Class cRefactorLexer is a cRefactorUtilities
             Move (Pos('@SQL"""', TokenizerData.sOverstrikeLine)) to iStartPos
             Move (RightPos('"""', TokenizerData.sOverstrikeLine)) to iEndPos
 
-            // Check if both start and end are on the same line and properly positioned
+            // Check if both start and end are on the same line and properly positioned. (An open one is the
+            // opener rule's above, and so is every open @-string.)
             If (iStartPos > 0 and iEndPos > iStartPos + 6) Begin
                 // Single-line SQL triple-quoted string
                 Set piMultiLineStringType to MLS_None
                 Move False to TokenizerData.bIsInDF23MultiLineString
-                Move True to TokenizerData.bLineIsReady
-                Function_Return TokenizerData
-            End
-            Else If (iStartPos > 0) Begin
-                // Start of a SQL multi-line triple-quoted string
-                Set piMultiLineStringType to MLS_SQLTripleQuote
-                Move True to TokenizerData.bIsInDF23MultiLineString
-                Move True to TokenizerData.bLineIsReady
-                Function_Return TokenizerData
-            End
-        End
-
-        // Check for at-quoted strings starting with @"
-        Else If (Pos('@"', TokenizerData.sOverstrikeLine) > 0) Begin
-            // Find the position of the start and end of the at-quoted string
-            Move (Pos('@"', TokenizerData.sOverstrikeLine)) to iStartPos
-            Move (RightPos('"', TokenizerData.sOverstrikeLine)) to iEndPos
-
-            // Check if the end quote is after the start and properly positioned
-            If (iStartPos > 0 and iEndPos > iStartPos + 1) Begin
-                // Single-line at-quoted string
-                Set piMultiLineStringType to MLS_None
-                Move False to TokenizerData.bIsInDF23MultiLineString
-                Move False to TokenizerData.bLineIsReady
-                Function_Return TokenizerData
-            End
-            Else If (iStartPos > 0) Begin
-                // Start of an open at-quoted multi-line string
-                Set piMultiLineStringType to MLS_AtQuote
-                Move True to TokenizerData.bIsInDF23MultiLineString
                 Move True to TokenizerData.bLineIsReady
                 Function_Return TokenizerData
             End
@@ -1731,20 +2251,141 @@ Class cRefactorLexer is a cRefactorUtilities
           e.g. it contains a ";" or one '"""', the function will set the
           property piMultiLineStringType.
     */
-    Function Tokenizer String sLine Returns tTokenizer
+    Function _TokenizeLine String sLine Returns tTokenizer
         tTokenizer TokenizerData
         tExpression[] aExpression
-        Boolean bFound bEnd bInMultiLineString bIsDoubleQuoteStart bIsOpenCommand bStatus
+        Boolean bFound bEnd bInMultiLineString bIsDoubleQuoteStart bIsOpenCommand bStatus bCloser bReread bFresh
+        Integer iType
+        String sQuote
+        tLineScan LineScan Fresh
 
-        Set psExecutionContext to "Tokenizer"   
         Move sLine to TokenizerData.sLine
+        Set pbKeepLineAsWritten to False
+        /* INSIDE A DF 23 """ STRING THE BODY IS TEXT, whatever it holds (2026-10-24). Decided before every other
+           test: a '#HEADER', a '/*' (a CSS or SQL comment), a '/api' or a '// x' in the string must not open a
+           header region, a block comment or a report image - a '/*' line used to clear the string state, so the
+           rest of the body read as code. The raw line decides (measured on DataFlex 26: a closing """ starts its
+           line, and text before a """ is error 4346, so no body line ends in one); the scope flags come from the
+           properties, as on the other finished lines. Two lines take the normal path instead. The CLOSING line:
+           its code after the """ fills the fields a whole-method reader needs (RemoveUnusedLocals finds a local
+           used there in sOverstrikeLine, and a ';' on it continues the next line), and HandleMultiLineString
+           ends the string. And the OPENING line once more - a fix changed it and the engine re-tokenizes it - so
+           it is tokenized as the first time, not read as body. A body line is marked pbKeepLineAsWritten.
+           AN @-STRING'S TEXT the same way (2026-10-29): a line without its closing quote is text whole - nothing
+           escapes that quote (measured on DataFlex 26), so a '// x', a '#HEADER' or a '/*' there is text too - and
+           its opening line read again opens it again (pbLastLineOpenedString). Its CLOSING line holds text too,
+           before the quote, so it is marked pbKeepLineAsWritten as well - its code after the quote is the line
+           functions' no more than a """ closer's is (the line is ready): NormalizeArrayNotation, reading it as code
+           from its first character, rewrote 'String [] asX" to s' (measured 2026-10-29). A closing line of either
+           kind (bCloser) skips the comment, header, image and block-comment tests below: its text is none of those,
+           and a """ closer followed by + "/*" no longer opens a block comment. The line is read by the line scanner
+           (ScanSourceLine), once from the string open at its start (LineScan) and once from its
+           first character (Fresh: its block comment, its end comment, the string it opens), each only when asked. */
+        Get pbLastLineOpenedString to bReread
+        Set pbLastLineOpenedString to False
+        Get piMultiLineStringType to iType
+        Get _AtStringQuote iType to sQuote
+        Move False to bCloser
+        Move False to bFresh
+        If (iType = MLS_TripleQuote or iType = MLS_SQLTripleQuote) Begin
+            // The opening line read again: an opener ends in """, so only such a line is read for it
+            If (Right(Trim(Replaces((Character(9)), sLine, " ")), 3) = '"""') Begin
+                Get ScanSourceLine sLine "" False to Fresh
+                Move True to bFresh
+            End
+            If (bFresh = True and Fresh.sOpenOut = '"""') Begin
+                Set piMultiLineStringType to MLS_None
+            End
+            Else Begin
+                Get ScanSourceLine sLine '"""' False to LineScan
+                If (LineScan.iCloseAt = 0) Begin
+                    Get _CollectTokenizerFromProperties TokenizerData to TokenizerData
+                    Move True to TokenizerData.bLineIsReady
+                    Set pbKeepLineAsWritten to True
+                    Set pTokenizer to TokenizerData
+                    Function_Return TokenizerData
+                End
+                Move True to bCloser
+            End
+        End
+        Else If (sQuote <> "") Begin
+            If (bReread = True) Begin
+                Get ScanSourceLine sLine "" False to Fresh
+                Move True to bFresh
+            End
+            If (bFresh = True and Fresh.sOpenOut <> "") Begin
+                Set piMultiLineStringType to MLS_None
+                Move "" to sQuote
+            End
+            Else Begin
+                Get ScanSourceLine sLine sQuote False to LineScan
+                If (LineScan.iCloseAt = 0) Begin
+                    Get _CollectTokenizerFromProperties TokenizerData to TokenizerData
+                    Move True to TokenizerData.bLineIsReady
+                    Set pbKeepLineAsWritten to True
+                    Set pTokenizer to TokenizerData
+                    Function_Return TokenizerData
+                End
+                Move True to bCloser
+                Set pbKeepLineAsWritten to True
+            End
+        End
         // Place all cases for when we are done at the top of
         // of this function so we can jump out.
         //
-        // Standard commented lines that uses double-slashes "//":
-        Get _IsCommentLine TokenizerData.sLine to TokenizerData.bIsComment
-        Get _IsBlankLine   TokenizerData.sLine to TokenizerData.bIsBlank
-        Get _IsOpenCommand TokenizerData.sLine to bIsOpenCommand
+        // A #HEADER ... #ENDHEADER region is PRECOMPILED into <program>.pkd and is not ours
+        // to refactor - see _IsHeaderDeclaration in cRefactorUtilities.pkg for what rewriting
+        // one costs (389 phantom compile errors). bLineIsReady is the universal "hands off
+        // this line" signal every refactoring function already tests first, so this ONE gate
+        // protects the whole region - including the #COMMAND macro bodies that live in it.
+        // Deliberately the first test in this group: it must not be possible for the comment/
+        // blank/open-command gate below to consume the #ENDHEADER line and leave the flag ON.
+        // Every line of the region, the #HEADER and #ENDHEADER lines too, is marked pbKeepLineAsWritten (2026-10-29):
+        // a function that tests no bLineIsReady still never gets one.
+        If (pbInHeader(Self) = True) Begin
+            Get _IsHeaderEnd TokenizerData.sLine to bFound
+            If (bFound = True) Begin
+                Set pbInHeader to False
+            End
+            Move True to TokenizerData.bLineIsReady
+            Set pbKeepLineAsWritten to True
+            Set pTokenizer to TokenizerData
+            Function_Return TokenizerData
+        End
+        Else If (bCloser = False) Begin
+            Get _IsHeaderDeclaration TokenizerData.sLine to bFound
+            If (bFound = True) Begin
+                Set pbInHeader to True
+                Move True to TokenizerData.bLineIsReady
+                Set pbKeepLineAsWritten to True
+                Set pTokenizer to TokenizerData
+                Function_Return TokenizerData
+            End
+        End
+
+        /* A BLOCK COMMENT'S AND A REPORT IMAGE'S TEXT ARE KEPT AS WRITTEN TOO (2026-10-30), as the whole-file
+           functions' guard keeps them (cRefactorFuncLib's _CommentAndImageTextFlagsOf): a line wholly inside a
+           block comment (no closing marker on it) and an image's text - not a page's name line, which
+           RemoveResidentImageOption edits, nor the image's closing marker. The tokenizer already reads both as
+           ready (bLineIsReady), but a function that reads the raw line tests nothing: on a workspace copy
+           AddUseFileExtension made 'Use the file' in a comment 'Use the.pkg file', and another line function made
+           'e.g. [Select]' there 'e.g.[Select]'. Marked here, from the state the line before left, so a blank or a
+           '//' line inside one is marked as well. */
+        If (bCloser = False) Begin
+            If (pbIsInDF23MultiLineComment(Self) = True and Pos("*/", sLine) = 0) ;
+                Set pbKeepLineAsWritten to True
+            If (pbIsInPage(Self) = True and IsImageStart(Self, sLine) = False and IsImageEnd(Self, sLine) = False) ;
+                Set pbKeepLineAsWritten to True
+        End
+
+        // Standard commented lines that uses double-slashes "//" - not inside a block comment, where the test
+        // further down reads every line: a '// ... */' line ends the comment (2026-10-30 - this returned first, so
+        // the comment stayed open in the tokenizer's state and the code below such a line read as comment).
+        If (bCloser = False and pbIsInDF23MultiLineComment(Self) = False) Begin
+            Get _IsCommentLine TokenizerData.sLine to TokenizerData.bIsComment
+            Get _IsBlankLine   TokenizerData.sLine to TokenizerData.bIsBlank
+            Get _IsOpenCommand TokenizerData.sLine to bIsOpenCommand
+        End
         If (TokenizerData.bIsComment = True or TokenizerData.bIsBlank = True or bIsOpenCommand = True) Begin
             Get _CollectTokenizerFromProperties TokenizerData to TokenizerData
             Move True to TokenizerData.bLineIsReady
@@ -1770,7 +2411,9 @@ Class cRefactorLexer is a cRefactorUtilities
                 Function_Return TokenizerData
             End
         End
-        Else If (pbIsInPage(Self) = False) Begin
+        // Not inside a block comment: a commented-out '/Body' line is comment text, as the file walk reads it
+        // (ScanSourceFile tests the comment first; 2026-10-30)
+        Else If (pbIsInPage(Self) = False and bCloser = False and pbIsInDF23MultiLineComment(Self) = False) Begin
             Get IsImageStart TokenizerData.sLine to TokenizerData.bIsInImage
             If (TokenizerData.bIsInImage = True) Begin
                 Send _ClearRefactoringProperties
@@ -1785,12 +2428,14 @@ Class cRefactorLexer is a cRefactorUtilities
         // DF 2023 block-style multi-line comment (slash-star opens, star-slash closes).
         If (pbIsInDF23MultiLineComment(Self) = True) Begin
             Get _IsDF23CommentEnd TokenizerData.sLine to bFound
-            If (bFound = True) Begin
-                Send _ClearRefactoringProperties
-            End
-            Else Begin
-                Get _CollectTokenizerFromProperties TokenizerData to TokenizerData
-            End
+            /* ONLY THE COMMENT ENDS HERE (2026-10-30), as only the object ends at an End_Object (below). This
+               called _ClearRefactoringProperties, which wipes every scope flag, so a block comment inside a method
+               ended the method for the tokenizer and the scope-aware functions went blind for the rest of it:
+               UnicodeStringToPointer left the Move after such a comment as it was. A comment line - its closing
+               line too - carries the scope it stands in. */
+            If (bFound = True) ;
+                Set pbIsInDF23MultiLineComment to False
+            Get _CollectTokenizerFromProperties TokenizerData to TokenizerData
             Move True to TokenizerData.bIsInDF23MultiLineComment
             Get _DF23CommentOverwrite TokenizerData.sLine to TokenizerData.sOverstrikeLine
             Move True to TokenizerData.bIsComment
@@ -1798,12 +2443,26 @@ Class cRefactorLexer is a cRefactorUtilities
             Set pTokenizer to TokenizerData
             Function_Return TokenizerData
         End
-        Else Begin
-            Get _IsDF23CommentStart TokenizerData.sLine to TokenizerData.bIsInDF23MultiLineComment
+        Else If (bCloser = False) Begin
+            If (bFresh = False) Begin
+                Get ScanSourceLine sLine "" False to Fresh
+                Move True to bFresh
+            End
+            Move (Fresh.iBlockStartAt > 0) to TokenizerData.bIsInDF23MultiLineComment
             If (TokenizerData.bIsInDF23MultiLineComment = True) Begin
                 Get _DF23CommentOverwrite TokenizerData.sLine to TokenizerData.sOverstrikeLine
-                Send _ClearRefactoringProperties
-                Set pbIsInDF23MultiLineComment to True
+                // The scope the comment stands in is kept: its opening line is no end of a method either (above)
+                Get _CollectTokenizerFromProperties TokenizerData to TokenizerData
+                Move True to TokenizerData.bIsInDF23MultiLineComment
+                // A SINGLE-LINE "/* ... */" opens AND closes right here - the ubiquitous VDF IDE
+                // marker ("/* Do NOT REMOVE THIS LINE: IDE GENERATED CODE WILL GO HERE */" -
+                // WinServ's GBE.dg, Nils 2026-07-17). Without this same-line close check the
+                // sticky flag stayed ON to end-of-file and EVERY converter below the marker
+                // silently skipped (the scan flagged the rows, the run changed 0 lines). The
+                // line itself reads as a comment either way; only the CARRY-OVER is gated. The comment ends at its
+                // first "*/", quotes or not: "/* every row's element */" carried over too (2026-10-30).
+                If (Fresh.bBlockOpenOut = True) ;
+                    Set pbIsInDF23MultiLineComment to True
                 Move True to TokenizerData.bIsComment
                 Move True to TokenizerData.bLineIsReady
                 Set pTokenizer to TokenizerData
@@ -1813,8 +2472,20 @@ Class cRefactorLexer is a cRefactorUtilities
 
         // Get the indentation part
         Get _Indentation (&TokenizerData) to TokenizerData.sIndentation
-        // Get the end comment part
-        Get EndComment sLine to TokenizerData.sEndComment
+        // The end comment, from the line's scan: on an @-string's closing line only the code after the string can
+        // hold one; any other line - a """ closer too, as before - is read from its first character
+        If (bCloser = True and sQuote <> "") Begin
+            Move (_ScannedEndComment(Self, sLine, LineScan)) to TokenizerData.sEndComment
+        End
+        Else Begin
+            If (bFresh = False) Begin
+                Get ScanSourceLine sLine "" False to Fresh
+                Move True to bFresh
+            End
+            Move (_ScannedEndComment(Self, sLine, Fresh)) to TokenizerData.sEndComment
+            If (bCloser = False) ;
+                Move Fresh to LineScan
+        End
 
         // This will overstrike string constant characters with "_" characters for a "some text" and
         // '+' characters for a 'some other text'
@@ -1838,15 +2509,23 @@ Class cRefactorLexer is a cRefactorUtilities
             Function_Return TokenizerData
         End
 
-        // Old school multi-line, ending with a semi-colon (;)
+        // Old school multi-line, ending with a semi-colon (;). FIRST the carried answer - does THIS
+        // line continue the previous one? - read before the property is overwritten with this line's
+        // own ending. _CollectTokenizerFromProperties fills the same field, but only on the non-code
+        // branches above; an ordinary code line reaches it here (2026-09-17, the split Indicate).
+        Get pbIsInSemiColonMultiLineString to TokenizerData.bIsContinuationLine
         Get _HasLineEndSemiColon TokenizerData.sOverstrikeLine to TokenizerData.bHasEndSemiColon
         Set pbIsInSemiColonMultiLineString to TokenizerData.bHasEndSemiColon
 
         // DF 23 Multi-line strings are lines that starts with a @, @SQL or """
         // The property piMultiLineStringType is set to <> MLS_None as soon as such a
         // multi-line string is started (and not ended):
-        Get HandleMultiLineString TokenizerData to TokenizerData
+        Get HandleMultiLineString TokenizerData LineScan to TokenizerData
         If (TokenizerData.bLineIsReady = True) Begin
+            // Stored like every other finished line (2026-10-24): without it a multi-line string's body and
+            // closing lines left pTokenizer holding the line before, which said "code" - and every line
+            // function reads pTokenizer, so they acted on the string's text.
+            Set pTokenizer to TokenizerData
             Function_Return TokenizerData
         End
 
@@ -1869,7 +2548,7 @@ Class cRefactorLexer is a cRefactorUtilities
             If (Lowercase(TokenizerData.asLineTokens[0]) = (Lowercase(CS_FunctionEnd)) or Lowercase(TokenizerData.asLineTokens[0]) = (Lowercase(CS_ProcedureEnd))) Begin
                 Move False to TokenizerData.bIsInFunction
                 Set pbInFunction to False
-                Send _ClearRefactoringProperties
+                Send _ClearMethodScopeProperties
                 Move True to TokenizerData.bLineIsReady
                 Set pTokenizer to TokenizerData
                 Function_Return TokenizerData
@@ -1902,7 +2581,7 @@ Class cRefactorLexer is a cRefactorUtilities
             If (Lowercase(TokenizerData.asLineTokens[0]) = (Lowercase(CS_ProcedureEnd)) or Lowercase(TokenizerData.asLineTokens[0]) = (Lowercase(CS_FunctionEnd))) Begin
                 Move False to TokenizerData.bIsInProcedure
                 Set pbInProcedure to False
-                Send _ClearRefactoringProperties
+                Send _ClearMethodScopeProperties
                 Move True to TokenizerData.bLineIsReady
                 Set pTokenizer to TokenizerData
                 Function_Return TokenizerData
@@ -1981,7 +2660,20 @@ Class cRefactorLexer is a cRefactorUtilities
         If (pbInObject(Self) = True) Begin
             Get _IsObjectEnd TokenizerData.sOverstrikeLine to bFound
             If (bFound = True) Begin
-                Send _ClearRefactoringProperties
+                // An Object is legally declared INSIDE a Procedure/Function body
+                // (a common legacy pattern: "Object oHasher is a cCryptographer"
+                // + End_Object mid-method). This used to call
+                // _ClearRefactoringProperties, which wipes EVERY scope flag -
+                // including the enclosing method's pbInProcedure/pbInFunction -
+                // so every line AFTER the End_Object was classified as
+                // outside-method and scope-aware functions (UnicodePointerToString,
+                // UnicodeStringToPointer, unused-locals) went blind for the rest
+                // of the method (found via a "Move <Address var> to <String var>"
+                // after an embedded hasher object, 2026-07-05). Only the OBJECT
+                // scope ends here; in compilable code a method inside an object
+                // is always closed by its own End_ keyword first, so the blanket
+                // clear was never needed for that direction.
+                Set pbInObject to False
                 Move True  to TokenizerData.bLineIsReady
                 Set pTokenizer to TokenizerData
                 Function_Return TokenizerData
@@ -2051,6 +2743,21 @@ Class cRefactorLexer is a cRefactorUtilities
         // This tokenizer call will be made automatically by the logic in DFRefactor.src & TestBenchRefactorFunctions.src.
         Set pTokenizer to TokenizerData
 
+        Function_Return TokenizerData
+    End_Function
+
+    /* The tokenizer (_TokenizeLine). psExecutionContext says "Tokenizer" while it runs - for the error log - and is put
+       back after it (2026-11-01): run notes are filed under that property's value, the running function's name, and a
+       whole-file function that tokenized a line filed every later note under "Tokenizer", which no summary prints - a
+       grid converter's "objects of <subclass> left as they are" never reached a run's notes. */
+    Function Tokenizer String sLine Returns tTokenizer
+        tTokenizer TokenizerData
+        String sContext
+
+        Get psExecutionContext to sContext
+        Set psExecutionContext to "Tokenizer"
+        Get _TokenizeLine sLine to TokenizerData
+        Set psExecutionContext to sContext
         Function_Return TokenizerData
     End_Function
 

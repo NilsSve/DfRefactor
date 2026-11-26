@@ -1,0 +1,969 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oPinnedIndicators-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-11
+//
+// Description : Unit tests for the per-file PINNED-indicator mechanism (cRefactorFuncLib / cBaseFuncLib): names the
+//               converters must leave ENTIRELY legacy because a reference to them cannot be safely converted - a
+//               GROUP/ALL 'indicate' participant (no modern Move form), or a name read by a 'use'd local include that
+//               is not itself converted. Identifiers are generic (never customer source). Each test sets the pin set
+//               itself and clears it at the end so it cannot leak to the next fixture.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+    Object oPinnedIndicators is a cTestFixture
+        Set psFunctionName to "PinnedIndicators"
+
+        // GROUP/ALL detection (re-pinned 2026-09-13): a group line the converter WRITES pins nothing -
+        // 'indicate <X> group any [a b c]' becomes a Move in the same pass as its participants' lines -
+        // while one it refuses (a bracket in front) still pins X + a + b (UPPERCASE).
+        {Published = True}
+        Procedure PinnedIndicators_GroupDetection
+            String[] asSource asPinned asEmpty
+
+            Move "   ELSE BEGIN"                                                        to asSource[0]
+            Move "       indicate grp_flag GROUP ANY [flag_a flag_b flag_c]" to asSource[1]
+            Move "       If [grp_flag] Begin"                                           to asSource[2]
+            Move "       END"                                                           to asSource[3]
+            Move "       indicate plain_flag"                                           to asSource[4]
+            Move "       [other] indicate grp_two GROUP ANY [flag_x flag_y]"           to asSource[5]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) "" to asPinned
+            Send Assert ((SearchArray("GRP_FLAG", asPinned)) = -1)
+            Send Assert ((SearchArray("FLAG_A", asPinned)) = -1)
+            Send Assert ((SearchArray("FLAG_B", asPinned)) = -1)
+            Send Assert ((SearchArray("FLAG_C", asPinned)) = -1)
+            // a plain indicator line (no GROUP) does not pin:
+            Send Assert ((SearchArray("PLAIN_FLAG", asPinned)) = -1)
+            // the group line behind a bracket is not written, so its names stay pinned:
+            Send Assert ((SearchArray("GRP_TWO", asPinned)) >= 0)
+            Send Assert ((SearchArray("FLAG_X", asPinned)) >= 0)
+            Send Assert ((SearchArray("FLAG_Y", asPinned)) >= 0)
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // A BUILT-IN indicator (Found/FindErr/Err/SeqEof) is NEVER renamed, so it must NOT be pinned
+        // even when it is a GROUP member - else every '[Found]' line would wrongly freeze (Nils 2026-07-09).
+        {Published = True}
+        Procedure PinnedIndicators_BuiltInNotPinned
+            String[] asSource asPinned asEmpty
+            // behind a bracket, so the converter does not write it and the pin walk runs (2026-09-13)
+            Move "   [other] indicate grp_flag GROUP ANY [Found flag_a]" to asSource[0]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) "" to asPinned
+            Send Assert ((SearchArray("GRP_FLAG", asPinned)) >= 0)     // renameable -> pinned
+            Send Assert ((SearchArray("FLAG_A", asPinned)) >= 0)       // renameable -> pinned
+            Send Assert ((SearchArray("FOUND", asPinned)) = -1)        // built-in -> NOT pinned
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // A multi-line string's text is not code (2026-10-29): a #COMMAND line there opens no macro body, so an
+        // indicator in a bracket after the string is not pinned as a macro's; one in a real macro body is.
+        {Published = True}
+        Procedure PinnedIndicators_StringTextOpensNoMacroBody
+            String[] asSource asPinned asEmpty
+            Move "Indicator flag_a flag_b"            to asSource[0]
+            Move '   Move """'                         to asSource[1]
+            Move "       #COMMAND NOT_A_MACRO"         to asSource[2]
+            Move '       """ to sText'                 to asSource[3]
+            Move "   [flag_a] Move 1 to iX"            to asSource[4]
+            Move "#COMMAND REAL_MACRO"                 to asSource[5]
+            Move "   [flag_b] Move 2 to iX"            to asSource[6]
+            Move "#ENDCOMMAND"                         to asSource[7]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) "" to asPinned
+            Send Assert ((SearchArray("FLAG_A", asPinned)) = -1)      // after the string -> NOT pinned
+            Send Assert ((SearchArray("FLAG_B", asPinned)) >= 0)      // in the macro body -> pinned
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // _LinesReferenceName: whole-word (not substring) match - the include-scan core.
+        {Published = True}
+        Procedure PinnedIndicators_LinesReferenceName
+            String[] asLines
+            Boolean b
+            Move "if (SHARED_IND) gosub go_on" to asLines[0]
+            Move "clear something"             to asLines[1]
+            Get _LinesReferenceName of ghoFuncLib (&asLines) "shared_ind" to b
+            Send Assert b
+            // a whole-word that is only a SUBSTRING of the real symbol must NOT match:
+            Get _LinesReferenceName of ghoFuncLib (&asLines) "shared" to b
+            Send AssertFalse b
+            Get _LinesReferenceName of ghoFuncLib (&asLines) "absent" to b
+            Send AssertFalse b
+        End_Procedure
+
+        // COMMENTS and STRING LITERALS in an include must not pin (Nils 2026-07-10: LOGIN2's
+        // 'Indicator User' stayed a half-converted legacy declaration because a used API-wrapper
+        // include said "...the current default user name..." in its header comment). Only a CODE
+        // reference counts; a name after a trailing comment marker or inside a literal does not -
+        // and a code reference on a line that ALSO has a string still matches.
+        {Published = True}
+        Procedure PinnedIndicators_LinesReferenceName_ProseDoesNotPin
+            String[] asLines
+            Boolean b
+            Move "// retrieves the current default user name or the user name used" to asLines[0]
+            Move 'Showln "the user must log in first"'                              to asLines[1]
+            Move "Move 1 to iX // seen by the user"                                 to asLines[2]
+            Get _LinesReferenceName of ghoFuncLib (&asLines) "user" to b
+            Send AssertFalse b
+            Move 'If (User) Showln "user says hello"' to asLines[3]
+            Get _LinesReferenceName of ghoFuncLib (&asLines) "user" to b
+            Send Assert b
+        End_Procedure
+
+        // _CodeOnlyLine: the line cleaner behind the include scan - literals masked in place
+        // (positions preserved), the line cut at a // outside literals, full-comment lines empty.
+        {Published = True}
+        Procedure PinnedIndicators_CodeOnlyLine
+            String sOut
+            Get _CodeOnlyLine of ghoFuncLib "// all comment" to sOut
+            Send Assert (sOut = "")
+            Get _CodeOnlyLine of ghoFuncLib 'Move "a // b" to sX // tail' to sOut
+            Send Assert (sOut = 'Move "      " to sX ')
+            Get _CodeOnlyLine of ghoFuncLib "If (User) Begin" to sOut
+            Send Assert (sOut = "If (User) Begin")
+        End_Procedure
+
+        // _IndicatorIsPinned: True for a line referencing a pinned name, False otherwise.
+        {Published = True}
+        Procedure PinnedIndicators_IsPinned
+            String[] asPinned asEmpty
+            String sLine
+            Boolean b
+            tTokenizer TD
+
+            Move "GRP_FLAG" to asPinned[0]
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Move "       If [grp_flag] Begin" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TD
+            Get _IndicatorIsPinned of ghoFuncLib TD to b
+            Send Assert b
+            Move "       If [other_ind] Begin" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TD
+            Get _IndicatorIsPinned of ghoFuncLib TD to b
+            Send AssertFalse b
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // ChangeSquareBracketsIndicators leaves a pinned bracket read entirely legacy.
+        {Published = True}
+        Procedure PinnedIndicators_ChangeSquareBracketsSkips
+            String[] asPinned asEmpty
+            String sLine
+            Boolean bChanged
+            tTokenizer TD
+            Move "GRP_FLAG" to asPinned[0]
+            Move "       If [grp_flag] Begin" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TD
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get ChangeSquareBracketsIndicators of ghoFuncLib (&sLine) to bChanged
+            Send AssertFalse bChanged
+            Send AssertSAreEqual "       If [grp_flag] Begin" sLine
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // ChangeLegacyIndicators leaves a pinned bracket read - and the GROUP line - legacy.
+        {Published = True}
+        Procedure PinnedIndicators_ChangeLegacyIndicatorsSkips
+            String[] asPinned asEmpty
+            String sLine
+            Boolean bChanged
+            tTokenizer TD
+            Move "GRP_FLAG" to asPinned[0]
+            Move "       If [grp_flag] Begin" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TD
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get ChangeLegacyIndicators of ghoFuncLib (&sLine) to bChanged
+            Send AssertFalse bChanged
+            Send AssertSAreEqual "       If [grp_flag] Begin" sLine
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // ChangeIndicatorToBoolean leaves the 'Indicator X' declaration of a pinned name legacy -
+        // no longer SILENTLY (Nils 2026-07-12): the kept line gets a same-line NOTE naming the why,
+        // and a second pass is a no-op (the marker guard).
+        {Published = True}
+        Procedure PinnedIndicators_ChangeIndicatorToBooleanSkips
+            String[] asPinned asEmpty
+            String sLine
+            Boolean bChanged
+            tTokenizer TD
+
+            Move "GRP_FLAG" to asPinned[0]
+            Move "indicator grp_flag" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TD
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get ChangeIndicatorToBoolean of ghoFuncLib (&sLine) to bChanged
+            Send Assert bChanged
+            Send Assert (Left(sLine, 18) = "indicator grp_flag")     // declaration KEPT...
+            Send Assert (sLine contains "NOTE (DFRefactor)")         // ...with the why on the line
+            // Second pass: already noted -> untouched.
+            Get Tokenizer of ghoFuncLib sLine to TD
+            Get ChangeIndicatorToBoolean of ghoFuncLib (&sLine) to bChanged
+            Send AssertFalse bChanged
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // A non-pinned 'Indicator X' still converts (control: proves the gate is selective).
+        {Published = True}
+        Procedure PinnedIndicators_ChangeIndicatorToBooleanControl
+            String[] asEmpty
+            String sLine
+            Boolean bChanged
+            tTokenizer TD
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+            Move "indicator ready_flag" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TD
+            Get ChangeIndicatorToBoolean of ghoFuncLib (&sLine) to bChanged
+            Send Assert bChanged
+            Send Assert (sLine contains "Global_Variable Boolean gbready_flag")
+        End_Procedure
+
+        // DeclareRefactoredIndicators neither shims nor read-renames a pinned name.
+        {Published = True}
+        Procedure PinnedIndicators_DeclareExcludes
+            Integer iResult
+            String[] asOrig asCode asPinned asEmpty
+
+            Move "Procedure DoIt"                 to asOrig[0]
+            Move "    indicate shared_ind True" to asOrig[1]
+            Move "    If [shared_ind] Begin"    to asOrig[2]
+            Move "    End"                        to asOrig[3]
+            Move "End_Procedure"                  to asOrig[4]
+            // Converted file still holds the legacy references (the pinned line converters left them):
+            Move "Procedure DoIt"                 to asCode[0]
+            Move "    indicate shared_ind True" to asCode[1]
+            Move "    If [shared_ind] Begin"    to asCode[2]
+            Move "    End"                        to asCode[3]
+            Move "End_Procedure"                  to asCode[4]
+            Set pasOriginalSource of ghoEngine to asOrig
+            Send ClearFuncLibProperties of ghoFuncLib
+            Move "SHARED_IND" to asPinned[0]
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get DeclareRefactoredIndicators of ghoFuncLib (&asCode) "" to iResult
+            Send AssertIAreEqual 0 iResult                                  // nothing shimmed
+            Send Assert ((SearchArray("#IFNDEF gbshared_ind", asCode)) = -1)
+            Send Assert ((SearchArray("    If [shared_ind] Begin", asCode)) >= 0)   // read NOT renamed
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+
+        /* --- The include-scan half of _ComputePinnedIndicators, END TO END with real files. ---
+
+           Every earlier test passes sFilePath = "" - which DISABLES the include scan - so the branch
+           that reads each USEd local include and pins the names it references had NO coverage at all.
+           It is also 24.4 seconds of a 55-second LegacyApp Analyze (measured 2026-07-22), and the
+           planned fix inverts its inner loop (scan each include once into an identifier set instead of
+           re-scanning the whole include per candidate). These tests pin the CURRENT observable set so
+           that optimisation cannot change what gets pinned - pinned indicators are the names every
+           converter must leave legacy, so a drift here mis-converts customer code silently.
+
+           The MAIN source is passed in memory (the function only uses sFilePath for the folder and the
+           cache key), but the INCLUDES are real files in the workspace Data folder - written, scanned,
+           deleted. ASCII content only. */
+
+        // The full contract in one scene: a referenced name pins (case-insensitively, reported
+        // UPPERCASE); a name only in a comment or a string literal does not (_CodeOnlyLine strips
+        // both - the LOGIN2 "user" prose lesson, Nils 2026-07-10); a substring of a longer identifier
+        // does not (whole-word); a name in NO include does not; a second include contributes; a
+        // non-local Use (Windows.pkg) is skipped; and the GROUP section still composes on top.
+        {Published = True}
+        Procedure PinnedIndicators_IncludeScanEndToEnd
+            String[] asInc1 asInc2 asSource asPinned asEmpty
+            String sDataPath sInc1 sInc2 sMainPath
+            Boolean bOk
+            Integer iVoid
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath   // psDataPath carries NO trailing separator - same trap as the phase log (2026-07-22)
+            Move (sDataPath + "ZPinInc1.mac") to sInc1
+            Move (sDataPath + "ZPinInc2.mac") to sInc2
+            Move (sDataPath + "ZPinMainProbe.src") to sMainPath   // never written - folder + cache key only
+            Move "// PROSEONLY appears in this comment and nowhere else"  to asInc1[0]
+            Move ('Move "STRINGONLY is only literal text" to sTmp')      to asInc1[1]
+            Move "If (SUFFIXTRAPEXTRA) Begin"                             to asInc1[2]
+            Move "End"                                                    to asInc1[3]
+            Move "move pinnedbyinc1 to iX"                                to asInc1[4]
+            Get rfWriteEncodedFileFromStringArray (&asInc1) sInc1 C_NewLine False to bOk
+            Send Assert bOk
+            Move "gosub check_it"                                        to asInc2[0]
+            Move "If (PinnedByInc2) Begin"                                to asInc2[1]
+            Move "End"                                                    to asInc2[2]
+            Get rfWriteEncodedFileFromStringArray (&asInc2) sInc2 C_NewLine False to bOk
+            Send Assert bOk
+            Move "Use Windows.pkg"                                        to asSource[0]
+            Move "Use ZPinInc1.mac"                                       to asSource[1]
+            Move "Use ZPinInc2.mac"                                       to asSource[2]
+            // behind a bracket: a group line the converter does not write, so the pin walk runs (2026-09-13)
+            Move "[other] indicate grp_main GROUP ANY [flag_x]"           to asSource[3]
+            Move "Indicate PinnedByInc1 True"                             to asSource[4]
+            Move "Indicate PinnedByInc2 True"                             to asSource[5]
+            Move "Indicate NotInAnyInclude True"                          to asSource[6]
+            Move "Indicate SuffixTrap True"                               to asSource[7]
+            Move "Indicate ProseOnly True"                                to asSource[8]
+            Move "Indicate StringOnly True"                               to asSource[9]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) sMainPath to asPinned
+            Send Assert ((SearchArray("PINNEDBYINC1", asPinned)) >= 0)      // code ref, case-insensitive
+            Send Assert ((SearchArray("PINNEDBYINC2", asPinned)) >= 0)      // second include contributes
+            Send Assert ((SearchArray("NOTINANYINCLUDE", asPinned)) = -1)   // referenced nowhere
+            Send Assert ((SearchArray("SUFFIXTRAP", asPinned)) = -1)        // whole-word, not substring
+            Send Assert ((SearchArray("PROSEONLY", asPinned)) = -1)         // comments are stripped
+            Send Assert ((SearchArray("STRINGONLY", asPinned)) = -1)        // string literals are masked
+            Send Assert ((SearchArray("GRP_MAIN", asPinned)) >= 0)          // GROUP section still composes
+            Send Assert ((SearchArray("FLAG_X", asPinned)) >= 0)
+            Move (rfDeleteFile(sInc1)) to iVoid
+            Move (rfDeleteFile(sInc2)) to iVoid
+            Set psPinnedCacheKey  of ghoFuncLib to ""
+            Set pasPinnedCacheSet of ghoFuncLib to asEmpty
+        End_Procedure
+
+        /* --- WHY a name is pinned, not just THAT it is (Nils 2026-07-30). ---
+
+           The analyzer's demotion hint stated both reasons as an either/or and led with the GROUP/ALL
+           one, which is the rare case - so on nearly every real row it opened with the wrong
+           explanation and a correct verdict read as a misfire. The reason has always been known at
+           compute time; it simply was not carried.
+
+           Pins the two tagged forms, the index-parallel invariant they depend on (a reason that slips
+           out of step with its name would attach the wrong file to the wrong indicator - worse than no
+           reason at all), and the line -> name -> reason lookup the hint actually walks. */
+        {Published = True}
+        Procedure PinnedIndicators_ReasonNamesTheGroupOrTheInclude
+            String[] asInc asSource asPinned asEmpty
+            String sDataPath sInc sMainPath sWhy sName
+            Boolean bOk
+            Integer iVoid
+            tTokenizer TD
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move (sDataPath + "ZPinWhy.mac") to sInc
+            Move (sDataPath + "ZPinWhyMain.src") to sMainPath   // never written - folder + cache key only
+            Move "If (SHAREDFLAG) Begin"                        to asInc[0]
+            Move "End"                                          to asInc[1]
+            Get rfWriteEncodedFileFromStringArray (&asInc) sInc C_NewLine False to bOk
+            Send Assert bOk
+            Move "Use ZPinWhy.mac"                              to asSource[0]
+            Move "[other] indicate grp_a GROUP ANY [flag_g]"     to asSource[1]   // bracket in front: not written, so pinned
+            Move "Indicate SharedFlag True"                      to asSource[2]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) sMainPath to asPinned
+            // The lookup reads the LIVE property, exactly as the analyzer does after computing.
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            // Index-parallel: one reason per name, no drift.
+            Send AssertIAreEqual (SizeOfArray(asPinned)) (SizeOfArray(pasPinnedReasons(ghoFuncLib)))
+            Get _PinnedIndicatorReason of ghoFuncLib "SHAREDFLAG" to sWhy
+            Send AssertSAreEqual "USE|ZPinWhy.mac" sWhy     // the include is named, so the hint can name it
+            // The GROUP reason carries the group line's 1-based NUMBER (asSource[1] = line 2), so the
+            // hint can cite where to check it - the group line is often far from the flagged one.
+            Get _PinnedIndicatorReason of ghoFuncLib "GRP_A" to sWhy
+            Send AssertSAreEqual "GROUP|2" sWhy
+            Get _PinnedIndicatorReason of ghoFuncLib "FLAG_G" to sWhy
+            Send AssertSAreEqual "GROUP|2" sWhy             // members carry the group reason too
+            Get _PinnedIndicatorReason of ghoFuncLib "NOTPINNEDATALL" to sWhy
+            Send AssertSAreEqual "" sWhy                    // unknown name -> no invented reason
+            // And the line -> name step the hint walks first.
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get Tokenizer of ghoFuncLib "Indicate SharedFlag True" to TD
+            Get _PinnedIndicatorOnLine of ghoFuncLib TD to sName
+            Send AssertSAreEqual "SHAREDFLAG" sName
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get Tokenizer of ghoFuncLib "Indicate SomethingElse True" to TD
+            Get _PinnedIndicatorOnLine of ghoFuncLib TD to sName
+            Send AssertSAreEqual "" sName
+            Move (rfDeleteFile(sInc)) to iVoid
+            Set psPinnedCacheKey  of ghoFuncLib to ""
+            Set pasPinnedCacheSet of ghoFuncLib to asEmpty
+            Set pasPinnedCacheReasons of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // The 1-slot cache: a same-file recompute returns the SAME set. The optimised version must
+        // keep this exactly - the engine and the analyzer both lean on it per file.
+        {Published = True}
+        Procedure PinnedIndicators_IncludeScanCacheStable
+            String[] asInc asSource asPinned1 asPinned2 asEmpty
+            String sDataPath sInc sMainPath
+            Boolean bOk
+            Integer iVoid i
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath   // psDataPath carries NO trailing separator - same trap as the phase log (2026-07-22)
+            Move (sDataPath + "ZPinInc1.mac") to sInc
+            Move (sDataPath + "ZPinCacheProbe.src") to sMainPath
+            Move "If (CachedName) Begin" to asInc[0]
+            Move "End"                   to asInc[1]
+            Get rfWriteEncodedFileFromStringArray (&asInc) sInc C_NewLine False to bOk
+            Send Assert bOk
+            Move "Use ZPinInc1.mac"        to asSource[0]
+            Move "Indicate CachedName True" to asSource[1]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) sMainPath to asPinned1
+            // Delete the include BETWEEN the calls: identical output now PROVES call 2 came from the
+            // cache, not from a rescan of the file.
+            Move (rfDeleteFile(sInc)) to iVoid
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) sMainPath to asPinned2
+            Send Assert (SizeOfArray(asPinned1) = SizeOfArray(asPinned2))
+            For i from 0 to (SizeOfArray(asPinned1) - 1)
+                Send Assert ((SearchArray(asPinned1[i], asPinned2)) >= 0)
+            Loop
+            Send Assert ((SearchArray("CACHEDNAME", asPinned1)) >= 0)
+            Set psPinnedCacheKey  of ghoFuncLib to ""
+            Set pasPinnedCacheSet of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // No LOCAL include on disk -> the include scan contributes nothing (the library Use resolves
+        // to the DataFlex Pkg folder, not here) - the pre-gate that lets most files skip the scan.
+        {Published = True}
+        Procedure PinnedIndicators_IncludeScanNoLocalIncludes
+            String[] asSource asPinned asEmpty
+            String sDataPath sMainPath
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath   // psDataPath carries NO trailing separator - same trap as the phase log (2026-07-22)
+            Move (sDataPath + "ZPinNoIncProbe.src") to sMainPath
+            Move "Use Windows.pkg"          to asSource[0]
+            Move "Indicate LonelyName True" to asSource[1]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) sMainPath to asPinned
+            Send Assert (SizeOfArray(asPinned) = 0)
+            Set psPinnedCacheKey  of ghoFuncLib to ""
+            Set pasPinnedCacheSet of ghoFuncLib to asEmpty
+        End_Procedure
+
+
+        // The extractor under the inverted include-scan: maximal [a-z0-9_] runs of the CODE only -
+        // comments cut, string literals masked, output UPPERCASE. The whole-word equivalence the
+        // inversion rests on is only as good as this split.
+        {Published = True}
+        Procedure PinnedIndicators_IdentifierRunsFromLines
+            String[] asLines asRuns
+
+            Move "move pinned_x to iVal   // CommentName here"       to asLines[0]
+            Move ('Move "LiteralName inside" to sTmp')              to asLines[1]
+            Move "If (SUFFIXTRAPEXTRA) Begin"                        to asLines[2]
+            Get _IdentifierRunsFromLines of ghoFuncLib (&asLines) to asRuns
+            Send Assert ((SearchArray("PINNED_X", asRuns)) >= 0)
+            Send Assert ((SearchArray("IVAL", asRuns)) >= 0)
+            Send Assert ((SearchArray("MOVE", asRuns)) >= 0)                // keywords are runs too - harmless
+            Send Assert ((SearchArray("SUFFIXTRAPEXTRA", asRuns)) >= 0)     // the WHOLE run, never a prefix of it
+            Send Assert ((SearchArray("SUFFIXTRAP", asRuns)) = -1)
+            Send Assert ((SearchArray("COMMENTNAME", asRuns)) = -1)         // comment cut
+            Send Assert ((SearchArray("LITERALNAME", asRuns)) = -1)         // literal masked
+        End_Procedure
+
+
+        /* _ScopeNeedsIndicatorCompanion, end to end on real files - the plan's "does it need the
+           DeclareRefactoredIndicators companion?" boolean. Was 47.7s of a 63s Run Plan when it
+           re-discovered indicator uses with a whole-file tokenizer pass; the COMPILER already
+           enumerates the uses (these files are only in the list because 4538-family warnings mapped
+           them to an indicator converter, and each warning points at a use line), so the use-route now
+           reads exactly the warned lines - asLineKeys, "<pathLc>|<line>". These pin both qualifying
+           routes, the miss, and the new contract that uses count ONLY from warned lines. */
+        {Published = True}
+        Procedure PinnedIndicators_ScopeScanDeclaredIndicatorQualifies
+            String[] asFiles asNoKeys
+            String sDataPath sFile
+            String[] asSrc
+            Boolean bNeed bOk
+            Integer iVoid
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move (sDataPath + "ZScopeDecl.tmp") to sFile
+            Move "Indicator MyScopeInd"        to asSrc[0]
+            Move "[MyScopeInd] Showln 'x'"     to asSrc[1]
+            Get rfWriteEncodedFileFromStringArray (&asSrc) sFile C_NewLine False to bOk
+            Send Assert bOk
+            Move sFile to asFiles[0]
+            // The DECLARATION route needs no warned lines at all.
+            Get _ScopeNeedsIndicatorCompanion of ghoFuncLib asFiles asNoKeys to bNeed
+            Send Assert (bNeed = True)
+            Move (rfDeleteFile(sFile)) to iVoid
+            Send _InitializeFuncLib of ghoFuncLib   // drop the verdict cache between probes
+        End_Procedure
+
+        {Published = True}
+        Procedure PinnedIndicators_ScopeScanUndeclaredUseQualifies
+            String[] asFiles asKeys asNoKeys
+            String sDataPath sFile
+            String[] asSrc
+            Boolean bNeed bOk
+            Integer iVoid
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move (sDataPath + "ZScopeUse.tmp") to sFile
+            // an UNDECLARED named indicator USE on line 1 - the compiler would warn 4538 here
+            Move "Indicate MyLooseInd True"    to asSrc[0]
+            Get rfWriteEncodedFileFromStringArray (&asSrc) sFile C_NewLine False to bOk
+            Send Assert bOk
+            Move sFile to asFiles[0]
+            // THE NEW CONTRACT: without a warned line, a use alone no longer qualifies...
+            Get _ScopeNeedsIndicatorCompanion of ghoFuncLib asFiles asNoKeys to bNeed
+            Send Assert (bNeed = False)
+            Send _InitializeFuncLib of ghoFuncLib   // fresh verdict for the second probe
+            // ...and WITH the warned line it does.
+            Move (Lowercase(sFile) + "|1") to asKeys[0]
+            Get _ScopeNeedsIndicatorCompanion of ghoFuncLib asFiles asKeys to bNeed
+            Send Assert (bNeed = True)
+            Move (rfDeleteFile(sFile)) to iVoid
+            Send _InitializeFuncLib of ghoFuncLib
+        End_Procedure
+
+        {Published = True}
+        Procedure PinnedIndicators_ScopeScanBuiltInOnlyDoesNotQualify
+            String[] asFiles asKeys
+            String sDataPath sFile
+            String[] asSrc
+            Boolean bNeed bOk
+            Integer iVoid
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move (sDataPath + "ZScopeNone.tmp") to sFile
+            // built-in indicators only - never renamed, so no companion needed even when warned
+            Move "[Found] Showln 'y'"          to asSrc[0]
+            Move "Indicate FindErr False"      to asSrc[1]
+            Get rfWriteEncodedFileFromStringArray (&asSrc) sFile C_NewLine False to bOk
+            Send Assert bOk
+            Move sFile to asFiles[0]
+            Move (Lowercase(sFile) + "|1") to asKeys[0]
+            Move (Lowercase(sFile) + "|2") to asKeys[1]
+            Get _ScopeNeedsIndicatorCompanion of ghoFuncLib asFiles asKeys to bNeed
+            Send Assert (bNeed = False)
+            Move (rfDeleteFile(sFile)) to iVoid
+            Send _InitializeFuncLib of ghoFuncLib
+        End_Procedure
+
+        /* A NAME READ INSIDE A #COMMAND BODY stays an Indicator (2026-09-07): the line converters skip macro
+           bodies, so converting its declaration alone left '[ X]' inside the macro unresolved at every
+           expansion - 188 errors from one macro. */
+        {Published = True}
+        { Description = "An indicator referenced inside a #COMMAND body is pinned; one used only outside is not" }
+        Procedure PinnedIndicators_MacroBodyUsePins
+            String[] asSource asPinned asEmpty
+            Move "indicator bFlag"                       to asSource[0]
+            Move "indicator bPlain"                      to asSource[1]
+            Move "#COMMAND MY_CMD"                       to asSource[2]
+            // (no literal '!n' in a fixture string: the compiler reads it as a macro argument even here)
+            Move "  [ bFlag] if iA eq 0 move 1 to iB"    to asSource[3]
+            Move "  [~bFlag] move 2 to iB"               to asSource[4]
+            Move "#ENDCOMMAND"                           to asSource[5]
+            Move "[bPlain] move 3 to iX"                 to asSource[6]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) "" to asPinned
+            Send Assert ((SearchArray("BFLAG", asPinned)) >= 0)
+            Send Assert ((SearchArray("BPLAIN", asPinned)) = -1)
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        {Published = True}
+        { Description = "A declared indicator whose name is not a plain identifier is pinned as written and by its identifier runs" }
+        Procedure PinnedIndicators_OddNamePins
+            String[] asSource asPinned asEmpty
+            Move "indicator out$flag_up?"          to asSource[0]
+            Move "indicator bPlain"                to asSource[1]
+            Move "indicate out$flag_up? true"      to asSource[2]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) "" to asPinned
+            Send Assert ((SearchArray("OUT$FLAG_UP?", asPinned)) >= 0)
+            // the run up to the '?' is one name now - '$' is a name character (2026-09-13)
+            Send Assert ((SearchArray("OUT$FLAG_UP", asPinned)) >= 0)
+            Send Assert ((SearchArray("BPLAIN", asPinned)) = -1)
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // '$' and '#' are characters legacy names carry, and DF26 takes them in a Global_Variable Boolean
+        // (measured 2026-09-13), so such a declaration is NOT odd and pins nothing: the converters carry
+        // the name whole, gb prefix and all.
+        {Published = True}
+        Procedure PinnedIndicators_DollarAndHashNamesAreNotOdd
+            String[] asSource asPinned asEmpty
+            Move "Indicator is$done fn#"           to asSource[0]
+            Move "Indicate is$done false"          to asSource[1]
+            Move "[fn#] Begin"                     to asSource[2]
+            Move "End"                             to asSource[3]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) "" to asPinned
+            Send AssertIAreEqual 0 (SizeOfArray(asPinned))
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        {Published = True}
+        { Description = "Built-ins, system indicator numbers and macro arguments inside a #COMMAND body never pin" }
+        Procedure PinnedIndicators_MacroBodyBuiltInsDoNotPin
+            String[] asSource asPinned asEmpty
+            Move "#COMMAND MY_CMD"                 to asSource[0]
+            Move "  [found] move iA to iB"                                  to asSource[1]
+            Move "  [ |122] move 0 to iB"                                   to asSource[2]
+            // a macro argument token, built at run time (Character(33) = the exclamation mark)
+            Move ("  [~" + Character(33) + "3] move 1 to iB")               to asSource[3]
+            Move "#ENDCOMMAND"                     to asSource[4]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) "" to asPinned
+            Send AssertIAreEqual 0 (SizeOfArray(asPinned))
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        /* A NAME INSIDE A BRACKET ON A RAW COMPILER DIRECTIVE stays an Indicator (2026-09-07). A procedure
+           written partly in '!A [not X] ...' directives had X's 'indicate X as [...]' turned into a Move to a
+           gb Boolean and X renamed inside the directive brackets - and a directive can only take an indicator:
+           'Indicator unresolved' on every such line. The exclamation mark is built at run time: a literal one
+           inside a fixture string is read by the compiler as macro syntax. */
+        {Published = True}
+        { Description = "An indicator named inside a bracket on a '!'-led directive line is pinned; the plain 'not' and an unrelated indicator are not" }
+        Procedure PinnedIndicators_DirectiveBracketPins
+            String[] asSource asPinned asEmpty
+            String sBang
+            Move (Character(33)) to sBang
+            Move "  indicate iflag as [ |122]"                    to asSource[0]
+            Move "  send do_it iImg"                             to asSource[1]
+            Move (sBang + "A [not iflag] $1C4 iImg")             to asSource[2]
+            Move (sBang + "A [] $20A iImg")                      to asSource[3]
+            Move "  indicate bother true"                        to asSource[4]
+            Move "  [bother] move 1 to iX"                       to asSource[5]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) "" to asPinned
+            Send Assert ((SearchArray("IFLAG", asPinned)) >= 0)
+            Send Assert ((SearchArray("NOT", asPinned)) = -1)
+            Send Assert ((SearchArray("BOTHER", asPinned)) = -1)
+            Send AssertIAreEqual 1 (SizeOfArray(asPinned))
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        {Published = True}
+        { Description = "Built-ins, system indicator numbers and an empty bracket on a directive line never pin" }
+        Procedure PinnedIndicators_DirectiveBuiltInsDoNotPin
+            String[] asSource asPinned asEmpty
+            String sBang
+            Move (Character(33)) to sBang
+            Move (sBang + "A [found] $1C4 iImg")                 to asSource[0]
+            Move (sBang + "A [ |122] $20A iImg")                 to asSource[1]
+            Move (sBang + "A [] $20A iImg")                      to asSource[2]
+            Move (sBang + "e move 0 to iX")                      to asSource[3]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) "" to asPinned
+            Send AssertIAreEqual 0 (SizeOfArray(asPinned))
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+        End_Procedure
+
+        // The pin reaches the converter: with the directive's name pinned, its declaration line is left legacy.
+        {Published = True}
+        { Description = "A directive-pinned indicator's 'indicate ... as' declaration is not converted" }
+        Procedure PinnedIndicators_DirectivePinKeepsDeclarationLegacy
+            String[] asSource asPinned asEmpty
+            String sBang sLine
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Move (Character(33)) to sBang
+            Move "  indicate iflag as [ |122]"                    to asSource[0]
+            Move (sBang + "A [not iflag] $1C4 iImg")             to asSource[1]
+            Get _ComputePinnedIndicators of ghoFuncLib (&asSource) "" to asPinned
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Move asSource[0] to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeLegacyIndicators of ghoFuncLib (&sLine) to bChanged
+            Set pasPinnedIndicators of ghoFuncLib to asEmpty
+            Send AssertFalse bChanged
+            Send AssertSAreEqual "  indicate iflag as [ |122]" sLine
+        End_Procedure
+
+        /* ---- THE INCLUDE LIFT (2026-09-14) ----
+           Pin reason (2) was unconditional, and its hint asked for a run the board could not start. Now a
+           local include that reads a name CONVERTS WITH THE RUN when every file that 'use's it is in the
+           run, it is plain code without includes or pins of its own, and no user keeps the name legacy for
+           a reason of its own: the name is NOT pinned, the include is recorded for the engine, the read for
+           the hint. Each refusal carries its why. The files live in the Data folder (the users scan reads
+           the include's own folder), written per test and deleted at its end; _InitializeFuncLib clears the
+           run set and every memo. Identifiers are generic. The includes read the name in the bracket
+           form the line converters rewrite; the one that reads it as an expression is the EXPR test. */
+
+        // The encoded writer the include tests use; asserts the write.
+        Procedure _LiftWrite String sPath String[] asLines
+            Boolean bOk
+            Get rfWriteEncodedFileFromStringArray (&asLines) sPath C_NewLine False to bOk
+            Send Assert bOk
+        End_Procedure
+
+        // The Data folder with its trailing separator (psDataPath carries none).
+        Function _LiftDataFolder Returns String
+            String sDataPath
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Function_Return (vFolderFormat(sDataPath))
+        End_Function
+
+        // The program every lift test starts from: uses the include, declares + writes LiftName.
+        Function _LiftMainLines Returns String[]
+            String[] asMain
+            Move "Use ZLiftInc.mac"       to asMain[0]
+            Move "Indicator LiftName"     to asMain[1]
+            Move "Indicate LiftName True" to asMain[2]
+            Function_Return asMain
+        End_Function
+
+        Procedure _LiftCleanUp
+            String sData
+            Integer iVoid
+            Get _LiftDataFolder to sData
+            Move (rfDeleteFile(sData + "ZLiftInc.mac"))   to iVoid
+            Move (rfDeleteFile(sData + "ZLiftInc2.mac"))  to iVoid
+            Move (rfDeleteFile(sData + "ZLiftMain.src"))  to iVoid
+            Move (rfDeleteFile(sData + "ZLiftOther.src")) to iVoid
+            Send _InitializeFuncLib of ghoFuncLib
+        End_Procedure
+
+        // One program, one include, one read: the measured case. With no run set the name pins exactly as
+        // before, reason string included; with the run = this program, the include converts with it - the
+        // name is not pinned, the include is on the engine's list, the read is on the hint's.
+        {Published = True}
+        Procedure PinnedIndicators_Lift_SingleUserIncludeConvertsWithTheRun
+            String[] asInc asMain asRun asNoFolders asPinned asIncs asNames asLeafs
+            String sData sInc sMain sWhy
+            Get _LiftDataFolder to sData
+            Move (sData + "ZLiftInc.mac")  to sInc
+            Move (sData + "ZLiftMain.src") to sMain
+            Move "If [LIFTNAME] Begin" to asInc[0]
+            Move "End"                 to asInc[1]
+            Send _LiftWrite sInc asInc
+            Get _LiftMainLines to asMain
+            Send _LiftWrite sMain asMain
+            // (a) no run context
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send Assert ((SearchArray("LIFTNAME", asPinned)) >= 0)
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get _PinnedIndicatorReason of ghoFuncLib "LIFTNAME" to sWhy
+            Send AssertSAreEqual "USE|ZLiftInc.mac" sWhy
+            Get pasRunIncludes of ghoFuncLib to asIncs
+            Send AssertIAreEqual 0 (SizeOfArray(asIncs))
+            // (b) the run is this program
+            Move sMain to asRun[0]
+            Send _SetRunFiles of ghoFuncLib asRun asNoFolders
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send AssertIAreEqual 0 (SizeOfArray(asPinned))
+            Get pasRunIncludes of ghoFuncLib to asIncs
+            Send AssertIAreEqual 1 (SizeOfArray(asIncs))
+            If (SizeOfArray(asIncs) = 1) ;
+                Send AssertSAreEqual (Lowercase(sInc)) (Lowercase(asIncs[0]))
+            Get pasLiftedNames    of ghoFuncLib to asNames
+            Get pasLiftedNameIncs of ghoFuncLib to asLeafs
+            Send AssertIAreEqual 1 (SizeOfArray(asNames))
+            If (SizeOfArray(asNames) = 1 and SizeOfArray(asLeafs) = 1) Begin
+                Send AssertSAreEqual "LIFTNAME"     asNames[0]
+                Send AssertSAreEqual "ZLiftInc.mac" asLeafs[0]
+            End
+            Send _LiftCleanUp
+        End_Procedure
+
+        // A name with '$' in it - the shape that started this - takes the whole-word fallback both in the
+        // pin walk and in the sharing test, and lifts the same way.
+        {Published = True}
+        Procedure PinnedIndicators_Lift_DollarNameLiftsToo
+            String[] asInc asMain asRun asNoFolders asPinned asNames
+            String sData sInc sMain
+            Get _LiftDataFolder to sData
+            Move (sData + "ZLiftInc.mac")  to sInc
+            Move (sData + "ZLiftMain.src") to sMain
+            Move "If [not is$done] Begin" to asInc[0]
+            Move "End"                    to asInc[1]
+            Send _LiftWrite sInc asInc
+            Move "Use ZLiftInc.mac"      to asMain[0]
+            Move "Indicator is$done"     to asMain[1]
+            Move "Indicate is$done false" to asMain[2]
+            Send _LiftWrite sMain asMain
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send Assert ((SearchArray("IS$DONE", asPinned)) >= 0)         // no run context: pinned
+            Move sMain to asRun[0]
+            Send _SetRunFiles of ghoFuncLib asRun asNoFolders
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send AssertIAreEqual 0 (SizeOfArray(asPinned))
+            Get pasLiftedNames of ghoFuncLib to asNames
+            Send Assert ((SearchArray("IS$DONE", asNames)) >= 0)
+            Send _LiftCleanUp
+        End_Procedure
+
+        // An include that reads the name as a plain expression ('If (X)'): no line converter rewrites that
+        // form and the include's own pass has nothing to rename by, so it cannot convert with the run.
+        {Published = True}
+        Procedure PinnedIndicators_Lift_ExpressionReadStays
+            String[] asInc asMain asRun asNoFolders asPinned
+            String sData sInc sMain sWhy
+            Get _LiftDataFolder to sData
+            Move (sData + "ZLiftInc.mac")  to sInc
+            Move (sData + "ZLiftMain.src") to sMain
+            Move "If (LIFTNAME) Begin" to asInc[0]
+            Move "End"                 to asInc[1]
+            Send _LiftWrite sInc asInc
+            Get _LiftMainLines to asMain
+            Send _LiftWrite sMain asMain
+            Move sMain to asRun[0]
+            Send _SetRunFiles of ghoFuncLib asRun asNoFolders
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send Assert ((SearchArray("LIFTNAME", asPinned)) >= 0)
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get _PinnedIndicatorReason of ghoFuncLib "LIFTNAME" to sWhy
+            Send AssertSAreEqual "USE|ZLiftInc.mac|EXPR|LIFTNAME" sWhy
+            Send _LiftCleanUp
+        End_Procedure
+
+        // Macro code is never refactored: an include whose #COMMAND body reads the name cannot convert
+        // with the run, and the reason says so.
+        {Published = True}
+        Procedure PinnedIndicators_Lift_MacroCodeNeverLifts
+            String[] asInc asMain asRun asNoFolders asPinned
+            String sData sInc sMain sWhy
+            Get _LiftDataFolder to sData
+            Move (sData + "ZLiftInc.mac")  to sInc
+            Move (sData + "ZLiftMain.src") to sMain
+            Move "#COMMAND CHECKIT"            to asInc[0]
+            Move "    [LIFTNAME] Move 1 to iX" to asInc[1]
+            Move "#ENDCOMMAND"                 to asInc[2]
+            Send _LiftWrite sInc asInc
+            Get _LiftMainLines to asMain
+            Send _LiftWrite sMain asMain
+            Move sMain to asRun[0]
+            Send _SetRunFiles of ghoFuncLib asRun asNoFolders
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send Assert ((SearchArray("LIFTNAME", asPinned)) >= 0)
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get _PinnedIndicatorReason of ghoFuncLib "LIFTNAME" to sWhy
+            Send AssertSAreEqual "USE|ZLiftInc.mac|MACRO" sWhy
+            Send _LiftCleanUp
+        End_Procedure
+
+        // A second program in the folder uses the include and is NOT in the run: pinned, and the reason
+        // names that program - "run both together" is advice the reader can act on. With every file counted
+        // in (the analyzer's "*") the same include lifts.
+        {Published = True}
+        Procedure PinnedIndicators_Lift_UserOutsideTheRunPins
+            String[] asInc asMain asOther asRun asNoFolders asPinned
+            String sData sInc sMain sOther sWhy
+            Get _LiftDataFolder to sData
+            Move (sData + "ZLiftInc.mac")   to sInc
+            Move (sData + "ZLiftMain.src")  to sMain
+            Move (sData + "ZLiftOther.src") to sOther
+            Move "If [LIFTNAME] Begin" to asInc[0]
+            Move "End"                 to asInc[1]
+            Send _LiftWrite sInc asInc
+            Get _LiftMainLines to asMain
+            Send _LiftWrite sMain asMain
+            Move "Use ZLiftInc.mac"   to asOther[0]
+            Move "Indicator LiftName" to asOther[1]
+            Send _LiftWrite sOther asOther
+            Move sMain to asRun[0]
+            Send _SetRunFiles of ghoFuncLib asRun asNoFolders
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send Assert ((SearchArray("LIFTNAME", asPinned)) >= 0)
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get _PinnedIndicatorReason of ghoFuncLib "LIFTNAME" to sWhy
+            Send AssertSAreEqual "USE|ZLiftInc.mac|USER|ZLiftOther.src" sWhy
+            Send _SetRunFilesAll of ghoFuncLib
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send AssertIAreEqual 0 (SizeOfArray(asPinned))
+            Send _LiftCleanUp
+        End_Procedure
+
+        // The second program is in the run but keeps the name legacy for a reason of its own (a group line
+        // the converter does not write): the include cannot change its read; the reason names both.
+        {Published = True}
+        Procedure PinnedIndicators_Lift_UserHoldingTheNamePins
+            String[] asInc asMain asOther asPinned
+            String sData sInc sMain sOther sWhy
+            Get _LiftDataFolder to sData
+            Move (sData + "ZLiftInc.mac")   to sInc
+            Move (sData + "ZLiftMain.src")  to sMain
+            Move (sData + "ZLiftOther.src") to sOther
+            Move "If [LIFTNAME] Begin" to asInc[0]
+            Move "End"                 to asInc[1]
+            Send _LiftWrite sInc asInc
+            Get _LiftMainLines to asMain
+            Send _LiftWrite sMain asMain
+            Move "Use ZLiftInc.mac"                                       to asOther[0]
+            Move "Indicator LiftName"                                     to asOther[1]
+            Move "[other] indicate LiftName GROUP ANY [flag_a flag_b]"    to asOther[2]
+            Send _LiftWrite sOther asOther
+            Send _SetRunFilesAll of ghoFuncLib
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send Assert ((SearchArray("LIFTNAME", asPinned)) >= 0)
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get _PinnedIndicatorReason of ghoFuncLib "LIFTNAME" to sWhy
+            Send AssertSAreEqual "USE|ZLiftInc.mac|HOLDS|ZLiftOther.src|LIFTNAME" sWhy
+            Send _LiftCleanUp
+        End_Procedure
+
+        // The include itself keeps a name legacy (its own group line the converter does not write): it
+        // cannot convert with the run.
+        {Published = True}
+        Procedure PinnedIndicators_Lift_IncludeWithPinsOfItsOwnStays
+            String[] asInc asMain asPinned
+            String sData sInc sMain sWhy
+            Get _LiftDataFolder to sData
+            Move (sData + "ZLiftInc.mac")  to sInc
+            Move (sData + "ZLiftMain.src") to sMain
+            Move "[x] indicate LiftName GROUP ANY [flag_a]" to asInc[0]
+            Move "If [LIFTNAME] Begin"                      to asInc[1]
+            Move "End"                                      to asInc[2]
+            Send _LiftWrite sInc asInc
+            Get _LiftMainLines to asMain
+            Send _LiftWrite sMain asMain
+            Send _SetRunFilesAll of ghoFuncLib
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send Assert ((SearchArray("LIFTNAME", asPinned)) >= 0)
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get _PinnedIndicatorReason of ghoFuncLib "LIFTNAME" to sWhy
+            Send Assert ((Pos("USE|ZLiftInc.mac|PINS|", sWhy)) = 1)
+            Send _LiftCleanUp
+        End_Procedure
+
+        // An include with a local include of its own: the run follows one level only.
+        {Published = True}
+        Procedure PinnedIndicators_Lift_NestedIncludeStays
+            String[] asInc asInc2 asMain asPinned
+            String sData sInc sInc2 sMain sWhy
+            Get _LiftDataFolder to sData
+            Move (sData + "ZLiftInc.mac")  to sInc
+            Move (sData + "ZLiftInc2.mac") to sInc2
+            Move (sData + "ZLiftMain.src") to sMain
+            Move "// nothing in here" to asInc2[0]
+            Send _LiftWrite sInc2 asInc2
+            Move "Use ZLiftInc2.mac"   to asInc[0]
+            Move "If [LIFTNAME] Begin" to asInc[1]
+            Move "End"                 to asInc[2]
+            Send _LiftWrite sInc asInc
+            Get _LiftMainLines to asMain
+            Send _LiftWrite sMain asMain
+            Send _SetRunFilesAll of ghoFuncLib
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send Assert ((SearchArray("LIFTNAME", asPinned)) >= 0)
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get _PinnedIndicatorReason of ghoFuncLib "LIFTNAME" to sWhy
+            Send AssertSAreEqual "USE|ZLiftInc.mac|NESTED" sWhy
+            Send _LiftCleanUp
+        End_Procedure
+
+        // Two includes of one program share the name; one carries macro code. They are one unit: neither
+        // lifts, the plain one's reason points at its partner, and nothing is on the engine's list.
+        {Published = True}
+        Procedure PinnedIndicators_Lift_PartnerIncludesGoTogether
+            String[] asInc asInc2 asMain asPinned asIncs
+            String sData sInc sInc2 sMain sWhy
+            Get _LiftDataFolder to sData
+            Move (sData + "ZLiftInc.mac")  to sInc
+            Move (sData + "ZLiftInc2.mac") to sInc2
+            Move (sData + "ZLiftMain.src") to sMain
+            Move "If [LIFTNAME] Begin" to asInc[0]
+            Move "End"                 to asInc[1]
+            Send _LiftWrite sInc asInc
+            Move "#COMMAND CHECKIT"            to asInc2[0]
+            Move "    [LIFTNAME] Move 1 to iX" to asInc2[1]
+            Move "#ENDCOMMAND"                 to asInc2[2]
+            Send _LiftWrite sInc2 asInc2
+            Move "Use ZLiftInc.mac"       to asMain[0]
+            Move "Use ZLiftInc2.mac"      to asMain[1]
+            Move "Indicator LiftName"     to asMain[2]
+            Move "Indicate LiftName True" to asMain[3]
+            Send _LiftWrite sMain asMain
+            Send _SetRunFilesAll of ghoFuncLib
+            Get _ComputePinnedIndicators of ghoFuncLib (&asMain) sMain to asPinned
+            Send Assert ((SearchArray("LIFTNAME", asPinned)) >= 0)
+            Set pasPinnedIndicators of ghoFuncLib to asPinned
+            Get _PinnedIndicatorReason of ghoFuncLib "LIFTNAME" to sWhy
+            Send AssertSAreEqual "USE|ZLiftInc.mac|VIA|ZLiftInc2.mac" sWhy
+            Get pasRunIncludes of ghoFuncLib to asIncs
+            Send AssertIAreEqual 0 (SizeOfArray(asIncs))
+            Send _LiftCleanUp
+        End_Procedure
+
+    End_Object

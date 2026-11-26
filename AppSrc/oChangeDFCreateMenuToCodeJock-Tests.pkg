@@ -1,0 +1,1417 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oChangeDFCreateMenuToCodeJock-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-11
+//
+// Description : Unit tests for DFCreate_Menu -> CodeJock: the parsing primitives and the block emitter.
+//
+//               The primitives carry the whole risk of the converter - everything downstream just assembles
+//               text around what they return - and the emitter is where the grammar becomes a tree. Every
+//               fixture is built from a line that actually occurs in the DF18/DF19 trees, not from an invented
+//               shape: the awkward cases (a trailing "To Current_Object", single-quoted Status_Help, a caption
+//               containing the word "send", a property declared in the middle of a menu) were all found by
+//               reading real menus, and each one is here because it would otherwise have been got wrong.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+    Object oChangeDFCreateMenuToCodeJock is a cTestFixture
+        Set psFunctionName to "ChangeDFCreateMenuToCodeJock"
+
+        // ---- object names out of captions -------------------------------------------------------
+        {Published = True}
+        Procedure CJMenu_NameFromCaption
+            String sName
+            Get _CJMenuNameFromCaption of ghoFuncLib "&Contact Manager" "_MenuItem" to sName
+            Send AssertSAreEqual "oContactManager_MenuItem" sName
+            Get _CJMenuNameFromCaption of ghoFuncLib "&Contact Type Entry/Edit" "_MenuItem" to sName
+            Send AssertSAreEqual "oContactTypeEntryEdit_MenuItem" sName
+            Get _CJMenuNameFromCaption of ghoFuncLib "&File" "_Menu" to sName
+            Send AssertSAreEqual "oFile_Menu" sName
+        End_Procedure
+
+        // A digit-leading caption cannot become a digit-leading identifier ("&1. Batch..." is real -
+        // DataScrub.src numbers its whole View menu that way).
+        {Published = True}
+        Procedure CJMenu_NameFromDigitLeadingCaption
+            String sName
+            Get _CJMenuNameFromCaption of ghoFuncLib "&1. Batch Header Integrity Check" "_MenuItem" to sName
+            Send AssertSAreEqual "oM1BatchHeaderIntegrityCheck_MenuItem" sName
+        End_Procedure
+
+        // A caption with characters outside ASCII (Swedish umlauts, codes 214 and 246) yields an ASCII name.
+        // Measured 2026-09-13: a decoded umlaut compares ABOVE "z" / "Z", so the range test drops it - this
+        // pins that, because a raw-read probe once made it look otherwise (an undecoded OEM byte rides on
+        // the letter before it and compares as that letter).
+        {Published = True}
+        Procedure CJMenu_NameFromNonAsciiCaption
+            String sName
+            Get _CJMenuNameFromCaption of ghoFuncLib ("&" + Character(214) + "ppna fil") "_MenuItem" to sName
+            Send AssertSAreEqual "oppnafil_MenuItem" sName
+            Get _CJMenuNameFromCaption of ghoFuncLib ("&S" + Character(246) + "k") "_Menu" to sName
+            Send AssertSAreEqual "oSk_Menu" sName
+        End_Procedure
+
+        // A caption with nothing usable in it still has to yield a legal name.
+        {Published = True}
+        Procedure CJMenu_NameFromEmptyCaption
+            String sName
+            Get _CJMenuNameFromCaption of ghoFuncLib "" "_MenuItem" to sName
+            Send AssertSAreEqual "oItem_MenuItem" sName
+            Get _CJMenuNameFromCaption of ghoFuncLib "---" "_MenuItem" to sName
+            Send AssertSAreEqual "oItem_MenuItem" sName
+        End_Procedure
+
+        // ---- quoted text ------------------------------------------------------------------------
+        {Published = True}
+        Procedure CJMenu_QuotedText
+            String sOut
+            Get _CJQuotedText of ghoFuncLib 'On_Item "&Contact Manager \aCtrl+1"      Send Activate_ConMan' to sOut
+            Send AssertSAreEqual "&Contact Manager \aCtrl+1" sOut
+            // Single quotes: the form File_PM.inc uses for Status_Help.
+            Get _CJQuotedText of ghoFuncLib "        Set Status_Help To 'Clear current record'" to sOut
+            Send AssertSAreEqual "Clear current record" sOut
+            // A separator carries an EMPTY literal - "" is the honest answer for it.
+            Get _CJQuotedText of ghoFuncLib 'On_Item "" send NONE' to sOut
+            Send AssertSAreEqual "" sOut
+        End_Procedure
+
+        // ---- accelerators -----------------------------------------------------------------------
+        {Published = True}
+        Procedure CJMenu_AcceleratorSplit
+            String sOut
+            Get _CJCaptionWithoutAccel of ghoFuncLib "&Clear/Add\aF5" to sOut
+            Send AssertSAreEqual "&Clear/Add" sOut
+            // The \a marker survives, because the accelerator is emitted as a VERBATIM comment.
+            Get _CJAcceleratorOf of ghoFuncLib "&Clear/Add\aF5" to sOut
+            Send AssertSAreEqual "\aF5" sOut
+            Get _CJCaptionWithoutAccel of ghoFuncLib "&Help Topic" to sOut
+            Send AssertSAreEqual "&Help Topic" sOut
+            Get _CJAcceleratorOf of ghoFuncLib "&Help Topic" to sOut
+            Send AssertSAreEqual "" sOut
+        End_Procedure
+
+        // ---- the message -------------------------------------------------------------------------
+        {Published = True}
+        Procedure CJMenu_MessageFromOnItem
+            String sOut
+            Get _CJMessageFromOnItem of ghoFuncLib 'On_Item "&Clear/Add\aF5" send Request_Clear' to sOut
+            Send AssertSAreEqual "Request_Clear" sOut
+            // A trailing receiver must not be swallowed into the message (Win_PM.inc's real form).
+            Get _CJMessageFromOnItem of ghoFuncLib 'On_Item "&Tool-bar"  send Toggle_ToolBar   To Current_Object' to sOut
+            Send AssertSAreEqual "Toggle_ToolBar" sOut
+            // Mixed case, because the legacy sources spell it both ways on adjacent lines.
+            Get _CJMessageFromOnItem of ghoFuncLib 'on_item "&Context Help"          send Extended_Help' to sOut
+            Send AssertSAreEqual "Extended_Help" sOut
+        End_Procedure
+
+        // A separator's `send NONE` is not a message - "" tells the caller to set pbControlBeginGroup
+        // on the NEXT item instead of emitting an object.
+        {Published = True}
+        Procedure CJMenu_SeparatorHasNoMessage
+            String sOut
+            Get _CJMessageFromOnItem of ghoFuncLib 'On_Item "" send NONE' to sOut
+            Send AssertSAreEqual "" sOut
+        End_Procedure
+
+        // The LAST send wins, so a caption containing the word "send" cannot hijack the parse.
+        {Published = True}
+        Procedure CJMenu_CaptionContainingSendDoesNotWin
+            String sOut
+            Get _CJMessageFromOnItem of ghoFuncLib 'On_Item "&Resend the report" send Activate_Resend' to sOut
+            Send AssertSAreEqual "Activate_Resend" sOut
+        End_Procedure
+
+        // A line with no send at all yields "" rather than garbage.
+        {Published = True}
+        Procedure CJMenu_NoSendYieldsBlank
+            String sOut
+            Get _CJMessageFromOnItem of ghoFuncLib '    Set Status_Help To "Available Views"' to sOut
+            Send AssertSAreEqual "" sOut
+        End_Procedure
+
+        // ---- block delimiters --------------------------------------------------------------------
+        {Published = True}
+        Procedure CJMenu_OpenAndCloseDetection
+            Boolean bOK
+            Get _CJIsMenuOpen of ghoFuncLib "    DFCreate_Menu Main_Menu" to bOK
+            Send Assert (bOK = True)
+            Get _CJIsMenuClose of ghoFuncLib "        End_Pull_Down" to bOK
+            Send Assert (bOK = True)
+            Get _CJIsMenuClose of ghoFuncLib "    End_Menu" to bOK
+            Send Assert (bOK = True)
+            Get _CJIsMenuOpen of ghoFuncLib '    On_Item "&Find\aF9" send Find_GE' to bOK
+            Send Assert (bOK = False)
+            Get _CJIsMenuClose of ghoFuncLib '    On_Item "&Find\aF9" send Find_GE' to bOK
+            Send Assert (bOK = False)
+        End_Procedure
+
+        // ---- the emitter, end to end -------------------------------------------------------------
+        // A real File pulldown: every item is a catalogue hit, so NONE may carry a psCaption (the
+        // shipped class supplies its own localized one) and each gets pbAddToDesignerMenu.
+        {Published = True}
+        Procedure CJMenu_EmitFilePulldown
+            String[] asBlock asOut
+            Integer iCount
+
+            Move 'DFCreate_Menu "&File" File_Menu is a DEOPopupMenu' to asBlock[0]
+            Move '    On_Item "&Clear/Add\aF5" send Request_Clear'   to asBlock[1]
+            Move "        Set Status_Help To 'Clear current record'" to asBlock[2]
+            Move '    On_Item "&Delete\aShift+F2" send Request_Delete' to asBlock[3]
+            Move "    End_Pull_Down" to asBlock[4]
+            Get _CJMenuBlockToObjects of ghoFuncLib asBlock "" (&asOut) to iCount
+            Send AssertIAreEqual 3 iCount
+            Send AssertSAreEqual "Object oFile_Menu is a cCJMenuItem" asOut[0]
+            Send AssertSAreEqual "    Set peControlType to xtpControlPopup" asOut[1]
+            Send AssertSAreEqual '    Set psCaption to "&File"' asOut[2]
+            Send AssertSAreEqual "    Object oClearAdd_MenuItem is a cCJClearMenuItem" asOut[3]
+            Send AssertSAreEqual "        Set pbAddToDesignerMenu to True" asOut[4]
+        End_Procedure
+
+        // A program's OWN item: no catalogue hit, so it keeps its caption and gets an OnExecute that
+        // sends the same message - carried across, never dropped.
+        {Published = True}
+        Procedure CJMenu_EmitGenericItemKeepsMessage
+            String[] asBlock asOut
+            Integer iCount iLine iSize
+            Boolean bSawSend bSawCaption
+
+            Move 'DFCreate_Menu "&View" ViewPopupMenu is a ViewPopupMenu' to asBlock[0]
+            Move '    On_Item "&Contact Manager \aCtrl+1" Send Activate_ConMan' to asBlock[1]
+            Move "End_Pull_Down" to asBlock[2]
+            Get _CJMenuBlockToObjects of ghoFuncLib asBlock "" (&asOut) to iCount
+            Move False to bSawSend
+            Move False to bSawCaption
+            Move (SizeOfArray(asOut) - 1) to iSize
+            For iLine from 0 to iSize
+                If ((Trim(asOut[iLine])) = "Send Activate_ConMan") ;
+                    Move True to bSawSend
+                If ((Trim(asOut[iLine])) = 'Set psCaption to "&Contact Manager"') ;
+                    Move True to bSawCaption
+            Loop
+            Send Assert (bSawSend = True)
+            Send Assert (bSawCaption = True)
+        End_Procedure
+
+        // A separator decorates the NEXT item rather than becoming an object of its own.
+        {Published = True}
+        Procedure CJMenu_SeparatorBecomesBeginGroup
+            String[] asBlock asOut
+            Integer iCount iLine iSize
+            Boolean bSawGroup
+
+            Move 'DFCreate_Menu "&Help" Help_Menu' to asBlock[0]
+            Move '    on_item "&Help Topic" send Help_on_topic' to asBlock[1]
+            Move '    on_item "" send NONE' to asBlock[2]
+            Move '    On_item "About" Send Activate_About' to asBlock[3]
+            Move "End_Pull_Down" to asBlock[4]
+            Get _CJMenuBlockToObjects of ghoFuncLib asBlock "" (&asOut) to iCount
+            // two real items - the separator is not one of them
+            Send AssertIAreEqual 3 iCount
+            Move False to bSawGroup
+            Move (SizeOfArray(asOut) - 1) to iSize
+            For iLine from 0 to iSize
+                If ((Trim(asOut[iLine])) = "Set pbControlBeginGroup to True") ;
+                    Move True to bSawGroup
+            Loop
+            Send Assert (bSawGroup = True)
+        End_Procedure
+
+        // A line the grammar does not cover is COMMENTED, never dropped - Win_PM.inc really does
+        // declare a property in the middle of its menu.
+        {Published = True}
+        Procedure CJMenu_UnknownLineIsCarriedCommented
+            String[] asBlock asOut
+            Integer iCount iLine iSize
+            Boolean bCarried
+
+            Move 'DFCreate_Menu "&Options" Options_Menu' to asBlock[0]
+            Move "    Set select_mode to Multi_Select" to asBlock[1]
+            Move "End_Pull_Down" to asBlock[2]
+            Get _CJMenuBlockToObjects of ghoFuncLib asBlock "" (&asOut) to iCount
+            Move False to bCarried
+            Move (SizeOfArray(asOut) - 1) to iSize
+            For iLine from 0 to iSize
+                If ((Pos("Set select_mode to Multi_Select", asOut[iLine])) > 0) ;
+                    Move True to bCarried
+            Loop
+            Send Assert (bCarried = True)
+        End_Procedure
+
+        // The Window pulldown is recognised by the MESSAGES it holds, never by its caption.
+        {Published = True}
+        Procedure CJMenu_WindowPulldownBecomesMDIContainer
+            String[] asBlock asOut
+            Integer iCount
+            Move 'DFCreate_Menu "&Window" Window_Menu' to asBlock[0]
+            Move '    On_Item "&Cascade" send Cascade_Windows' to asBlock[1]
+            Move "End_Pull_Down" to asBlock[2]
+            Get _CJMenuBlockToObjects of ghoFuncLib asBlock "" (&asOut) to iCount
+            Send AssertSAreEqual "Object oWindow_Menu is a cCJMDIWindowsMenuItem" asOut[0]
+        End_Procedure
+
+        // ...and a pulldown WITHOUT those messages stays an ordinary popup, whatever it is called.
+        {Published = True}
+        Procedure CJMenu_PlainPulldownIsNotMDI
+            String[] asBlock asOut
+            Integer iCount
+            Move 'DFCreate_Menu "&Window" Window_Menu' to asBlock[0]
+            Move '    On_Item "&Something" send Activate_Something' to asBlock[1]
+            Move "End_Pull_Down" to asBlock[2]
+            Get _CJMenuBlockToObjects of ghoFuncLib asBlock "" (&asOut) to iCount
+            Send AssertSAreEqual "Object oWindow_Menu is a cCJMenuItem" asOut[0]
+        End_Procedure
+
+        // Status_Help AFTER End_Pull_Down describes the PULLDOWN, not the item before it.
+        {Published = True}
+        Procedure CJMenu_StatusHelpAfterCloseBelongsToPulldown
+            String[] asBlock asOut
+            Integer iCount
+            Move 'DFCreate_Menu "&View" ViewPopupMenu is a ViewPopupMenu' to asBlock[0]
+            Move '    On_Item "&Contact Manager" Send Activate_ConMan' to asBlock[1]
+            Move "End_Pull_Down" to asBlock[2]
+            Move 'Set Status_Help To "Available Views"' to asBlock[3]
+            Get _CJMenuBlockToObjects of ghoFuncLib asBlock "" (&asOut) to iCount
+            Send AssertSAreEqual '    Set psToolTip to "Available Views"' asOut[3]
+        End_Procedure
+
+        // ---- #INCLUDE expansion -----------------------------------------------------------------
+        // Nils's first live Auto-fix run (2026-08-16) faulted 4381 in _CJExpandMenuIncludes on the
+        // very first #INCLUDE line: the array was "emptied" with Move "" (a string into a String[]
+        // is a runtime conversion error the compiler lets through), and no test had ever handed the
+        // function an include line. These three do - the missing-file case is the exact branch.
+
+        // A block with no #INCLUDE passes through untouched, line for line.
+        {Published = True}
+        Procedure CJMenu_ExpandIncludes_NoIncludeIsPassthrough
+            String[] asBlock asOut
+            Move 'DFCreate_Menu Main_Menu' to asBlock[0]
+            Move '    On_Item "&Find\aF9" send Find_GE' to asBlock[1]
+            Move "End_Menu" to asBlock[2]
+            Get _CJExpandMenuIncludes of ghoFuncLib (&asBlock) "" to asOut
+            Send AssertArrayAreEqual asBlock asOut
+        End_Procedure
+
+        // A fragment that cannot be found is kept as its ORIGINAL line - never dropped, never a fault.
+        {Published = True}
+        Procedure CJMenu_ExpandIncludes_MissingFragmentKeepsLine
+            String[] asBlock asOut
+            String sDataPath
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move 'DFCreate_Menu Main_Menu' to asBlock[0]
+            Move '    #INCLUDE _NoSuchFragment_.inc   // file pulldown' to asBlock[1]
+            Move "End_Menu" to asBlock[2]
+            Get _CJExpandMenuIncludes of ghoFuncLib (&asBlock) sDataPath to asOut
+            Send AssertIAreEqual 3 (SizeOfArray(asOut))
+            Send AssertSAreEqual asBlock[1] asOut[1]
+        End_Procedure
+
+        // A fragment that IS there is inlined below its (now commented) #INCLUDE line; a trailing
+        // end-of-line comment on the include line must not become part of the file name.
+        {Published = True}
+        Procedure CJMenu_ExpandIncludes_FragmentIsInlined
+            String[] asBlock asOut asFrag
+            String sDataPath sFrag
+            Boolean bOk
+            Integer iVoid
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (sDataPath + "_CJFrag_.inc") to sFrag
+            Move 'DFCreate_Menu "&File" File_Menu is a DEOPopupMenu' to asFrag[0]
+            Move '    On_Item "&Clear/Add\aF5" send Request_Clear' to asFrag[1]
+            Move "End_Pull_Down" to asFrag[2]
+            Get rfWriteEncodedFileFromStringArray (&asFrag) sFrag C_NewLine False to bOk
+            Send Assert bOk
+            Move 'DFCreate_Menu Main_Menu' to asBlock[0]
+            Move '    #INCLUDE _CJFrag_.inc   // file pulldown' to asBlock[1]
+            Move "End_Menu" to asBlock[2]
+            Get _CJExpandMenuIncludes of ghoFuncLib (&asBlock) sDataPath to asOut
+            Move (rfDeleteFile(sFrag)) to iVoid
+            // 3 block lines - the include line - + its commented echo + 3 fragment lines = 6
+            Send AssertIAreEqual 6 (SizeOfArray(asOut))
+            Send AssertSAreEqual asBlock[0] asOut[0]
+            Send Assert ((Pos("#INCLUDE _CJFrag_.inc", asOut[1])) > 0)
+            Send Assert ((Left(Trim(asOut[1]), 2)) = "//")
+            Send AssertSAreEqual asFrag[0] asOut[2]
+            Send AssertSAreEqual asFrag[1] asOut[3]
+            Send AssertSAreEqual asFrag[2] asOut[4]
+            Send AssertSAreEqual "End_Menu" asOut[5]
+        End_Procedure
+
+        // ---- The root caption (2026-09-04, LegacyApp ORDER.SRC) --------------------------------------
+        // Quotes inside the root line's trailing COMMENT are not a caption: the root stays a menu bar.
+        {Published = True}
+        Procedure CJMenu_RootCaptionInComment_StaysMenuBar
+            String[] asBlock asOut
+            Integer iEmitted i
+            Boolean bBar bPopupFromComment
+
+            Move 'DFCreate_Menu Main_Menu //"LegacyApp Business System"'    to asBlock[0]
+            Move 'DFCreate_Menu "&File" File_Menu is a DEOPopupMenu'      to asBlock[1]
+            Move '    On_Item "&Clear/Add\aF5" send Request_Clear'         to asBlock[2]
+            Move "End_Pull_Down"                                           to asBlock[3]
+            Move "End_Menu"                                                to asBlock[4]
+            Get _CJMenuBlockToObjects of ghoFuncLib asBlock "" (&asOut) to iEmitted
+            Send Assert (iEmitted > 0)
+            Move False to bBar
+            Move False to bPopupFromComment
+            For i from 0 to (SizeOfArray(asOut) - 1)
+                If (asOut[i] contains "is a cCJMenuBar") ;
+                    Move True to bBar
+                If (asOut[i] contains "LegacyAppBusinessSystem") ;
+                    Move True to bPopupFromComment
+            Loop
+            Send Assert bBar
+            Send AssertFalse bPopupFromComment
+        End_Procedure
+
+        // ---- Hand-written code in the menu (2026-09-04, LegacyApp Order.mn) ------------------------
+        // A Procedure inside the block REFUSES the program: nothing emitted, nothing changed, and the
+        // count + first name are left for the run note. A commented-out procedure does not count.
+        {Published = True}
+        Procedure CJMenu_UserProcedureInBlock_Refused
+            String[] asCode asOrig
+            String sDataPath sFirst
+            Integer iEmitted iProcs
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move "Object Main is a Panel"                                    to asCode[0]
+            Move "    DFCreate_Menu Main_Menu"                               to asCode[1]
+            Move '    DFCreate_Menu "&Order" SalesPopupMenu is a ViewPopupMenu' to asCode[2]
+            Move "    //  Procedure OnChange"                                to asCode[3]
+            Move "    Procedure OnChange"                                    to asCode[4]
+            Move "        Send DoSomething"                                  to asCode[5]
+            Move "    End_Procedure"                                         to asCode[6]
+            Move '    On_Item "&New" Send Activate_New'                      to asCode[7]
+            Move "    End_Pull_Down"                                         to asCode[8]
+            Move "    End_Menu"                                              to asCode[9]
+            Move "    Object oClientArea is a ClientArea"                    to asCode[10]
+            Move "    End_Object"                                            to asCode[11]
+            Move "End_Object"                                                to asCode[12]
+            Move asCode to asOrig
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Send AssertIAreEqual 0 iEmitted
+            Send AssertIAreEqual (SizeOfArray(asOrig)) (SizeOfArray(asCode))
+            Send AssertSAreEqual asOrig[4] asCode[4]
+            Get piCJUserProcs of ghoFuncLib to iProcs
+            Get psCJFirstUserProc of ghoFuncLib to sFirst
+            Send AssertIAreEqual 1 iProcs
+            Send AssertSAreEqual "OnChange" sFirst
+        End_Procedure
+
+        // ---- OnInitMenu -> OnPopupInit (Nils 2026-09-04: "we should be able to deal with them") --
+        // Order.mn's shape in miniature: a user lookup, an If/Else, Shadow_State by literal index -
+        // with the Item keyword and without - Select_State, a separator that takes an index, an
+        // index past the end, a trailing comment, a commented-out line. The procedure lands inside
+        // the popup after its children; nothing of the body is "carried across for review".
+        {Published = True}
+        Procedure CJMenu_OnInitMenu_BecomesOnPopupInit
+            String[] asBlock asOut
+            Integer iEmitted i iProc iEnd iEndObj
+            Boolean bA bC bChecked bSep bPast bVerbatim bReview bComment
+
+            Move 'DFCreate_Menu Main_Menu'                                       to asBlock[0]
+            Move 'DFCreate_Menu "&Order" SalesPopupMenu is a ViewPopupMenu'       to asBlock[1]
+            Move 'Procedure OnInitMenu'                                           to asBlock[2]
+            Move '    Integer iuser'                                              to asBlock[3]
+            Move '    Move (fusernr(Self)) to iuser'                              to asBlock[4]
+            Move '    If (userinfo.no_order = "1") Begin'                         to asBlock[5]
+            Move '        Set shadow_state Item 0 to true'                        to asBlock[6]
+            Move '        //        set shadow_state item 2 to true'              to asBlock[7]
+            Move '        Set shadow_state Item 1 to (fStopView(Self, "01", "100"))   //SttNewPr' to asBlock[8]
+            Move '    End'                                                        to asBlock[9]
+            Move '    Else Begin'                                                 to asBlock[10]
+            Move '        Set shadow_state 2 to false'                            to asBlock[11]
+            Move '        Set select_state Item 2 to (bDone)'                     to asBlock[12]
+            Move '        Set shadow_state Item 7 to true'                        to asBlock[13]
+            Move '    End'                                                        to asBlock[14]
+            Move 'End_Procedure'                                                  to asBlock[15]
+            Move 'On_Item "&Alpha" Send Activate_Alpha'                           to asBlock[16]
+            Move 'On_Item "" Send none'                                           to asBlock[17]
+            Move 'On_Item "&Charlie" Send Activate_Charlie'                       to asBlock[18]
+            Move 'End_Pull_Down'                                                  to asBlock[19]
+            Move 'End_Menu'                                                       to asBlock[20]
+            Get _CJMenuBlockToObjects of ghoFuncLib asBlock "" (&asOut) to iEmitted
+            Send Assert (iEmitted > 0)
+            Move -1 to iProc
+            Move -1 to iEnd
+            Move -1 to iEndObj
+            For i from 0 to (SizeOfArray(asOut) - 1)
+                If (asOut[i] contains "Procedure OnPopupInit Variant vCommandBarControl Handle hoCommandBarControls") ;
+                    Move i to iProc
+                If (asOut[i] contains "Set pbEnabled of (oAlpha_MenuItem(Self)) to False") ;
+                    Move True to bA
+                If (asOut[i] contains "Set pbEnabled of (oCharlie_MenuItem(Self)) to True") ;
+                    Move True to bC
+                If (asOut[i] contains "Set pbChecked of (oCharlie_MenuItem(Self)) to (bDone)") ;
+                    Move True to bChecked
+                If (asOut[i] contains "item 1 is a separator line") ;
+                    Move True to bSep
+                If (asOut[i] contains "item 7 is a separator line") ;
+                    Move True to bPast
+                If (asOut[i] contains "Move (fusernr(Self)) to iuser" and not (asOut[i] contains "TODO")) ;
+                    Move True to bVerbatim
+                If (asOut[i] contains "//        set shadow_state item 2 to true") ;
+                    Move True to bComment
+                If (asOut[i] contains "not part of the menu grammar") ;
+                    Move True to bReview
+                If (iProc >= 0 and iEnd < 0 and Trim(asOut[i]) = "End_Procedure") ;
+                    Move i to iEnd
+                If (iEnd >= 0 and iEndObj < 0 and Trim(asOut[i]) = "End_Object") ;
+                    Move i to iEndObj
+            Loop
+            Send Assert (iProc > 0)
+            Send Assert bA
+            Send Assert bC
+            Send Assert bChecked
+            Send Assert bSep
+            Send Assert bPast
+            Send Assert bVerbatim
+            Send Assert bComment
+            Send AssertFalse bReview
+            // the procedure closes right before the popup's own End_Object
+            Send AssertIAreEqual (iEnd + 1) iEndObj
+            // the first child came BEFORE the procedure
+            Move False to bA
+            For i from 0 to (iProc - 1)
+                If (asOut[i] contains "Object oAlpha_MenuItem is a") ;
+                    Move True to bA
+            Loop
+            Send Assert bA
+        End_Procedure
+
+        // Two items with the same caption in one pulldown get distinct object names, and the
+        // translated Shadow_State lines address each by its own name (Order.mn's Utskrifter has
+        // four such pairs; DF26 compiles the twins without a word and reaches only one of them).
+        {Published = True}
+        Procedure CJMenu_TwinCaptions_GetUniqueNames
+            String[] asBlock asOut
+            Integer iEmitted i
+            Boolean bFirst bSecond bMap1 bMap2
+
+            Move 'DFCreate_Menu Main_Menu'                                       to asBlock[0]
+            Move 'DFCreate_Menu "&Print" PrintPopupMenu is a ViewPopupMenu'       to asBlock[1]
+            Move 'Procedure OnInitMenu'                                           to asBlock[2]
+            Move '    Set shadow_state Item 0 to true'                            to asBlock[3]
+            Move '    Set shadow_state Item 1 to false'                           to asBlock[4]
+            Move 'End_Procedure'                                                  to asBlock[5]
+            Move 'On_Item "Due invoices" Send Activate_DueA'                      to asBlock[6]
+            Move 'On_Item "Due invoices" Send Activate_DueB'                      to asBlock[7]
+            Move 'End_Pull_Down'                                                  to asBlock[8]
+            Move 'End_Menu'                                                       to asBlock[9]
+            Get _CJMenuBlockToObjects of ghoFuncLib asBlock "" (&asOut) to iEmitted
+            For i from 0 to (SizeOfArray(asOut) - 1)
+                If (asOut[i] contains "Object oDueinvoices_MenuItem is a") ;
+                    Move True to bFirst
+                If (asOut[i] contains "Object oDueinvoices_MenuItem_2 is a") ;
+                    Move True to bSecond
+                If (asOut[i] contains "Set pbEnabled of (oDueinvoices_MenuItem(Self)) to False") ;
+                    Move True to bMap1
+                If (asOut[i] contains "Set pbEnabled of (oDueinvoices_MenuItem_2(Self)) to True") ;
+                    Move True to bMap2
+            Loop
+            Send Assert bFirst
+            Send Assert bSecond
+            Send Assert bMap1
+            Send Assert bMap2
+        End_Procedure
+
+        // With only an OnInitMenu in it, the program CONVERTS (it used to be refused).
+        {Published = True}
+        Procedure CJMenu_OnInitMenuAlone_Converts
+            String[] asCode
+            String sDataPath sFirst
+            Integer iEmitted iProcs
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move "Object Main is a Panel"                                    to asCode[0]
+            Move "    DFCreate_Menu Main_Menu"                               to asCode[1]
+            Move '    DFCreate_Menu "&Order" SalesPopupMenu is a ViewPopupMenu' to asCode[2]
+            Move "    Procedure OnInitMenu"                                  to asCode[3]
+            Move "        Set shadow_state Item 0 to True"                   to asCode[4]
+            Move "    End_Procedure"                                         to asCode[5]
+            Move '    On_Item "&New" Send Activate_New'                      to asCode[6]
+            Move "    End_Pull_Down"                                         to asCode[7]
+            Move "    End_Menu"                                              to asCode[8]
+            Move "    Object oClientArea is a ClientArea"                    to asCode[9]
+            Move "    End_Object"                                            to asCode[10]
+            Move "End_Object"                                                to asCode[11]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Send Assert (iEmitted > 0)
+            Get piCJUserProcs of ghoFuncLib to iProcs
+            Get psCJFirstUserProc of ghoFuncLib to sFirst
+            Send AssertIAreEqual 0 iProcs
+            Send AssertSAreEqual "" sFirst
+        End_Procedure
+
+        // A #included file with no menu grammar - MyShadow.pkg's helper functions - is not inlined:
+        // it stays a live #Include inside the menu bar object, and it does not refuse the program.
+        {Published = True}
+        Procedure CJMenu_MethodsInclude_KeptLiveInMenuBar
+            String[] asCode asShadow
+            String sDataPath sShadow
+            Integer iEmitted iProcs iVoid i iBar iInc
+            Boolean bOk bCommented
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move (sDataPath + "_CJShadow_.pkg") to sShadow
+            Move "Open Amenu"                                                to asShadow[0]
+            Move "Function fStopView String smenu String sview Returns Integer" to asShadow[1]
+            Move "    Function_Return 0"                                     to asShadow[2]
+            Move "End_Procedure"                                             to asShadow[3]
+            Get rfWriteEncodedFileFromStringArray (&asShadow) sShadow C_NewLine False to bOk
+            Move "Object Main is a Panel"                                    to asCode[0]
+            Move "    DFCreate_Menu Main_Menu"                               to asCode[1]
+            Move "#include _CJShadow_.pkg"                                   to asCode[2]
+            Move '    DFCreate_Menu "&Order" SalesPopupMenu is a ViewPopupMenu' to asCode[3]
+            Move '    On_Item "&New" Send Activate_New'                      to asCode[4]
+            Move "    End_Pull_Down"                                         to asCode[5]
+            Move "    End_Menu"                                              to asCode[6]
+            Move "    Object oClientArea is a ClientArea"                    to asCode[7]
+            Move "    End_Object"                                            to asCode[8]
+            Move "End_Object"                                                to asCode[9]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Move (rfDeleteFile(sShadow)) to iVoid
+            Send Assert (iEmitted > 0)
+            Get piCJUserProcs of ghoFuncLib to iProcs
+            Send AssertIAreEqual 0 iProcs
+            Move -1 to iBar
+            Move -1 to iInc
+            Move False to bCommented
+            For i from 0 to (SizeOfArray(asCode) - 1)
+                If (asCode[i] contains "Object oMenuBar is a cCJMenuBar") ;
+                    Move i to iBar
+                If (Left(Trim(asCode[i]), 8) = "#Include" and asCode[i] contains "_CJShadow_.pkg") ;
+                    Move i to iInc
+                If (asCode[i] contains "Function fStopView") ;
+                    Move True to bCommented
+            Loop
+            Send Assert (iBar >= 0)
+            Send Assert (iInc > iBar)
+            Send AssertFalse bCommented
+        End_Procedure
+
+        // POSITIVE CONTROL: the same menu without the procedure converts, and the counters read 0.
+        {Published = True}
+        Procedure CJMenu_NoUserProcedure_Converts
+            String[] asCode
+            String sDataPath sFirst
+            Integer iEmitted iProcs
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move "Object Main is a Panel"                                    to asCode[0]
+            Move "    DFCreate_Menu Main_Menu"                               to asCode[1]
+            Move '    DFCreate_Menu "&Order" SalesPopupMenu is a ViewPopupMenu' to asCode[2]
+            Move "    //  Procedure OnInitMenu"                              to asCode[3]
+            Move '    On_Item "&New" Send Activate_New'                      to asCode[4]
+            Move "    End_Pull_Down"                                         to asCode[5]
+            Move "    End_Menu"                                              to asCode[6]
+            Move "    Object oClientArea is a ClientArea"                    to asCode[7]
+            Move "    End_Object"                                            to asCode[8]
+            Move "End_Object"                                                to asCode[9]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Send Assert (iEmitted > 0)
+            Get piCJUserProcs of ghoFuncLib to iProcs
+            Get psCJFirstUserProc of ghoFuncLib to sFirst
+            Send AssertIAreEqual 0 iProcs
+            Send AssertSAreEqual "" sFirst
+        End_Procedure
+
+        // ---- Shipped fragments keep their grammar only (2026-09-04) ----------------------------
+        // File_pm.inc's shape: a #warning, the pulldown, items with Status_Help, an OnInitMenu body.
+        // The grammar survives, the code does not, and the count says how much went.
+        {Published = True}
+        Procedure CJMenu_ShippedFragment_GrammarOnly
+            String[] asInc asOut
+            Integer iOmitted
+
+            Move '#warning DFERR_COMP_WARNING_OBSOLETE_PACKAGE "Obsolete Package: File_pm.inc"' to asInc[0]
+            Move 'DFCreate_Menu "&File" File_Menu is a DEOPopupMenu'                          to asInc[1]
+            Move '    On_Item "&Clear/Add\aF5" Send Request_Clear'                             to asInc[2]
+            Move "        Set Status_Help to 'Clear current record / Add a new record'"         to asInc[3]
+            Move ""                                                                             to asInc[4]
+            Move "    Procedure OnInitMenu"                                                     to asInc[5]
+            Move "        Integer Obj# IsDeo"                                                   to asInc[6]
+            Move "        Get Focus of desktop to Obj#"                                         to asInc[7]
+            Move "        Set Shadow_State Item 0 to (not(IsDeo))"                              to asInc[8]
+            Move "    End_Procedure"                                                            to asInc[9]
+            Move "    // a comment survives, it weighs nothing"                                 to asInc[10]
+            Move "End_Pull_Down"                                                                to asInc[11]
+            Get _CJShippedFragmentGrammarOnly of ghoFuncLib (&asInc) (&iOmitted) to asOut
+            Send AssertIAreEqual 6 iOmitted
+            Send AssertIAreEqual 6 (SizeOfArray(asOut))
+            Send AssertSAreEqual asInc[1]  asOut[0]
+            Send AssertSAreEqual asInc[2]  asOut[1]
+            Send AssertSAreEqual asInc[3]  asOut[2]
+            Send AssertSAreEqual asInc[4]  asOut[3]
+            Send AssertSAreEqual asInc[10] asOut[4]
+            Send AssertSAreEqual asInc[11] asOut[5]
+        End_Procedure
+
+        // ---- Fragment resolution (2026-09-04) ------------------------------------------------
+        // The program's folder wins; a name found nowhere resolves to "" (psTargetPkgFolder is
+        // blank under the runner, so the install branch cannot be reached here - it is the same
+        // vFolderFormat + name test, against the folder the analyzer already scans).
+        {Published = True}
+        Procedure CJMenu_ResolveFragment_BaseDirThenNothing
+            String[] asFrag
+            String sDataPath sFrag sPath
+            Boolean bOk bInstall
+            Integer iVoid
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move (sDataPath + "_CJRes_.inc") to sFrag
+            Move "End_Pull_Down" to asFrag[0]
+            Get rfWriteEncodedFileFromStringArray (&asFrag) sFrag C_NewLine False to bOk
+            Get _CJResolveFragmentPath of ghoFuncLib "_CJRes_.inc" sDataPath (&bInstall) to sPath
+            Move (rfDeleteFile(sFrag)) to iVoid
+            Send AssertSAreEqual (Lowercase(sFrag)) (Lowercase(sPath))
+            Send AssertFalse bInstall
+            Get _CJResolveFragmentPath of ghoFuncLib "_CJNoSuch_.inc" sDataPath (&bInstall) to sPath
+            Send AssertSAreEqual "" sPath
+        End_Procedure
+
+        // ---- The anchor (2026-09-04, LegacyApp) ---------------------------------------------------
+        // A SUBCLASSED client area anchors: the token after "is a" ends in "clientarea". A class
+        // that merely contains the word does not.
+        {Published = True}
+        Procedure CJMenu_Anchor_SubclassedClientArea
+            String[] asCode
+            String sIndent
+            Integer iAnchor
+            Boolean bFound bWrap
+
+            Move "Object Main is a cAmPanel"                          to asCode[0]
+            Move "    DFCreate_Menu Main_Menu"                        to asCode[1]
+            Move "    End_Menu"                                       to asCode[2]
+            Move "    Object oHelper is a cClientAreaHelper"          to asCode[3]
+            Move "    End_Object"                                     to asCode[4]
+            Move "    Object Client_Area is a cAmAppClientArea"       to asCode[5]
+            Move "    End_Object"                                     to asCode[6]
+            Move "End_Object"                                         to asCode[7]
+            Get _CJFindMenuAnchor of ghoFuncLib (&asCode) (&iAnchor) (&bWrap) (&sIndent) to bFound
+            Send Assert bFound
+            Send AssertIAreEqual 5 iAnchor
+            Send Assert bWrap
+            Send AssertSAreEqual "    " sIndent
+        End_Procedure
+
+        // ---- The .mn route (2026-09-04, LegacyApp) --------------------------------------------
+        // The program carries "Use X.mn" and no block of its own: the block is read out of the
+        // menu file, the CodeJock tree lands at the anchor, the Use line is commented, and the
+        // menu file on disk is untouched.
+        {Published = True}
+        Procedure CJMenu_UsedFragment_ConvertedIntoProgram
+            String[] asCode asMn asBack
+            String sDataPath sMn
+            Boolean bOk bSys bUseCommented
+            Integer iEmitted iVoid i
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath   // psDataPath has no trailing separator
+            Move (sDataPath + "_CJUsed_.mn") to sMn
+            Move "DFCreate_Menu Main_Menu"                              to asMn[0]
+            Move 'DFCreate_Menu "&File" File_Menu is a DEOPopupMenu'   to asMn[1]
+            Move '    On_Item "&Clear/Add\aF5" send Request_Clear'     to asMn[2]
+            Move "End_Pull_Down"                                        to asMn[3]
+            Move "End_Menu"                                             to asMn[4]
+            Get rfWriteEncodedFileFromStringArray (&asMn) sMn C_NewLine False to bOk
+            Send Assert bOk
+            Move "Object Main is a Panel"                     to asCode[0]
+            Move "Use _CJUsed_.mn //  Menu package."          to asCode[1]
+            Move "    Object oClientArea is a ClientArea"     to asCode[2]
+            Move "    End_Object"                             to asCode[3]
+            Move "End_Object"                                 to asCode[4]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Move (rfReadEncodedFileAsStringArray(sMn)) to asBack
+            Move (rfDeleteFile(sMn)) to iVoid
+            Send Assert (iEmitted > 0)
+            Move False to bSys
+            Move False to bUseCommented
+            For i from 0 to (SizeOfArray(asCode) - 1)
+                If (asCode[i] contains "is a cCJCommandBarSystem") ;
+                    Move True to bSys
+                If (asCode[i] contains "Use _CJUsed_.mn" and Left(Trim(asCode[i]), 2) = "//") ;
+                    Move True to bUseCommented
+            Loop
+            Send Assert bSys
+            Send Assert bUseCommented
+            // the menu file came back exactly as written
+            Send AssertIAreEqual 5 (SizeOfArray(asBack))
+            Send AssertSAreEqual asMn[0] asBack[0]
+            Send AssertSAreEqual asMn[4] asBack[4]
+        End_Procedure
+
+        // A program with neither a block nor a Use of a menu file is left alone (0), as before.
+        {Published = True}
+        Procedure CJMenu_NoBlockNoFragment_Untouched
+            String[] asCode
+            String sDataPath
+            Integer iEmitted
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move "Object Main is a Panel"                     to asCode[0]
+            Move "Use cApplication.pkg"                       to asCode[1]
+            Move "    Object oClientArea is a ClientArea"     to asCode[2]
+            Move "    End_Object"                             to asCode[3]
+            Move "End_Object"                                 to asCode[4]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Send AssertIAreEqual 0 iEmitted
+            Send AssertIAreEqual 5 (SizeOfArray(asCode))
+        End_Procedure
+
+        // The includer search: the .src that says "Use <leaf>" is found, one that does not is not,
+        // a commented Use does not count - and a pulldown .inc that only a menu file #includes
+        // resolves through that menu file to the SAME program (LegacyApp's HELP_APP.inc); one whose
+        // menu file nothing uses resolves to nobody.
+        {Published = True}
+        Procedure CJMenu_IncludersOfFragment_FindsTheProgram
+            String[] asProg asOther asMn asDeadMn asFound
+            String sDataPath sProg sOther sMn sDeadMn
+            Boolean bOk
+            Integer iVoid
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath   // psDataPath has no trailing separator
+            Move (sDataPath + "_CJProg_.src")  to sProg
+            Move (sDataPath + "_CJOther_.src") to sOther
+            Move (sDataPath + "_CJUsed2_.mn")  to sMn
+            Move (sDataPath + "_CJDead2_.mn")  to sDeadMn
+            Move "Object Main is a Panel"                     to asProg[0]
+            Move "Use _CJUsed2_.mn //  Menu package."         to asProg[1]
+            Move "End_Object"                                 to asProg[2]
+            Move "Object Main is a Panel"                     to asOther[0]
+            Move "// Use _CJUsed2_.mn"                        to asOther[1]
+            Move "Use _CJUsed2_.mnx"                          to asOther[2]
+            Move "End_Object"                                 to asOther[3]
+            Move "DFCreate_Menu Main_Menu"                    to asMn[0]
+            Move "#include _CJHelp_.inc   // help pulldown"   to asMn[1]
+            Move "End_Menu"                                   to asMn[2]
+            Move "DFCreate_Menu Main_Menu"                    to asDeadMn[0]
+            Move "#include _CJOrphan_.inc"                    to asDeadMn[1]
+            Move "End_Menu"                                   to asDeadMn[2]
+            Get rfWriteEncodedFileFromStringArray (&asProg)   sProg   C_NewLine False to bOk
+            Get rfWriteEncodedFileFromStringArray (&asOther)  sOther  C_NewLine False to bOk
+            Get rfWriteEncodedFileFromStringArray (&asMn)     sMn     C_NewLine False to bOk
+            Get rfWriteEncodedFileFromStringArray (&asDeadMn) sDeadMn C_NewLine False to bOk
+            Get _CJIncludersOfFragment of ghoFuncLib (sDataPath + "_CJUsed2_.mn") to asFound
+            Send AssertIAreEqual 1 (SizeOfArray(asFound))
+            Send AssertSAreEqual (Lowercase(sProg)) (Lowercase(asFound[0]))
+            // the .inc, one hop down, reaches the same program
+            Get _CJIncludersOfFragment of ghoFuncLib (sDataPath + "_CJHelp_.inc") to asFound
+            Send AssertIAreEqual 1 (SizeOfArray(asFound))
+            Send AssertSAreEqual (Lowercase(sProg)) (Lowercase(asFound[0]))
+            // the .inc whose menu file nobody uses reaches nobody
+            Get _CJIncludersOfFragment of ghoFuncLib (sDataPath + "_CJOrphan_.inc") to asFound
+            Send AssertIAreEqual 0 (SizeOfArray(asFound))
+            Move (rfDeleteFile(sProg))   to iVoid
+            Move (rfDeleteFile(sOther))  to iVoid
+            Move (rfDeleteFile(sMn))     to iVoid
+            Move (rfDeleteFile(sDeadMn)) to iVoid
+        End_Procedure
+
+        // ---- The packages the emitted tree needs (2026-09-07) ---------------------------------------
+        /* DfAllEnt brings the command bar system, the menu bar and cCJMenuItem; the standard items (Exit,
+           the status bar, cascade/tile/minimize/restore/arrange) live in cCJStandardMenuItemClasses.pkg and
+           the Windows pulldown's container in cCJMDIWindowsMenuItem.pkg. A converted program that Used
+           neither compiled with twenty 'MUST BE DEFINED' errors. */
+
+        // Index of the first line whose trimmed lowercase text starts with sPrefix and contains sNeedle; -1 when none.
+        Function IndexOfUse String[] asLines String sNeedle Returns Integer
+            Integer i iLast
+            String sLow
+            Move (SizeOfArray(asLines) - 1) to iLast
+            For i from 0 to iLast
+                Move (Lowercase(Trim(asLines[i]))) to sLow
+                If (Left(sLow, 4) = "use " and (sLow contains Lowercase(sNeedle))) ;
+                    Function_Return i
+            Loop
+            Function_Return -1
+        End_Function
+
+        Function CountOfUse String[] asLines String sNeedle Returns Integer
+            Integer i iLast iN
+            String sLow
+            Move (SizeOfArray(asLines) - 1) to iLast
+            Move 0 to iN
+            For i from 0 to iLast
+                Move (Lowercase(Trim(asLines[i]))) to sLow
+                If (Left(sLow, 4) = "use " and (sLow contains Lowercase(sNeedle))) ;
+                    Increment iN
+            Loop
+            Function_Return iN
+        End_Function
+
+        // A Window pulldown recognised by its messages: both packages, after the last top-level Use and
+        // before the program's first top-level Object.
+        {Published = True}
+        Procedure CJMenu_PackagesOfTheTreeAreUsed
+            String[] asCode
+            String sDataPath
+            Integer iEmitted iStd iMdi iWin iMain i
+            Boolean bMdiObject bCascadeObject
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move "Use DfAllEnt.pkg"                                                  to asCode[0]
+            Move "Use Windows.pkg"                                                   to asCode[1]
+            Move ""                                                                  to asCode[2]
+            Move "Object Main is a Panel"                                           to asCode[3]
+            Move "    DFCreate_Menu Main_Menu"                                      to asCode[4]
+            Move '    DFCreate_Menu "&Window" WindowPullDown is a ViewPopupMenu'     to asCode[5]
+            Move '    On_Item "&Cascade" Send Cascade_Windows'                      to asCode[6]
+            Move '    On_Item "Tile &Horizontally" Send Tile_Windows_Horizontally'  to asCode[7]
+            Move '    On_Item "&Arrange Icons" Send Arrange_Icons'                  to asCode[8]
+            Move "    End_Pull_Down"                                                to asCode[9]
+            Move "    End_Menu"                                                     to asCode[10]
+            Move "    Object oClientArea is a ClientArea"                           to asCode[11]
+            Move "    End_Object"                                                   to asCode[12]
+            Move "End_Object"                                                       to asCode[13]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Send Assert (iEmitted > 0)
+            Move False to bMdiObject
+            Move False to bCascadeObject
+            Move -1 to iMain
+            For i from 0 to (SizeOfArray(asCode) - 1)
+                If (Lowercase(asCode[i]) contains "is a ccjmdiwindowsmenuitem") ;
+                    Move True to bMdiObject
+                If (Lowercase(asCode[i]) contains "is a ccjcascademenuitem") ;
+                    Move True to bCascadeObject
+                If (iMain = -1 and Lowercase(asCode[i]) = "object main is a panel") ;
+                    Move i to iMain
+            Loop
+            Send Assert bMdiObject
+            Send Assert bCascadeObject
+            Get IndexOfUse asCode "windows.pkg"                    to iWin
+            Get IndexOfUse asCode "ccjstandardmenuitemclasses.pkg" to iStd
+            Get IndexOfUse asCode "ccjmdiwindowsmenuitem.pkg"      to iMdi
+            Send Assert (iStd > iWin)
+            Send Assert (iMdi > iWin)
+            Send Assert (iStd < iMain)
+            Send Assert (iMdi < iMain)
+            Send AssertIAreEqual 1 (CountOfUse(Self, asCode, "ccjstandardmenuitemclasses.pkg"))
+            Send AssertIAreEqual 1 (CountOfUse(Self, asCode, "ccjmdiwindowsmenuitem.pkg"))
+        End_Procedure
+
+        // The About item's own package (2026-10-31): cCJAboutMenuItem.pkg, once, before the first top-level Object -
+        // it was counted among the standard items, and the converted program failed with 'MUST BE DEFINED'.
+        {Published = True}
+        Procedure CJMenu_AboutItemGetsItsOwnPackage
+            String[] asCode
+            String sDataPath
+            Integer iEmitted iAbout iMain i
+            Boolean bAboutObject
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move "Use DfAllEnt.pkg"                                                  to asCode[0]
+            Move ""                                                                  to asCode[1]
+            Move "Object Main is a Panel"                                           to asCode[2]
+            Move "    DFCreate_Menu Main_Menu"                                      to asCode[3]
+            Move '    DFCreate_Menu "&Help" HelpPullDown is a ViewPopupMenu'         to asCode[4]
+            Move '    On_Item "&About" Send Activate_About'                         to asCode[5]
+            Move "    End_Pull_Down"                                                to asCode[6]
+            Move "    End_Menu"                                                     to asCode[7]
+            Move "    Object oClientArea is a ClientArea"                           to asCode[8]
+            Move "    End_Object"                                                   to asCode[9]
+            Move "End_Object"                                                       to asCode[10]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Send Assert (iEmitted > 0)
+            Move False to bAboutObject
+            Move -1 to iMain
+            For i from 0 to (SizeOfArray(asCode) - 1)
+                If (Lowercase(asCode[i]) contains "is a ccjaboutmenuitem") ;
+                    Move True to bAboutObject
+                If (iMain = -1 and Lowercase(asCode[i]) = "object main is a panel") ;
+                    Move i to iMain
+            Loop
+            Send Assert bAboutObject "the About item is a cCJAboutMenuItem"
+            Get IndexOfUse asCode "ccjaboutmenuitem.pkg" to iAbout
+            Send Assert (iAbout > 0 and iAbout < iMain) ("Use cCJAboutMenuItem.pkg at " + String(iAbout) + ", Main at " + String(iMain))
+            Send AssertIAreEqual 1 (CountOfUse(Self, asCode, "ccjaboutmenuitem.pkg"))
+        End_Procedure
+
+        // Already Used: nothing is added twice.
+        {Published = True}
+        Procedure CJMenu_PackagesNotDuplicatedWhenAlreadyUsed
+            String[] asCode
+            String sDataPath
+            Integer iEmitted
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move "Use DfAllEnt.pkg"                                                  to asCode[0]
+            Move "Use cCJStandardMenuItemClasses.pkg"                                to asCode[1]
+            Move "Use cCJMDIWindowsMenuItem.pkg"                                     to asCode[2]
+            Move "Object Main is a Panel"                                           to asCode[3]
+            Move "    DFCreate_Menu Main_Menu"                                      to asCode[4]
+            Move '    DFCreate_Menu "&Window" WindowPullDown is a ViewPopupMenu'     to asCode[5]
+            Move '    On_Item "&Cascade" Send Cascade_Windows'                      to asCode[6]
+            Move "    End_Pull_Down"                                                to asCode[7]
+            Move "    End_Menu"                                                     to asCode[8]
+            Move "    Object oClientArea is a ClientArea"                           to asCode[9]
+            Move "    End_Object"                                                   to asCode[10]
+            Move "End_Object"                                                       to asCode[11]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Send Assert (iEmitted > 0)
+            Send AssertIAreEqual 1 (CountOfUse(Self, asCode, "ccjstandardmenuitemclasses.pkg"))
+            Send AssertIAreEqual 1 (CountOfUse(Self, asCode, "ccjmdiwindowsmenuitem.pkg"))
+        End_Procedure
+
+        // A menu of plain items needs nothing beyond what DfAllEnt brings: no Use line is added.
+        {Published = True}
+        Procedure CJMenu_PlainMenuAddsNoPackages
+            String[] asCode
+            String sDataPath
+            Integer iEmitted
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move "Use DfAllEnt.pkg"                                                  to asCode[0]
+            Move "Object Main is a Panel"                                           to asCode[1]
+            Move "    DFCreate_Menu Main_Menu"                                      to asCode[2]
+            Move '    DFCreate_Menu "&File" FilePullDown is a ViewPopupMenu'         to asCode[3]
+            Move '    On_Item "&New" Send Activate_New'                             to asCode[4]
+            Move "    End_Pull_Down"                                                to asCode[5]
+            Move "    End_Menu"                                                     to asCode[6]
+            Move "    Object oClientArea is a ClientArea"                           to asCode[7]
+            Move "    End_Object"                                                   to asCode[8]
+            Move "End_Object"                                                       to asCode[9]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Send Assert (iEmitted > 0)
+            Send AssertIAreEqual 0 (CountOfUse(Self, asCode, "ccjstandardmenuitemclasses.pkg"))
+            Send AssertIAreEqual 0 (CountOfUse(Self, asCode, "ccjmdiwindowsmenuitem.pkg"))
+        End_Procedure
+
+        // ---- A dotted legacy message name survives (2026-09-07) --------------------------------------
+        // The identifier after 'send' was read as letters, digits and underscores only, so a dotted name was
+        // cut at the dot: the converted item then sent a message that exists and does nothing.
+        {Published = True}
+        Procedure CJMenu_DottedMessageKeptWhole
+            String[] asCode
+            String sDataPath sMsg
+            Integer iEmitted i
+            Boolean bFound
+
+            Get _CJMessageFromOnItem of ghoFuncLib 'On_Item "Show" Send Report.ShowOpenFiles' to sMsg
+            Send AssertSAreEqual "Report.ShowOpenFiles" sMsg
+            Get _CJMessageFromOnItem of ghoFuncLib 'On_Item "Count" Send count#' to sMsg
+            Send AssertSAreEqual "count#" sMsg
+            Get _CJMessageFromOnItem of ghoFuncLib 'On_Item "Do" Send Do_It$ To Current_Object' to sMsg
+            Send AssertSAreEqual "Do_It$" sMsg
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move "Use DfAllEnt.pkg"                                                  to asCode[0]
+            Move "Object Main is a Panel"                                           to asCode[1]
+            Move "    DFCreate_Menu Main_Menu"                                      to asCode[2]
+            Move '    DFCreate_Menu "&File" FilePullDown is a ViewPopupMenu'         to asCode[3]
+            Move '    On_Item "Show open" Send Report.ShowOpenFiles'                to asCode[4]
+            Move "    End_Pull_Down"                                                to asCode[5]
+            Move "    End_Menu"                                                     to asCode[6]
+            Move "    Object oClientArea is a ClientArea"                           to asCode[7]
+            Move "    End_Object"                                                   to asCode[8]
+            Move "End_Object"                                                       to asCode[9]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Send Assert (iEmitted > 0)
+            Move False to bFound
+            For i from 0 to (SizeOfArray(asCode) - 1)
+                If (Trim(asCode[i]) = "Send Report.ShowOpenFiles") ;
+                    Move True to bFound
+            Loop
+            Send Assert bFound
+        End_Procedure
+
+        // ---- An EMPTY legacy menu (2026-09-11) -----------------------------------------------------
+        // A program Uses a menu file whose Main_Menu holds nothing: there was nothing to emit, so a run
+        // returned 0, left the Use live, and the scan offered it again at every Check. It is retired
+        // now: the Use commented with a marker, no menu bar added, the menu file untouched.
+        {Published = True}
+        Procedure CJMenu_EmptyUsedMenu_RetiredWithoutMenuBar
+            String[] asCode asMn asBack
+            String sDataPath sMn
+            Boolean bOk bUseCommented bMark bMenuBar bEmpty
+            Integer iEmitted iVoid i
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move (sDataPath + "_CJEmpty_.mn") to sMn
+            Move "DFCreate_Menu Main_Menu"      to asMn[0]
+            Move ""                             to asMn[1]
+            Move "End_Menu // Main_Menu"        to asMn[2]
+            Move ""                             to asMn[3]
+            Move "Register_Object Client_Area"  to asMn[4]
+            Get rfWriteEncodedFileFromStringArray (&asMn) sMn C_NewLine False to bOk
+            Send Assert bOk
+            Move "Object Main is a Panel"                                to asCode[0]
+            Move "Use _CJEmpty_.mn //  Menu package."                    to asCode[1]
+            Move "    Object oCommandBarSystem is a cCJCommandBarSystem" to asCode[2]
+            Move "    End_Object"                                        to asCode[3]
+            Move "    Object oClientArea is a ClientArea"                to asCode[4]
+            Move "    End_Object"                                        to asCode[5]
+            Move "End_Object"                                            to asCode[6]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Get pbCJEmptyMenu of ghoFuncLib to bEmpty
+            Move (rfReadEncodedFileAsStringArray(sMn)) to asBack
+            Move (rfDeleteFile(sMn)) to iVoid
+            Send AssertIAreEqual 0 iEmitted
+            Send Assert bEmpty
+            Move False to bUseCommented
+            Move False to bMark
+            Move False to bMenuBar
+            For i from 0 to (SizeOfArray(asCode) - 1)
+                If (asCode[i] contains "Use _CJEmpty_.mn" and Left(Trim(asCode[i]), 2) = "//") ;
+                    Move True to bUseCommented
+                If (asCode[i] contains "is EMPTY") ;
+                    Move True to bMark
+                If (asCode[i] contains "cCJMenuBar") ;
+                    Move True to bMenuBar
+            Loop
+            Send Assert bUseCommented
+            Send Assert bMark
+            Send Assert (bMenuBar = False)
+            // one line added - the marker - and nothing emitted
+            Send AssertIAreEqual 8 (SizeOfArray(asCode))
+            // the menu file came back exactly as written
+            Send AssertIAreEqual 5 (SizeOfArray(asBack))
+            Send AssertSAreEqual asMn[4] asBack[4]
+        End_Procedure
+
+        // The same in the program itself: the block is commented where it stands, one marker above it,
+        // and nothing else - no command bar system brought in, no packages added.
+        {Published = True}
+        Procedure CJMenu_EmptyOwnBlock_Retired
+            String[] asCode
+            String sDataPath
+            Integer iEmitted i iCommented
+            Boolean bSys bEmpty
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move "Use DfAllEnt.pkg"                           to asCode[0]
+            Move "Object Main is a Panel"                     to asCode[1]
+            Move "    DFCreate_Menu Main_Menu"                to asCode[2]
+            Move "    End_Menu"                               to asCode[3]
+            Move "    Object oClientArea is a ClientArea"     to asCode[4]
+            Move "    End_Object"                             to asCode[5]
+            Move "End_Object"                                 to asCode[6]
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Get pbCJEmptyMenu of ghoFuncLib to bEmpty
+            Send AssertIAreEqual 0 iEmitted
+            Send Assert bEmpty
+            Send AssertIAreEqual 8 (SizeOfArray(asCode))
+            Move False to bSys
+            Move 0 to iCommented
+            For i from 0 to (SizeOfArray(asCode) - 1)
+                If (asCode[i] contains "cCJCommandBarSystem") ;
+                    Move True to bSys
+                If (Left(Trim(asCode[i]), 2) = "//") ;
+                    Increment iCommented
+            Loop
+            Send Assert (bSys = False)
+            // the marker and the two legacy lines
+            Send AssertIAreEqual 3 iCommented
+            Send AssertIAreEqual 1 (CountOfUse(Self, asCode, ".pkg"))
+        End_Procedure
+
+        // NOT empty: a block whose only content is an #include the converter cannot read also emits
+        // nothing - and must never be retired as empty. The program is left exactly as it was, and the
+        // reason is kept for the run notes.
+        {Published = True}
+        Procedure CJMenu_UnreadableFragmentOnly_NotRetired
+            String[] asCode asOrig
+            String sDataPath sDecline
+            Integer iEmitted i
+            Boolean bSame bEmpty
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move "Object Main is a Panel"                     to asCode[0]
+            Move "    DFCreate_Menu Main_Menu"                to asCode[1]
+            Move "        #include _CJNoSuchFragment_.inc"    to asCode[2]
+            Move "    End_Menu"                               to asCode[3]
+            Move "    Object oClientArea is a ClientArea"     to asCode[4]
+            Move "    End_Object"                             to asCode[5]
+            Move "End_Object"                                 to asCode[6]
+            Move asCode to asOrig
+            Get _CJConvertMenuInFile of ghoFuncLib (&asCode) sDataPath to iEmitted
+            Get pbCJEmptyMenu of ghoFuncLib to bEmpty
+            Get psCJDecline of ghoFuncLib to sDecline
+            Send AssertIAreEqual 0 iEmitted
+            Send Assert (bEmpty = False)
+            Send Assert (sDecline <> "")
+            Send AssertIAreEqual (SizeOfArray(asOrig)) (SizeOfArray(asCode))
+            Move True to bSame
+            For i from 0 to (SizeOfArray(asOrig) - 1)
+                If (asCode[i] <> asOrig[i]) ;
+                    Move False to bSame
+            Loop
+            Send Assert bSame
+        End_Procedure
+
+        // What counts as empty: the root and its close, blanks and comments - nothing else.
+        {Published = True}
+        Procedure CJMenu_MenuBlockIsEmpty_OnlyTheRootAndItsClose
+            String[] asB asNone
+            Boolean b
+
+            Move "DFCreate_Menu Main_Menu"    to asB[0]
+            Move ""                           to asB[1]
+            Move "// a comment"               to asB[2]
+            Move "End_Menu // Main_Menu"      to asB[3]
+            Get _CJMenuBlockIsEmpty of ghoFuncLib (&asB) to b
+            Send Assert b
+            // an item is content
+            Move 'On_Item "&About" Send Activate_About' to asB[2]
+            Get _CJMenuBlockIsEmpty of ghoFuncLib (&asB) to b
+            Send Assert (b = False)
+            // a captioned DFCreate_Menu is a pulldown - content, even with nothing in it
+            Move 'DFCreate_Menu "&Help" Help_Menu' to asB[2]
+            Get _CJMenuBlockIsEmpty of ghoFuncLib (&asB) to b
+            Send Assert (b = False)
+            // an #include is content, read or not
+            Move "#include File_PM.inc"       to asB[2]
+            Get _CJMenuBlockIsEmpty of ghoFuncLib (&asB) to b
+            Send Assert (b = False)
+            // so is any other code line
+            Move "Set Status_Help to 'Help'"  to asB[2]
+            Get _CJMenuBlockIsEmpty of ghoFuncLib (&asB) to b
+            Send Assert (b = False)
+            // and no block at all is not an empty menu
+            Get _CJMenuBlockIsEmpty of ghoFuncLib (&asNone) to b
+            Send Assert (b = False)
+        End_Procedure
+
+        // A pulldown in a .pkg (2026-09-11): #included by a menu file a program uses, it reaches that
+        // program as an .inc one does. A .pkg the program merely Uses does not - the converter never
+        // follows a Use of a package, so the run must not claim it will.
+        {Published = True}
+        Procedure CJMenu_IncludersOfFragment_PackagePulldown
+            String[] asProg asMn asPulled asUsed
+            String sDataPath sProg sMn
+            Boolean bOk
+            Integer iVoid
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move (sDataPath + "_CJPkProg_.src") to sProg
+            Move (sDataPath + "_CJPkMenu_.mn")  to sMn
+            Move "Object Main is a Panel"                     to asProg[0]
+            Move "Use _CJPkMenu_.mn //  Menu package."        to asProg[1]
+            Move "Use _CJPkUsed_.pkg"                         to asProg[2]
+            Move "End_Object"                                 to asProg[3]
+            Move "DFCreate_Menu Main_Menu"                    to asMn[0]
+            Move "#include _CJPkPull_.pkg   // help pulldown" to asMn[1]
+            Move "End_Menu"                                   to asMn[2]
+            Get rfWriteEncodedFileFromStringArray (&asProg) sProg C_NewLine False to bOk
+            Get rfWriteEncodedFileFromStringArray (&asMn)   sMn   C_NewLine False to bOk
+            Get _CJIncludersOfFragment of ghoFuncLib (sDataPath + "_CJPkPull_.pkg") to asPulled
+            Get _CJIncludersOfFragment of ghoFuncLib (sDataPath + "_CJPkUsed_.pkg") to asUsed
+            Move (rfDeleteFile(sProg)) to iVoid
+            Move (rfDeleteFile(sMn))   to iVoid
+            Send AssertIAreEqual 1 (SizeOfArray(asPulled))
+            If (SizeOfArray(asPulled) > 0) ;
+                Send AssertSAreEqual (Lowercase(sProg)) (Lowercase(asPulled[0]))
+            Send AssertIAreEqual 0 (SizeOfArray(asUsed))
+        End_Procedure
+
+        // The run's MENU fragments are found by content (2026-09-11): a .mn a program uses resolves to
+        // it; a .pkg holding a pulldown nobody pulls in is listed as a menu fragment with no program
+        // (the run notes then say so); a .pkg with no menu is not a fragment at all; a .src is the
+        // program itself and is never listed here.
+        {Published = True}
+        Procedure CJMenu_FragmentProgramMap_ByContent
+            String[] asProg asMn asLoose asPlain asFiles asMenuFrags asMap
+            String sDataPath sProg sMn sLoose sPlain
+            Boolean bOk
+            Integer iVoid
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (vFolderFormat(sDataPath)) to sDataPath
+            Move (sDataPath + "_CJFmProg_.src")  to sProg
+            Move (sDataPath + "_CJFmMenu_.mn")   to sMn
+            Move (sDataPath + "_CJFmLoose_.pkg") to sLoose
+            Move (sDataPath + "_CJFmPlain_.pkg") to sPlain
+            Move "Object Main is a Panel"               to asProg[0]
+            Move "Use _CJFmMenu_.mn //  Menu package."  to asProg[1]
+            Move "End_Object"                           to asProg[2]
+            Move "DFCreate_Menu Main_Menu"              to asMn[0]
+            Move 'On_Item "&About" Send Activate_About' to asMn[1]
+            Move "End_Menu"                             to asMn[2]
+            Move 'DFCreate_Menu "&Help" Help_Menu'      to asLoose[0]
+            Move 'On_Item "&About" Send Activate_About' to asLoose[1]
+            Move "End_Pull_Down"                        to asLoose[2]
+            Move "Procedure DoNothing"                  to asPlain[0]
+            Move "End_Procedure"                        to asPlain[1]
+            Get rfWriteEncodedFileFromStringArray (&asProg)  sProg  C_NewLine False to bOk
+            Get rfWriteEncodedFileFromStringArray (&asMn)    sMn    C_NewLine False to bOk
+            Get rfWriteEncodedFileFromStringArray (&asLoose) sLoose C_NewLine False to bOk
+            Get rfWriteEncodedFileFromStringArray (&asPlain) sPlain C_NewLine False to bOk
+            Move sProg  to asFiles[0]
+            Move sMn    to asFiles[1]
+            Move sLoose to asFiles[2]
+            Move sPlain to asFiles[3]
+            Get _CJFragmentProgramMap of ghoFuncLib (&asFiles) (&asMenuFrags) to asMap
+            Move (rfDeleteFile(sProg))  to iVoid
+            Move (rfDeleteFile(sMn))    to iVoid
+            Move (rfDeleteFile(sLoose)) to iVoid
+            Move (rfDeleteFile(sPlain)) to iVoid
+            Send AssertIAreEqual 2 (SizeOfArray(asMenuFrags))
+            Send Assert (SearchArray(Lowercase(sMn), asMenuFrags) <> -1)
+            Send Assert (SearchArray(Lowercase(sLoose), asMenuFrags) <> -1)
+            // one row: the menu file, to the program that uses it
+            Send AssertIAreEqual 1 (SizeOfArray(asMap))
+            If (SizeOfArray(asMap) > 0) ;
+                Send AssertSAreEqual (Lowercase("_CJFmMenu_.mn|" + sProg)) (Lowercase(asMap[0]))
+        End_Procedure
+
+        // The packages a converted menu needs compile in every case: after the #ENDIF, not after the Use inside it.
+        {Published = True}
+        Procedure CJMenu_EnsureUsesStaysOutOfAConditional
+            String[] asCode asNeed
+            Integer iN
+
+            Move "Use DfAllEnt.pkg"                                  to asCode[0]
+            Move (Character(35) + "IFDEF SOME_FLAG")                 to asCode[1]
+            Move "Use Extra.pkg"                                     to asCode[2]
+            Move (Character(35) + "ENDIF")                           to asCode[3]
+            Move "Object Main is a Panel"                            to asCode[4]
+            Move "End_Object"                                        to asCode[5]
+            Move "cCJCommandBarSystem.pkg"                           to asNeed[0]
+            Get _CJEnsureUses of ghoFuncLib (&asCode) (&asNeed) "why" to iN
+            Send AssertIAreEqual 1 iN
+            Send AssertSAreEqual (Character(35) + "ENDIF") asCode[3]
+            Send Assert (Pos("Use cCJCommandBarSystem.pkg", asCode[4]) = 1) asCode[4]
+        End_Procedure
+
+        /* A MENU LEFT AS IT IS STILL COMPILES (2026-11-01): DataFlex 26 compiles DFCreate_Menu only with Dfmenu.pkg and
+           its ViewPopupMenu / DEOPopupMenu only with Dfdeomnu.pkg, which Uses Dfmenu.pkg - both still shipped, obsolete.
+           A program whose menu the converter leaves - here for a procedure of its own in the pulldown - gets
+           'Use Dfdeomnu.pkg' after its last Use before Main, once; the menu itself is untouched. */
+        {Published = True}
+        Procedure CJMenu_LeftMenuGetsTheLegacyMenuPackage
+            String[] asProg asOut
+            String sRoot sFile
+            Integer iItems1 iItems2 i iUses iMenuLine
+            Boolean bOk bKept1 bKept2
+            Move (vFolderFormat(vGetTempPath(Desktop)) + "DFRefactorTests_KeepMenu\") to sRoot
+            Move (rfRemoveFolderTree(sRoot)) to bOk
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "_CJKeep_.src") to sFile
+            Move "Use DfAllEnt.pkg"                                   to asProg[0]
+            Move "Object Main is a Panel"                             to asProg[1]
+            Move "    DFCreate_Menu Main_Menu"                        to asProg[2]
+            Move '        DFCreate_Menu "&File" File_Menu is a PopupMenu' to asProg[3]
+            Move '        On_Item "&Print" Send DoPrint'              to asProg[4]
+            Move "        Procedure DoPrint"                          to asProg[5]
+            Move "        End_Procedure"                              to asProg[6]
+            Move "        End_Pull_Down"                              to asProg[7]
+            Move "    End_Menu"                                       to asProg[8]
+            Move "    Object oClientArea is a ClientArea"             to asProg[9]
+            Move "    End_Object"                                     to asProg[10]
+            Move "End_Object"                                         to asProg[11]
+            Get rfWriteEncodedFileFromStringArray (&asProg) sFile C_NewLine False to bOk
+            Get _CJConvertProgramFile of ghoFuncLib sFile False to iItems1
+            Get pbCJLegacyMenuKept of ghoFuncLib to bKept1
+            Get _CJConvertProgramFile of ghoFuncLib sFile False to iItems2
+            Get pbCJLegacyMenuKept of ghoFuncLib to bKept2
+            Move (rfReadEncodedFileAsStringArray(sFile)) to asOut
+            Move (rfRemoveFolderTree(sRoot)) to bOk
+            Move 0 to iUses
+            Move -1 to iMenuLine
+            For i from 0 to (SizeOfArray(asOut) - 1)
+                If (Lowercase(Trim(asOut[i])) contains "use dfdeomnu.pkg") ;
+                    Increment iUses
+                If (Trim(asOut[i]) = "DFCreate_Menu Main_Menu") ;
+                    Move i to iMenuLine
+            Loop
+            Send AssertIAreEqual 0 iItems1
+            Send Assert bKept1 "the first run adds the Use"
+            Send AssertFalse bKept2
+            Send AssertIAreEqual 1 iUses
+            Send Assert (Lowercase(Trim(asOut[1])) contains "use dfdeomnu.pkg") ("after the last Use: " + asOut[1])
+            Send Assert (iMenuLine > 0) "the legacy menu itself stays"
+        End_Procedure
+
+        /* A FILE A PROGRAM PULLS IN IS LOOKED FOR AS DATAFLEX LOOKS (2026-11-01): beside the program, then in the
+           workspace's source folders - a workspace with AppSrcPath '.\AppSrc;.\Pkg' keeps its menu files in Pkg\, and
+           'Use <menu>.mn' found nothing beside the program. On folders in the Windows TEMP folder, named as the
+           workspace's source roots: the menu file in Pkg\ is found from AppSrc\; a name no folder has comes back "". */
+        {Published = True}
+        Procedure CJMenu_FindInWorkspaceLooksInTheSourceFolders
+            String[] asRoots asMn asNone
+            String sRoot sPath sOther
+            Boolean bOk
+            Move (vFolderFormat(vGetTempPath(Desktop)) + "DFRefactorTests_FindInWs\") to sRoot
+            Move (rfRemoveFolderTree(sRoot)) to bOk
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (rfDirectoryCreateEx((sRoot + "AppSrc\"), False)) to bOk
+            Move (rfDirectoryCreateEx((sRoot + "Pkg\"), False)) to bOk
+            Move "DFCreate_Menu Main_Menu" to asMn[0]
+            Move "End_Menu"                to asMn[1]
+            Get rfWriteEncodedFileFromStringArray (&asMn) (sRoot + "Pkg\_CJFiwMenu_.mn") C_NewLine False to bOk
+            Move (sRoot + "AppSrc\") to asRoots[0]
+            Move (sRoot + "Pkg\")    to asRoots[1]
+            Set pasCJSourceRootsOverride of ghoFuncLib to asRoots
+            Get _CJFindInWorkspace of ghoFuncLib "_CJFiwMenu_.mn" (sRoot + "AppSrc\") to sPath
+            Get _CJFindInWorkspace of ghoFuncLib "_NoSuchMenuFile_.mn" (sRoot + "AppSrc\") to sOther
+            Set pasCJSourceRootsOverride of ghoFuncLib to asNone
+            Move (rfRemoveFolderTree(sRoot)) to bOk
+            Send AssertSAreEqual (Lowercase(sRoot + "Pkg\_CJFiwMenu_.mn")) (Lowercase(sPath))
+            Send AssertSAreEqual "" sOther
+        End_Procedure
+
+        /* A MENU FILE IN ANOTHER FOLDER THAN ITS PROGRAM (2026-11-01): one workspace keeps its menu files in Pkg\ and its
+           programs in AppSrc\, and the map of the menu file's folder alone held no program - all three were skipped as
+           pulled in by nobody. The menu file, and the pulldown it #includes, reach the program in the other folder. */
+        {Published = True}
+        Procedure CJMenu_FragmentInAnotherFolderReachesItsProgram
+            String[] asProg asMn asInc asFiles asMenuFrags asMap
+            String sRoot sProg sMn sInc
+            Boolean bOk
+            Integer i iProg
+
+            Move (vFolderFormat(vGetTempPath(Desktop)) + "DFRefactorTests_MenuFolders\") to sRoot
+            Move (rfRemoveFolderTree(sRoot)) to bOk
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (rfDirectoryCreateEx((sRoot + "Prog\"), False)) to bOk
+            Move (rfDirectoryCreateEx((sRoot + "Pkg\"), False)) to bOk
+            Move (sRoot + "Prog\_CJAfApp_.src")  to sProg
+            Move (sRoot + "Pkg\_CJAfMenu_.mn")   to sMn
+            Move (sRoot + "Pkg\_CJAfHelp_pm.inc") to sInc
+            Move "Object Main is a Panel"                    to asProg[0]
+            Move "    Use _CJAfMenu_.mn //  Menu package."    to asProg[1]
+            Move "End_Object"                                to asProg[2]
+            Move "DFCreate_Menu Main_Menu"                   to asMn[0]
+            Move "  #Include _CJAfHelp_pm.inc"               to asMn[1]
+            Move "End_Menu"                                  to asMn[2]
+            Move 'DFCreate_Menu "&Help" Help_Menu'           to asInc[0]
+            Move 'On_Item "&About" Send Activate_About'      to asInc[1]
+            Move "End_Pull_Down"                             to asInc[2]
+            Get rfWriteEncodedFileFromStringArray (&asProg) sProg C_NewLine False to bOk
+            Get rfWriteEncodedFileFromStringArray (&asMn)   sMn   C_NewLine False to bOk
+            Get rfWriteEncodedFileFromStringArray (&asInc)  sInc  C_NewLine False to bOk
+            Move sProg to asFiles[0]
+            Move sMn   to asFiles[1]
+            Move sInc  to asFiles[2]
+            Get _CJFragmentProgramMap of ghoFuncLib (&asFiles) (&asMenuFrags) to asMap
+            Move (rfRemoveFolderTree(sRoot)) to bOk
+            Move 0 to iProg
+            For i from 0 to (SizeOfArray(asMap) - 1)
+                If (Lowercase(asMap[i]) = Lowercase("_CJAfMenu_.mn|" + sProg) or Lowercase(asMap[i]) = Lowercase("_CJAfHelp_pm.inc|" + sProg)) ;
+                    Increment iProg
+            Loop
+            Send AssertIAreEqual 2 (SizeOfArray(asMenuFrags))
+            Send AssertIAreEqual 2 iProg
+        End_Procedure
+
+    End_Object

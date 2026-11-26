@@ -1,0 +1,2277 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oLibraryInventory-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-31
+//
+// Description : Unit tests for the shared-library inventory (WorkspaceLibraryInventory, cRefactorApplication).
+//
+//               Built against a REAL fixture workspace written to the Windows temp folder (to the workspace's
+//               Data folder until 2026-10-05), because every hard part of
+//               this resolver is a filesystem/format fact rather than a string transform: the [Libraries]
+//               entries have to resolve as relative paths, the versions have to come out of the .sws contents,
+//               and the sibling scan has to see actual files.
+//
+//               The fixture deliberately reproduces the three traps found in the 2026-07-30 survey of Nils's
+//               machine:
+//               1. the library .sws living in a generic "StudioLibrary" container folder (vwin32fh's shape),
+//               which would otherwise name every such library "StudioLibrary";
+//               2. a filename whose version token disagrees with the version inside the file ("DF250" vs
+//               Version=25.0), which is why nothing here parses filenames;
+//               3. a Dev-role .sws sitting beside the consumable one at the SAME version - matching on
+//               version alone picks the right version and the wrong role.
+//
+//               ASCII content only; every file and folder is removed at the end.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+    Object oLibraryInventory_Tests is a cTestFixture
+        Set psFunctionName to "WorkspaceLibraryInventory"
+
+        // In the Windows TEMP folder (Nils 2026-10-05), not in the workspace's Data folder as before.
+        // vGetTempPath is a method of the Desktop, not a global function.
+        Function _LibTestRoot Returns String
+            Function_Return (vFolderFormat(vGetTempPath(Desktop)) + "DFRefactorTests_LibInv\")
+        End_Function
+
+        /* SwsManifestValue - the description / workspaceName a JSON .sws declares about itself
+           (2026-08-19). What the Libraries dialog puts under a card's title, for a package from the
+           cache and now for a library that has been converted to JSON. An INI .sws must answer "",
+           because that is every library that has not been converted and the card must not invent a
+           line for them. */
+        Function _WriteJsonSws String sPath String sBody Returns Boolean
+            String[] asLines
+            Boolean bOk
+            Move sBody to asLines[0]
+            Get rfWriteEncodedFileFromStringArray (&asLines) sPath C_NewLine False to bOk
+            Function_Return bOk
+        End_Function
+
+        /* PRETTY-PRINTED, one key per line - the shape df-cli convert actually writes (verified
+           against a converted DFAbout-Library-DF26.sws, 2026-08-19). The first cut of this test used
+           single-line JSON, which the line scanner would parse even if it could not handle the real
+           layout - a fixture easier than the thing it stands for proves nothing. */
+        {Published = True}
+        Procedure Manifest_ReadsDescriptionAndWorkspaceName
+            String sRoot sFile sVal
+            String[] asLines
+            Handle ho
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZManifest.sws") to sFile
+            Move '{'                                                     to asLines[0]
+            Move '    "description": "About dialog for DataFlex.",'      to asLines[1]
+            Move '    "df": 26.0,'                                       to asLines[2]
+            Move '    "paths": {'                                        to asLines[3]
+            Move '        "configFile": "Config.ws"'                     to asLines[4]
+            Move '    },'                                                to asLines[5]
+            Move '    "workspaceName": "DFAbout"'                        to asLines[6]
+            Move '}'                                                     to asLines[7]
+            Get rfWriteEncodedFileFromStringArray (&asLines) sFile C_NewLine False to bOk
+            Send Assert bOk
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get SwsManifestValue of ho sFile "description" to sVal
+            Send AssertSAreEqual "About dialog for DataFlex." sVal
+            Get SwsManifestValue of ho sFile "workspaceName" to sVal
+            Send AssertSAreEqual "DFAbout" sVal
+            // A key the file does not declare answers "", never a guess.
+            Get SwsManifestValue of ho sFile "icon" to sVal
+            Send AssertSAreEqual "" sVal
+            Send Destroy of ho
+            Move (rfDeleteFile(sFile)) to bOk
+        End_Procedure
+
+        /* A git dependency's identity is its REPO, not the .sws stem df-cli checks it out under
+           (Nils 2026-08-19: the card said "DFABOUT-LIBRARY-DF26" and showed no owner). */
+        {Published = True}
+        Procedure GitSource_OwnerAndRepo
+            Handle ho
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Send AssertSAreEqual "Library-DFAbout" (GitRepoFromSource(ho, "https://github.com/NilsSve/Library-DFAbout.git"))
+            Send AssertSAreEqual "NilsSve"         (GitOwnerFromSource(ho, "https://github.com/NilsSve/Library-DFAbout.git"))
+            // No ".git", and a trailing slash.
+            Send AssertSAreEqual "VDFQuery20"   (GitRepoFromSource(ho, "https://github.com/DataFlexCode/VDFQuery20/"))
+            Send AssertSAreEqual "DataFlexCode" (GitOwnerFromSource(ho, "https://github.com/DataFlexCode/VDFQuery20/"))
+            // The ssh form puts the owner after a colon rather than a slash.
+            Send AssertSAreEqual "Library-DUF" (GitRepoFromSource(ho, "git@github.com:NilsSve/Library-DUF.git"))
+            Send AssertSAreEqual "NilsSve"     (GitOwnerFromSource(ho, "git@github.com:NilsSve/Library-DUF.git"))
+            // Nothing recognisable answers "" - the caller then keeps what it had.
+            Send AssertSAreEqual "" (GitRepoFromSource(ho, ""))
+            Send AssertSAreEqual "" (GitOwnerFromSource(ho, "notaurl"))
+            Send Destroy of ho
+        End_Procedure
+
+        // A 40-char SHA is shortened to the 7 git itself shows; a real version is left alone.
+        {Published = True}
+        Procedure ShortVersion_OnlyShortensCommits
+            Handle ho
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Send AssertSAreEqual "a1f8ff9" (ShortDependencyVersion(ho, "a1f8ff9c2b1e4d5a6f70819243546576879a0b1c"))
+            Send AssertSAreEqual "1.0.0"   (ShortDependencyVersion(ho, "1.0.0"))
+            Send AssertSAreEqual "26.0"    (ShortDependencyVersion(ho, "26.0"))
+            // Long but not hex - a tag, say - stays whole rather than being cut to nonsense.
+            Send AssertSAreEqual "release-candidate-two" (ShortDependencyVersion(ho, "release-candidate-two"))
+            Send Destroy of ho
+        End_Procedure
+
+        /* THE KEY MUST COME FROM THE PACKAGE, NOT FROM ONE OF ITS DEPENDENCIES (2026-08-19). This is
+           the shape that breaks a depth-blind scan: "dependencies" holds an object whose own "version"
+           is a 40-character commit, and it sits ABOVE the package's real version in the file, so a
+           first-match-wins scan returns the dependency's hash as the library's version. The manifest
+           below is DataFlex's own layout - verified against the cached Web UI FlexTron df.sws, which
+           keeps "version" and "icon" inside a nested "package" object, not at the top level. */
+        {Published = True}
+        Procedure Manifest_VersionComesFromPackageNotDependencies
+            String sRoot sFile sVal
+            String[] asLines
+            Handle ho
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZManifestPkg.sws") to sFile
+            Move '{'                                                          to asLines[0]
+            Move '    "dependencies": ['                                      to asLines[1]
+            Move '        {'                                                  to asLines[2]
+            Move '            "source": "https://github.com/NilsSve/X.git",'   to asLines[3]
+            Move '            "sws": "X-Library-DF26.sws",'                    to asLines[4]
+            Move '            "version": "a1f8ff9c2fe5b1a2ff3adf1d490f2dbe464dcfed"' to asLines[5]
+            Move '        }'                                                  to asLines[6]
+            Move '    ],'                                                     to asLines[7]
+            Move '    "description": "A library with a dependency.",'          to asLines[8]
+            Move '    "df": 26.0,'                                             to asLines[9]
+            Move '    "package": {'                                           to asLines[10]
+            Move '        "icon": "PoweredByDataFlex.png",'                    to asLines[11]
+            Move '        "version": "1.0.0"'                                  to asLines[12]
+            Move '    },'                                                      to asLines[13]
+            Move '    "workspaceName": "DFAbout"'                              to asLines[14]
+            Move '}'                                                           to asLines[15]
+            Get rfWriteEncodedFileFromStringArray (&asLines) sFile C_NewLine False to bOk
+            Send Assert bOk
+            Get Create (RefClass(cLibraryInventory)) to ho
+            // The package's own version, NOT the dependency's commit that appears first in the file.
+            Get SwsManifestValue of ho sFile "version" to sVal
+            Send AssertSAreEqual "1.0.0" sVal
+            // Nested "package" scalars are reachable - this is where DataFlex puts the icon.
+            Get SwsManifestValue of ho sFile "icon" to sVal
+            Send AssertSAreEqual "PoweredByDataFlex.png" sVal
+            // POSITIVE CONTROL: top-level keys still read, so a pass above is not "found nothing".
+            Get SwsManifestValue of ho sFile "workspaceName" to sVal
+            Send AssertSAreEqual "DFAbout" sVal
+            Get SwsManifestValue of ho sFile "description" to sVal
+            Send AssertSAreEqual "A library with a dependency." sVal
+            // A dependency-only key stays invisible: "source" belongs to the dependency, not to us.
+            Get SwsManifestValue of ho sFile "source" to sVal
+            Send AssertSAreEqual "" sVal
+            Send Destroy of ho
+            Move (rfDeleteFile(sFile)) to bOk
+        End_Procedure
+
+        /* A value carrying braces of its own must not throw the depth count off - df-cli writes
+           "${AppSrc}/FlexTronScriptIncludes.html" into includeFiles, and a naive brace count would
+           then read every following key at the wrong depth and return "" for all of them. */
+        {Published = True}
+        Procedure Manifest_BracesInsideAValueDoNotShiftDepth
+            String sRoot sFile sVal
+            String[] asLines
+            Handle ho
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZManifestBrace.sws") to sFile
+            Move '{'                                                    to asLines[0]
+            Move '    "package": {'                                     to asLines[1]
+            Move '        "includeFiles": ['                            to asLines[2]
+            Move '            "${AppSrc}/FlexTronScriptIncludes.html"'   to asLines[3]
+            Move '        ],'                                           to asLines[4]
+            Move '        "version": "1.0.52"'                          to asLines[5]
+            Move '    },'                                               to asLines[6]
+            Move '    "workspaceName": "Web UI FlexTron"'               to asLines[7]
+            Move '}'                                                    to asLines[8]
+            Get rfWriteEncodedFileFromStringArray (&asLines) sFile C_NewLine False to bOk
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get SwsManifestValue of ho sFile "version" to sVal
+            Send AssertSAreEqual "1.0.52" sVal
+            // The key AFTER the brace-carrying value still reads, which is what proves depth held.
+            Get SwsManifestValue of ho sFile "workspaceName" to sVal
+            Send AssertSAreEqual "Web UI FlexTron" sVal
+            Send Destroy of ho
+            Move (rfDeleteFile(sFile)) to bOk
+        End_Procedure
+
+        /* THE CLASS VARIABLE (2026-10-05). Code compiled into every program creates its inventory through
+           giLibraryInventoryClass, so the application can put a class there that reads a JSON workspace
+           file. Here, in the runner, no package has: it holds the plain class, and what it creates is an
+           inventory. */
+        {Published = True}
+        Procedure LibraryInventory_ClassVariableCreatesAnInventory
+            Handle ho
+            Boolean bIs
+            Send AssertIAreEqual (RefClass(cLibraryInventory)) giLibraryInventoryClass
+            Get Create giLibraryInventoryClass to ho
+            Send Assert (ho <> 0) "nothing was created through giLibraryInventoryClass"
+            Get IsObjectOfClass of ho (RefClass(cLibraryInventory)) to bIs
+            Send Assert bIs "what giLibraryInventoryClass created is not a cLibraryInventory"
+            Send Destroy of ho
+        End_Procedure
+
+        // An INI .sws has no manifest keys at all - it must answer "", not scrape a look-alike line.
+        {Published = True}
+        Procedure Manifest_IniSwsAnswersEmpty
+            String sRoot sFile sVal
+            Handle ho
+            Boolean bOk
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZManifestIni.sws") to sFile
+            Get _WriteJsonSws sFile ('[Properties]') to bOk
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get SwsManifestValue of ho sFile "description" to sVal
+            Send AssertSAreEqual "" sVal
+            Send Destroy of ho
+            Move (rfDeleteFile(sFile)) to bOk
+        End_Procedure
+
+        // Writes a minimal INI-format .sws: a [Properties] Version and an optional [Libraries] block.
+        Procedure _WriteSws String sPath String sVersion String[] asLibEntries
+            String[] asLines
+            Integer i iMax
+            Boolean bOk
+
+            Move "[Properties]"            to asLines[0]
+            Move ("Version=" + sVersion)   to asLines[1]
+            Move "[WorkspacePaths]"        to asLines[2]
+            Move "ConfigFile=.\config.ws"  to asLines[3]
+            Move (SizeOfArray(asLibEntries) - 1) to iMax
+            If (iMax >= 0) Begin
+                Move "[Libraries]" to asLines[SizeOfArray(asLines)]
+                For i from 0 to iMax
+                    Move ("Lib" + String(i + 1) + "=" + asLibEntries[i]) to asLines[SizeOfArray(asLines)]
+                Loop
+            End
+            Get rfWriteEncodedFileFromStringArray (&asLines) sPath C_NewLine False to bOk
+            Send Assert bOk ("could not write fixture " + sPath)
+        End_Procedure
+
+        // Builds the whole fixture tree. Returns the main workspace's .sws path.
+        Function _BuildFixture Returns String
+            String sRoot sAlpha sBeta sMain
+            String[] asLibs asNone
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (sRoot + "Libraries\Alpha\StudioLibrary\") to sAlpha
+            Move (sRoot + "Libraries\Beta\") to sBeta
+            Move (rfDirectoryCreateEx(sAlpha, False)) to bOk
+            Send Assert bOk "could not create the Alpha fixture folder"
+            Move (rfDirectoryCreateEx(sBeta, False)) to bOk
+            Send Assert bOk "could not create the Beta fixture folder"
+
+            /* ALPHA - vwin32fh's shape. Its .sws sits in a generic "StudioLibrary" container, its
+               25.0 file is named "DF250" while declaring 25.0 inside, and a Dev-role file shadows
+               the consumable one at that same version. */
+            Send _WriteSws (sAlpha + "Alpha-Library-DF191.sws") "19.1" asNone
+            Send _WriteSws (sAlpha + "Alpha-Library-DF250.sws") "25.0" asNone
+            Send _WriteSws (sAlpha + "Alpha-Dev-DF250.sws")     "25.0" asNone
+
+            // BETA - a plain copy that stops at 19.1: nothing local for a 25.0 target.
+            Send _WriteSws (sBeta + "BetaLibrary19.1.sws") "19.1" asNone
+
+            // The consuming workspace, referencing both by RELATIVE path as Studio writes them.
+            Move "Libraries\Alpha\StudioLibrary\Alpha-Library-DF191.sws" to asLibs[0]
+            Move "Libraries\Beta\BetaLibrary19.1.sws"                    to asLibs[1]
+            Move (sRoot + "ZLibMain.sws") to sMain
+            Send _WriteSws sMain "19.1" asLibs
+            Function_Return sMain
+        End_Function
+
+        Procedure _RemoveFixture
+            String sRoot sAlpha sBeta
+            Integer iVoid
+            Get _LibTestRoot to sRoot
+            Move (sRoot + "Libraries\Alpha\StudioLibrary\") to sAlpha
+            Move (sRoot + "Libraries\Beta\") to sBeta
+            Move (rfDeleteFile(sAlpha + "Alpha-Library-DF191.sws")) to iVoid
+            Move (rfDeleteFile(sAlpha + "Alpha-Library-DF250.sws")) to iVoid
+            Move (rfDeleteFile(sAlpha + "Alpha-Dev-DF250.sws"))     to iVoid
+            Move (rfDeleteFile(sBeta  + "BetaLibrary19.1.sws"))     to iVoid
+            Move (rfDeleteFile(sRoot  + "ZLibMain.sws"))            to iVoid
+        End_Procedure
+
+        /* Every call goes through a freshly created cLibraryInventory. The class is standalone for
+           exactly this reason: UnitTests declares "Object oApplication is a cApplication",
+           so a resolver hung off cRefactorApplication would be unreachable here - every
+           "Get <fn> of ghoApplication" returns nothing silently, and the tests would fail for a
+           reason that has nothing to do with the logic. (Cost a long debugging session
+           2026-07-31.) Same pattern as the cDeepScanner fixtures. */
+        Function _Inventory String sSwsFile String sTargetVersion Returns tLibraryInfo[]
+            tLibraryInfo[] aLibs
+            Handle ho
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WorkspaceLibraryInventory of ho sSwsFile sTargetVersion to aLibs
+            Send Destroy of ho
+            Function_Return aLibs
+        End_Function
+
+        // Helper: the record for one library by display name (order is [Libraries] order, but
+        // asserting by name keeps the tests readable if that ever changes).
+        Function _LibNamed tLibraryInfo[] aLibs String sName Returns tLibraryInfo
+            tLibraryInfo Empty
+            Integer i iMax
+            Move (SizeOfArray(aLibs) - 1) to iMax
+            For i from 0 to iMax
+                If (Lowercase(aLibs[i].sName) = Lowercase(sName)) ;
+                    Function_Return aLibs[i]
+            Loop
+            Function_Return Empty
+        End_Function
+
+        /* The whole contract in one scene, against a 25.0 target:
+           both libraries found; the container folder does not become the name; the version comes
+           from the file's CONTENT not its name; the Dev-role sibling is not offered as the
+           destination; and the two verdicts differ because only one copy can reach 25.0. */
+        {Published = True}
+        Procedure LibraryInventory_ResolvesVersionsRolesAndVerdicts
+            tLibraryInfo[] aLibs
+            tLibraryInfo Alpha Beta
+            String sMain
+
+            Get _BuildFixture to sMain
+            Get _Inventory sMain "25.0" to aLibs
+            Send AssertIAreEqual 2 (SizeOfArray(aLibs))
+
+            Get _LibNamed aLibs "Alpha" to Alpha
+            // (1) the generic container folder is skipped - NOT "StudioLibrary"
+            Send AssertSAreEqual "Alpha" Alpha.sName
+            // (2) the referenced .sws and its declared version
+            Send AssertSAreEqual "19.1" Alpha.sRefVersion
+            // (3) versions come from CONTENT: the 25.0 file is named "DF250"
+            Send Assert (SearchArray("25.0", Alpha.asAvailVersions) <> -1) "25.0 not seen - filename was parsed instead of content?"
+            Send Assert (SearchArray("19.1", Alpha.asAvailVersions) <> -1)
+            // (4) the Dev-role sibling declares 25.0 too, and must NOT be the destination
+            Send Assert (Pos("Alpha-Library-DF250.sws", Alpha.sTargetSwsFile) > 0) ("wrong destination: " + Alpha.sTargetSwsFile)
+            Send Assert (Pos("Dev", Alpha.sTargetSwsFile) = 0) ("Dev-role .sws offered as destination: " + Alpha.sTargetSwsFile)
+            // (5) a local build exists, so this is a repoint
+            Send Assert (Alpha.eStatus = eLibRetargetLocal)
+
+            // BETA stops at 19.1 - nothing local reaches the target.
+            Get _LibNamed aLibs "Beta" to Beta
+            Send AssertSAreEqual "Beta" Beta.sName
+            Send AssertSAreEqual "" Beta.sTargetSwsFile
+            Send Assert (Beta.eStatus = eLibNoLocalBuild)
+            Send _RemoveFixture
+        End_Procedure
+
+        /* THE NORMALISER, asserted directly - pure string work, no fixture.
+
+           Windows collapses ".." itself when it opens a file, so an un-normalised path WORKS and
+           the flaw shows up only where paths are compared as strings or shown to a human. That is
+           why each case here names the thing that would otherwise go wrong. */
+        {Published = True}
+        Procedure LibraryInventory_NormalizePathCollapsesDotSegments
+            Handle ho
+            String s
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            // The defect, exactly as it reached a dialog on 2026-08-06.
+            Get NormalizePath of ho "C:\Proj\LegacyApp10\..\Libraries\vdfquery" to s
+            Send AssertSAreEqual "C:\Proj\Libraries\vdfquery" s
+            Get NormalizePath of ho "C:\A\B\..\..\C" to s
+            Send AssertSAreEqual "C:\C" s
+            Get NormalizePath of ho "C:\A\.\B" to s
+            Send AssertSAreEqual "C:\A\B" s
+
+            // A drive letter can never be eaten, however many ".." are aimed at it: there is
+            // nothing above a root, so the surplus is discarded rather than escaping the drive.
+            Get NormalizePath of ho "C:\A\..\..\..\B" to s
+            Send AssertSAreEqual "C:\B" s
+
+            // A UNC "\\server\share" is ONE root, not two poppable folders.
+            Get NormalizePath of ho "\\srv\share\A\..\B" to s
+            Send AssertSAreEqual "\\srv\share\B" s
+
+            // RELATIVE input: a leading ".." is KEPT. Dropping it would silently claim the path
+            // means something it does not - we were never told what it is relative to.
+            Get NormalizePath of ho "..\Libraries\X" to s
+            Send AssertSAreEqual "..\Libraries\X" s
+            Get NormalizePath of ho "" to s
+            Send AssertSAreEqual "" s
+            Send Destroy of ho
+        End_Procedure
+
+        /* A library ABOVE the workspace home - "Lib1=..\Libraries\..." - which is how a shared
+           pool is normally referenced and precisely the shape that leaked.
+
+           The inventory always WORKED on this: the un-normalised string opens the right folder, so
+           every existing test passed while sFolder carried a literal "..\" downstream into the copy
+           plan's rows and out to the user as "E:\LegacyApp10\..\Libraries\vdfquery". Assert the string, not
+           just the outcome - the outcome was never what was broken. */
+        {Published = True}
+        Procedure LibraryInventory_ParentRelativeEntryResolvesWithoutDotDot
+            tLibraryInfo[] aLibs
+            String sRoot sConsumerDir sConsumerSws sMain
+            String[] asLibs
+            Boolean bOk
+            Integer iVoid
+
+            Get _BuildFixture to sMain
+            Get _LibTestRoot to sRoot
+
+            // The consumer sits one level DOWN, so it must reach UP to the shared pool.
+            Move (sRoot + "Consumer\") to sConsumerDir
+            Move (rfDirectoryCreateEx(sConsumerDir, False)) to bOk
+            Send Assert bOk "could not create the Consumer fixture folder"
+            Move "..\Libraries\Alpha\StudioLibrary\Alpha-Library-DF191.sws" to asLibs[0]
+            Move (sConsumerDir + "ZLibConsumer.sws") to sConsumerSws
+            Send _WriteSws sConsumerSws "19.1" asLibs
+
+            Get _Inventory sConsumerSws "25.0" to aLibs
+            Send AssertIAreEqual 1 (SizeOfArray(aLibs))
+            Send Assert ((aLibs[0].sFolder contains "..") = False) ;
+                ("the resolved folder still carries '..': " + aLibs[0].sFolder)
+            Send Assert (Lowercase(aLibs[0].sFolder) contains Lowercase(sRoot + "Libraries\Alpha")) ;
+                ("resolved to the wrong folder: " + aLibs[0].sFolder)
+            // It still has to WORK, not merely look tidy - the .sws was found and read.
+            Send AssertSAreEqual "19.1" aLibs[0].sRefVersion
+
+            Move (rfDeleteFile(sConsumerSws)) to iVoid
+            Move (rfRemoveFolderTree(sConsumerDir)) to bOk
+            Send _RemoveFixture
+        End_Procedure
+
+        // Already on the target: no action, and the status says so rather than offering a repoint.
+        {Published = True}
+        Procedure LibraryInventory_MatchingTargetNeedsNoAction
+            tLibraryInfo[] aLibs
+            tLibraryInfo Alpha
+            String sMain
+            Get _BuildFixture to sMain
+            Get _Inventory sMain "19.1" to aLibs
+            Get _LibNamed aLibs "Alpha" to Alpha
+            Send Assert (Alpha.eStatus = eLibMatchesTarget)
+            Send _RemoveFixture
+        End_Procedure
+
+        /* No target version (no compiler picked yet) still LISTS the libraries - the dialog can show
+           what a workspace uses - but every verdict is eLibUnknown. A blank target must never be
+           read as "matches", which is the shape of bug that makes a board claim a clean state it
+           has no evidence for. */
+        {Published = True}
+        Procedure LibraryInventory_NoTargetListsButDoesNotJudge
+            tLibraryInfo[] aLibs
+            String sMain
+            Integer i iMax
+            Get _BuildFixture to sMain
+            Get _Inventory sMain "" to aLibs
+            Send AssertIAreEqual 2 (SizeOfArray(aLibs))
+            Move (SizeOfArray(aLibs) - 1) to iMax
+            For i from 0 to iMax
+                Send Assert (aLibs[i].eStatus = eLibUnknown) ("blank target produced a verdict for " + aLibs[i].sName)
+            Loop
+            Send _RemoveFixture
+        End_Procedure
+
+        // A workspace that does not exist, or one with no [Libraries] block, returns empty rather
+        // than erroring - the common case for a modern workspace.
+        {Published = True}
+        Procedure LibraryInventory_MissingOrLibraryLessWorkspaceIsEmpty
+            tLibraryInfo[] aLibs
+            String sRoot sSolo
+            String[] asNone
+            Boolean bOk
+            Integer iVoid
+            Get _Inventory "C:\NoSuchFolder\NoSuch.sws" "25.0" to aLibs
+            Send AssertIAreEqual 0 (SizeOfArray(aLibs))
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZLibSolo.sws") to sSolo
+            Send _WriteSws sSolo "25.0" asNone
+            Get _Inventory sSolo "25.0" to aLibs
+            Send AssertIAreEqual 0 (SizeOfArray(aLibs))
+            Move (rfDeleteFile(sSolo)) to iVoid
+        End_Procedure
+
+        /* Which SELECTED folders belong to a library - the pre-run warning's input.
+
+           Two traps, both real:
+             1. Alpha's .sws sits in a generic "StudioLibrary" container, exactly as vwin32fh's does,
+                while its packages live one level UP. Anchoring on the .sws folder would miss the
+                library's actual source entirely, so the match walks to the ROOT folder first.
+             2. "Libraries\AlphaExtra" is a different library. A plain prefix test without the
+                trailing separator would claim it as Alpha. */
+        {Published = True}
+        Procedure LibraryInventory_SelectedFoldersThatAreLibraries
+            Handle ho
+            String[] asSel asHit
+            String sMain sRoot
+
+            Get _BuildFixture to sMain
+            Get _LibTestRoot to sRoot
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            // The library ROOT, one level above the .sws - the vwin32fh shape.
+            Move (sRoot + "Libraries\Alpha") to asSel[0]
+            Get LibrariesInFolders of ho sMain (&asSel) to asHit
+            Send AssertIAreEqual 1 (SizeOfArray(asHit))
+            Send AssertSAreEqual "Alpha" asHit[0]
+
+            // A folder INSIDE the library counts too.
+            Move (ResizeArray(asSel, 0)) to asSel
+            Move (sRoot + "Libraries\Alpha\AppSrc") to asSel[0]
+            Get LibrariesInFolders of ho sMain (&asSel) to asHit
+            Send AssertIAreEqual 1 (SizeOfArray(asHit))
+
+            // A NEIGHBOUR whose name merely starts the same is not Alpha.
+            Move (ResizeArray(asSel, 0)) to asSel
+            Move (sRoot + "Libraries\AlphaExtra") to asSel[0]
+            Get LibrariesInFolders of ho sMain (&asSel) to asHit
+            Send AssertIAreEqual 0 (SizeOfArray(asHit))
+
+            // Both libraries, and each named once however many of its folders are picked.
+            Move (ResizeArray(asSel, 0)) to asSel
+            Move (sRoot + "Libraries\Alpha")        to asSel[0]
+            Move (sRoot + "Libraries\Alpha\AppSrc") to asSel[1]
+            Move (sRoot + "Libraries\Beta")         to asSel[2]
+            Move (sRoot + "AppSrc")                 to asSel[3]   // the workspace's own code
+            Get LibrariesInFolders of ho sMain (&asSel) to asHit
+            Send AssertIAreEqual 2 (SizeOfArray(asHit))
+
+            // Nothing selected under a library -> nothing to warn about.
+            Move (ResizeArray(asSel, 0)) to asSel
+            Move (sRoot + "AppSrc") to asSel[0]
+            Get LibrariesInFolders of ho sMain (&asSel) to asHit
+            Send AssertIAreEqual 0 (SizeOfArray(asHit))
+
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* The upstream-home catalog. Matching is on the library's FOLDER - the only stable
+           identifier - and it has two shapes that both have to keep working: a plain folder name
+           (exact), and SigCJ's version-carrying folders (prefix). An unknown library must return ""
+           rather than a guess: the report then lists it with no link, which is the honest outcome. */
+        {Published = True}
+        Procedure LibraryInventory_HomeUrlMatchesFolderShapes
+            Handle ho
+            String sUrl
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            Get LibraryHomeUrl of ho "vwin32fh" to sUrl
+            Send Assert (Pos("vdf-guidance.com", sUrl) > 0) sUrl
+            Get LibraryHomeUrl of ho "VWin32fh" to sUrl              // case-insensitive
+            Send Assert (Pos("vdf-guidance.com", sUrl) > 0) sUrl
+            // SigCJ folders carry their CodeJock version, so this one must match on the prefix.
+            Get LibraryHomeUrl of ho "SigCodejock Wrapper 18.2.0" to sUrl
+            Send Assert (Pos("subversion.asckey.co.uk", sUrl) > 0) sUrl
+            Get LibraryHomeUrl of ho "SigCodejock Classes v1" to sUrl
+            Send Assert (Pos("subversion.asckey.co.uk", sUrl) > 0) sUrl
+            Get LibraryHomeUrl of ho "DUF" to sUrl
+            Send AssertSAreEqual "https://github.com/NilsSve/Library-DUF" sUrl
+            Get LibraryHomeUrl of ho "RDCToolsLib" to sUrl
+            Send Assert (Pos("github.com/NilsSve", sUrl) > 0) sUrl
+            // VDFQuery's last release is the DF20 port - author-deprecated, nothing newer coming;
+            // the home is the NilsSve build, which ships no vwin32fh copy of its own (2026-09-05).
+            Get LibraryHomeUrl of ho "VDFQuery" to sUrl
+            Send Assert (Pos("github.com/NilsSve/VDFQuery20", sUrl) > 0) sUrl
+
+            // Not in the catalog -> no link, not a guess.
+            Get LibraryHomeUrl of ho "SomeCustomerLibrary" to sUrl
+            Send AssertSAreEqual "" sUrl
+            Get LibraryHomeUrl of ho "" to sUrl
+            Send AssertSAreEqual "" sUrl
+            Send Destroy of ho
+        End_Procedure
+
+        Function _Parse String sLine Returns String
+            Handle ho
+            String sOut
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get UsedPackageOnLine of ho sLine to sOut
+            Send Destroy of ho
+            Function_Return sOut
+        End_Function
+
+        /* THE USE-LINE PARSER - the one piece of the library-usage scan with real logic, and the
+           only piece testable without a workspace on disk (the rest is file I/O and a status panel).
+
+           The extension is normalised ON, so a bare "Use vWin32fh" and "Use vWin32fh.pkg" compare
+           equal against the library's actual filenames - the compiler assumes .pkg and the file
+           carries it, so the comparison stays filename-to-filename either way. A name that already
+           has an extension keeps exactly the one it has: RefactorConstants.h.pkg must not become
+           RefactorConstants.h.pkg.pkg. */
+        {Published = True}
+        Procedure LibUse_RecognisesTheRealForms
+            Send AssertSAreEqual "vwin32fh.pkg" (_Parse(Self, "Use vWin32fh.pkg"))
+            Send AssertSAreEqual "vwin32fh.pkg" (_Parse(Self, "use vwin32fh.pkg"))
+            Send AssertSAreEqual "vwin32fh.pkg" (_Parse(Self, "USE VWIN32FH.PKG"))
+            Send AssertSAreEqual "vwin32fh.pkg" (_Parse(Self, "Use vWin32fh"))
+            Send AssertSAreEqual "vwin32fh.pkg" (_Parse(Self, "    Use vWin32fh.pkg   // legacy file handling"))
+            Send AssertSAreEqual "vwin32fh.pkg" (_Parse(Self, 'Use "vWin32fh.pkg"'))
+            Send AssertSAreEqual "vwin32fh.pkg" (_Parse(Self, ("Use" + (Character(9)) + "vWin32fh.pkg")))
+            Send AssertSAreEqual "refactorconstants.h.pkg" (_Parse(Self, "Use RefactorConstants.h.pkg"))
+        End_Procedure
+
+        /* The look-alikes, which is the half that matters. A parser that says yes too often reports
+           files as depending on a library they never name, and the user opens them to find nothing
+           there - worse than no answer, because it is a confident wrong one. "Used" and "UseTheThing"
+           are what a bare Left(sLine, 3) test would swallow. */
+        {Published = True}
+        Procedure LibUse_RejectsTheLookAlikes
+            Send AssertSAreEqual "" (_Parse(Self, "// Use vWin32fh.pkg"))
+            Send AssertSAreEqual "" (_Parse(Self, "Used vWin32fh.pkg"))
+            Send AssertSAreEqual "" (_Parse(Self, "UseTheThing"))
+            Send AssertSAreEqual "" (_Parse(Self, "Use"))
+            Send AssertSAreEqual "" (_Parse(Self, "Use "))
+            Send AssertSAreEqual "" (_Parse(Self, ""))
+            Send AssertSAreEqual "" (_Parse(Self, "    "))
+            Send AssertSAreEqual "" (_Parse(Self, "Move sUse to sOther"))
+        End_Procedure
+
+        // The package set is read off disk, so this asserts what it can without one: a folder that is
+        // not there yields nothing rather than faulting. The matching itself is a SearchArray over
+        // these names, covered by the parser tests above.
+        {Published = True}
+        Procedure LibUse_MissingLibraryFolderYieldsNoPackages
+            Handle ho
+            String[] asNames
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get LibraryPackageNames of ho "C:\__no_such_library_folder__\" to asNames
+            Send Destroy of ho
+            Send AssertIAreEqual 0 (SizeOfArray(asNames))
+        End_Procedure
+
+        /* ---- THE WRITER: WriteSwsLibraryEntries -------------------------------------------------
+           The Library Maintenance dialog's OK lands here, so these tests are about a file the user
+           cannot afford to have damaged. Each one names the damage it is guarding against. */
+
+        // Reads a whole .sws back as lines, so a test can assert on the file's SHAPE and not only
+        // on what the section reader makes of it.
+        Function _ReadLines String sPath Returns String[]
+            Function_Return (rfReadEncodedFileAsStringArray(sPath))
+        End_Function
+
+        // Does asLines contain sWanted (exact, after trimming)?
+        Function _HasLine String[] asLines String sWanted Returns Boolean
+            Integer i iMax
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                If (Trim(Replaces(Character(13), asLines[i], "")) = sWanted) ;
+                    Function_Return True
+            Loop
+            Function_Return False
+        End_Function
+
+        /* The ordinary edit: a different set of libraries, RENUMBERED from 1, and everything
+           outside the section untouched.
+
+           Renumbering is not tidiness - the Studio reads Lib1, Lib2, Lib3 in sequence, so removing
+           the middle entry of three and leaving Lib1/Lib3 behind loses the last library silently. */
+        {Published = True}
+        Procedure LibWrite_ReplacesEntriesAndRenumbers
+            Handle ho
+            String sMain
+            String[] asNew asLines asEntries
+            Boolean bOk
+
+            Get _BuildFixture to sMain
+            Move "Libraries\Beta\BetaLibrary19.1.sws" to asNew[0]
+            Move "..\Shared\Gamma\GammaLibrary25.0.sws" to asNew[1]
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WriteSwsLibraryEntries of ho sMain asNew to bOk
+            Send Assert bOk "the writer refused an ordinary INI .sws"
+            Get SwsLibraryEntries of ho sMain to asEntries
+            Send Destroy of ho
+
+            Send AssertIAreEqual 2 (SizeOfArray(asEntries))
+            Send AssertSAreEqual "Libraries\Beta\BetaLibrary19.1.sws"   asEntries[0]
+            Send AssertSAreEqual "..\Shared\Gamma\GammaLibrary25.0.sws" asEntries[1]
+
+            Get _ReadLines sMain to asLines
+            Send Assert (_HasLine(Self, asLines, "Lib1=Libraries\Beta\BetaLibrary19.1.sws")) "not renumbered from 1"
+            Send Assert (_HasLine(Self, asLines, "Lib2=..\Shared\Gamma\GammaLibrary25.0.sws")) "second entry missing"
+            // Nothing outside [Libraries] may move: this is surgery on one section.
+            Send Assert (_HasLine(Self, asLines, "[Properties]")) "[Properties] lost"
+            Send Assert (_HasLine(Self, asLines, "Version=19.1")) "the workspace version was rewritten"
+            Send Assert (_HasLine(Self, asLines, "ConfigFile=.\config.ws")) "[WorkspacePaths] content lost"
+            Send _RemoveFixture
+        End_Procedure
+
+        /* Removing every library empties the section but KEEPS the header, so the file still states
+           "no libraries" and re-adding one needs no structural change. */
+        {Published = True}
+        Procedure LibWrite_EmptySetKeepsTheHeader
+            Handle ho
+            String sMain
+            String[] asNone asLines asEntries
+            Boolean bOk
+
+            Get _BuildFixture to sMain
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WriteSwsLibraryEntries of ho sMain asNone to bOk
+            Get SwsLibraryEntries of ho sMain to asEntries
+            Send Destroy of ho
+
+            Send Assert bOk "the writer refused an empty set"
+            Send AssertIAreEqual 0 (SizeOfArray(asEntries))
+            Get _ReadLines sMain to asLines
+            Send Assert (_HasLine(Self, asLines, "[Libraries]")) "the section header was removed with its last entry"
+            Send _RemoveFixture
+        End_Procedure
+
+        /* THE SILENT-FAILURE CASE, reproduced: a .sws with no [Libraries] header at all (found on
+           DataFolderSelector25.0.sws, where Lib1..Lib3 sat under [Projects] and the Studio never
+           loaded them - no error, just unresolved dependencies). Writing entries into such a file
+           must CREATE the header, or the tool reproduces the bug it exists to fix. */
+        {Published = True}
+        Procedure LibWrite_CreatesTheSectionHeaderWhenMissing
+            Handle ho
+            String sRoot sPath
+            String[] asLines asNew asNone asEntries
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZNoLibSection.sws") to sPath
+            Send _WriteSws sPath "19.1" asNone      // [Properties] + [WorkspacePaths], no [Libraries]
+
+            Move "Libraries\Beta\BetaLibrary19.1.sws" to asNew[0]
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WriteSwsLibraryEntries of ho sPath asNew to bOk
+            Get SwsLibraryEntries of ho sPath to asEntries
+            Send Destroy of ho
+
+            Send Assert bOk "the writer refused a .sws that has no [Libraries] section"
+            Get _ReadLines sPath to asLines
+            Send Assert (_HasLine(Self, asLines, "[Libraries]")) "no [Libraries] header written - the Studio would ignore the entry"
+            // Read back through the section reader: proves the header actually encloses the entry.
+            Send AssertIAreEqual 1 (SizeOfArray(asEntries))
+            Send AssertSAreEqual "Libraries\Beta\BetaLibrary19.1.sws" asEntries[0]
+            Move (rfDeleteFile(sPath)) to bOk
+        End_Procedure
+
+        /* A JSON .sws NEVER gets INI surgery - it is routed to the JSON writer instead, and the one
+           thing that must never happen is a "[Libraries]" block appended to a JSON document,
+           producing a file neither the Studio nor this tool can read.
+
+           This fixture has NO "dependencies" key at all, which is a legitimate workspace (one with
+           no libraries) and exercises the INSERT path: the key is added after the opening brace,
+           every existing member survives, and the document stays JSON.
+
+           (Until 2026-08-12 this asserted a flat refusal. That was the honest answer while nothing
+           could read a JSON workspace; now that cLibraryInventoryApp can, refusing would have left
+           the dialog able to show a list it could never save.) */
+        {Published = True}
+        Procedure LibWrite_JsonWorkspaceGainsADependenciesKeyNotAnIniSection
+            Handle ho
+            String sRoot sPath
+            String[] asLines asJson asNew
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZJson.sws") to sPath
+            Move '{'                       to asJson[0]
+            Move '  "df": 26.0,'           to asJson[1]
+            Move '  "projects": []'        to asJson[2]
+            Move '}'                       to asJson[3]
+            Get rfWriteEncodedFileFromStringArray (&asJson) sPath C_NewLine False to bOk
+
+            Move "Libraries\Beta\BetaLibrary19.1.sws" to asNew[0]
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WriteSwsLibraryEntries of ho sPath asNew to bOk
+            Send Destroy of ho
+
+            Send Assert bOk "the JSON writer refused a workspace that simply had no dependencies key"
+            Get _ReadLines sPath to asLines
+            // THE ONE THING THAT MUST NEVER HAPPEN.
+            Send Assert (_HasLine(Self, asLines, "[Libraries]") = False) "an INI section was appended to a JSON document"
+            // The key was inserted, with the entry escaped as JSON requires.
+            Send Assert (_HasLine(Self, asLines, '"dependencies": [')) "no dependencies key was inserted"
+            Send Assert (_HasLine(Self, asLines, '"Libraries\\Beta\\BetaLibrary19.1.sws"')) "the entry was not written, or not escaped"
+            Send Assert (_HasLine(Self, asLines, "],")) "the inserted array is not comma-separated from the next member"
+            // ...and every member that was already there is still there.
+            Send Assert (_HasLine(Self, asLines, '"df": 26.0,')) "an existing member was lost"
+            Send Assert (_HasLine(Self, asLines, '"projects": []')) "an existing member was lost"
+            Move (rfDeleteFile(sPath)) to bOk
+        End_Procedure
+
+        /* ---- RelativeLibraryEntry ----------------------------------------------------------------
+           How an entry is WRITTEN decides whether the workspace survives being copied. Pure string
+           work against a stated home, so no fixture. */
+        {Published = True}
+        Procedure LibWrite_RelativeEntryPrefersPortableForms
+            Handle ho
+            String s
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            // Inside home -> enclosed relative, which is what the Studio itself writes.
+            Get RelativeLibraryEntry of ho "C:\Proj\App\Libraries\vwin32fh\vWin32fh-Library-DF25.0.sws" "C:\Proj\App" to s
+            Send AssertSAreEqual "Libraries\vwin32fh\vWin32fh-Library-DF25.0.sws" s
+            // A trailing separator on home must not change the answer.
+            Get RelativeLibraryEntry of ho "C:\Proj\App\Libraries\Beta\BetaLibrary25.0.sws" "C:\Proj\App\" to s
+            Send AssertSAreEqual "Libraries\Beta\BetaLibrary25.0.sws" s
+
+            // BESIDE home - the shared-pool shape. "..\Libraries\X" resolves against a COPY of the
+            // workspace exactly as it did against the original, which is what makes the pool work.
+            Get RelativeLibraryEntry of ho "C:\Proj\Libraries\vwin32fh\vWin32fh-Library-DF25.0.sws" "C:\Proj\App" to s
+            Send AssertSAreEqual "..\Libraries\vwin32fh\vWin32fh-Library-DF25.0.sws" s
+
+            // Somewhere else entirely -> absolute, because nothing shorter would resolve.
+            Get RelativeLibraryEntry of ho "D:\Vendor\SigCJ\SigCj25.0.sws" "C:\Proj\App" to s
+            Send AssertSAreEqual "D:\Vendor\SigCJ\SigCj25.0.sws" s
+
+            // An un-normalised input still compares correctly - Windows opens "..\" happily, so
+            // this is exactly the shape that fails every prefix test while looking right.
+            Get RelativeLibraryEntry of ho "C:\Proj\App\..\Libraries\Beta\BetaLibrary25.0.sws" "C:\Proj\App" to s
+            Send AssertSAreEqual "..\Libraries\Beta\BetaLibrary25.0.sws" s
+            Send Destroy of ho
+        End_Procedure
+
+        /* ---- THE JSON .sws WRITER ---------------------------------------------------------------
+           Shaped on a REAL df-cli-converted workspace (E:\WinServ, 2026-08-12): forward-slash
+           relative paths, "df" as a bare number, and a "studio" block carrying the class
+           preferences. That last one is the point of the whole design - a parse-and-restringify
+           would drop everything tSwsFile does not model, and preferredClasses is exactly that.
+
+           NOTE these fixtures only exercise the WRITER, which is pure text surgery in the base
+           class. Reading a JSON .sws needs cJsonObject via cLibraryInventoryApp, which lives in the
+           FT application and is out of the console runner's reach by design. */
+        Procedure _WriteJsonSws String sPath String sDeps
+            String[] asLines
+            Boolean bOk
+
+            Move '{'                                             to asLines[0]
+            Move '    "dependencies": ['                         to asLines[1]
+            Move ('        ' + sDeps)                            to asLines[2]
+            Move '    ],'                                        to asLines[3]
+            Move '    "df": 19.1,'                               to asLines[4]
+            Move '    "paths": {'                                to asLines[5]
+            Move '        "configFile": "Programs/WinServ.ws"'   to asLines[6]
+            Move '    },'                                        to asLines[7]
+            Move '    "studio": {'                               to asLines[8]
+            Move '        "preferredClasses": {'                 to asLines[9]
+            Move '            "dbList": {'                       to asLines[10]
+            Move '                "class": "cTrDbList",'       to asLines[11]
+            Move '                "file": "VDFTranslator.pkg"'   to asLines[12]
+            Move '            }'                                 to asLines[13]
+            Move '        }'                                     to asLines[14]
+            Move '    }'                                         to asLines[15]
+            Move '}'                                             to asLines[16]
+            Get rfWriteEncodedFileFromStringArray (&asLines) sPath C_NewLine False to bOk
+            Send Assert bOk ("could not write JSON fixture " + sPath)
+        End_Procedure
+
+        /* The array is spliced and NOTHING ELSE MOVES - which is the whole reason this is text
+           surgery rather than a round trip through tSwsFile. The class preferences are the witness:
+           they live in the .sws ([[reference_sws_class_preferences]]), tSwsFile models them only
+           partly, and a re-serialise would silently rewrite or lose them. */
+        {Published = True}
+        Procedure LibWriteJson_SplicesDependenciesAndLeavesTheRestAlone
+            Handle ho
+            String sRoot sPath
+            String[] asNew asLines
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZJsonWrite.sws") to sPath
+            Send _WriteJsonSws sPath '"../WebAppSrc/StudioLibrary/WebAppSrc-Library-DF250.sws"'
+
+            Move "Libraries/Beta/BetaLibrary25.0.sws" to asNew[0]
+            Move "C:\Shared\Alpha\Alpha-Library-DF260.sws" to asNew[1]
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WriteSwsLibraryEntries of ho sPath asNew to bOk
+            Send Destroy of ho
+            Send Assert bOk "the JSON writer refused an ordinary df-cli workspace"
+
+            Get _ReadLines sPath to asLines
+            Send Assert (_HasLine(Self, asLines, '"dependencies": [')) "the key line was not rewritten in place"
+            Send Assert (_HasLine(Self, asLines, '"Libraries/Beta/BetaLibrary25.0.sws",')) "first entry missing or not comma-separated"
+            // A WINDOWS PATH MUST BE ESCAPED: "C:\Shared" carries \S, an invalid JSON escape, and an
+            // unescaped entry stops the whole document parsing.
+            Send Assert (_HasLine(Self, asLines, '"C:\\Shared\\Alpha\\Alpha-Library-DF260.sws"')) "backslashes were not escaped"
+            // ...and the LAST entry carries no trailing comma.
+            Send Assert (_HasLine(Self, asLines, '"C:\\Shared\\Alpha\\Alpha-Library-DF260.sws",') = False) "trailing comma after the last entry"
+            // The closing bracket keeps the comma it had - "dependencies" is not the last member.
+            Send Assert (_HasLine(Self, asLines, "],")) "the closing bracket lost its comma"
+            // EVERYTHING ELSE IS UNTOUCHED - the class preferences above all.
+            Send Assert (_HasLine(Self, asLines, '"df": 19.1,')) "the df version was rewritten"
+            Send Assert (_HasLine(Self, asLines, '"configFile": "Programs/WinServ.ws"')) "paths lost"
+            Send Assert (_HasLine(Self, asLines, '"class": "cTrDbList",')) "the Studio class preferences were lost"
+            Send Assert (_HasLine(Self, asLines, '"file": "VDFTranslator.pkg"')) "the class preference file was lost"
+            Send Assert (_HasLine(Self, asLines, '"preferredClasses": {')) "the preferredClasses block was lost"
+            Move (rfDeleteFile(sPath)) to bOk
+        End_Procedure
+
+        // Removing every library empties the array rather than deleting the key, and keeps the
+        // comma - an empty "dependencies" is a legal and readable statement of "none".
+        {Published = True}
+        Procedure LibWriteJson_EmptySetLeavesAnEmptyArray
+            Handle ho
+            String sRoot sPath
+            String[] asNone asLines
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZJsonEmpty.sws") to sPath
+            Send _WriteJsonSws sPath '"../WebAppSrc/StudioLibrary/WebAppSrc-Library-DF250.sws"'
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WriteSwsLibraryEntries of ho sPath asNone to bOk
+            Send Destroy of ho
+            Send Assert bOk "the JSON writer refused an empty set"
+
+            Get _ReadLines sPath to asLines
+            Send Assert (_HasLine(Self, asLines, '"dependencies": [],')) "an emptied array was not written as []"
+            Send Assert (_HasLine(Self, asLines, '"df": 19.1,')) "the rest of the document moved"
+            Move (rfDeleteFile(sPath)) to bOk
+        End_Procedure
+
+        /* A GIT / CLOUD DEPENDENCY IS CARRIED THROUGH - it used to be REFUSED (2026-08-14).
+
+           This test asserted the opposite until Nils met the consequence: his converted WinServ.sws
+           has two git packages, so every library edit reported "not saved" and the dialog could do
+           nothing at all with that workspace. Refusing protected the packages by making the feature
+           useless on exactly the workspaces DF26 produces.
+
+           The name is kept deliberately close to what it was, so anyone bisecting to this commit
+           lands on the test whose EXPECTATION changed rather than wondering where it went.
+
+           Asserted on content, not on line count or exact indentation: the writer legitimately
+           re-indents the element to the array it is rebuilding, and a test that pins whitespace
+           fails for reasons nobody cares about. */
+        {Published = True}
+        Procedure LibWriteJson_CarriesAnObjectDependencyThrough
+            Handle ho
+            String sRoot sPath sAll
+            String[] asNew asAfter
+            Integer i iMax
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZJsonGit.sws") to sPath
+            Send _WriteJsonSws sPath '{ "source": "https://github.com/x/y", "version": "1.2" }'
+
+            Move "Libraries/Beta/BetaLibrary25.0.sws" to asNew[0]
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WriteSwsLibraryEntries of ho sPath asNew to bOk
+            Send Destroy of ho
+            Send Assert bOk "the writer still refuses an array holding a git/cloud dependency"
+
+            Get _ReadLines sPath to asAfter
+            Move "" to sAll
+            Move (SizeOfArray(asAfter) - 1) to iMax
+            For i from 0 to iMax
+                Move (sAll + asAfter[i] + Character(10)) to sAll
+            Loop
+            Send Assert (Pos('"source": "https://github.com/x/y"', sAll) > 0) ;
+                "the object dependency was dropped by the write"
+            Send Assert (Pos('"version": "1.2"', sAll) > 0) ;
+                "the object dependency lost its pinned version"
+            Send Assert (Pos("Libraries/Beta/BetaLibrary25.0.sws", sAll) > 0) ;
+                "the new path entry was not written"
+            Move (rfDeleteFile(sPath)) to bOk
+        End_Procedure
+
+        /* ---- WorkspaceLibraryEntries: the DANGLING entry --------------------------------------
+           THE UNDERCOUNT, pinned. WorkspaceLibraryInventory keeps only entries whose .sws resolves,
+           so a workspace declaring three libraries with one missing described itself as two - and
+           the tile, the row list and the footer all agreed with each other while disagreeing with
+           the file. Only the ALL-missing case was ever caught (2026-08-05).
+
+           Both functions are asserted in one scene, because the point is that they DIFFER: the full
+           list is what a screen shows, the filtered one is what a caller needing a readable .sws
+           gets, and each is wrong in the other's job. */
+        {Published = True}
+        Procedure LibraryEntries_KeepsTheEntryWhoseSwsIsMissing
+            tLibraryInfo[] aAll aFound
+            Handle ho
+            String sMain sRoot
+            String[] asLibs
+            Boolean bOk
+            Integer i iMax iGone
+
+            Get _LibTestRoot to sRoot
+            Get _BuildFixture to sMain
+            // Rewrite the fixture's [Libraries] with a THIRD entry pointing at nothing.
+            Move "Libraries\Alpha\StudioLibrary\Alpha-Library-DF191.sws" to asLibs[0]
+            Move "Libraries\Gone\GhostLibrary25.0.sws"                   to asLibs[1]
+            Move "Libraries\Beta\BetaLibrary19.1.sws"                    to asLibs[2]
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WriteSwsLibraryEntries of ho sMain asLibs to bOk
+            Send Assert bOk "could not rewrite the fixture [Libraries]"
+
+            Get WorkspaceLibraryEntries of ho sMain "25.0" to aAll
+            Get WorkspaceLibraryInventory of ho sMain "25.0" to aFound
+            Send Destroy of ho
+
+            // EVERY declared entry, in file order - three of them, the middle one missing.
+            Send AssertIAreEqual 3 (SizeOfArray(aAll))
+            Send Assert (aAll[1].bFound = False) "the missing entry was not flagged"
+            Send Assert (aAll[1].eStatus = eLibNotFound) "a missing entry got a target verdict instead of eLibNotFound"
+            Send AssertSAreEqual "Libraries\Gone\GhostLibrary25.0.sws" aAll[1].sRawEntry
+            // Named from its own file stem - the folder cannot be asked, it is not there either.
+            Send AssertSAreEqual "GhostLibrary25.0.sws" aAll[1].sName
+            // Nothing is GUESSED for a row that could not be read.
+            Send AssertSAreEqual "" aAll[1].sRefVersion
+            Send AssertIAreEqual 0 (SizeOfArray(aAll[1].asAvailVersions))
+            // sRefSwsFile still carries where it RESOLVED to - that path is the diagnosis.
+            Send Assert (Pos("Gone", aAll[1].sRefSwsFile) > 0) ("resolved path lost: " + aAll[1].sRefSwsFile)
+            // The found rows carry their raw entry too, so a screen can show what the file says.
+            Send Assert (aAll[0].bFound = True) "a present library was flagged missing"
+            Send AssertSAreEqual "Libraries\Alpha\StudioLibrary\Alpha-Library-DF191.sws" aAll[0].sRawEntry
+
+            // ...and the FILTERED view is unchanged for the callers that need a readable .sws.
+            Send AssertIAreEqual 2 (SizeOfArray(aFound))
+            Move 0 to iGone
+            Move (SizeOfArray(aFound) - 1) to iMax
+            For i from 0 to iMax
+                If (aFound[i].bFound = False) ;
+                    Increment iGone
+            Loop
+            Send AssertIAreEqual 0 iGone
+            Send _RemoveFixture
+        End_Procedure
+
+        /* ---- DF26 DEPENDENCY CLASSIFICATION ------------------------------------------------------
+           Under DF26 the "dependencies" array is a UNION and only one shape is a path. Treating a
+           DataFlex system package as one is how "DataFlex-dev/Web UI FlexTron#1.0.51" rendered as a red
+           "not found - nothing is at that path". Strings taken verbatim from a real DF26 workspace
+           (C:\DataFlex 26.0 Examples\FlexTron) and from E:\WinServ. */
+        {Published = True}
+        Procedure LibDep_PackagesAndPathsAreToldApart
+            Handle ho
+            Integer e
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            // PACKAGES - "<repo>/<Name>#<version>", spaces are ordinary in the name.
+            Get DependencyKind of ho "DataFlex-dev/Web UI FlexTron#1.0.51" to e
+            Send Assert (e = eDepPackage) "a DataFlex system package was read as a path"
+            Get DependencyKind of ho "DataFlex-dev/DataFlex Reports Material Theme#26.0.1" to e
+            Send Assert (e = eDepPackage) "a package name with spaces was read as a path"
+            // A package with no pinned version is still a package.
+            Get DependencyKind of ho "DataFlex-dev/Web UI" to e
+            Send Assert (e = eDepPackage) "an unpinned package was read as a path"
+
+            /* PATHS - every INI [Libraries] entry, and the path form of a JSON dependency. The .sws
+               suffix is decisive and is tested FIRST, so a forward-slash relative path can never be
+               mistaken for a repo/name pair. */
+            Get DependencyKind of ho "../WebAppSrc/StudioLibrary/WebAppSrc-Library-DF250.sws" to e
+            Send Assert (e = eDepPath) "the JSON path form was read as a package"
+            Get DependencyKind of ho "Libraries\Beta\BetaLibrary19.1.sws" to e
+            Send Assert (e = eDepPath) "an INI relative entry was read as a package"
+            Get DependencyKind of ho "..\vwin32fh\StudioLibrary\vWin32fh-Library-DF191.sws" to e
+            Send Assert (e = eDepPath) "an INI parent-relative entry was read as a package"
+            Get DependencyKind of ho "C:\Shared\Alpha\Alpha-Library-DF260.sws" to e
+            Send Assert (e = eDepPath) "an absolute path was read as a package"
+            Get DependencyKind of ho "\\server\share\X.sws" to e
+            Send Assert (e = eDepPath) "a UNC path was read as a package"
+            // Nothing recognisable falls back to PATH - the pre-DF26 behaviour, and the safe
+            // direction: a misread package is an odd row, a misread path stops resolving a library.
+            Get DependencyKind of ho "SomethingOdd" to e
+            Send Assert (e = eDepPath) "an unrecognisable entry did not fall back to a path"
+            Get DependencyKind of ho "" to e
+            Send Assert (e = eDepPath) "an empty entry did not fall back to a path"
+            Send Destroy of ho
+        End_Procedure
+
+        // Splitting a package string, and deriving where df-cli caches it. The folder mangling was
+        // read off real cache entries: "-" and " " fold to "_" in both halves.
+        {Published = True}
+        Procedure LibDep_PackageStringSplitsAndLocates
+            Handle ho
+            String s
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            Get PackageRepository of ho "DataFlex-dev/Web UI FlexTron#1.0.51" to s
+            Send AssertSAreEqual "DataFlex-dev" s
+            Get PackageName of ho "DataFlex-dev/Web UI FlexTron#1.0.51" to s
+            Send AssertSAreEqual "Web UI FlexTron" s
+            Get PackageVersion of ho "DataFlex-dev/Web UI FlexTron#1.0.51" to s
+            Send AssertSAreEqual "1.0.51" s
+            // Unpinned: a name, and no version invented for it.
+            Get PackageName of ho "DataFlex-dev/Web UI" to s
+            Send AssertSAreEqual "Web UI" s
+            Get PackageVersion of ho "DataFlex-dev/Web UI" to s
+            Send AssertSAreEqual "" s
+
+            // "DataFlex-dev/Web UI FlexTron#1.0.44" -> ...\Cache\DataFlex_dev_Web_UI_FlexTron-1.0.44\
+            Get PackageCacheFolder of ho "DataFlex-dev/Web UI FlexTron#1.0.44" to s
+            Send Assert (Pos("DataFlex_dev_Web_UI_FlexTron-1.0.44", s) > 0) ("cache folder not derived: " + s)
+            Send Assert (Pos("DataFlex\Packages\Cache\", s) > 0) ("cache root wrong: " + s)
+            // A real multi-word one, checked against an entry that exists on disk.
+            Get PackageCacheFolder of ho "DataFlex-dev/DataFlex Reports Web Shared#26.0.10" to s
+            Send Assert (Pos("DataFlex_dev_DataFlex_Reports_Web_Shared-26.0.10", s) > 0) ("cache folder not derived: " + s)
+            // No pinned version -> no derivable folder, and none guessed at.
+            Get PackageCacheFolder of ho "DataFlex-dev/Web UI" to s
+            Send AssertSAreEqual "" s
+            Send Destroy of ho
+        End_Procedure
+
+        /* A package entry never resolves as a path. This is the bug the classification exists to
+           prevent: the row must not come back bFound=False pointing at a phantom file under the
+           workspace home. */
+        {Published = True}
+        Procedure LibDep_PackageEntryIsNotResolvedAsAPath
+            tLibraryInfo[] aInfo
+            Handle ho
+            String[] asRaw
+
+            Move "DataFlex-dev/Web UI FlexTron#1.0.51" to asRaw[0]
+            Move "Libraries\Beta\BetaLibrary19.1.sws"  to asRaw[1]
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get LibraryEntriesInfo of ho (&asRaw) "C:\NoSuchWorkspace\" "26.0" to aInfo
+            Send Destroy of ho
+
+            Send AssertIAreEqual 2 (SizeOfArray(aInfo))
+            // The package: named, version taken from the ENTRY, and never given a target verdict.
+            Send Assert (aInfo[0].eKind = eDepPackage) "the package row was not classified"
+            Send AssertSAreEqual "Web UI FlexTron" aInfo[0].sName
+            Send AssertSAreEqual "1.0.51" aInfo[0].sRefVersion
+            Send Assert (aInfo[0].eStatus = eLibPackage) "a package was judged against the target"
+            // The thing that used to go wrong: it must NOT be pointing at a made-up path.
+            Send Assert (Pos("NoSuchWorkspace", aInfo[0].sRefSwsFile) = 0) ("a package was resolved against the workspace home: " + aInfo[0].sRefSwsFile)
+            // The path entry beside it is untouched by any of this.
+            Send Assert (aInfo[1].eKind = eDepPath) "a path entry was reclassified"
+            Send Assert (aInfo[1].eStatus = eLibNotFound) "the path entry lost its own verdict"
+        End_Procedure
+
+        /* ---- A PACKAGE'S df-min / df-max RANGE ---------------------------------------------------
+           A package's own claim about which DataFlex releases it supports - the only sound basis
+           for judging one, since everything else this class reads describes a .sws file and a
+           package is not one. Shapes taken from a real cached manifest
+           (DataFlex-dev/Web UI FlexTron: df-min 26.0, df-max 26.0). */
+        {Published = True}
+        Procedure LibPkg_RangeDecidesCompatibility
+            Handle ho
+            Boolean b
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            // The real case: a package pinned to one release.
+            Get VersionInRange of ho "26.0" "26.0" "26.0" to b
+            Send Assert (b = True) "a package pinned to 26.0 rejected a 26.0 target"
+            Get VersionInRange of ho "25.0" "26.0" "26.0" to b
+            Send Assert (b = False) "a 25.0 target was accepted by a 26.0-only package"
+            Get VersionInRange of ho "27.0" "26.0" "26.0" to b
+            Send Assert (b = False) "a target above df-max was accepted"
+
+            // A span, inclusive at BOTH ends - the point of a max is to include what it names.
+            Get VersionInRange of ho "25.0" "25.0" "26.0" to b
+            Send Assert (b = True) "the lower bound was treated as exclusive"
+            Get VersionInRange of ho "26.0" "25.0" "26.0" to b
+            Send Assert (b = True) "the upper bound was treated as exclusive"
+
+            /* AN ABSENT END IS NO BOUND, not zero. A package stating only df-min supports
+               everything from there on, and reading the missing end as 0 would make every such
+               package look capped at nothing. */
+            Get VersionInRange of ho "26.0" "25.0" "" to b
+            Send Assert (b = True) "an open upper bound was treated as a limit"
+            Get VersionInRange of ho "24.0" "25.0" "" to b
+            Send Assert (b = False) "df-min stopped applying once df-max was absent"
+            Get VersionInRange of ho "19.1" "" "26.0" to b
+            Send Assert (b = True) "an open lower bound was treated as a limit"
+
+            // Numeric, not textual - "9.0" sorts ABOVE "19.1" as text.
+            Get VersionInRange of ho "9.0" "19.1" "26.0" to b
+            Send Assert (b = False) "the range compared as text"
+
+            /* NO RANGE IS NOT A REFUSAL. HasVersionRange is what tells the two apart, and the
+               caller must ask it first - a package that has not said is not one that has said no. */
+            Get HasVersionRange of ho "" "" to b
+            Send Assert (b = False) "an empty range was reported as usable"
+            Get HasVersionRange of ho "26.0" "" to b
+            Send Assert (b = True) "a df-min-only range was reported as unusable"
+            Get HasVersionRange of ho "" "26.0" to b
+            Send Assert (b = True) "a df-max-only range was reported as unusable"
+            // An unreadable target cannot be placed in any range.
+            Get VersionInRange of ho "" "25.0" "26.0" to b
+            Send Assert (b = False) "a blank target was placed inside a range"
+            Send Destroy of ho
+        End_Procedure
+
+        /* ---- THE LIBRARY CHAIN ------------------------------------------------------------------
+           Built to the shape found on E:\WinServ 2026-08-12, which is the whole reason the walk
+           exists: a workspace declaring ONE library whose header says 25.0 while every library IT
+           declares is on 19.1. Every visible row read fine and the build would have pulled 19.1
+           library code into DataFlex 26. */
+        Function _BuildChainFixture Returns String
+            String sRoot sMid sLeafA sLeafB sMain
+            String[] asMid asMain asNone
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (sRoot + "Chain\Mid\") to sMid
+            Move (sRoot + "Chain\LeafA\") to sLeafA
+            Move (sRoot + "Chain\LeafB\") to sLeafB
+            Move (rfDirectoryCreateEx(sMid, False)) to bOk
+            Move (rfDirectoryCreateEx(sLeafA, False)) to bOk
+            Move (rfDirectoryCreateEx(sLeafB, False)) to bOk
+
+            // Two leaves, both left behind on 19.1, neither declaring anything of its own.
+            Send _WriteSws (sLeafA + "LeafA-Library-DF191.sws") "19.1" asNone
+            Send _WriteSws (sLeafB + "LeafB-Library-DF191.sws") "19.1" asNone
+            // The middle library: a 25.0 HEADER over a 19.1 chain - the WinServ shape exactly.
+            Move "..\LeafA\LeafA-Library-DF191.sws" to asMid[0]
+            Move "..\LeafB\LeafB-Library-DF191.sws" to asMid[1]
+            Send _WriteSws (sMid + "Mid-Library-DF250.sws") "25.0" asMid
+            // The workspace, which sees ONE library and calls it 25.0.
+            Move "Chain\Mid\Mid-Library-DF250.sws" to asMain[0]
+            Move (sRoot + "ZChainMain.sws") to sMain
+            Send _WriteSws sMain "19.1" asMain
+            Function_Return sMain
+        End_Function
+
+        Procedure _RemoveChainFixture
+            String sRoot
+            Integer iVoid
+            Get _LibTestRoot to sRoot
+            Move (rfDeleteFile(sRoot + "Chain\LeafA\LeafA-Library-DF191.sws")) to iVoid
+            Move (rfDeleteFile(sRoot + "Chain\LeafB\LeafB-Library-DF191.sws")) to iVoid
+            Move (rfDeleteFile(sRoot + "Chain\Mid\Mid-Library-DF250.sws")) to iVoid
+            Move (rfDeleteFile(sRoot + "ZChainMain.sws")) to iVoid
+        End_Procedure
+
+        /* The chain is walked, ordered parent-then-children, and the ROLL-UP on the parent is what
+           makes its "25.0" honest. Without these fields the workspace shows one tidy row. */
+        {Published = True}
+        Procedure LibChain_RollsUpAVersionHeaderOverAnOlderChain
+            tLibraryInfo[] aTree aFlat
+            Handle ho
+            String sMain
+
+            Get _BuildChainFixture to sMain
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WorkspaceLibraryTree of ho sMain "26.0" 4 to aTree
+            Get WorkspaceLibraryEntries of ho sMain "26.0" to aFlat
+            Send Destroy of ho
+
+            // THE FLAT READER IS UNCHANGED - one row, the workspace's own. The two callers that
+            // rewrite entries depend on that and would break silently if the chain leaked in.
+            Send AssertIAreEqual 1 (SizeOfArray(aFlat))
+
+            // The tree: parent first, then its two children, in declaration order.
+            Send AssertIAreEqual 3 (SizeOfArray(aTree))
+            Send AssertIAreEqual 0 aTree[0].iDepth
+            Send AssertSAreEqual "Mid" aTree[0].sName
+            Send AssertIAreEqual 1 aTree[1].iDepth
+            Send AssertIAreEqual 1 aTree[2].iDepth
+            // A child names the library that declares it, not the workspace.
+            Send AssertSAreEqual "Mid" aTree[1].sDeclaredBy
+            Send AssertSAreEqual "" aTree[0].sDeclaredBy
+
+            /* THE ROLL-UP. The parent declares 25.0; both of its own libraries are 19.1, so both
+               are behind IT - which is true regardless of what the workspace is migrating to, and
+               is the signal that the header was bumped without its chain. */
+            Send AssertSAreEqual "25.0" aTree[0].sRefVersion
+            Send AssertIAreEqual 2 aTree[0].iChainCount
+            Send AssertIAreEqual 2 aTree[0].iChainBehind
+            Send AssertSAreEqual "19.1" aTree[0].sChainOldest
+            // A leaf declares nothing, and must not claim otherwise.
+            Send AssertIAreEqual 0 aTree[1].iChainCount
+            Send AssertIAreEqual 0 aTree[1].iChainBehind
+            Send _RemoveChainFixture
+            Send _RemoveFixture
+        End_Procedure
+
+        /* The GLOBAL wrapper is the class method and nothing else.
+
+           WorkspaceLibraryChain exists so a caller that has no inventory object can ask the
+           question in one line, WITHOUT the logic moving onto cRefactorApplication - where the
+           console runner could not reach it and this very test could not exist (Nils 2026-08-14).
+
+           Asserted against the class method rather than against hard-coded rows, so the two cannot
+           drift: the wrapper's whole contract is "same answer, less ceremony".
+
+           The size assertion earns its place - a struct ARRAY does marshal out of a global function
+           while a BARE struct silently does not, and this file's cousins have been bitten by that
+           often enough to check rather than assume. */
+        {Published = True}
+        Procedure LibChain_GlobalWrapperMatchesTheClassMethod
+            tLibraryInfo[] aViaClass aViaGlobal
+            Handle ho
+            String sMain
+            Integer i iMax
+
+            Get _BuildChainFixture to sMain
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WorkspaceLibraryTree of ho sMain "26.0" CI_LibraryTreeMaxDepth to aViaClass
+            Send Destroy of ho
+            Get WorkspaceLibraryChain sMain "26.0" to aViaGlobal
+
+            Send Assert (SizeOfArray(aViaGlobal) > 0) ;
+                "the wrapper returned an empty array - a struct array must marshal out of a global function"
+            Send AssertIAreEqual (SizeOfArray(aViaClass)) (SizeOfArray(aViaGlobal))
+            Move (SizeOfArray(aViaClass) - 1) to iMax
+            For i from 0 to iMax
+                Send AssertSAreEqual aViaClass[i].sName        aViaGlobal[i].sName
+                Send AssertIAreEqual aViaClass[i].iDepth       aViaGlobal[i].iDepth
+                Send AssertSAreEqual aViaClass[i].sRefSwsFile  aViaGlobal[i].sRefSwsFile
+                Send Assert (aViaClass[i].bFound = aViaGlobal[i].bFound) "bFound differs between wrapper and class"
+            Loop
+            Send _RemoveChainFixture
+            Send _RemoveFixture
+        End_Procedure
+
+        /* A CYCLE TERMINATES. A library declaring something already visited - itself, an ancestor,
+           or a sibling reached twice - must not walk forever, and the guard is on the RESOLVED path
+           so one file named two ways is still one file. */
+        {Published = True}
+        Procedure LibChain_CycleTerminates
+            tLibraryInfo[] aTree
+            Handle ho
+            String sRoot sMain sMid
+            String[] asMid asMain
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (sRoot + "Chain\Mid\") to sMid
+            Move (rfDirectoryCreateEx(sMid, False)) to bOk
+            // Mid declares ITSELF - the tightest cycle there is.
+            Move "Mid-Library-DF250.sws" to asMid[0]
+            Send _WriteSws (sMid + "Mid-Library-DF250.sws") "25.0" asMid
+            Move "Chain\Mid\Mid-Library-DF250.sws" to asMain[0]
+            Move (sRoot + "ZCycleMain.sws") to sMain
+            Send _WriteSws sMain "19.1" asMain
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WorkspaceLibraryTree of ho sMain "26.0" 4 to aTree
+            Send Destroy of ho
+
+            // The self-reference is listed ONCE beneath its parent and not descended into again.
+            Send AssertIAreEqual 2 (SizeOfArray(aTree))
+            Send AssertIAreEqual 0 aTree[0].iDepth
+            Send AssertIAreEqual 1 aTree[1].iDepth
+            Move (rfDeleteFile(sMid + "Mid-Library-DF250.sws")) to bOk
+            Move (rfDeleteFile(sMain)) to bOk
+        End_Procedure
+
+        /* ---- IsVersionBelow -----------------------------------------------------------------------
+           Drives the amber in the Library Maintenance dialog's Version column, so a wrong answer
+           here is a wrong colour on a row the user acts on. */
+        {Published = True}
+        Procedure LibVersion_BelowTargetComparesNumerically
+            Handle ho
+            Boolean b
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            // The ordinary case, both directions.
+            Get IsVersionBelow of ho "19.1" "25.0" to b
+            Send Assert (b = True) "19.1 is not reported as below 25.0"
+            Get IsVersionBelow of ho "26.0" "25.0" to b
+            Send Assert (b = False) "26.0 reported as below 25.0"
+            // Equal is NOT behind - the row that is already right must not be flagged.
+            Get IsVersionBelow of ho "25.0" "25.0" to b
+            Send Assert (b = False) "a library AT the target was flagged as behind"
+            // Same major, older minor.
+            Get IsVersionBelow of ho "19.0" "19.1" to b
+            Send Assert (b = True) "19.0 is not reported as below 19.1"
+
+            /* THE REASON THIS IS NOT A STRING COMPARE. "9.0" sorts ABOVE "19.1" as text, so a
+               single-digit-era copy - precisely the one most in need of the flag - would be
+               reported as up to date. */
+            Get IsVersionBelow of ho "9.0" "19.1" to b
+            Send Assert (b = True) "9.0 vs 19.1 compared as text - the oldest copies would read as current"
+
+            // DFUnit ships the sentinel Version=99.0. Ahead is not behind, so it needs no guard.
+            Get IsVersionBelow of ho "99.0" "26.0" to b
+            Send Assert (b = False) "the 99.0 sentinel was flagged as behind"
+
+            /* NO ANSWER IS NEVER "BEHIND". A blank version, a blank target or something unparseable
+               must not colour a row - a claim about the user's workspace made on a number nobody
+               could read is a guess wearing a fact's clothes. */
+            Get IsVersionBelow of ho "" "25.0" to b
+            Send Assert (b = False) "a blank version was called behind"
+            Get IsVersionBelow of ho "19.1" "" to b
+            Send Assert (b = False) "a blank target produced a verdict"
+            Get IsVersionBelow of ho "unknown" "25.0" to b
+            Send Assert (b = False) "an unparseable version was called behind"
+
+            // Trailing noise on an otherwise readable version still compares.
+            Get IsVersionBelow of ho "24.0 RC1" "25.0" to b
+            Send Assert (b = True) "a version with trailing text became unreadable"
+            // A bare major with no minor reads as x.0.
+            Get IsVersionBelow of ho "24" "25.0" to b
+            Send Assert (b = True) "a version with no minor part became unreadable"
+            Send Destroy of ho
+        End_Procedure
+
+        /* A GIT DEPENDENCY SURVIVES A LIBRARY EDIT (Nils 2026-08-14).
+
+           The shape is his converted WinServ.sws: one path string followed by two object-form git
+           packages. Removing the path used to be REFUSED outright - the writer saw a brace in the
+           array and declined rather than delete a package it could not rebuild - so the Libraries
+           dialog could not save that workspace at all.
+
+           Three things are asserted, and the third is the one that matters: the write succeeds, the
+           path list is what was asked for, and the two objects are still there with their source,
+           sws and version intact. A writer that "succeeds" by quietly dropping the packages would
+           pass the first two.
+
+           Read back through SwsLibraryEntries and the JSON reader rather than by comparing text, so
+           the test says the FILE is still a workspace, not merely that some bytes were preserved. */
+        {Published = True}
+        Procedure Test_JsonWrite_KeepsGitDependencies
+            Handle ho
+            String sRoot sPath sAll
+            String[] asJson asNew asLines
+            Integer i iMax
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZGitDeps.sws") to sPath
+            Move '{'                                                             to asJson[0]
+            Move '    "dependencies": ['                                         to asJson[1]
+            Move '        "../Alpha/AlphaLibrary19.1.sws",'                      to asJson[2]
+            Move '        {'                                                     to asJson[3]
+            Move '            "source": "https://example.invalid/Thing.git",'   to asJson[4]
+            Move '            "sws": "Thing.sws",'                               to asJson[5]
+            Move '            "version": "abc123"'                               to asJson[6]
+            Move '        },'                                                    to asJson[7]
+            Move '        {'                                                     to asJson[8]
+            Move '            "source": "https://example.invalid/Other.git",'   to asJson[9]
+            Move '            "sws": "Sub/Other-Library-DF250.sws",'              to asJson[10]
+            Move '            "version": "def456"'                               to asJson[11]
+            Move '        }'                                                     to asJson[12]
+            Move '    ],'                                                        to asJson[13]
+            Move '    "df": 26.0,'                                               to asJson[14]
+            Move '    "projects": []'                                            to asJson[15]
+            Move '}'                                                             to asJson[16]
+            Get rfWriteEncodedFileFromStringArray (&asJson) sPath C_NewLine False to bOk
+            Send Assert bOk "could not write the JSON fixture"
+
+            // Replace the one path with a different one - the everyday edit the dialog performs.
+            Move "../Beta/BetaLibrary26.0.sws" to asNew[0]
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WriteSwsLibraryEntries of ho sPath asNew to bOk
+            Send Assert bOk "the writer refused a dependencies array containing git packages"
+
+            Send Destroy of ho
+            /* READ BACK AS TEXT, not through SwsLibraryEntries. Parsing a JSON .sws needs cJsonObject
+               and therefore cLibraryInventoryApp; the base class this fixture uses answers an empty
+               list for one, which would make the assertion below pass or fail for a reason that has
+               nothing to do with the writer. The writer is a line-level splice, so text is also the
+               level it actually operates at. */
+
+            /* THE PACKAGES. Checked against the raw file because SwsLibraryEntries deliberately
+               reports only strings - the very asymmetry that made the old writer delete them. */
+            Move (rfReadEncodedFileAsStringArray(sPath)) to asLines
+            Move ""  to sAll
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                Move (sAll + asLines[i] + Character(10)) to sAll
+            Loop
+            Send Assert (Pos("https://example.invalid/Thing.git", sAll) > 0) ;
+                "the first git dependency was dropped by the write"
+            Send Assert (Pos("https://example.invalid/Other.git", sAll) > 0) ;
+                "the second git dependency was dropped by the write"
+            Send Assert (Pos("Sub/Other-Library-DF250.sws", sAll) > 0) ;
+                "a git dependency lost its sws member"
+            Send Assert (Pos("abc123", sAll) > 0 and Pos("def456", sAll) > 0) ;
+                "a git dependency lost its pinned version - the workspace would re-clone at HEAD"
+            Send Assert (Pos("../Beta/BetaLibrary26.0.sws", sAll) > 0) ;
+                "the replacement path entry was not written"
+            // The old path must be GONE, or the edit only appeared to happen.
+            Send Assert (Pos("AlphaLibrary19.1.sws", sAll) = 0) ;
+                "the replaced path entry is still in the file"
+            // Still one array, still one document: a doubled or missing comma parses as neither.
+            Send Assert (Pos(",,", (Replaces(" ", sAll, ""))) = 0) ;
+                "the rewritten array has a doubled comma"
+        End_Procedure
+
+        /* REMOVING THE LAST PATH LEAVES THE PACKAGES STANDING.
+
+           The empty-list case has its own history in this dialog: an early version returned before
+           drawing the package cards, so emptying the path list made the packages vanish from the
+           screen. This is the file-level twin of that bug - an empty asEntries must not be read as
+           "the workspace depends on nothing". */
+        {Published = True}
+        Procedure Test_JsonWrite_EmptyListKeepsPackages
+            Handle ho
+            String sRoot sPath sAll
+            String[] asJson asNone asLines
+            Integer i iMax
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZGitOnly.sws") to sPath
+            Move '{'                                                             to asJson[0]
+            Move '    "dependencies": ['                                         to asJson[1]
+            Move '        "../Alpha/AlphaLibrary19.1.sws",'                      to asJson[2]
+            Move '        {'                                                     to asJson[3]
+            Move '            "source": "https://example.invalid/Thing.git",'   to asJson[4]
+            Move '            "sws": "Thing.sws"'                                to asJson[5]
+            Move '        }'                                                     to asJson[6]
+            Move '    ],'                                                        to asJson[7]
+            Move '    "df": 26.0'                                                to asJson[8]
+            Move '}'                                                             to asJson[9]
+            Get rfWriteEncodedFileFromStringArray (&asJson) sPath C_NewLine False to bOk
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get WriteSwsLibraryEntries of ho sPath (&asNone) to bOk
+            Send Destroy of ho
+            Send Assert bOk "the writer refused an empty library list"
+
+            Move (rfReadEncodedFileAsStringArray(sPath)) to asLines
+            Move "" to sAll
+            Move (SizeOfArray(asLines) - 1) to iMax
+            For i from 0 to iMax
+                Move (sAll + asLines[i] + Character(10)) to sAll
+            Loop
+            Send Assert (Pos("https://example.invalid/Thing.git", sAll) > 0) ;
+                "clearing the path list deleted the git package too"
+            Send Assert (Pos("AlphaLibrary19.1.sws", sAll) = 0) ;
+                "the path entry was not removed"
+            // "df" is a sibling of "dependencies" - the splice must not have eaten it.
+            Send Assert (Pos('"df"', sAll) > 0) "the write damaged a neighbouring key"
+        End_Procedure
+
+        /* THE ELEMENT SPLITTER, ON ITS OWN.
+
+           The two tests above go through the file; this one pins the piece they both depend on. An
+           object element must come back WHOLE - splitting the array on commas per line is the
+           obvious implementation and it cuts every object into three useless fragments. */
+        {Published = True}
+        Procedure Test_JsonArrayElements_ObjectStaysWhole
+            Handle ho
+            String[] asLines asElem
+            Integer iCount
+
+            Move '    "dependencies": ['                                to asLines[0]
+            Move '        "a/one.sws",'                                 to asLines[1]
+            Move '        {'                                            to asLines[2]
+            Move '            "source": "x, with a comma",'             to asLines[3]
+            Move '            "sws": "t.sws"'                           to asLines[4]
+            Move '        },'                                           to asLines[5]
+            Move '        "b/two.sws"'                                  to asLines[6]
+            Move '    ]'                                                to asLines[7]
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get _JsonArrayElements of ho (&asLines) 0 7 to asElem
+            Send Destroy of ho
+
+            Move (SizeOfArray(asElem)) to iCount
+            Send Assert (iCount = 3) ("expected 3 elements, got " + String(iCount))
+            If (iCount = 3) Begin
+                Send Assert (asElem[0] = '"a/one.sws"') ("first element was " + asElem[0])
+                // The brace opens it and the brace closes it: nothing before, nothing after.
+                Send Assert (Left(asElem[1], 1) = "{") "the object element did not start at its brace"
+                Send Assert (Right(asElem[1], 1) = "}") "the object element did not end at its brace"
+                // A comma INSIDE a string literal is content, not a separator.
+                Send Assert (Pos("x, with a comma", asElem[1]) > 0) ;
+                    "the splitter broke an element at a comma inside a string literal"
+                Send Assert (asElem[2] = '"b/two.sws"') ("last element was " + asElem[2])
+            End
+        End_Procedure
+        /* THE CHAIN WALK, pinned on WinServ's exact shape (2026-08-16). LibraryEntriesTree is the
+           one reader behind the Libraries tile, the Libraries dialog and the copy plan, and it had
+           no direct test - so the copy plan's "parent covered by its own child" bug (08-15) had
+           nothing upstream to catch a wrong tree. Two things this pins:
+             - the workspace declares Parent AND lists Parent's own child FIRST (Lib1 = the child,
+               Lib2 = the parent, as WinServ lists vwin32fh before WebAppSrc). Every depth-0 row
+               must still be emitted, in [Libraries] order, and the child must ALSO appear at
+               depth 1 under the parent - the tree does not dedupe across depths;
+             - the parent's roll-up: iChainCount = its own declared libraries, iChainBehind =
+               those older than the parent's own version, sChainOldest = the oldest of them. */
+        {Published = True}
+        Procedure Test_LibraryEntriesTree_ChildListedBeforeParent
+            Handle ho
+            tLibraryInfo[] aTree
+            String[] asRaw asSeen asNone asParentLibs
+            String sRoot sHome sParentDir sChildDir
+            Integer i iMax iDepth0 iDepth1 iParentAt iChildAt0 iChildAt1
+            Boolean bOk
+
+            Get _LibTestRoot to sRoot
+            Move (sRoot + "Tree\") to sRoot
+            Move (sRoot + "Parent\") to sParentDir
+            Move (sRoot + "Parent\Child\StudioLibrary\") to sChildDir
+            Move (rfDirectoryCreateEx(sChildDir, False)) to bOk
+            Move (rfDirectoryCreateEx((sRoot + "Wsp\"), False)) to bOk
+            // Child on 19.1, Parent on 25.0 declaring the child -> child is BEHIND its parent.
+            Send _WriteSws (sChildDir + "Child-Library-DF191.sws") "19.1" asNone
+            Move "Child\StudioLibrary\Child-Library-DF191.sws" to asParentLibs[0]
+            Send _WriteSws (sParentDir + "ParentLibrary25.0.sws") "25.0" asParentLibs
+            // The WORKSPACE lists the child first, then the parent - WinServ's order.
+            Move (sRoot + "Wsp\") to sHome
+            Move "..\Parent\Child\StudioLibrary\Child-Library-DF191.sws" to asRaw[0]
+            Move "..\Parent\ParentLibrary25.0.sws"                          to asRaw[1]
+
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get LibraryEntriesTree of ho (&asRaw) sHome "26.0" 0 4 (&asSeen) to aTree
+            Send Destroy of ho
+
+            Move 0 to iDepth0
+            Move 0 to iDepth1
+            Move -1 to iParentAt
+            Move -1 to iChildAt0
+            Move -1 to iChildAt1
+            Move (SizeOfArray(aTree) - 1) to iMax
+            For i from 0 to iMax
+                If (aTree[i].iDepth = 0) Begin
+                    Increment iDepth0
+                    If (Pos("parentlibrary25.0", Lowercase(aTree[i].sRefSwsFile)) > 0) ;
+                        Move i to iParentAt
+                    If (Pos("child-library-df191", Lowercase(aTree[i].sRefSwsFile)) > 0) ;
+                        Move i to iChildAt0
+                End
+                If (aTree[i].iDepth = 1) Begin
+                    Increment iDepth1
+                    If (Pos("child-library-df191", Lowercase(aTree[i].sRefSwsFile)) > 0) ;
+                        Move i to iChildAt1
+                End
+            Loop
+            Send Assert (iDepth0 = 2)      ("expected 2 depth-0 rows, got " + String(iDepth0))
+            Send Assert (iChildAt0 = 0)    "the child must be depth-0 row 0 - listed first, emitted first"
+            Send Assert (iParentAt = 1 or iParentAt = 2) "the parent must be a depth-0 row after the child"
+            Send Assert (iChildAt1 <> -1)  "the child must ALSO appear at depth 1 under its parent"
+            If (iChildAt1 <> -1) ;
+                Send Assert (iChildAt1 = iParentAt + 1) "a parent's children follow it immediately"
+            If (iParentAt <> -1) Begin
+                Send Assert (aTree[iParentAt].iChainCount = 1)  ("parent iChainCount " + String(aTree[iParentAt].iChainCount) + " <> 1")
+                Send Assert (aTree[iParentAt].iChainBehind = 1) ("parent iChainBehind " + String(aTree[iParentAt].iChainBehind) + " <> 1 - the 19.1 child is behind 25.0")
+                Send AssertSAreEqual "19.1" aTree[iParentAt].sChainOldest
+            End
+            If (iChildAt1 <> -1) ;
+                Send Assert (Pos("parentlibrary25.0", Lowercase(aTree[iChildAt1].sDeclaredBySws)) > 0) "the nested child must name the parent .sws that declares it"
+        End_Procedure
+
+        /* THE DEPENDENCY KEY - the one spelling two surfaces have to agree on.
+
+           The Libraries dialog labels each package row with it, and WorkspaceUpdateScan labels each
+           finding with it; the dialog then matches the two to decide whether a row's Update chip
+           lights. A disagreement does not fail loudly - it shows a dead chip on a package that DOES
+           have an update, which looks exactly like a package that does not. That is why it is one
+           function (it was two, until 2026-09-10) and why it is tested rather than assumed.
+
+           The forward-slash case is the real one, not a curiosity: a git dependency records its
+           sub-path the JSON way, and one of the libraries in use keeps its .sws in a subfolder. */
+        {Published = True}
+        Procedure DepKey_StripsFolderAndExtension
+            tSwsDependency Dep
+
+            Move "StudioLibrary/vWin32fh-Library-DF26.0.sws" to Dep.sSws
+            Send AssertSAreEqual "vWin32fh-Library-DF26.0" (SwsDependencyKey(Dep))
+            // The ordinary case: a manifest at the repository root.
+            Move "SomeLibrary.sws" to Dep.sSws
+            Send AssertSAreEqual "SomeLibrary" (SwsDependencyKey(Dep))
+            // Backslashes too - the same dependency written the Windows way.
+            Move "Nested\Deeper\Thing.sws" to Dep.sSws
+            Send AssertSAreEqual "Thing" (SwsDependencyKey(Dep))
+        End_Procedure
+
+        /* THE EDGES, and one of them is a silent data-loss bug if the extension test is written
+           without its length guard: a name that does not end in .sws must keep all of its
+           characters, not lose the last four. */
+        {Published = True}
+        Procedure DepKey_HandlesTheEdges
+            tSwsDependency Dep
+
+            // Nothing in, nothing out - a path dependency carries no sSws at all.
+            Move "" to Dep.sSws
+            Send AssertSAreEqual "" (SwsDependencyKey(Dep))
+            // The extension match is case-insensitive; the NAME's own case survives untouched,
+            // because it is shown to the user and matched against what the dialog rendered.
+            Move "Lib/Thing.SWS" to Dep.sSws
+            Send AssertSAreEqual "Thing" (SwsDependencyKey(Dep))
+            // No extension: nothing to strip.
+            Move "PlainName" to Dep.sSws
+            Send AssertSAreEqual "PlainName" (SwsDependencyKey(Dep))
+            // Trimmed before anything else is looked at.
+            Move "  Spaced.sws  " to Dep.sSws
+            Send AssertSAreEqual "Spaced" (SwsDependencyKey(Dep))
+        End_Procedure
+
+        /* TWO LINES, ONE KEY - the [Projects] shape that cost a workspace its main program in the
+           DataFlex 26 conversion (2026-09-11): Project1 written twice, and no Project0. Both
+           programs must come out, in the order they were written and ahead of Project2. A reader
+           asking for the key Project1 gets only one of them, which is the whole bug. */
+        {Published = True}
+        Procedure SwsProjects_RepeatedSlotKeepsBothPrograms
+            String[] asLines asOut
+
+            Move "[Properties]"        to asLines[0]
+            Move "Version=19.1"        to asLines[1]
+            Move "[Projects]"          to asLines[2]
+            Move "Project1=Main.src"   to asLines[3]
+            Move "Project1=Login.src"  to asLines[4]
+            Move "Project2=Report.src" to asLines[5]
+            Move "[Libraries]"         to asLines[6]
+            Move "Lib1=Libraries\Alpha\AlphaLibrary19.1.sws" to asLines[7]
+
+            Move (SwsIniProjectsFromLines(asLines)) to asOut
+            Send AssertIAreEqual 3 (SizeOfArray(asOut))
+            If (SizeOfArray(asOut) = 3) Begin
+                Send AssertSAreEqual "Main.src"   asOut[0]
+                Send AssertSAreEqual "Login.src"  asOut[1]
+                Send AssertSAreEqual "Report.src" asOut[2]
+            End
+            Send Assert (SwsIniProjectsNeedRenumbering(asLines)) "a repeated slot must be renumbered"
+        End_Procedure
+
+        /* THE ORDER IS THE SLOT NUMBER, AND EACH PROGRAM IS LISTED ONCE. Numeric, not textual -
+           Project10 comes after Project2 - with the edges a hand-edited file really has: spacing
+           round the "=", a tab and a stray CR, the same program under a second slot in another
+           case, an empty slot, a key that merely starts with "Project", a comment, and a slot line
+           in some other section. */
+        {Published = True}
+        Procedure SwsProjects_OrderIsTheSlotNumberAndEachProgramOnce
+            String[] asLines asOut
+
+            Move "[projects]"                                           to asLines[0]
+            Move "Project10=Ten.src"                                    to asLines[1]
+            Move "Project2=Two.src"                                     to asLines[2]
+            Move "  Project0 =  Zero.src "                              to asLines[3]
+            Move "Project3=TWO.SRC"                                     to asLines[4]
+            Move "Project4="                                            to asLines[5]
+            Move "ProjectPath=.\AppSrc"                                 to asLines[6]
+            Move "; Project5=Commented.src"                             to asLines[7]
+            Move (Character(9) + "Project6=Tabbed.src" + Character(13)) to asLines[8]
+            Move "[Other]"                                              to asLines[9]
+            Move "Project7=Elsewhere.src"                               to asLines[10]
+
+            Move (SwsIniProjectsFromLines(asLines)) to asOut
+            Send AssertIAreEqual 4 (SizeOfArray(asOut))
+            If (SizeOfArray(asOut) = 4) Begin
+                Send AssertSAreEqual "Zero.src"   asOut[0]
+                Send AssertSAreEqual "Two.src"    asOut[1]
+                Send AssertSAreEqual "Tabbed.src" asOut[2]
+                Send AssertSAreEqual "Ten.src"    asOut[3]
+            End
+
+            // The key test on its own: digits only after the word, any case, leading zeros fine.
+            Send AssertIAreEqual 7    (SwsIniProjectKeyNumber("Project07"))
+            Send AssertIAreEqual 3    (SwsIniProjectKeyNumber("PROJECT3"))
+            Send AssertIAreEqual (-1) (SwsIniProjectKeyNumber("Project"))
+            Send AssertIAreEqual (-1) (SwsIniProjectKeyNumber("Project1a"))
+            Send AssertIAreEqual (-1) (SwsIniProjectKeyNumber("ProjectPath"))
+        End_Procedure
+
+        /* RENUMBERED WHERE BROKEN, UNTOUCHED WHERE NOT. The repeated slot is rewritten Project0..N
+           in place, every other line exactly as it was, and the result needs no second pass. A
+           healthy section is returned as read - spacing a rewrite would lose included. A section
+           that skips a slot is not healthy, and a JSON .sws has no [Projects] header, so nothing in
+           it is ever rewritten. */
+        {Published = True}
+        Procedure SwsProjects_RenumberRewritesOnlyWhatIsBroken
+            String[] asLines asOut
+
+            Move "[Properties]"        to asLines[0]
+            Move "Version=19.1"        to asLines[1]
+            Move "[Projects]"          to asLines[2]
+            Move "Project1=Main.src"   to asLines[3]
+            Move "Project1=Login.src"  to asLines[4]
+            Move "Project2=Report.src" to asLines[5]
+            Move "[Libraries]"         to asLines[6]
+            Move "Lib1=Libraries\Alpha\AlphaLibrary19.1.sws" to asLines[7]
+            Move (SwsIniLinesWithProjectsRenumbered(asLines)) to asOut
+            Send AssertIAreEqual 8 (SizeOfArray(asOut))
+            If (SizeOfArray(asOut) = 8) Begin
+                Send AssertSAreEqual "[Properties]"        asOut[0]
+                Send AssertSAreEqual "Version=19.1"        asOut[1]
+                Send AssertSAreEqual "[Projects]"          asOut[2]
+                Send AssertSAreEqual "Project0=Main.src"   asOut[3]
+                Send AssertSAreEqual "Project1=Login.src"  asOut[4]
+                Send AssertSAreEqual "Project2=Report.src" asOut[5]
+                Send AssertSAreEqual "[Libraries]"         asOut[6]
+                Send AssertSAreEqual "Lib1=Libraries\Alpha\AlphaLibrary19.1.sws" asOut[7]
+            End
+            Send AssertFalse (SwsIniProjectsNeedRenumbering(asOut))
+
+            // Healthy, with spacing a rewrite would lose: returned exactly as read.
+            Move (ResizeArray(asLines, 0)) to asLines
+            Move "[Projects]"          to asLines[0]
+            Move "Project0 = Main.src" to asLines[1]
+            Move "Project1=Login.src"  to asLines[2]
+            Send AssertFalse (SwsIniProjectsNeedRenumbering(asLines))
+            Move (SwsIniLinesWithProjectsRenumbered(asLines)) to asOut
+            Send AssertIAreEqual 3 (SizeOfArray(asOut))
+            If (SizeOfArray(asOut) = 3) ;
+                Send AssertSAreEqual "Project0 = Main.src" asOut[1]
+
+            // A skipped slot is not healthy.
+            Move "Project2=Login.src" to asLines[2]
+            Send Assert (SwsIniProjectsNeedRenumbering(asLines)) "a skipped slot must be renumbered"
+
+            // A JSON .sws: no [Projects] header, nothing to rewrite, no programs read.
+            Move (ResizeArray(asLines, 0)) to asLines
+            Move "{"                  to asLines[0]
+            Move '    "projects": ['  to asLines[1]
+            Move '        "Main.src"' to asLines[2]
+            Move "    ]"              to asLines[3]
+            Move "}"                  to asLines[4]
+            Send AssertFalse (SwsIniProjectsNeedRenumbering(asLines))
+            Send AssertIAreEqual 0 (SizeOfArray(SwsIniProjectsFromLines(asLines)))
+        End_Procedure
+
+        /* THE CHECK AFTER A CONVERSION names what did not arrive, in the order the old file listed
+           it - case-insensitively, since these are file names - and says nothing when all did. */
+        {Published = True}
+        Procedure SwsProjects_MissingNamesWhatDidNotArrive
+            String[] asListed asNow asLost
+
+            Move "Main.src"   to asListed[0]
+            Move "Login.src"  to asListed[1]
+            Move "Report.src" to asListed[2]
+            Move "login.SRC"  to asNow[0]
+            Move "Report.src" to asNow[1]
+            Move (SwsProgramsMissing(asListed, asNow)) to asLost
+            Send AssertIAreEqual 1 (SizeOfArray(asLost))
+            If (SizeOfArray(asLost) = 1) ;
+                Send AssertSAreEqual "Main.src" asLost[0]
+            Send Assert (SwsProgramsMissingNote(asLost) contains "Main.src") "the note must name the lost program"
+
+            Move "Main.src" to asNow[2]
+            Move (SwsProgramsMissing(asListed, asNow)) to asLost
+            Send AssertIAreEqual 0 (SizeOfArray(asLost))
+            Send AssertSAreEqual "" (SwsProgramsMissingNote(asLost))
+        End_Procedure
+
+        /* THE FILE KEEPS ITS SHAPE. Renumbering in place rewrites the file, and a .sws must come back
+           with the BOM, line breaks and final line break it had - written here the way the Studio
+           never writes one (UTF-8 with a BOM, bare LF, a final break), so that a writer which
+           normalised anything would show it. A healthy file is not written at all, and a missing one
+           is nothing to do rather than a failure. */
+        {Published = True}
+        Procedure SwsProjects_FileRenumberKeepsTheFilesShape
+            String sRoot sSws
+            String[] asLines asBack
+            Boolean bOk bTrailing
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZRenumber.sws") to sSws
+            Move "[Projects]"         to asLines[0]
+            Move "Project1=Main.src"  to asLines[1]
+            Move "Project1=Login.src" to asLines[2]
+            Move (rfWriteEncodedFileFromStringArrayEx(&asLines, sSws, CS_LF, True, True)) to bOk
+            Send Assert bOk "could not write the fixture"
+
+            Send Assert (SwsIniRenumberProjectsInFile(sSws)) "the renumbering write failed"
+            Move (rfReadEncodedFileLines(sSws, False, &bTrailing)) to asBack
+            Send AssertIAreEqual 3 (SizeOfArray(asBack))
+            If (SizeOfArray(asBack) = 3) Begin
+                Send AssertSAreEqual "Project0=Main.src"  asBack[1]
+                Send AssertSAreEqual "Project1=Login.src" asBack[2]
+            End
+            Send Assert (rfFileHasBOM(sSws)) "the BOM was lost"
+            Send Assert (rfDetectFileLineBreak(sSws) = CS_LF) "the bare-LF line breaks became CRLF"
+            Send Assert bTrailing "the final line break was lost"
+
+            // Healthy: not written, so its spacing survives.
+            Move (ResizeArray(asLines, 0)) to asLines
+            Move "[Projects]"          to asLines[0]
+            Move "Project0 = Main.src" to asLines[1]
+            Move (rfWriteEncodedFileFromStringArray(&asLines, sSws, C_NewLine, False)) to bOk
+            Send Assert (SwsIniRenumberProjectsInFile(sSws)) "a healthy file reported a failure"
+            Move (rfReadEncodedFileAsStringArray(sSws)) to asBack
+            Send AssertIAreEqual 2 (SizeOfArray(asBack))
+            If (SizeOfArray(asBack) = 2) ;
+                Send AssertSAreEqual "Project0 = Main.src" asBack[1]
+
+            Move (rfDeleteFile(sSws)) to bOk
+            Send Assert (SwsIniRenumberProjectsInFile(sSws)) "a missing file is nothing to do, not a failure"
+        End_Procedure
+
+
+        /* A .sws WITH GIT CONFLICT MARKERS is its own answer (2026-09-14): neither INI nor JSON, so
+           the chain walk and the Libraries dialog can name the file. df-cli read one on a real
+           library, dumped its text as "not in ini format", refused the whole chain - and, run the
+           copy step's old way, waited until killed. A plain INI beside it still reads as INI. */
+        {Published = True}
+        Procedure Format_ConflictMarkersAreTheirOwnAnswer
+            String sRoot sBad sGood
+            String[] asBad asGood
+            Handle ho
+            Boolean bOk
+            Integer iFmt iVoid
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZConflict.sws") to sBad
+            Move (sRoot + "ZPlain.sws")    to sGood
+            Move "<<<<<<< HEAD"     to asBad[0]
+            Move "[Properties]"     to asBad[1]
+            Move "Version=25.0"     to asBad[2]
+            Move "======="          to asBad[3]
+            Move "[Properties]"     to asBad[4]
+            Move "Version=25.0"     to asBad[5]
+            Move ">>>>>>> 772bacec" to asBad[6]
+            Get rfWriteEncodedFileFromStringArray (&asBad) sBad C_NewLine False to bOk
+            Send Assert bOk
+            Move "[Properties]"     to asGood[0]
+            Move "Version=25.0"     to asGood[1]
+            Get rfWriteEncodedFileFromStringArray (&asGood) sGood C_NewLine False to bOk
+            Send Assert bOk
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get SwsFormatOf of ho sBad to iFmt
+            Send AssertIAreEqual eSwsConflict iFmt
+            Get SwsFormatOf of ho sGood to iFmt
+            Send AssertIAreEqual eSwsIni iFmt
+            Send Destroy of ho
+            Move (rfDeleteFile(sBad))  to iVoid
+            Move (rfDeleteFile(sGood)) to iVoid
+        End_Procedure
+
+        // ...and an entry pointing at such a file is UNREADABLE: there (bFound), but no verdict and no
+        // version, and the chain walk does not descend into it - its own [Libraries] line, inside the
+        // markers, is never read.
+        {Published = True}
+        Procedure Entries_ConflictMarkedLibraryIsUnreadable
+            String sRoot sLibDir sLib
+            String[] asRaw asBad asVisited
+            tLibraryInfo[] aInfo
+            Handle ho
+            Boolean bOk
+            Integer iVoid
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZBadLib\") to sLibDir
+            Move (rfDirectoryCreateEx(sLibDir, False)) to bOk
+            Move (sLibDir + "ZBadLib25.0.sws") to sLib
+            Move "<<<<<<< HEAD"                   to asBad[0]
+            Move "[Properties]"                   to asBad[1]
+            Move "Version=25.0"                   to asBad[2]
+            Move "[Libraries]"                    to asBad[3]
+            Move "Lib1=..\ZNested\ZNested25.0.sws" to asBad[4]
+            Move "======="                        to asBad[5]
+            Move ">>>>>>> 772bacec"               to asBad[6]
+            Get rfWriteEncodedFileFromStringArray (&asBad) sLib C_NewLine False to bOk
+            Send Assert bOk
+            Move "ZBadLib\ZBadLib25.0.sws" to asRaw[0]
+            Get Create (RefClass(cLibraryInventory)) to ho
+            Get LibraryEntriesInfo of ho (&asRaw) sRoot "26.0" to aInfo
+            Send AssertIAreEqual 1 (SizeOfArray(aInfo))
+            If (SizeOfArray(aInfo) = 1) Begin
+                Send Assert (aInfo[0].bFound = True)
+                Send AssertIAreEqual eLibUnreadable aInfo[0].eStatus
+                Send AssertSAreEqual "" aInfo[0].sRefVersion
+            End
+            Get LibraryEntriesTree of ho (&asRaw) sRoot "26.0" 0 CI_LibraryTreeMaxDepth (&asVisited) to aInfo
+            Send AssertIAreEqual 1 (SizeOfArray(aInfo))
+            Send Destroy of ho
+            Move (rfDeleteFile(sLib)) to iVoid
+        End_Procedure
+
+        /* THE THREE TIERS, and the boundary is the point (Nils 2026-09-16: "not packages, but
+           libraries might be local and private and those should also be possible to refactor").
+
+           The old blanket rule skipped every library copy in a workspace. That is right for one
+           with an upstream - editing the copy forks it and the next update clobbers the edits -
+           and WRONG for a local private library, where there is no upstream and refactoring in
+           place is the only way it is ever modernised. So an UNRECOGNISED folder must come back
+           "" and stay in scope. If that assertion ever fails, DFRefactor has quietly stopped
+           refactoring people's own code, which is far worse than the over-reach it replaced. */
+        /* THE THREE TIERS, and the BOUNDARY is the point (Nils 2026-09-16: "not packages, but
+           libraries might be local and private and those should also be possible to refactor").
+
+           The old blanket rule skipped every library copy in a workspace. Right for one with an
+           upstream - editing the copy forks it, and the next update clobbers the edits - and WRONG
+           for a local private library, where no upstream exists and refactoring in place is the
+           only way it is ever modernised. So an UNRECOGNISED folder must answer "" and stay in
+           scope. If that assertion ever fails, DFRefactor has quietly stopped refactoring people's
+           own code, which is worse than the over-reach it replaced.
+
+           rfLibrarySkipReason is a GLOBAL deliberately: as a cRefactorApplication method it was
+           unreachable here (the runner's ghoApplication is a bare cApplication), answered "" for
+           every input, and the failures read as a comparison bug -
+           see [[feedback_test_runner_app_class]]. */
+        {Published = True}
+        Procedure LibrarySkip_KnownLibrariesSkipUnknownOnesStay
+            String[] asFold asName
+            String sWhy
+
+            Move "e:\ws\libraries\vwin32fh\" to asFold[0]
+            Move "vwin32fh"                  to asName[0]
+            Move (rfLibrarySkipReason("E:\Ws\Libraries\vwin32fh\AppSrc\vWin32fh.pkg", &asFold, &asName)) to sWhy
+            Send Assert (sWhy <> "") "a library with a known upstream must be skipped"
+            Send Assert (Pos("vwin32fh", sWhy) > 0) "the reason must name the library"
+            // the disk's casing is not ours to trust
+            Move (rfLibrarySkipReason("e:\ws\LIBRARIES\VWIN32FH\AppSrc\x.pkg", &asFold, &asName)) to sWhy
+            Send Assert (sWhy <> "") "the folder test must ignore case"
+
+            /* THE BOUNDARY: same workspace, a library folder the catalogue does NOT know, so no
+               upstream, so it is presumed the user's own and STAYS IN SCOPE. */
+            Move (rfLibrarySkipReason("E:\Ws\Libraries\OurSharedCode\AppSrc\Common.pkg", &asFold, &asName)) to sWhy
+            Send AssertSAreEqual "" sWhy
+            // and the workspace's own AppSrc, which is not a library at all
+            Move (rfLibrarySkipReason("E:\Ws\AppSrc\Order.vw", &asFold, &asName)) to sWhy
+            Send AssertSAreEqual "" sWhy
+        End_Procedure
+
+        /* The two PACKAGE tiers, tested by path: a DF26 git dependency is a dependencies entry
+           whose checkout lives under DfPkg, so cLibraryInventory gives it no folder to match on.
+           Both are read-only by design and are never refactored in place. */
+        {Published = True}
+        Procedure LibrarySkip_PackageCheckoutsAreNeverRefactored
+            String[] asFold asName
+            String sWhy
+
+            // no library folders at all - these must refuse on the path alone
+            Move (rfLibrarySkipReason("E:\Ws\DfPkg\NilsSve_DUFLibrary26.0-2c683e5\AppSrc\Working.pkg", &asFold, &asName)) to sWhy
+            Send Assert (sWhy <> "") "a DfPkg checkout must never be refactored in place"
+            Send Assert (Pos("DfPkg", sWhy) > 0) "the reason must say which kind of package it is"
+            Move (rfLibrarySkipReason("C:\ProgramData\DataFlex\Packages\Cache\x\AppSrc\y.pkg", &asFold, &asName)) to sWhy
+            Send Assert (sWhy <> "") "the DataFlex package cache must never be refactored in place"
+            // POSITIVE CONTROL: a path merely CONTAINING the word must not trip it
+            Move (rfLibrarySkipReason("E:\Ws\AppSrc\DfPkgHelper.pkg", &asFold, &asName)) to sWhy
+            Send AssertSAreEqual "" sWhy
+        End_Procedure
+
+        /* GIT PIN KINDS (2026-09-25). A commit, a version tag and anything else get three different
+           answers to "is something newer?", so they must be told apart exactly: a tag taken for a
+           commit would be compared with a branch head and always read as behind. */
+        {Published = True}
+        Procedure GitPin_KindsAreToldApart
+            Send Assert (IsGitCommitPin("7c4dd0feb1cefa91eec142461154f22283ebed7b")) "a 40-character hex SHA is a commit"
+            Send Assert (IsGitCommitPin("7C4DD0FEB1CEFA91EEC142461154F22283EBED7B")) "a commit in capitals is still a commit"
+            Send Assert (IsGitCommitPin("7c4dd0feb1cefa91eec142461154f22283ebed7") = False) "39 characters is not a commit"
+            Send Assert (IsGitCommitPin("1.0.0") = False) "a version is not a commit"
+            Send Assert (IsVersionTagPin("1.0.0")) "1.0.0 is a version tag"
+            Send Assert (IsVersionTagPin("10.20.30")) "parts of several digits are a version tag"
+            Send Assert (IsVersionTagPin(" 1.0.1 ")) "surrounding spaces do not matter"
+            Send Assert (IsVersionTagPin("^1.0.0") = False) "a caret RANGE is not a pin on one version"
+            Send Assert (IsVersionTagPin(">=1.0.0 <2.0.0") = False) "a combined range is not a version tag"
+            Send Assert (IsVersionTagPin("v1.0.0") = False) "a v in front is not the shape RDC tags use"
+            Send Assert (IsVersionTagPin("1.0") = False) "two parts are not a version tag"
+            Send Assert (IsVersionTagPin("1.0.0.0") = False) "four parts are not a version tag"
+            Send Assert (IsVersionTagPin("1.0.0-beta") = False) "a pre-release is not offered as a release"
+            Send Assert (IsVersionTagPin("Autumn2024") = False) "a name is not a version tag"
+            Send Assert (IsVersionTagPin("main") = False) "a branch is not a version tag"
+            Send Assert (IsVersionTagPin("") = False) "nothing is not a version tag"
+        End_Procedure
+
+        /* THE CARET, NOT THE NEWEST (2026-09-25). What Update Check offers must be what the
+           workspace's libraries accept - they ask for "^<version>" - so a new major is never
+           offered, versions compare as NUMBERS (1.10.0 is above 1.2.0), and tags of any other
+           shape are ignored. */
+        {Published = True}
+        Procedure NewestTag_StaysInsideTheCaret
+            String[] asTags asZero asNone
+
+            Move "1.0.0"      to asTags[0]
+            Move "1.0.1"      to asTags[1]
+            Move "1.2.0"      to asTags[2]
+            Move "1.10.0"     to asTags[3]
+            Move "2.0.0"      to asTags[4]
+            Move "Autumn2024" to asTags[5]
+            Move "0.1"        to asTags[6]
+            Move "v1.11.0"    to asTags[7]
+            Move "1.12.0-rc1" to asTags[8]
+            Send AssertSAreEqual "1.10.0" (NewestCompatibleVersionTag("1.0.0", asTags)) "the newest 1.x, compared as numbers"
+            Send AssertSAreEqual "1.10.0" (NewestCompatibleVersionTag("1.2.0", asTags)) "from the middle of 1.x"
+            Send AssertSAreEqual "" (NewestCompatibleVersionTag("1.10.0", asTags)) "at the newest 1.x there is nothing to offer - 2.0.0 is not an offer"
+            Send AssertSAreEqual "" (NewestCompatibleVersionTag("2.0.0", asTags)) "at the newest release there is nothing to offer"
+            Send AssertSAreEqual "" (NewestCompatibleVersionTag("^1.0.0", asTags)) "a range is not a pin on one version"
+            Send AssertSAreEqual "" (NewestCompatibleVersionTag("7c4dd0feb1cefa91eec142461154f22283ebed7b", asTags)) "a commit is not a version"
+            Send AssertSAreEqual "" (NewestCompatibleVersionTag("1.0.0", asNone)) "no tags, no offer"
+            // 0.x promises nothing across a minor, so the caret stays inside it; 0.0.x cannot move.
+            Move "0.1.1" to asZero[0]
+            Move "0.2.0" to asZero[1]
+            Move "0.0.4" to asZero[2]
+            Send AssertSAreEqual "0.1.1" (NewestCompatibleVersionTag("0.1.0", asZero)) "0.1.x stays inside 0.1"
+            Send AssertSAreEqual "" (NewestCompatibleVersionTag("0.0.3", asZero)) "a 0.0.x pin cannot move"
+        End_Procedure
+
+        /* `git ls-remote --tags --refs` read back: names out, peeled twins skipped - and anything
+           that is not a listing answers False, which the scan reads as UNKNOWN. A failed question
+           must never come back as "no newer release". */
+        {Published = True}
+        Procedure LsRemoteTags_ReadsTheListingAndRefusesAnythingElse
+            String[] asLines asTags asNone
+            Boolean bOk
+
+            Move ("7c4dd0feb1cefa91eec142461154f22283ebed7b" + Character(9) + "refs/tags/1.0.0")    to asLines[0]
+            Move ("c3c2fc6c8121b864519c8cfdf43e34e1a4ab2e52" + Character(9) + "refs/tags/1.0.1")    to asLines[1]
+            Move ("7c4dd0feb1cefa91eec142461154f22283ebed7b" + Character(9) + "refs/tags/1.0.1^{}") to asLines[2]
+            Move (GitTagsFromLsRemote(asLines, &asTags)) to bOk
+            Send Assert bOk "a tag listing is an answer"
+            Send AssertSAreEqual "1.0.0|1.0.1" (StrJoinFromArray(asTags, "|")) "both tags, and not the peeled twin"
+            // A repository with no tags prints nothing - and that IS an answer.
+            Move (GitTagsFromLsRemote(asNone, &asTags)) to bOk
+            Send Assert bOk "an empty listing is a real answer"
+            Move "fatal: repository 'https://github.com/NilsSve/Nope.git/' not found" to asLines[0]
+            Move (GitTagsFromLsRemote(asLines, &asTags)) to bOk
+            Send Assert (bOk = False) "a git error is UNKNOWN, not an empty tag list"
+        End_Procedure
+
+        // Raw text in and out, so the pin tests can compare BYTES - line endings included.
+        Function _WriteRawText String sPath String sText Returns Boolean
+            UChar[] ucaBytes
+            Integer iChannel
+
+            Move (rfStringToUtf8Bytes(sText)) to ucaBytes
+            Move (Seq_New_Channel()) to iChannel
+            If (iChannel < 0) ;
+                Function_Return False
+            Direct_Output Channel iChannel ("binary:" + sPath)
+            Write Channel iChannel ucaBytes
+            Close_Output Channel iChannel
+            Send Seq_Release_Channel iChannel
+            Function_Return True
+        End_Function
+
+        Function _ReadRawText String sPath Returns String
+            UChar[] ucaBytes
+            Move (rfReadFileSliceBytes(sPath, 0, (rfFileSize(sPath)))) to ucaBytes
+            Function_Return (rfUtf8BytesToString(ucaBytes))
+        End_Function
+
+        /* MOVE ONE PIN, TOUCH NOTHING ELSE (2026-09-25). A commit pin was unique text; a tag is not,
+           so this file is built to catch a text-only replace every way it can go wrong: two packages
+           on the same "1.0.5", the workspace's own package version "1.0.5", a registry entry
+           "#1.0.54" that CONTAINS "1.0.5", braces and escaped quotes inside a value, an entry on a
+           single line - and the Studio's LF endings with no final newline, kept byte for byte. */
+        {Published = True}
+        Procedure SetPin_MovesOnlyTheNamedDependency
+            String sRoot sFile sLf sText sWant
+            Boolean bOk
+            Handle ho
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZSetPin.sws") to sFile
+            Move (Character(10)) to sLf
+            Move ('{' + sLf) to sText
+            Move (sText + '    "dependencies": [' + sLf) to sText
+            Move (sText + '        "DataFlex-dev/Web UI FlexTron#1.0.54",' + sLf) to sText
+            Move (sText + '        {' + sLf) to sText
+            Move (sText + '            "source": "https://github.com/NilsSve/Library-A.git",' + sLf) to sText
+            Move (sText + '            "sws": "A-Library-26.0.sws",' + sLf) to sText
+            Move (sText + '            "version": "1.0.5"' + sLf) to sText
+            Move (sText + '        },' + sLf) to sText
+            Move (sText + '        { "source": "https://github.com/NilsSve/Library-B.git", "sws": "Sub/B-Library-26.0.sws", "version": "1.0.5" }' + sLf) to sText
+            Move (sText + '    ],' + sLf) to sText
+            Move (sText + '    "description": "Braces {like} these and a \"quoted\" word, in a value",' + sLf) to sText
+            Move (sText + '    "package": {' + sLf) to sText
+            Move (sText + '        "version": "1.0.5"' + sLf) to sText
+            Move (sText + '    }' + sLf) to sText
+            Move (sText + '}') to sText
+            Get _WriteRawText sFile sText to bOk
+            Send Assert bOk "the fixture was written"
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            // B, named with a backslash where the file has a slash: only B's version moves.
+            Get SetSwsDependencyVersion of ho sFile "https://github.com/NilsSve/Library-B.git" "Sub\B-Library-26.0.sws" "1.0.5" "1.0.6" to bOk
+            Send Assert bOk "the one-line entry was found and moved"
+            Move (Replace('"version": "1.0.5" }', sText, '"version": "1.0.6" }')) to sWant
+            Send AssertSAreEqual sWant (_ReadRawText(Self, sFile)) "only B's version changed, every other byte kept"
+
+            // A, in the Studio's one-key-per-line layout.
+            Get SetSwsDependencyVersion of ho sFile "https://github.com/NilsSve/Library-A.git" "A-Library-26.0.sws" "1.0.5" "1.0.6" to bOk
+            Send Assert bOk "the multi-line entry was found and moved"
+            Move (Replace(('"version": "1.0.5"' + sLf + '        },'), sWant, ('"version": "1.0.6"' + sLf + '        },'))) to sWant
+            Send AssertSAreEqual sWant (_ReadRawText(Self, sFile)) "only A's version changed - FlexTron#1.0.54 and the package's own 1.0.5 untouched"
+            Send Destroy of ho
+            Move (rfDeleteFile(sFile)) to bOk
+        End_Procedure
+
+        /* ...AND REFUSE WHEN IT CANNOT BE SURE. Two entries one source and version both match, a pin
+           that no longer says the old value, an entry the file does not have: each answers False
+           and leaves the file as it was. This file is CRLF WITH a final newline - the shape DUF's
+           and RDCFlexTron's manifests have - and must stay so. */
+        {Published = True}
+        Procedure SetPin_RefusesWhenItCannotBeSure
+            String sRoot sFile sNl sText sWant
+            Boolean bOk
+            Handle ho
+
+            Get _LibTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "ZSetPinTwo.sws") to sFile
+            Move (Character(13) + Character(10)) to sNl
+            Move ('{' + sNl) to sText
+            Move (sText + '    "dependencies": [' + sNl) to sText
+            Move (sText + '        { "source": "https://github.com/NilsSve/Library-R.git", "sws": "P.sws", "version": "2.0.0" },' + sNl) to sText
+            Move (sText + '        { "source": "https://github.com/NilsSve/Library-R.git", "sws": "Q.sws", "version": "2.0.0" }' + sNl) to sText
+            Move (sText + '    ]' + sNl) to sText
+            Move (sText + '}' + sNl) to sText
+            Get _WriteRawText sFile sText to bOk
+            Send Assert bOk "the fixture was written"
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            // One repository, two packages, one version: without the .sws there is no telling which.
+            Get SetSwsDependencyVersion of ho sFile "https://github.com/NilsSve/Library-R.git" "" "2.0.0" "2.0.1" to bOk
+            Send Assert (bOk = False) "two matching entries must not both move - nor either one"
+            Get SetSwsDependencyVersion of ho sFile "https://github.com/NilsSve/Library-R.git" "Q.sws" "1.9.9" "2.0.1" to bOk
+            Send Assert (bOk = False) "a pin that no longer says the old value must not be written over"
+            Get SetSwsDependencyVersion of ho sFile "https://github.com/NilsSve/Library-S.git" "Q.sws" "2.0.0" "2.0.1" to bOk
+            Send Assert (bOk = False) "an entry the file does not have must not be written"
+            Send AssertSAreEqual sText (_ReadRawText(Self, sFile)) "every refusal left the file exactly as it was"
+            // POSITIVE CONTROL: with the .sws named the same call is sure, and CRLF + final newline stay.
+            Get SetSwsDependencyVersion of ho sFile "https://github.com/NilsSve/Library-R.git" "Q.sws" "2.0.0" "2.0.1" to bOk
+            Send Assert bOk "named by source AND .sws, the entry is certain"
+            Move (Replace('"sws": "Q.sws", "version": "2.0.0"', sText, '"sws": "Q.sws", "version": "2.0.1"')) to sWant
+            Send AssertSAreEqual sWant (_ReadRawText(Self, sFile)) "only Q moved; CRLF and the final newline kept"
+            Send Destroy of ho
+            Move (rfDeleteFile(sFile)) to bOk
+        End_Procedure
+
+        /* A RANGE PIN FINDS ITS ONE CHECKOUT (2026-09-25). df-cli names the folder after the tag it
+           resolved ("-1.0.1"), never after "^1.0.0", so the suffix match cannot see it; the one
+           checkout carrying the .sws can. Two such checkouts are a guess, answered "" - and an exact
+           tag that is not checked out never borrows another version's folder. */
+        {Published = True}
+        Procedure DependencyManifest_RangeFindsItsOneCheckout
+            tSwsDependency Dep
+            String sRoot sHome sNew sOld sGot
+            Boolean bOk
+            Handle ho
+
+            Get _LibTestRoot to sRoot
+            Move (sRoot + "ZRangeHome\") to sHome
+            Move (sHome + "DfPkg\TestOwner_X_Library-1.0.1\") to sNew
+            Move (sHome + "DfPkg\TestOwner_X_Library-1.0.0\") to sOld
+            Move (rfDirectoryCreateEx(sNew, False)) to bOk
+            Get _WriteJsonSws (sNew + "X-Library.sws") '{ "df": 26.0 }' to bOk
+            Send Assert bOk "the checkout was written"
+            Move True to Dep.bIsObject
+            Move "https://github.com/TestOwner/Library-X.git" to Dep.sSource
+            Move "X-Library.sws" to Dep.sSws
+            Get Create (RefClass(cLibraryInventory)) to ho
+
+            Move "^1.0.0" to Dep.sVersion
+            Get ObjectDependencyManifest of ho sHome Dep to sGot
+            Send AssertSAreEqual (sNew + "X-Library.sws") sGot "a range finds the one checkout carrying its .sws"
+            Move "1.0.1" to Dep.sVersion
+            Get ObjectDependencyManifest of ho sHome Dep to sGot
+            Send AssertSAreEqual (sNew + "X-Library.sws") sGot "an exact tag still finds its own folder"
+            Move "1.0.2" to Dep.sVersion
+            Get ObjectDependencyManifest of ho sHome Dep to sGot
+            Send AssertSAreEqual "" sGot "an exact tag that is not checked out borrows nothing"
+
+            // The previous version's folder left behind: two carry the .sws, so a range cannot tell.
+            Move (rfDirectoryCreateEx(sOld, False)) to bOk
+            Get _WriteJsonSws (sOld + "X-Library.sws") '{ "df": 26.0 }' to bOk
+            Move "^1.0.0" to Dep.sVersion
+            Get ObjectDependencyManifest of ho sHome Dep to sGot
+            Send AssertSAreEqual "" sGot "two checkouts carrying the .sws are a guess, answered empty"
+            Send Destroy of ho
+            Move (rfRemoveFolderTree(sHome)) to bOk
+        End_Procedure
+
+        Procedure TearDown
+            Send _InitializeFuncLib of ghoFuncLib
+        End_Procedure
+    End_Object

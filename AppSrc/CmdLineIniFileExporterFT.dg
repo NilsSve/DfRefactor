@@ -1,0 +1,727 @@
+﻿Use Windows.pkg
+Use File_dlg.pkg
+Use vWin32fh.pkg
+Use cRefactorApplication.pkg
+Use cIniFile.pkg
+Use RefactorConstants.h.pkg
+Use cFTDbModalPanel.pkg
+Use cRDCForm.pkg
+Use cRDCCheckbox.pkg
+Use cRDCButton.pkg
+Use cRDCHeaderGroup.pkg
+Use cTextEdit.pkg
+Use FTAllWebControlClasses.pkg    // FT: web button/field controls (cWebHtmlBox)
+Use cFTDbLocalWebControlHost.pkg    // FT: hosts the web fields in this DB modal panel
+Use cFTGridHost.pkg               // FT: the button bar - one host on a grid of 8 px columns (RDCFlexTron)
+Use cFTDeferTimer.pkg             // FT: oCLEDeferTimer - the post-export confirmation, on a clean stack
+Use RDCRunProgram.pkg              // RDCRevealInExplorer - the post-export 'show me the files' offer
+Use FTMarkupBuilders.pkg         // the HTML vocabulary - OpenHtml, IconLabel, the builders
+Use FTThemeColors.pkg            // FTWebBg / FTCJTheme - the FT palette
+Use cCmdLineIniFile.pkg          // the command-line INI reader
+
+/* The post-export confirmation is its OWN deferred step (oCLEDeferTimer), not a box at the end of
+   DoExport. DoExport runs after the Export click and may have popped the shared message dialog on the
+   way (the overwrite prompt); popping it again on that return path is the documented
+   'Could not find object oCfmBody_hb' failure - the box silently never appears, which is
+   exactly what happened on 2026-08-22. Re-arming the timer gives it a clean stack. */
+Define CI_CLEDeferExportDone for 4
+
+Open SysFile
+Open FolderSelHeaA
+Open FolderSelDtlA
+
+Object oCmdLineIniFileExporter is a cFTDbModalPanel
+    Set Label to "Export Refactor Settings to CmdLine Ini-File"
+    Set Size to 333 404
+    Set piMinSize to 89 211
+    Set Location to 1 2  
+    Set Icon to "Export.ico"
+
+    // The ini-file path lives here: a web field set by the startup default + the Select dialog; DoExport
+    // reads it. The other values reach properties as they change (psCapUserName, the pbExport* ticks), so
+    // DoExport - run after the Export click - never does a by-handle GET (the err-98 wall - see BackupFilesFT.dg).
+    Property String  psIniFilePath
+    Property String  psCapUserName
+    // What DoExport actually wrote, handed to the deferred confirmation. Not psIniFilePath:
+    // the user can edit that field while the confirmation is still pending.
+    Property String  psExportedIni
+    // True when the last export wrote the CI scan's two files too (a workspace export) - DoExportDone names them.
+    Property Boolean pbExportedScanFiles False
+    // The 4 export-selection checkboxes are now web (oWebChecksHost); their state lives here
+    // (default True, matching the original Checked_State). DoExport reads these directly.
+    Property Boolean pbExportSWS       True
+    Property Boolean pbExportFolders   True
+    Property Boolean pbExportFilters   True
+    Property Boolean pbExportFunctions True
+    /* ALL FUNCTIONS, NOT THE SELECTION (Nils 2026-11-20). Ticked, the export writes every published Modernization
+       function instead of the ones ticked in Select Functions - and the Unicode64 group too only when
+       pbExportUnicode64 is ticked as well: those fixes belong to a move to 64-bit or Unicode. Left out always: the
+       Tidy Up group (its editor and removal functions), report functions the user has not ticked (they change
+       nothing and only make a run longer), and the never-pick list (the engine would not run those anyway).
+       IsAllExportFunction is the rule; the user's function list is not changed. The counts are for the two rows'
+       labels, taken when the dialog opens (Popup). */
+    Property Boolean pbExportAllFunctions False
+    Property Boolean pbExportUnicode64    False
+    Property Integer piAllFunctionsCount  0
+    Property Integer piUnicode64Count     0
+
+    Object oOpenDialog is a OpenDialog
+        Set Filter_String to "Ini Files|*.ini|.sws Files|*.sws|All Files|*.*"
+        Set MultiSelect_State to False
+
+        Procedure OnStartup
+            // DFRefactor's own home - cmd-line ini-file lives next to the exe.
+            tWorkspacePaths OrgWS
+            Get pOrgWS of ghoApplication to OrgWS
+            Set Initial_Folder to OrgWS.sPrograms
+        End_Procedure
+    End_Object
+
+    Object oInfo_grp is a cRDCHeaderGroup
+        Set Location to 4 19
+        Set Size to 50 368
+        Set Label to "Info"
+        Set psImage to "ActionAbout.ico"
+        
+        /* A read-only cTextEdit, not a TextBox (Nils 2026-11-20): the text outgrew the box and was cut off - an edit
+           control wraps it (on its own - it has no Wrap_State) and gets a vertical scroll bar when it needs one.
+           Read_Only_State, not Enabled_State False: a disabled edit cannot be scrolled, and greys its text. The text
+           is set once the control's window exists (Page); FTColorPanel gives it the theme's colours with the rest
+           of the panel. Skip_State: Tab passes it by. */
+        Object oInfo_edt is a cTextEdit
+            Set Location to 8 48
+            Set Size to 35 314
+            Set Read_Only_State to True
+            Set Skip_State to True
+
+            Procedure Page Integer iPageObject
+                String sNL
+                Forward Send Page iPageObject
+                Move (Character(13) + Character(10)) to sNL
+                Set Value to ("Exports the refactoring settings to an ini-file, for this program's command line: DFRefactorFT64.exe /bm <ini-file> runs them headless. The ini-file shown is the default one; any file name with an .ini extension will do, with its full path." + sNL + sNL + ;
+                              "Beside the ini-file it also writes <ini name>_RUN.ps1, a ready-to-run PowerShell script for the /bm run - and, for a workspace, <ini name>_SCAN.ps1 for the CI scan (/scan) and <ini name>_CI-SAMPLE.yml, a starter CI workflow to copy and adjust.")
+            End_Procedure
+        End_Object
+        
+    End_Object
+
+    Object oIniFile_grp is a cRDCHeaderGroup
+        Set Location to 63 19
+        Set Size to 50 368
+        Set Label to "Specify Ini-file"
+        Set psImage to "ActionOpen.ico" 
+        Set psNote to "Export file name."
+
+        // FT: the ini-file path as an editable cFTWebForm + a Select button (cFTWebButton) - mirrors
+        // CompilerSetupFT's compiler-path row. The path syncs to psIniFilePath (OnStartup seed, OnChange,
+        // and the Select dialog), which the cross-host DoExport reads.
+        Object oWebIniFileHost is a cFTDbLocalWebControlHost
+            Set Location to 27 0
+            Set Size to 18 360
+            Set peAnchors to anTopLeftRight
+            Set piColumnCount to 14
+
+            Object oWebIniFile_wf is a cFTWebForm
+                Set piColumnSpan  to 12
+                Set psLabel to "Ini-File Name:"
+                Set psToolTip to "The ini-file to export settings to. Type a path, or use Select to browse."
+                Procedure OnStartup
+                    String sPath
+                    Get ComputeDefaultIniPath of (oCmdLineIniFileExporter(Self)) to sPath
+                    Set psValue to sPath
+                    Set psIniFilePath of (oCmdLineIniFileExporter(Self)) to sPath
+                End_Procedure
+                // Editable: sync each change to psIniFilePath (same-host) so the cross-host Export reads a
+                // property, never a cross-host / deferred WebGet (the err-98 path).
+                Procedure OnChange String sNewValue String sOldValue
+                    Forward Send OnChange sNewValue sOldValue
+                    Set psIniFilePath of (oCmdLineIniFileExporter(Self)) to sNewValue
+                End_Procedure
+            End_Object
+
+            Object oWebSelect_btn is a cFTWebButton
+                Set piColumnIndex to 12
+                Set piColumnSpan  to 2
+                Set psCSSClass to "FtFixedBtn"      // fixed/natural width via application.css (piColumnSpan width is proportional - it stretches)
+                Set psCaption to "Select"
+                Set psToolTip to "Browse for an ini-file."
+                // cFTWebButton shows the file dialog directly (no cTimer defer needed - see CompilerSetupFT).
+                Procedure OnClick
+                    Boolean bOpen
+                    String[] asFileNames
+                    String sFileName
+                    Get Show_Dialog of oOpenDialog to bOpen
+                    If (bOpen = True) Begin
+                        Get Selected_Files of oOpenDialog to asFileNames
+                        Move asFileNames[0] to sFileName
+                        WebSet psValue of oWebIniFile_wf to sFileName
+                        Set psIniFilePath of (oCmdLineIniFileExporter(Self)) to sFileName
+                    End
+                End_Procedure
+            End_Object
+        End_Object
+        
+    End_Object
+
+    Object oExportDetails_grp is a cRDCHeaderGroup
+        Set Location to 122 19
+        Set Size to 177 368
+        Set Label to "Selections"
+        Set psImage to "SelectAll.ico"
+
+        // FT: the four detail fields as cFTWebForm controls (the native cRDCForm labels were unreadable
+        // under the dark cascade). Three are read-only (pbReadOnly); User Name is editable. The native
+        // info-icon TextBoxes are gone - their tooltips moved onto each field's psToolTip. The fields are
+        // seeded in OnStartup (pre-realization Set psValue). User Name syncs every change to psCapUserName
+        // via its server OnChange, so the (cross-host) Export reads a property, never a cross-host WebGet.
+        Object oWebFormsHost is a cFTDbLocalWebControlHost
+            Set Location to 13 12
+            Set Size to 72 348
+            Set peAnchors to anTopLeftRight
+            Set piColumnCount to 12
+
+            Object oWebSWSFile_wf is a cFTWebForm
+                Set piColumnSpan  to 12
+                Set psLabel to ".SWS File:"
+                Set pbReadOnly to True
+                Set psToolTip to "To change the .sws file, use the 'Current Workspace' combo-button in the program's toolbar."
+                Procedure OnStartup
+                    String sSWSFile
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Set psValue to sSWSFile
+                End_Procedure
+            End_Object
+
+            Object oWebUserName_wf is a cFTWebForm
+                Set piColumnSpan  to 7
+                Set psLabel to "User Name:"
+                Set psToolTip to "The 'User Name' is used by index.2 for the FolderSelHea table, to find the workspace Home folder. FolderSelDtl is the child table that holds the actual folder selections. So folder selections for a workspace can be different for each user. This value CAN be changed here."
+                Procedure OnStartup
+                    String sUserName
+                    Get psUserName of ghoApplication to sUserName
+                    Set psValue to sUserName
+                    Set psCapUserName of (oCmdLineIniFileExporter(Self)) to sUserName
+                End_Procedure
+                // Editable: sync each change to psCapUserName (same-host) so the cross-host Export reads a
+                // property instead of a cross-host / deferred WebGet (the err-98 path).
+                Procedure OnChange String sNewValue String sOldValue
+                    Forward Send OnChange sNewValue sOldValue
+                    Set psCapUserName of (oCmdLineIniFileExporter(Self)) to sNewValue
+                End_Procedure
+            End_Object
+
+            Object oWebFolders_wf is a cFTWebForm
+                Set piColumnSpan  to 7
+                Set psLabel to "Selected Folders:"
+                Set pbReadOnly to True
+                Set psToolTip to "The number of selected folders for the current workspace"
+                Procedure OnStartup
+                    String[] asFolders
+                    Get pasSelectedFolders of ghoApplication to asFolders
+                    Set psValue to (SizeOfArray(asFolders))
+                End_Procedure
+            End_Object
+
+            Object oWebFunctions_wf is a cFTWebForm
+                Set piColumnSpan  to 7
+                Set psLabel to "Selected Functions:"
+                Set pbReadOnly to True
+                Set psToolTip to "The current number of selected refactoring functions."
+                Procedure OnStartup
+                    Set psValue to SysFile.SelectedFunctionTotal
+                End_Procedure
+            End_Object
+        End_Object
+        
+        // FT: the 4 export-selection checkboxes as a cWebHtmlBox - the native cRDCCheckbox labels were
+        // unreadable under the dark cascade (owner-drawn label ignores TextColor). Each row toggles a
+        // pbExport* property; ChecksHtml re-renders on click and DoExport reads the properties directly.
+        Object oWebChecksHost is a cFTDbLocalWebControlHost
+            Set Location to 90 80
+            Set Size to 80 280
+            Set peAnchors to anTopLeftRight
+            Set piColumnCount to 1
+
+            Function CheckRow String sId Boolean bChecked String sLabel String sTip Returns String
+                String sCls sGlyph
+                If (bChecked = True) Begin
+                    Move "cbrow on" to sCls
+                    Move CS_Check to sGlyph
+                End
+                Else Begin
+                    Move "cbrow" to sCls
+                    Move "" to sGlyph
+                End
+                Function_Return ((ClickableHtml("div", (sCls), (sId), "", ((SpanOpen("cbbox")) + sGlyph + (CS_SpanEnd + (SpanOpen("cblbl"))) + sLabel + CS_SpanEnd), (sTip))))
+            End_Function
+
+            /* A row under another, indented. bEnabled False dims it, and its click is ignored (OnClick asks
+               the same rule). */
+            Function SubCheckRow String sId Boolean bChecked Boolean bEnabled String sLabel String sTip Returns String
+                String sCls sGlyph
+                Move "cbrow cbsub" to sCls
+                Move "" to sGlyph
+                If (bChecked = True) Begin
+                    Move (sCls + " on") to sCls
+                    Move CS_Check to sGlyph
+                End
+                If (bEnabled = False) ;
+                    Move (sCls + " cbdis") to sCls
+                Function_Return ((ClickableHtml("div", (sCls), (sId), "", ((SpanOpen("cbbox")) + sGlyph + (CS_SpanEnd + (SpanOpen("cblbl"))) + sLabel + CS_SpanEnd), (sTip))))
+            End_Function
+
+            Function ChecksHtml Returns String
+                String sHtml sAllLabel sUniLabel
+                Boolean bSWS bFolders bFilters bFunctions bAll bUni
+                Integer iAll iUni
+
+                Get pbExportSWS       of (oCmdLineIniFileExporter(Self)) to bSWS
+                Get pbExportFolders   of (oCmdLineIniFileExporter(Self)) to bFolders
+                Get pbExportFilters   of (oCmdLineIniFileExporter(Self)) to bFilters
+                Get pbExportFunctions of (oCmdLineIniFileExporter(Self)) to bFunctions
+                Get pbExportAllFunctions of (oCmdLineIniFileExporter(Self)) to bAll
+                Get pbExportUnicode64    of (oCmdLineIniFileExporter(Self)) to bUni
+                Get piAllFunctionsCount  of (oCmdLineIniFileExporter(Self)) to iAll
+                Get piUnicode64Count     of (oCmdLineIniFileExporter(Self)) to iUni
+                Move "Export all Modernization functions, not only my selection" to sAllLabel
+                If (iAll > 0) ;
+                    Move ("Export all " + String(iAll) + " Modernization functions, not only my selection") to sAllLabel
+                Move "Include the Unicode64 functions - for a move to 64-bit or Unicode" to sUniLabel
+                If (iUni > 0) ;
+                    Move ("Include the " + String(iUni) + " Unicode64 functions - for a move to 64-bit or Unicode") to sUniLabel
+                Move (CS_PaletteCssLink + CS_PageFitCssLink + CssLink("cmdlineini") + (DivOpen("cbwrap"))) to sHtml
+                Move (sHtml + CheckRow(Self, "sws", bSWS, "Export .sws File Name (See tooltips for explanations)", "If an .sws file is not present in the ini-file, the name of the .sws file *must* be specified on the command line with the /sws flag.")) to sHtml
+                Move (sHtml + CheckRow(Self, "folders", bFolders, "Export Selection of Source Code Folders", "If omitted, the current selections of folders made for that workspace, will be used.")) to sHtml
+                Move (sHtml + CheckRow(Self, "filters", bFilters, "Export File Filter Selections", "If omitted, the current program's 'File Filter' settings will be used.")) to sHtml
+                Move (sHtml + CheckRow(Self, "functions", bFunctions, "Export Selection of Refactoring Functions", "If omitted, the current selections of refactoring functions will be used.")) to sHtml
+                Move (sHtml + SubCheckRow(Self, "allfns", bAll, bFunctions, sAllLabel, "Every Modernization function instead of the ones ticked in Select Functions. Left out: the Tidy Up group (its editor and removal functions), report functions you have not ticked, and the functions on your never-pick list. Your function list is not changed.")) to sHtml
+                Move (sHtml + SubCheckRow(Self, "uni64", bUni, (bFunctions and bAll), sUniLabel, "Adds the 64-bit and Unicode migration functions. Tick this only for a workspace that is moving to 64-bit or Unicode.")) to sHtml
+                Move (sHtml + CS_DivEnd) to sHtml
+                Function_Return sHtml
+            End_Function
+
+            Object oWebChecks_htm is a cFTWebHtmlBox
+                Set piColumnSpan  to 1
+                // DESIGN-TIME PLACEHOLDER for the Studio's Windows Designer, which models the LAST literal
+                // psHtml it can parse. It is the string the runtime seeds (dumped by the cFTWebHtmlBox design
+                // dump, no workspace loaded); the runtime expression sits in End_Construct_Object below.
+                Set psHtml to """
+                <link rel="stylesheet" href="RDCFlexTron/palette.css">
+                <link rel="stylesheet" href="RDCFlexTron/buttons.css">
+                <link rel="stylesheet" href="RDCFlexTron/bars.css">
+                <link rel="stylesheet" href="RDCFlexTron/pagefit.css">
+                <link rel="stylesheet" href="CssStyle/cmdlineini.css">
+                <div class="cbwrap">
+                    <div class="cbrow on" data-ServerOnClick="sws"
+                        title="If an .sws file is not present in the ini-file, the name of the .sws file *must* be specified on the command line with the /sws flag."><span
+                        class="cbbox">&#10003;</span><span class="cblbl">Export .sws File Name (See tooltips for explanations)</span></div>
+                    <div class="cbrow on" data-ServerOnClick="folders" title="If omitted, the current selections of folders made for that workspace, will be used."><span
+                        class="cbbox">&#10003;</span><span class="cblbl">Export Selection of Source Code Folders</span></div>
+                    <div class="cbrow on" data-ServerOnClick="filters" title="If omitted, the current program's 'File Filter' settings will be used."><span class="cbbox">&#10003;</span><span
+                        class="cblbl">Export File Filter Selections</span></div>
+                    <div class="cbrow on" data-ServerOnClick="functions" title="If omitted, the current selections of refactoring functions will be used."><span class="cbbox">&#10003;</span><span
+                        class="cblbl">Export Selection of Refactoring Functions</span></div></div>
+                """
+
+                // RUNTIME content - here rather than in the object body, so the Designer keeps the literal above.
+                Procedure End_Construct_Object
+                    Forward Send End_Construct_Object
+                    Set psHtml to (ChecksHtml(Self))
+                End_Procedure
+                // Each time the dialog opens: the labels carry the counts Popup has just taken.
+                Procedure OnStartup
+                    Send UpdateHtml (ChecksHtml(Self))
+                End_Procedure
+                Procedure OnClick String sId String sParam
+                    Boolean b bFunctions bAll
+
+                    If (sId = "sws") Begin
+                        Get pbExportSWS of (oCmdLineIniFileExporter(Self)) to b
+                        Set pbExportSWS of (oCmdLineIniFileExporter(Self)) to (not(b))
+                    End
+                    If (sId = CS_IdSelFolders) Begin
+                        Get pbExportFolders of (oCmdLineIniFileExporter(Self)) to b
+                        Set pbExportFolders of (oCmdLineIniFileExporter(Self)) to (not(b))
+                    End
+                    If (sId = "filters") Begin
+                        Get pbExportFilters of (oCmdLineIniFileExporter(Self)) to b
+                        Set pbExportFilters of (oCmdLineIniFileExporter(Self)) to (not(b))
+                    End
+                    If (sId = CS_IdSelFunctions) Begin
+                        Get pbExportFunctions of (oCmdLineIniFileExporter(Self)) to b
+                        Set pbExportFunctions of (oCmdLineIniFileExporter(Self)) to (not(b))
+                    End
+                    // The two rows under Functions take a click only while the row above them is ticked.
+                    Get pbExportFunctions    of (oCmdLineIniFileExporter(Self)) to bFunctions
+                    Get pbExportAllFunctions of (oCmdLineIniFileExporter(Self)) to bAll
+                    If (sId = "allfns" and bFunctions = True) ;
+                        Set pbExportAllFunctions of (oCmdLineIniFileExporter(Self)) to (not(bAll))
+                    If (sId = "uni64" and bFunctions = True and bAll = True) Begin
+                        Get pbExportUnicode64 of (oCmdLineIniFileExporter(Self)) to b
+                        Set pbExportUnicode64 of (oCmdLineIniFileExporter(Self)) to (not(b))
+                    End
+                    Send PushHtml of Self (ChecksHtml(Self))
+                End_Procedure
+            End_Object
+        End_Object
+
+    End_Object
+
+    /* THE BUTTON BAR: one grid host of 8 px columns and two framework buttons (cFTWebButton, RDCFlexTron), as in
+       ShowOtherLogFilesFT.dg. A button's work runs in OnButtonClick, after the web click has returned (the
+       library's click relay), so the export's message boxes and Close_Panel can run there. The plain host,
+       not the data-aware one: the bar holds no field bound to a DD. Column 0 takes the rest of the width;
+       the spans fit the captions (Export Data ~105 px, Close ~72, measured 2026-09-30). Until then this bar
+       was HTML chips (BarButtonHtml) with a click-id OnClick. */
+    Object oWebBottomBar is a cFTGridHost
+        Set Location to 306 164
+        Set Size to 20 227
+        Set peAnchors to anBottomRight
+        Set piColumnCount to 27         // column 0, then Export Data's 15 and Close's 11
+        Set psColumnWidths to "0/1fr"   // column 0 takes the extra width
+
+        Object oExportBtn is a cFTWebButton
+            Set piColumnIndex to 1
+            Set piColumnSpan to 15
+            Set psCaption to "Export Data"
+            Set psCSSClass to "ftbtn ftg-check"
+            Set psToolTip to "Export the selected settings to the ini-file."
+
+            Procedure OnButtonClick
+                Send DoExport of (oCmdLineIniFileExporter(Self))
+            End_Procedure
+        End_Object
+
+        Object oCloseBtn is a cFTWebButton
+            Set piColumnIndex to 16
+            Set piColumnSpan to 11
+            Set psCaption to "Close"
+            Set psCSSClass to "ftbtn ftg-close"
+            Set psToolTip to "Close this dialog."
+
+            Procedure OnButtonClick
+                Send DoClose of (oCmdLineIniFileExporter(Self))
+            End_Procedure
+        End_Object
+    End_Object
+
+    // FT: the post-export confirmation's timer - DoExport arms this 1-ms one-shot once the export has
+    // succeeded, so DoExportDone runs on a clean stack (see CI_CLEDeferExportDone).
+    Object oCLEDeferTimer is a cFTDeferTimer
+        Procedure OnDeferredAction Integer iAction String sParam
+            If (iAction = CI_CLEDeferExportDone) ;
+                Delegate Send DoExportDone
+        End_Procedure
+    End_Object
+
+    // Compute the default ini-file path (was oIniFile_fm.OnStartup). oWebIniFile_wf.OnStartup seeds it
+    // into the editable path field + psIniFilePath.
+    Function ComputeDefaultIniPath Returns String
+        tWorkspacePaths OrgWS TargetWS
+
+        Get pOrgWS of ghoApplication to OrgWS
+        Get pTargetWS of ghoApplication to TargetWS
+        /* The name comes from the TARGET workspace, the folder from pOrgWS - DFRefactor's
+           OWN Programs folder, which is where /bm searches for a bare file name.
+
+           rfDefaultIniFileName is a GLOBAL, and must stay one on this path: this function is
+           called from oWebIniFile_wf.OnStartup, inside the WebView2 pump. Creating an object
+           here to reach the same logic as a class method HUNG the program (2026-08-22). */
+        Function_Return (rfDefaultIniFileName(TargetWS.sSWSFile, OrgWS.sPrograms))
+    End_Function
+
+    // The Export action (was oExport_btn.OnClick), run from the Export button's OnButtonClick, after the web
+    // click. Reads the ini path from psIniFilePath and the rest from properties - never a by-handle GET here.
+    Procedure DoExport
+        Integer iRetval
+        String sFileName sSWSFile sRetval sUserName sScriptName
+        Boolean bExists bSWSFile bFolders bFilters bFunctions
+
+        Get psIniFilePath  to sFileName
+        Get pbExportSWS   to bSWSFile
+        Get psSWSFile of ghoApplication to sSWSFile
+        Get psCapUserName  to sUserName
+        Get pbExportFolders   to bFolders
+        Get pbExportFilters   to bFilters
+        Get pbExportFunctions to bFunctions
+
+        If (bSWSFile = True) Begin
+            Get vFilePathExists sSWSFile to bExists
+            If (bExists = False) Begin
+                Send FTInfoBox ("The .sws file:" * sSWSFile * "doesn't exist. Cannot continue with this selection.")
+                Procedure_Return
+            End
+        End
+        Get vFilePathExists sFileName to bExists
+        If (bExists = True) Begin
+            Get FTYesNoBox "The file already exists, overwrite?" to iRetval
+            If (iRetval = MBR_No) Begin
+                Procedure_Return
+            End
+        End
+        Send Cursor_Wait of Cursor_Control
+        Get ExportToIniFile sFileName bSWSFile sSWSFile sUserName bFolders bFilters bFunctions to sRetval
+        Send Cursor_Ready of Cursor_Control
+        If (not(Lowercase(sRetval) contains "error")) Begin
+            // Deferred - see CI_CLEDeferExportDone. NOTE the first theory there (a second pop of
+            // the shared box on its return path) is DISPROVEN: deferring did not fix it, and the
+            // overwrite prompt above uses the same call and shows fine. What is established is
+            // only that no themed box appears AFTER ExportToIniFile has run; hence the native
+            // box in DoExportDone. The deferral is kept because it is harmless and correct.
+            Set psExportedIni to sFileName
+            Send ArmAction of (oCLEDeferTimer(Self)) CI_CLEDeferExportDone
+        End
+        Else Begin
+            Send FTInfoBox sRetval "Export failed!"
+        End
+    End_Procedure
+
+    /* The post-export confirmation: names BOTH files the export wrote, then offers to show them.
+       One dialog, one question. The INI is what gets revealed - Explorer selects it, and the
+       _RUN.ps1 sits beside it in the same folder, so one reveal shows the pair. */
+    Procedure DoExportDone
+        Integer iRetval
+        String  sIniPath sIniLeaf sScriptName sFolder sMsg sNL
+
+        Get psExportedIni to sIniPath
+        If (sIniPath = "") ;
+            Procedure_Return
+        Get RunnerScriptName of ghoApplication sIniPath to sScriptName
+        Get ParseFileName   sIniPath to sIniLeaf
+        Get ParseFolderName sIniPath to sFolder
+        Move (Character(10)) to sNL
+
+        Move ("Settings exported." + sNL + sNL) to sMsg
+        Move (sMsg + "   " + sIniLeaf   + sNL) to sMsg
+        Move (sMsg + "   " + sScriptName + "   (ready-to-run, for headless / build use)" + sNL) to sMsg
+        If (pbExportedScanFiles(Self) = True) Begin
+            Move (sMsg + "   " + ScanScriptName(ghoApplication, sIniPath) + "   (the CI scan, /scan)" + sNL) to sMsg
+            Move (sMsg + "   " + CIWorkflowSampleName(ghoApplication, sIniPath) + "   (a starter CI workflow, to copy and adjust)" + sNL) to sMsg
+        End
+        Move (sMsg + sNL) to sMsg
+        // ParseFolderName is "" for a bare file name - the path field is editable, so that is
+        // reachable by typing. Drop the line rather than print a dangling "in ".
+        If (Trim(sFolder) <> "") ;
+            Move (sMsg + "in " + sFolder + sNL + sNL) to sMsg
+        Move (sMsg + "Show them in Explorer?") to sMsg
+        /* NATIVE YesNo_Box, deliberately - not FTYesNoBox.
+
+           The themed box (DFRefactor's own MessageBoxFT.dg then) did not appear from here once
+           ExportToIniFile had run: the overwrite prompt a few lines earlier used the SAME call
+           and showed fine, so it is the export, not the dialog, that breaks it. Twice the user
+           pressed Export and was told nothing (2026-08-22). A Windows modal owns its own message
+           loop and cannot be left un-remounted, so this one reports the result whatever state
+           the export leaves behind. Try the themed box (RDCFlexTron's FTYesNoBox since
+           2026-09-29) only once the underlying cause is understood and fixed. */
+        Get YesNo_Box sMsg "Export complete" MB_DEFBUTTON1 to iRetval
+        If (iRetval = MBR_Yes) ;
+            Send RDCRevealInExplorer sIniPath
+    End_Procedure
+
+    // The Close action (was oClose_btn.OnClick), from the Close button's OnButtonClick and from Alt+C. Both
+    // run inside the modal's own message pump, so Close_Panel cleanly ends the modal loop.
+    Procedure DoClose
+        Send Close_Panel
+    End_Procedure
+
+    /* Clear a numbered section before it is rewritten - Folder Name1.., Function Name1..
+
+       DeleteSection, NOT a loop of WriteString(key, ""). That loop wrote 1000 empty keys per
+       section and cost 1000 whole-file rewrites, because DataFlex 26 changed cIniFile out from
+       under it (Nils found it 2026-08-22, on an export that appeared to hang):
+
+         DF25 - a thin wrapper over Kernel32 WritePrivateProfileStringW. An empty value did not
+                leave a key behind, and each call was one API call.
+         DF26 - a pure DataFlex in-memory array. SetValue with "" STORES key= , and every
+                WriteString calls WriteToFile, rewriting the entire file.
+
+       So the same loop that was harmless under DF25 produced a 36 KB ini of dead keys under
+       DF26 and took minutes. DeleteSection is one call, exists in both 25.0 and 26.0, and says
+       what this always meant. Re-exporting over a polluted ini heals it: the section goes
+       first, then the real entries are written. */
+    Procedure WipeExistingIniValues Handle hoIni String sSection
+        Send DeleteSection of hoIni sSection
+    End_Procedure
+    
+    Function ExportToIniFile String sFileName Boolean bSWSFile String sSWSFile String sUserName Boolean bFolders Boolean bFilters Boolean bFunctions Returns String
+        Boolean bOK bExists
+        Handle hoIni hoSpec
+        String sHomePath sFilters sResultPath sSpec sExeName sIniName sSingleFile sExePath
+        Boolean bWorkspaceMode bAll bUnicode64 bTake
+        Integer iCount
+        
+        Move False to Err
+        Get Create (RefClass(cIniFile)) to hoIni
+        Get Create (RefClass(cCmdLineIniFile)) to hoSpec  
+        Set psFileName of hoIni to sFileName
+        // ONE name for this build's executable - the Help syntax line and the
+        // Run-DFRefactor.ps1 wrapper at the end both use it, so they cannot disagree.
+        Move "DFRefactorFT64.exe" to sExeName
+
+        /* [Help] FIRST, so a freshly exported INI opens with the line that runs it.
+           Nothing reads these keys - they are here because whoever opens this file next is
+           usually not the person who exported it, and the switch is not guessable (Nils had
+           to run with -h to find it). The syntax line names THIS file, so it can be copied
+           straight to a command prompt. Written after Set psFileName because cIniFile
+           errors on any write before the file name is known. */
+        Get ParseFileName sFileName to sIniName
+        Send WriteString of hoIni CS_CmdIniHelpSection CS_CmdIniHelpSyntax   (sExeName * "/bm" * sIniName)
+        Send WriteString of hoIni CS_CmdIniHelpSection CS_CmdIniHelpSwitches CS_CmdIniHelpSwitchesText
+        Send WriteString of hoIni CS_CmdIniHelpSection CS_CmdIniHelpResult   CS_CmdIniHelpResultText
+        Send WriteString of hoIni CS_CmdIniHelpSection CS_CmdIniHelpWrapper  CS_CmdIniHelpWrapperText
+        Send WriteString of hoIni CS_CmdIniHelpSection CS_CmdIniHelpCreatedBy CS_CmdIniHelpCreatedByText
+
+        If (bSWSFile = True) Begin
+            Send WriteString of hoIni CS_CmdIniSWSFileSection CS_CmdIniSWSFile sSWSFile
+        End
+
+        /* [Single File Section] - written from the mode the program is actually in, with no
+           checkbox of its own. "Export these settings" means exactly that: if the user is working
+           on one file rather than a workspace, the INI should say so, and the reader gives that
+           file precedence over the .sws.
+
+           WRITTEN EVEN WHEN BLANK, on purpose. Re-exporting a workspace-mode session over an INI
+           that once named a single file has to CLEAR it - otherwise the stale name silently wins
+           over the .sws on the next headless run, which is the failure this section is supposed
+           to prevent rather than cause. */
+        Get pbWorkspaceMode of ghoApplication to bWorkspaceMode
+        Move "" to sSingleFile
+        If (bWorkspaceMode = False) ;
+            Get psCurrentSourceFileName of ghoApplication to sSingleFile
+        Send WriteString of hoIni CS_CmdIniSingleFileSection CS_CmdIniSingleFileName sSingleFile
+
+        If (bFolders = True) Begin
+            // Start by wiping any existing folder selections from the ini-file:
+            Send WipeExistingIniValues hoIni CS_CmdIniFoldersSection
+            
+            If (sUserName = "") Begin
+                Get psUserName of ghoApplication to sUserName
+            End
+            Send WriteString of hoIni CS_CmdIniUserSection CS_CmdIniUserName sUserName       
+                
+            Get psHomeTarget of ghoApplication to sHomePath 
+            Clear FolderSelHeaA
+            Move sUserName to FolderSelHeaA.UserName
+            Move sHomePath to FolderSelHeaA.WorkspaceHomeFolder
+            Find eq FolderSelHeaA by Index.2
+            
+            Constraint_Set (Self) Clear
+            Constrained_Clear eq FolderSelDtlA by Index.3
+            If (Found = False) Begin
+                Function_Return ("Error. The FolderSelHeaA record could not be found for User name:" * String(sUserName) + "\and workspace Home path:" * String(sHomePath))
+            End                   
+            Constrain FolderSelDtlA.FolderSelHeaID eq FolderSelHeaA.ID
+            Constrain FolderSelDtlA.bSelected eq 1
+            Constrained_Find First FolderSelDtlA by Index.3
+            Move 1 to iCount
+            While (Found = True)
+                Send WriteString of hoIni CS_CmdIniFoldersSection (CS_CmdIniFolderName + String(iCount)) (Trim(FolderSelDtlA.FolderName))
+                Increment iCount  
+                Constrained_Find Next
+            Loop
+        End 
+        
+        If (bFilters = True) Begin
+            Move (Trim(SysFile.FileExtensionFilter)) to sFilters
+            Send WriteString of hoIni CS_CmdIniFileFilterSection CS_CmdIniFileFilters sFilters
+        End   
+        
+        If (bFunctions = True) Begin
+            // Start by wiping any existing function selections from the ini-file:
+            Send WipeExistingIniValues hoIni CS_CmdIniFunctionSection
+            
+            // The user's selection, or every function IsAllExportFunction takes (pbExportAllFunctions) - each with
+            // the parameter stored for it in Select Functions.
+            Get pbExportAllFunctions to bAll
+            Get pbExportUnicode64    to bUnicode64
+            Move 1 to iCount
+            Constraint_Set (Self +1) Clear
+            Constrained_Clear eq FunctionsA by Index.3
+            If (bAll = True) Begin
+                Constrain FunctionsA.bPublished eq 1
+            End
+            Else Begin
+                Constrain FunctionsA.Selected eq 1
+            End
+            Constrained_Find First FunctionsA by Index.3
+            While (Found = True)
+                Move True to bTake
+                If (bAll = True) ;
+                    Get IsAllExportFunction bUnicode64 to bTake
+                If (bTake = True) Begin
+                    // ONE encoder for both halves of the feed - the reader decodes with the
+                    // same class, so the "Name,Parameter" rule cannot drift between them.
+                    Get EncodeFunctionSpec of hoSpec (Trim(FunctionsA.Function_Name)) (Trim(FunctionsA.Parameter)) to sSpec
+                    Send WriteString of hoIni CS_CmdIniFunctionSection (CS_CmdInitFunction + String(iCount)) sSpec
+                    Increment iCount
+                End
+                Constrained_Find Next
+            Loop
+        End
+
+        // Default result file = "Result.txt" beside the INI, so an exported INI is build-ready (the run
+        // records its outcome there and Run-DFRefactor.ps1 reads it back).
+        Get BatchResultPathForIni of ghoApplication sFileName to sResultPath
+        Send WriteString of hoIni CS_CmdIniResultSection CS_CmdIniResultFile sResultPath
+
+        Send Destroy of hoIni
+        Send Destroy of hoSpec
+
+        // Drop a ready-to-run wrapper next to the INI, pre-filled to this INI, so the exported pair is build-ready.
+        Send WriteRunnerScript of ghoApplication sFileName sResultPath sExeName
+        /* The CI scan's wrapper and a starter CI workflow (2026-11-20) - for a workspace only: /scan scans the
+           workspace the INI names. The program's full path is their default for the exe. */
+        Set pbExportedScanFiles to bSWSFile
+        If (bSWSFile = True) Begin
+            Get GetApplicationFileName of ghoApplication to sExePath
+            Send WriteScanScript       of ghoApplication sFileName sExePath (ParseFolderName(sSWSFile))
+            Send WriteCIWorkflowSample of ghoApplication sFileName sExePath sSWSFile
+        End
+        Function_Return (Err = False)
+    End_Function
+
+    // Whether the function in the FunctionsA buffer goes into an "all functions" export - see pbExportAllFunctions.
+    Function IsAllExportFunction Boolean bUnicode64 Returns Boolean
+        Integer eType eGroup
+        If (IsNeverPickFunction(ghoApplication, Trim(FunctionsA.Function_Name)) = True) ;
+            Function_Return False
+        Move FunctionsA.Type    to eType
+        Move FunctionsA.FnGroup to eGroup
+        If (eType = eReportFunction or eType = eReportFunctionAll) ;
+            Function_Return (FunctionsA.Selected = 1)
+        If (eGroup = eFnGroupModernization) ;
+            Function_Return True
+        Function_Return (bUnicode64 = True and eGroup = eFnGroupUnicode64)
+    End_Function
+
+    // How many published functions an "all functions" export writes (IsAllExportFunction) - for the rows' labels.
+    Function AllExportCount Boolean bUnicode64 Returns Integer
+        Integer iCount
+        Boolean bTake
+        Move 0 to iCount
+        Constraint_Set (Self + 2) Clear
+        Constrained_Clear eq FunctionsA by Index.3
+        Constrain FunctionsA.bPublished eq 1
+        Constrained_Find First FunctionsA by Index.3
+        While (Found = True)
+            Get IsAllExportFunction bUnicode64 to bTake
+            If (bTake = True) ;
+                Increment iCount
+            Constrained_Find Next
+        Loop
+        Function_Return iCount
+    End_Function
+
+    Procedure Popup
+        Integer iAll
+        // The two "all functions" rows show their counts, taken now - the function list may have changed.
+        Get AllExportCount False to iAll
+        Set piAllFunctionsCount to iAll
+        Set piUnicode64Count to (AllExportCount(Self, True) - iAll)
+        // The cFTWebForm fields seed themselves in OnStartup (pre-realization Set psValue).
+        Broadcast Recursive Send OnStartup
+        Forward Send Popup
+    End_Procedure
+
+    On_Key Key_Alt+Key_C Send DoClose      // was KeyAction of oClose_btn (now a web button)
+End_Object

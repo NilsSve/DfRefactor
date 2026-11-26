@@ -1,0 +1,551 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cFTDeepScanDriver
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-31
+//
+// Description : FlexTron driver for Deep Scan: runs the scanner for the dashboard and turns
+//               results into tile state.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use cDeepScanner.pkg
+Use cEncodingHelpers.pkg   // rfReadEncodedFileAsStringArray - the FlexCOM sweep reads the excluded proxies
+Use RefactorStatusPanel.pkg
+
+/*  cFTDeepScanDriver - runs a Deep Scan over a set of folders and returns the hits as analyzer
+    messages, plus the incremental scan cache that makes a re-scan cheap.
+
+    LIFTED OUT OF THE DASHBOARD VIEW (2026-07-31), second slice of the untangle. The scan lane is
+    not dashboard furniture: the guided trail's Check calls it too, and it reached it by borrowing
+    ScanFoldersToMessages off oDashboard_vw - which is how a screen ended up owning an engine.
+
+    The cache moves with it, because it is the reason this had to live somewhere long-lived in the
+    first place: the per-scan cDeepScanner instance dies with the scan, so whoever drives the scan
+    has to hold the cache across runs. That is this object now, rather than a view.
+
+    A class plus one global object, so either view drives a scan without reaching through the other.
+*/
+Class cFTDeepScanDriver is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        /* Session-lifetime incremental scan cache (Nils 2026-07-16): per-file hits keyed by
+           lower-cased path, valid while the file's last-write time + size AND the rules
+           fingerprint are unchanged - so the scan -> Run Fix Plan -> re-scan convergence loop only
+           re-reads what actually changed (see cDeepScanner.ScanFileCached). Owned HERE because this
+           object outlives the per-scan cDeepScanner instance; _PrimeScanner Gets it ONCE into a
+           ScanFoldersToMessages local, which threads it ByRef (a per-file property Get would
+           deep-copy the whole cache every file). In-memory only - a new session deliberately starts cold.
+
+           Inside the constructor because a CLASS property must be (error 4391); it sat at object
+           level while this lived in a view, where that is allowed. */
+        Property tDeepScanCache pDeepScanCache
+
+        /* RE-ENTRY GUARD, and it belongs with the scan - which is the bug this fixes.
+           ScanFoldersToMessages moved here in the 2026-07-31 untangle but this property stayed
+           behind on the dashboard view, so every Get/Set of it in this class hit an object that has
+           no such property: "Invalid message SET_PBDEEPSCANNING", error 98, on the FIRST Check run
+           after the move (Nils 2026-08-01). It compiled clean because the view's declaration made
+           the symbol known - a moved method whose property stays behind cannot fail any earlier
+           than runtime.
+
+           Blocks a mid-scan click reaching the pumped message queue from starting a second scan. */
+        Property Boolean pbDeepScanning False
+        /* THE SCAN KNOWS IT IS LOOKING AT A CHARACTER-MODE PROGRAM (Nils 2026-09-23: "in character
+           mode the Local keyword is necessary - could you not suggest the remove-Local function?").
+           Asked once per scan (_PrimeScanner), read per file (_ScanOneFile): the hits of every
+           converter the character-mode gate lists (FunctionNeedsWindowsProgram - RemoveLocalKeyWord
+           among them) are dropped before they become rows, so the board never offers a fix the
+           engine would only refuse. The cache keeps the full hits; the filter sits after it. */
+        Property Boolean pbCharModeScan False
+
+        /* THE LEARNED SUBCLASSES FOR THE CONVERTERS (Nils 2026-09-05). The funclib asks this object
+           (LearnedSubclassPairs) which classes the last scan learned as descendants of the legacy roots,
+           so a grid converter run with an EMPTY parameter converts their objects too - the same objects
+           the board listed. Memoised per workspace (psLearnedPairsKey = the scan cache's own file path):
+           refreshed by _FinishScan after every scan, else read once from the saved scan cache - a run
+           straight after a restart. */
+        Property String[] pasLearnedPairNames
+        Property String[] pasLearnedPairRoots
+        Property String   psLearnedPairsKey    ""
+        Property Boolean  pbLearnedPairsLoaded False
+        // ...and the last scan's verdict on each grid subclass (cDeepScanner.pasPortNames), kept and reloaded
+        // with the pairs - the analyzer asks through the funclib (GridSubclassWhy -> LearnedGridVerdicts).
+        Property String[] pasLearnedPortNames
+        Property String[] pasLearnedPortWhy
+        // Register as the funclib's source (cBaseFuncLib.phoSubclassSource); the funclib is created earlier.
+        If (ghoFuncLib <> 0) ;
+            Set phoSubclassSource of ghoFuncLib to Self
+    End_Procedure
+
+    // The funclib's question (cBaseFuncLib.LearnedSubclassesOf): the pairs of the last scan, lowercase, parallel.
+    Procedure LearnedSubclassPairs String[] ByRef asNames String[] ByRef asRoots
+        String sKey
+
+        Get DeepScanCacheJsonPath of ghoApplication to sKey
+        If (pbLearnedPairsLoaded(Self) = False or psLearnedPairsKey(Self) <> sKey) ;
+            Send _LoadLearnedPairsFromCache sKey
+        Get pasLearnedPairNames to asNames
+        Get pasLearnedPairRoots to asRoots
+    End_Procedure
+
+    // The funclib's other question (cBaseFuncLib.GridSubclassWhy): the last scan's verdicts on the grid
+    // subclasses, loaded with the pairs.
+    Procedure LearnedGridVerdicts String[] ByRef asNames String[] ByRef asWhy
+        String sKey
+
+        Get DeepScanCacheJsonPath of ghoApplication to sKey
+        If (pbLearnedPairsLoaded(Self) = False or psLearnedPairsKey(Self) <> sKey) ;
+            Send _LoadLearnedPairsFromCache sKey
+        Get pasLearnedPortNames to asNames
+        Get pasLearnedPortWhy   to asWhy
+    End_Procedure
+
+    /* No scan yet this session (or another workspace since): the saved scan cache's fingerprint carries
+       the pairs the last scan learned - read once. The loaded copy is NOT stored in pDeepScanCache: the
+       scan hydrates that itself (_PrimeScanner) and keeps the in-memory copy authoritative. */
+    Procedure _LoadLearnedPairsFromCache String sKey
+        tDeepScanCache Cache
+        String[] asNames asRoots asPortNames asPortWhy
+        Handle ho
+
+        Get pDeepScanCache to Cache
+        If (Cache.sRulesFingerprint = "") ;
+            Send LoadDeepScanCacheFromDisk (&Cache)
+        Get Create (RefClass(cDeepScanner)) to ho
+        Send SubclassPairsInFingerprint of ho Cache.sRulesFingerprint (&asNames) (&asRoots)
+        Send PortVerdictsInFingerprint  of ho Cache.sRulesFingerprint (&asPortNames) (&asPortWhy)
+        Send Destroy of ho
+        Set pasLearnedPortNames to asPortNames
+        Set pasLearnedPortWhy   to asPortWhy
+        Send _KeepLearnedPairs asNames asRoots sKey
+    End_Procedure
+
+    Procedure _KeepLearnedPairs String[] asNames String[] asRoots String sKey
+        Set pasLearnedPairNames  to asNames
+        Set pasLearnedPairRoots  to asRoots
+        Set psLearnedPairsKey    to sKey
+        Set pbLearnedPairsLoaded to True
+    End_Procedure
+
+    // Creates the per-scan cDeepScanner into ho, loads its rules into aRules and primes the
+    // session's incremental cache DSCache (hydrated from disk on the first scan of the session,
+    // then validated against the rules fingerprint) - all ByRef, so the caller's locals are the
+    // ones threaded through the rest of the scan.
+    // bFileScope = the caller named the files itself (the single-file door, not a folder walk):
+    // the learned-subclass set is then the last WORKSPACE scan's set plus whatever the named
+    // files declare, in that order - _LearnSubclassesForFiles says why the order matters.
+    Procedure _PrimeScanner Handle ByRef ho tDeepScanRule[] ByRef aRules tDeepScanCache ByRef DSCache String[] ByRef asFiles Boolean bFileScope
+        Boolean bCharMode
+        Get Create (RefClass(cDeepScanner)) to ho
+        Get MainProgramIsCharacterMode of ghoApplication to bCharMode
+        Set pbCharModeScan to bCharMode
+        // Whether a menu file is live is asked of the programs in the scan's folders, not its own folder only.
+        Set pasMenuMapFiles of ho to asFiles
+        Get LoadDeepScanRules of ho (DeepScanRulesJsonPath(ho)) to aRules
+        // The workspace's own subclasses of the legacy classes, learned BEFORE the cache is judged:
+        // the learned set is part of the rules fingerprint (cDeepScanner.ValidateScanCache).
+        If (bFileScope = True) ;
+            Send _LearnSubclassesForFiles ho (&asFiles) (&aRules)
+        Else ;
+            Send LearnWorkspaceSubclasses of ho (&asFiles) (&aRules)
+        // Prime the incremental cache: a rules change since it was built (fingerprint
+        // mismatch - a toggle, a reseed) flushes every entry; otherwise all entries stay
+        // valid and per-file freshness decides in _ScanOneFile.
+        Get pDeepScanCache to DSCache
+        /* FIRST scan of the session: hydrate from disk. Without this the cache was
+           session-lifetime, so every program start re-read and re-lexed the whole workspace even
+           when nothing had been edited (Nils 2026-07-28). An empty entry array is the honest test
+           for "nothing in memory yet" - after this the in-memory copy is authoritative and the
+           file is only written, never re-read. */
+        If (SizeOfArray(DSCache.aEntries) = 0) ;
+            Send LoadDeepScanCacheFromDisk (&DSCache)
+        Send ValidateScanCache of ho (&aRules) (&DSCache)
+    End_Procedure
+
+    /* The learned subclasses for a scan whose files the CALLER named (one file). Learning from
+       that file alone would be wrong twice over: the learned set rides the cache fingerprint
+       (cDeepScanner.ValidateScanCache), so a one-file set would FLUSH the whole workspace cache
+       and make the next Check cold; and _FinishScan hands the set to the converters as "what the
+       workspace declares" (LearnedSubclassPairs), so one file's declarations would replace the
+       workspace's. So: the last workspace scan's set FIRST, in its own order - a file that adds
+       nothing leaves the fingerprint byte-identical - then only the pairs this file adds. */
+    Procedure _LearnSubclassesForFiles Handle ho String[] ByRef asFiles tDeepScanRule[] ByRef aRules
+        String[] asMemoNames asMemoRoots asNames asRoots asMemoPortNames asMemoPortWhy asPortNames asPortWhy
+        Integer i iLast
+
+        Send LearnedSubclassPairs (&asMemoNames) (&asMemoRoots)
+        Send LearnedGridVerdicts  (&asMemoPortNames) (&asMemoPortWhy)
+        Send LearnWorkspaceSubclasses of ho (&asFiles) (&aRules)
+        /* The verdicts the same way as the pairs: the workspace scan's FIRST, in their own order, then only
+           what this file adds. A class the workspace scan judged keeps that verdict - this pass saw one file,
+           and whether another class is built on it is a question about all of them. */
+        Get pasPortNames of ho to asPortNames
+        Get pasPortWhy   of ho to asPortWhy
+        Move (SizeOfArray(asPortNames) - 1) to iLast
+        For i from 0 to iLast
+            If (SearchArray(asPortNames[i], asMemoPortNames) = -1) Begin
+                Move asPortNames[i] to asMemoPortNames[-1]
+                Move asPortWhy[i]   to asMemoPortWhy[-1]
+            End
+        Loop
+        Set pasPortNames of ho to asMemoPortNames
+        Set pasPortWhy   of ho to asMemoPortWhy
+        Get pasSubclassNames of ho to asNames
+        Get pasSubclassRoots of ho to asRoots
+        Move (SizeOfArray(asNames) - 1) to iLast
+        For i from 0 to iLast
+            If (SearchArray(asNames[i], asMemoNames) = -1) Begin
+                Move asNames[i] to asMemoNames[-1]
+                Move asRoots[i] to asMemoRoots[-1]
+            End
+        Loop
+        Set pasSubclassNames of ho to asMemoNames
+        Set pasSubclassRoots of ho to asMemoRoots
+    End_Procedure
+
+    // Picks the status-panel caption - the caller's own lead-in, or the cold-pass wording when
+    // the primed cache is empty - and starts the panel sized to the iLast + 1 files to scan.
+    Procedure _StartScanPanel String sPanelCaption tDeepScanCache ByRef DSCache Integer iLast
+        String sCaption
+        Integer iDash
+
+        /* THE PANEL SAYS WHICH KIND OF SCAN THIS IS, and to do that the cache has to be primed
+           FIRST - hence the reordering: creating the scanner, loading the rules and validating
+           the cache all used to happen after StartStatusPanel, which meant the caption was
+           chosen before anyone knew whether it would be a cold pass.
+
+           ValidateScanCache empties the cache whenever the rules fingerprint has moved (a
+           version bump, a rule toggle), so every file is read and lexed again. That is the
+           whole difference between a Check that takes seconds and one that takes minutes, and
+           the panel is what the user watches while it happens - being told 'analyzing source'
+           for seven minutes says nothing about why this run is the slow one (Nils 2026-09-01).
+
+           The caller's lead-in is kept so the message stays true to its lane: 'Check' and
+           'Analyze Source pass 2' each keep their own, and only the tail is replaced. Short on
+           purpose - the panel truncates. */
+        Move sPanelCaption to sCaption
+        If (SizeOfArray(DSCache.aEntries) = 0) Begin
+            Move (Pos(" - ", sPanelCaption)) to iDash
+            If (iDash > 1) ;
+                Move (Left(sPanelCaption, (iDash - 1)) + " - rebuilding the scan cache") to sCaption
+            Else ;
+                Move "Rebuilding the scan cache" to sCaption
+        End
+        Send StartStatusPanel of ghoStatusPanel sCaption "" (iLast + 1) (iLast + 1)
+    End_Procedure
+
+    // One panel tick for file iFile (0-based) of iLast + 1: repaints the panel and status bar
+    // only when the paint gate is due, always sets the OVERALL bar to iFile + 1, and polls Cancel
+    // on the same gate. Returns the Check_StatusPanel result - MSG_CANCEL when the user
+    // cancelled, 0 when the poll was skipped this tick.
+    Function _PollScanPanel Integer iFile Integer iLast Integer iStartTick Handle hoStatusBar String sFileName Returns Integer
+        Boolean bPaint
+        Integer iCheck
+
+        // TIME-DRIVEN PANEL, not per-file (Nils 2026-07-26). This block used to repaint and PUMP
+        // for every file - four pumps each (Caption_Text, TableName_Text, PumpMsgQueue, and
+        // Check_StatusPanel's ProcessEvents) - so a 1,686-file workspace paid ~6,700 pumps per
+        // scan, nearly all of them around a cache hit costing microseconds. That is the cost that
+        // arrived with the scan, and it lands on every Check. PanelPaintDue bounds it by WALL CLOCK
+        // (~5 paints/second, see RefactorStatusPanel.pkg): the loop itself (in ScanFoldersToMessages) now only advances the
+        // bar position, which is a cheap control write with no pump. Cancel still polls on the same
+        // gate, so worst-case latency is one paint interval.
+        //   The two bars mean DIFFERENT things (Nils 2026-07-26): the OVERALL bar is files, and the
+        // PER-FILE bar belongs to the file being scanned - cDeepScanner.ScanLines scales it to that
+        // file's line count and steps it through both of its walks, so a big file no longer reads
+        // as a frozen panel. Do NOT drive the per-file bar from here: two bars moving in tandem
+        // say nothing that one bar does not already say.
+        Get PanelPaintDue of ghoStatusPanel to bPaint
+        If (bPaint = True) Begin
+            Set Caption_Text of ghoStatusPanel to ("Analyze Source - File No:" * String(iFile + 1) * "of:" * String(iLast + 1))
+            // Panel field conventions (see RefactorStatusPanel.pkg): the full path belongs on the
+            // multi-line TableName line, not the Action area (which is for source-line-level text).
+            Set TableName_Text of ghoStatusPanel to sFileName
+            Set StatusText of hoStatusBar to ("Analyze Source: file " + String(iFile + 1) + " of " + String(iLast + 1) + " (" + String((GetTickCount() - iStartTick) / 1000) + "s)")
+            Send PumpMsgQueue of Desktop
+        End
+        // Absolute position (not DoAdvance), so a throttled paint never leaves the bar short.
+        Set piPositionTot of ghoStatusPanel to (iFile + 1)
+        // Cancel: the panel's Cancel button does NOT close it - cStatusPanel.Close_Panel just
+        // sets pbCancel and the panel stays up (so an Active_State poll never fires; Nils
+        // 2026-07-10). Check_StatusPanel is the sanctioned poll: it runs ProcessEvents (which
+        // is what actually dispatches the button click during this tight loop), reads the
+        // flag, and stops the panel itself - MSG_CANCEL back means the user cancelled.
+        // Polled on the paint gate: ProcessEvents is the expensive half of the old per-file cost.
+        Move 0 to iCheck
+        If (bPaint = True) ;
+            Get Check_StatusPanel of ghoStatusPanel to iCheck
+        Function_Return iCheck
+    End_Function
+
+    // The hits a character-mode program can use: those whose converter the gate does not list.
+    // See pbCharModeScan. Order is kept.
+    Function _HitsForCharacterMode tDeepScanHit[] ByRef aHits Returns tDeepScanHit[]
+        tDeepScanHit[] aKeep
+        Integer i iMax
+        Boolean bGated
+
+        Move (SizeOfArray(aHits) - 1) to iMax
+        For i from 0 to iMax
+            Move False to bGated
+            If (ghoFuncLib <> 0 and Trim(aHits[i].sRefactorFn) <> "") ;
+                Get FunctionNeedsWindowsProgram of ghoFuncLib aHits[i].sRefactorFn to bGated
+            If (bGated = False) ;
+                Move aHits[i] to aKeep[-1]
+        Loop
+        Function_Return aKeep
+    End_Function
+
+    // Scans one file - or takes its hits from the unchanged-file cache, counting that in
+    // iCacheHits - and appends the file's analyzer messages to aMessages. ho is the scanner.
+    Procedure _ScanOneFile Handle ho String sFileName tDeepScanRule[] ByRef aRules tDeepScanCache ByRef DSCache tCompileError[] ByRef aMessages Integer ByRef iCacheHits
+        tDeepScanHit[] aHits
+        tCompileError[] aFileMsgs
+        Integer i iN
+        Boolean bFromCache
+
+        // Cache front: an unchanged file (last-write time + size) under unchanged
+        // rules reuses its previous hits without re-reading - after a plan run,
+        // only the files that run (or the user) actually wrote get re-scanned.
+        Get ScanFileCached of ho sFileName (&aRules) (&DSCache) (&bFromCache) to aHits
+        If (bFromCache = True) ;
+            Increment iCacheHits
+        // A character-mode program: the gated converters' hits stop here (see pbCharModeScan).
+        If (pbCharModeScan(Self) = True and SizeOfArray(aHits) > 0) ;
+            Get _HitsForCharacterMode (&aHits) to aHits
+        If (SizeOfArray(aHits) > 0) Begin
+            Get HitsToMessages of ho aHits sFileName to aFileMsgs
+            Move (SizeOfArray(aFileMsgs) - 1) to iN
+            For i from 0 to iN
+                Move aFileMsgs[i] to aMessages[-1]
+            Loop
+        End
+    End_Procedure
+
+    // Appends a DS 9220 message to aMessages for every COM proxy the collection excluded that
+    // still uses retired FlexCOM; a no-op while rule 9220 is disabled. ho is the scanner whose
+    // HitsToMessages shapes the row; aRules is the loaded rule set.
+    Procedure _SweepFlexComProxies Handle ho tDeepScanRule[] ByRef aRules tCompileError[] ByRef aMessages
+        tDeepScanHit FlexHit
+        tDeepScanHit[] aFlexHits
+        String[] asProxies asProxyCode
+        tCompileError[] aFileMsgs
+        Integer iFlexRule iFlexLine iFlexN iFlexI i iN
+
+        /* THE FLEXCOM SWEEP, over the files the scan just deliberately did not read. Collection
+           excludes Studio-generated COM proxies - correctly, they are never refactored - but a
+           FlexCOM-era proxy is EXACTLY the file DS 9220 exists for, so the rule could never fire
+           on its only real target: LegacyApp4's rcmail.pkg produced a clean board while
+           the workspace was unrefactorable (2026-08-27). AllSourceFiles now publishes what it
+           dropped (pasProxySkipped, fresh from THIS driver's own call in ScanFoldersToMessages), and this sweep runs
+           just the one cheap check on each: the same LineUsingRetiredFlexCom the engine's halt
+           uses, so the row and the halt can never disagree. The hit is fabricated from the 9220
+           rule's own record and folded through HitsToMessages - one message shape, one matcher. */
+        Move 0 to iFlexRule
+        Move (SizeOfArray(aRules) - 1) to iN
+        For i from 0 to iN
+            If (aRules[i].iDSNumber = 9220 and aRules[i].bEnabled = True) ;
+                Move (i + 1) to iFlexRule
+        Loop
+        If (iFlexRule > 0) Begin
+            Get pasProxySkipped of ghoApplication to asProxies
+            Move (SizeOfArray(asProxies) - 1) to iN
+            For i from 0 to iN
+                Move (rfReadEncodedFileAsStringArray(asProxies[i])) to asProxyCode
+                Get LineUsingRetiredFlexCom of ghoFuncLib (&asProxyCode) to iFlexLine
+                If (iFlexLine > 0) Begin
+                    Move (ResizeArray(aFlexHits, 0)) to aFlexHits
+                    Move iFlexLine                            to FlexHit.iLine
+                    Move aRules[iFlexRule - 1].sSymbol        to FlexHit.sSymbol
+                    Move aRules[iFlexRule - 1].eCategory      to FlexHit.eCategory
+                    Move aRules[iFlexRule - 1].sRefactorFn    to FlexHit.sRefactorFn
+                    Move aRules[iFlexRule - 1].sHint          to FlexHit.sHint
+                    Move aRules[iFlexRule - 1].iDSNumber      to FlexHit.iDSNumber
+                    Move FlexHit to aFlexHits[0]
+                    Get HitsToMessages of ho aFlexHits asProxies[i] to aFileMsgs
+                    Move (SizeOfArray(aFileMsgs) - 1) to iFlexN
+                    For iFlexI from 0 to iFlexN
+                        Move aFileMsgs[iFlexI] to aMessages[-1]
+                    Loop
+                End
+            Loop
+        End
+    End_Procedure
+
+    // Scan teardown, shared by the cancelled and the completed run: persists the cache to memory
+    // and disk, destroys the scanner ho, stops the panel, restores the cursor and clears the
+    // re-entry guard.
+    Procedure _FinishScan Handle ho tDeepScanCache ByRef DSCache
+        String[] asNames asRoots asPortNames asPortWhy
+        String sKey
+
+        // Persist the cache back EVEN WHEN CANCELLED (this runs before the caller's cancel
+        // branch on purpose): each entry is valid on its own, so the next scan resumes
+        // from whatever this one already covered instead of re-reading it.
+        Set pDeepScanCache to DSCache
+        // ...and THIS scan's learned subclasses, for the converters (LearnedSubclassPairs).
+        Get pasSubclassNames of ho to asNames
+        Get pasSubclassRoots of ho to asRoots
+        Get DeepScanCacheJsonPath of ghoApplication to sKey
+        // The verdicts first: _KeepLearnedPairs marks the memo loaded, and LearnedGridVerdicts reads it then.
+        Get pasPortNames of ho to asPortNames
+        Get pasPortWhy   of ho to asPortWhy
+        Set pasLearnedPortNames to asPortNames
+        Set pasLearnedPortWhy   to asPortWhy
+        Send _KeepLearnedPairs asNames asRoots sKey
+        // ...and to DISK, for the next program start. Same reasoning as the in-memory save above:
+        // written even when cancelled, because every entry is valid on its own.
+        Send SaveDeepScanCacheToDisk DSCache
+        Send Destroy of ho
+        Send Stop_StatusPanel of ghoStatusPanel
+        Send Cursor_Ready of Cursor_Control
+        Set pbDeepScanning to False
+    End_Procedure
+
+    // THE SCAN CORE, shared by the dashboard chip (RunDeepScan wraps it with scope confirms,
+    // campaign narration and the DS-mode grid load) and the guided Check (CheckWorkspaceFT),
+    // which MERGES the result into the compile-lane analysis instead - phase 2 of the
+    // convergence (Nils 2026-07-25: 'Object oX is a cTrGrid' is invisible to the compiler,
+    // and the scan lane never ran under Check, so its "Grid subclass" row never surfaced).
+    // Scans asFolders (no confirms - scope is the CALLER's contract), drives the status panel
+    // (cancellable) and the session's incremental cache, and returns the hits as analyzer
+    // currency (tCompileError[], "DS <n>"). iFilesTotal = files found (0 = nothing to scan);
+    // iCacheHits = how many came from the unchanged-file cache; bCancelled per the panel.
+    // The loop itself is _ScanFileList, shared with ScanFilesToMessages (the single-file door).
+    Function ScanFoldersToMessages String[] asFolders String sPanelCaption Boolean ByRef bCancelled Integer ByRef iFilesTotal Integer ByRef iCacheHits Returns tCompileError[]
+        Handle hoStatusBar
+        tRefactorFiles RFiles
+        tCompileError[] aMessages
+        Boolean bBusy
+
+        Move False to bCancelled
+        Move 0 to iFilesTotal
+        Move 0 to iCacheHits
+        Get pbDeepScanning to bBusy
+        If (bBusy = True) ;
+            Function_Return aMessages
+        Set pbDeepScanning to True
+        Send Cursor_Wait of Cursor_Control
+        Get Statusbar_Id of (phoMainPanel(ghoApplication)) to hoStatusBar
+        Set StatusText of hoStatusBar to "Analyze Source: collecting source files..."
+        Send PumpMsgQueue of Desktop
+        Get AllSourceFiles of ghoApplication asFolders SysFile.FileExtensionFilter to RFiles
+        Get _ScanFileList (&RFiles.asFullFileNames) sPanelCaption False (&bCancelled) (&iFilesTotal) (&iCacheHits) to aMessages
+        Function_Return aMessages
+    End_Function
+
+    /* THE SINGLE-FILE DOOR (Nils 2026-09-17: a legacy file that cannot be included in any program
+       has no compile lane, and the manual function picker leaves the user guessing which of the
+       functions apply to it). Scans exactly asFiles - no collection, no folder walk - and returns
+       the same analyzer currency as the folder scan, so the Analyzer grid, Run Fix Plan and the
+       post-plan verify re-scan work unchanged on it. What differs from a folder scan: no FlexCOM
+       proxy sweep (that reads the proxies a COLLECTION excluded, and nothing was collected here),
+       and the learned-subclass set is the workspace's plus these files' (_LearnSubclassesForFiles). */
+    Function ScanFilesToMessages String[] asFiles String sPanelCaption Boolean ByRef bCancelled Integer ByRef iFilesTotal Integer ByRef iCacheHits Returns tCompileError[]
+        tCompileError[] aMessages
+        Boolean bBusy
+
+        Move False to bCancelled
+        Move 0 to iFilesTotal
+        Move 0 to iCacheHits
+        Get pbDeepScanning to bBusy
+        If (bBusy = True) ;
+            Function_Return aMessages
+        Set pbDeepScanning to True
+        Send Cursor_Wait of Cursor_Control
+        Get _ScanFileList (&asFiles) sPanelCaption True (&bCancelled) (&iFilesTotal) (&iCacheHits) to aMessages
+        Function_Return aMessages
+    End_Function
+
+    // The loop both doors share. Enters with the re-entry guard SET and the wait cursor on (the
+    // doors own those: the folder door pumps while it collects, so it must already be guarded);
+    // releases both on every exit. bFileScope per ScanFilesToMessages.
+    Function _ScanFileList String[] ByRef asFiles String sPanelCaption Boolean bFileScope Boolean ByRef bCancelled Integer ByRef iFilesTotal Integer ByRef iCacheHits Returns tCompileError[]
+        Handle ho hoStatusBar
+        tDeepScanRule[] aRules
+        tDeepScanCache DSCache
+        tCompileError[] aMessages
+        Integer iFile iLast iStartTick iCheck
+
+        Get Statusbar_Id of (phoMainPanel(ghoApplication)) to hoStatusBar
+        Move (GetTickCount()) to iStartTick
+        Move (SizeOfArray(asFiles) - 1) to iLast
+        Move (iLast + 1) to iFilesTotal
+        If (iLast < 0) Begin
+            Send Cursor_Ready of Cursor_Control
+            Set StatusText of hoStatusBar to "Ready."
+            Set pbDeepScanning to False
+            Function_Return aMessages
+        End
+        Send _PrimeScanner (&ho) (&aRules) (&DSCache) (&asFiles) bFileScope
+        Send _StartScanPanel sPanelCaption (&DSCache) iLast
+        For iFile from 0 to iLast
+            Get _PollScanPanel iFile iLast iStartTick hoStatusBar asFiles[iFile] to iCheck
+            If (iCheck = MSG_CANCEL) Begin
+                Move True to bCancelled
+                Move iLast to iFile
+            End
+            Else Begin
+                Send _ScanOneFile ho asFiles[iFile] (&aRules) (&DSCache) (&aMessages) (&iCacheHits)
+            End
+        Loop
+        If (bCancelled = False and bFileScope = False) ;
+            Send _SweepFlexComProxies ho (&aRules) (&aMessages)
+        Send _FinishScan ho (&DSCache)
+        Function_Return aMessages
+    End_Function
+
+    /* Hydrate the scan cache from Data\DeepScanCache-<wskey>.json.
+
+       asPathsLow is NOT persisted - it is a lookup index parallel to aEntries, so it is rebuilt
+       here rather than stored twice. Everything else about validity is unchanged: the caller runs
+       ValidateScanCache immediately after this, which flushes the lot on a rules-fingerprint
+       mismatch, and each entry still has to pass the last-write + size test per file. A cache
+       whose version does not match is returned empty by ReadDeepScanCache, so a struct change
+       degrades to a normal cold scan rather than misreading fields. */
+    Procedure LoadDeepScanCacheFromDisk tDeepScanCache ByRef Cache
+        tDeepScanCacheFile TheFile
+        Integer i iLast
+        String[] asPaths
+
+        Get ReadDeepScanCache of ghoApplication to TheFile
+        Move (SizeOfArray(TheFile.aEntries) - 1) to iLast
+        If (iLast < 0) ;
+            Procedure_Return
+        For i from 0 to iLast
+            Move TheFile.aEntries[i].sFileLow to asPaths[i]
+        Loop
+        Move TheFile.sRulesFingerprint to Cache.sRulesFingerprint
+        Move TheFile.aEntries          to Cache.aEntries
+        Move asPaths                   to Cache.asPathsLow
+    End_Procedure
+
+    // The other half. By value, not ByRef: this is the last thing done with the cache and the
+    // write must not be able to disturb it.
+    Procedure SaveDeepScanCacheToDisk tDeepScanCache Cache
+        tDeepScanCacheFile TheFile
+        Move Cache.sRulesFingerprint to TheFile.sRulesFingerprint
+        Move Cache.aEntries          to TheFile.aEntries
+        // The scope this cache came from, so the file can say what it does NOT hold.
+        Get pasLastScopeFolders of ghoApplication to TheFile.asScopeFolders
+        Get pasEmptyFolders     of ghoApplication to TheFile.asEmptyFolders
+        Send WriteDeepScanCache of ghoApplication TheFile
+    End_Procedure
+
+End_Class
+
+// One instance. Both the Dashboard's Analyze Source chip and the guided trail's Check drive scans
+// through this handle.
+#IFNDEF ghoDeepScanDriver
+    Global_Variable Handle ghoDeepScanDriver
+    Move 0 to ghoDeepScanDriver
+#ENDIF
+
+Object oDeepScanDriver is a cFTDeepScanDriver
+    Move Self to ghoDeepScanDriver
+End_Object

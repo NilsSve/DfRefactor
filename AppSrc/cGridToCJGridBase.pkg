@@ -2,7 +2,7 @@
 
  Abstract base class for CJ grid conversion worker classes.
  Shared by:
-   cDbGridTocDbCJGrid  (data-aware:     DbGrid/cLangDbGrid -> cDbCJGrid)
+   cDbGridTocDbCJGrid  (data-aware:     DbGrid/cTrDbGrid -> cDbCJGrid)
    cGridToCJGrid       (non-data-aware: Grid               -> cCJGrid)
 
  This class provides all transformation logic that operates at the cCJGrid level --
@@ -29,7 +29,9 @@
    - "Object X is a <OldGridClass>"    ->  "Object X is a <NewGridClass>"
    - Commented out: Set Main_File (hints which DDO to wire up)
    - Removed: Set Wrap_State, Set psColumnsID, Set Visible_State, Set Dynamic_Update_State
-   - Removed: Define <constant> N (column index constants)
+   - PRESERVED: Define <constant> N - preserved as-is since 2026-07-03 (was removed as a dead column-index
+     constant, but preserved procedures still reference these; deleting broke the compile - see the
+     pass-through branch in ProcessGridBody)
    - Removed: Set Child_Table_State, Set Item_Limit, Set Base_Item,
               Set pbComboNavigation, Set Move_Value_Out_State,
               Set Auto_Export_State, Set Auto_Index_State, Set Auto_Column_State
@@ -46,12 +48,18 @@
    - Translated: Set Read_Only_State       -> Set pbReadOnly
    - Translated: Set Header_Visible_State  -> Set pbShowHeader
    - Translated: Set Resize_Column_State   -> Set pbAllowColumnResize
-   - Translated: Set Highlight_Row_State   -> Set pbShowRowFocus
+   - Translated: Set Highlight_Row_State   -> Set pbShowRowFocus + Set pbSelectionEnable (a row shows its
+                 colour, piHighlightBackColor, only when it can be selected; not on a dbList - see there)
    - Translated: Set Gridline_Mode         -> Set peHorizontalGridStyle / peVerticalGridStyle
    - Translated: Set CurrentRowColor       -> Set piHighlightBackColor
    - Translated: Set CurrentRowTextColor   -> Set piHighlightForeColor
    - Translated: Set CurrentCellColor      -> Set piFocusCellBackColor
    - Translated: Set CurrentCellTextColor  -> Set piFocusCellForeColor
+   - Translated: Set Highlight_Row_Color   -> Set piHighlightBackColor   (CurrentRowColor's older name)
+   - Translated: Set Current_Item_Color    -> Set piFocusCellBackColor   (CurrentCellColor's older name)
+   - Translated: Set Select_Mode           -> Set pbMultipleSelection to True for Multi_Select, else removed
+                 (dbGrid / dbList / List - the Grid converter maps it itself, the same way)
+   - TODO:       Set Highlight_State       -> no cCJGrid counterpart; the TODO keeps the line
 
  Method override handling (Procedure/Function blocks inside the grid body):
    - Renamed:    Goto_Top_Row    -> MoveToFirstRow   (Forward Send/Get also renamed)
@@ -96,6 +104,9 @@ Class cGridToCJGridBase is a cObject
         Forward Send Construct_Object
         Property String[]  pasSource
         Property String    psFileName          ""
+        // Decline markers TransformSource added to the current file - a reason to write it back even when
+        // nothing converted (see FileNeedsWrite). Reset per file at the top of TransformSource.
+        Property Integer   piDeclineMarkers    0
         Property Integer   piChangedFiles       0
         Property Integer   piChangedGrids       0
         // Class name parameters (set by ParseAndSetParameter).
@@ -103,6 +114,30 @@ Class cGridToCJGridBase is a cObject
         Property String    psLegacyGridClass   "DbGrid"
         Property String    psTargetGridClass   "cCJGrid"
         Property String    psTargetColumnClass "cCJGridColumn"
+        /* AN EMPTY PARAMETER REACHES THE WORKSPACE'S SUBCLASSES (Nils 2026-09-05: "a legacy grid should be
+           handled the same way as a legacy dbgrid, when no params are being specified"). psLegacyRootToken
+           is the legacy root the Deep Scan learns subclasses under ("dbgrid" / "grid" / "dblist" / "list",
+           set by each subclass constructor); pasLegacySubclasses is what the funclib knew for it when the
+           parameter came in EMPTY (_LoadLegacySubclasses) - IsGridDeclaration takes those objects too, since
+           2026-10-03 to leave them as they are (SubclassToLeave), not to convert them. A named parameter
+           narrows the run to that one class, as before. */
+        Property String    psLegacyRootToken   ""
+        Property String[]  pasLegacySubclasses
+        Property Boolean   pbEmptyParameter    False
+        // The subclass objects an EMPTY run left as they are, per class (TallySubclassLeft) - one run note
+        // per class at the end of the run (NoteSubclassesLeft), not one per object.
+        Property String[]  pasSubclassLeftKeys
+        Property String[]  pasSubclassLeftNames
+        Property Integer[] paiSubclassLeftCounts
+        // The DEDICATED legacy package whose sole purpose is the converted grid class,
+        // safe to swap for the target package once every such object is converted
+        // (dbGrid -> "Dftable.pkg", dbList -> "Dfsellst.pkg"). "" for Grid/List, whose
+        // legacy class lives in the foundational Windows.pkg which must NEVER be removed
+        // (only the target package is added for those). Set by the subclass constructor.
+        // The TARGET package is not stored - it is derived from psTargetGridClass at
+        // fix-up time via TargetUsePackageFor, so a user-supplied custom target class
+        // (unknown package) automatically leaves the Use lines alone.
+        Property String    psLegacyUsePackage  ""
         // Per-grid state: translatable Entry_Display properties collected during
         // grid pre-scan, flushed by FlushEntryDisplayExtracted before column objects.
         Property String[]  pasEntryDisplayExtracted
@@ -123,8 +158,8 @@ Class cGridToCJGridBase is a cObject
     Procedure ReadFile String sFileName
         String[] asSource
         Set psFileName        to sFileName
-        Set pbLastFileWasUtf8 to (RFFileHasBOM(sFileName))
-        Move (RFReadEncodedFileAsStringArray(sFileName)) to asSource
+        Set pbLastFileWasUtf8 to (rfFileHasBOM(sFileName))
+        Move (rfReadEncodedFileAsStringArray(sFileName)) to asSource
         Set pasSource to asSource
     End_Procedure
 
@@ -138,7 +173,8 @@ Class cGridToCJGridBase is a cObject
         Get psFileName        to sFileName
         Get pasSource         to asSource
         Get pbLastFileWasUtf8 to bIsUtf8
-        Move (RFWriteEncodedFileFromStringArray(asSource, sFileName, CS_CRLF, bIsUtf8)) to bOK
+        // Through the write-time macro guard: macro code is never refactored (cRefactorFuncLib._GuardedWriteEncodedFile).
+        Get _GuardedWriteEncodedFile of ghoFuncLib sFileName (&asSource) bIsUtf8 to bOK
         If (bOK = False) Begin
             Error DFERR_PROGRAM ("Write failed:" * sFileName * "(cGridToCJGridBase WriteFile)")
         End
@@ -151,12 +187,13 @@ Class cGridToCJGridBase is a cObject
     // - Empty sParameter: use defaults set by the subclass constructor.
     // - 2 parts: exact old-class match and new grid class; column stays as-is.
     // - 3 parts: all three specified.
-    // Returns False (and sets an Error) when sParameter is invalid.
+    // Returns False when sParameter is invalid, logging why - it does NOT raise an error.
     Function ParseAndSetParameter String sParameter Returns Boolean
         String[]  asParts
-        String    sOld sNewGrid sNewCol
+        String    sOld sNewGrid sNewCol sFn
         Integer   iParts
 
+        Send _LoadLegacySubclasses sParameter
         // Empty -> leave defaults from constructor unchanged.
         If (sParameter = "") Begin
             Set psLegacyGridClass to ""
@@ -167,7 +204,20 @@ Class cGridToCJGridBase is a cObject
         Move (SizeOfArray(asParts)) to iParts
 
         If (iParts < 2 or iParts > 3) Begin
-            Error DFERR_PROGRAM ('RefactorGridToCJGrid: sParameter must be "OldGridClass,NewGridClass[,NewColumnClass]".')
+            /* A MALFORMED PARAMETER IS A CONFIGURATION STATE, NOT A PROGRAM FAULT
+               (Nils 2026-08-03) - the same sweep as the two colliding-declaration converters
+               in oRefactorFuncLib. `Error DFERR_PROGRAM` raises a RUNTIME error: a modal
+               mid-run in the UI, and in a headless run an Error_Count entry that reads as an
+               engine failure. Logged and skipped instead, so the user still learns why the
+               converter did nothing. Guarded on ghoStatusLog - the DFUnit runner builds no
+               engine, so there is no log to write to.
+
+               The note is keyed on psExecutionContext, which the engine sets to the running
+               function's name before each call - this base class serves all four converters
+               (Grid, List, dbGrid, dbList) and cannot name itself, and hard-coding one of them
+               would put a wrong name against the other three. */
+            Get psExecutionContext of ghoFuncLib to sFn
+            Send AddRunNote of ghoFuncLib sFn ('SKIPPED - the parameter must be "OldGridClass,NewGridClass[,NewColumnClass]".')
             Function_Return False
         End
 
@@ -175,7 +225,9 @@ Class cGridToCJGridBase is a cObject
         Move (Trim(asParts[1])) to sNewGrid
 
         If (sOld = "" or sNewGrid = "") Begin
-            Error DFERR_PROGRAM ("RefactorGridToCJGrid: OldGridClass and NewGridClass must not be empty.")
+            // Configuration state, not a fault - logged and skipped. See the note above.
+            Get psExecutionContext of ghoFuncLib to sFn
+            Send AddRunNote of ghoFuncLib sFn "SKIPPED - the old and new grid class names must both be given."
             Function_Return False
         End
 
@@ -192,19 +244,472 @@ Class cGridToCJGridBase is a cObject
         Function_Return True
     End_Function
 
+    // *** Use-statement fix-up ***
+
+    // Maps a KNOWN standard target grid class to the package that defines it, so the
+    // converter can add / swap the right "Use <pkg>". Returns "" for any class not in
+    // the map - i.e. a user-supplied CUSTOM target class - so the fix-up then leaves
+    // every Use line alone (we cannot know a custom class's package). Each standard
+    // grid package pulls in its own column package (cCJGrid.pkg -> cCJGridColumn.pkg;
+    // cDbCJGrid.pkg -> cCJGrid.pkg + cdbCJGridColumn.pkg; cDbCJGridPromptList.pkg ->
+    // cDbCJGrid.pkg), so one Use of the grid package is self-sufficient.
+    Function TargetUsePackageFor String sTargetClass Returns String
+        String sLC
+        Move (Lowercase(Trim(sTargetClass))) to sLC
+        If (sLC = "ccjgrid") ;
+            Function_Return "cCJGrid.pkg"
+        If (sLC = "cdbcjgrid") ;
+            Function_Return "cDbCJGrid.pkg"
+        If (sLC = "cdbcjgridpromptlist") ;
+            Function_Return "cDbCJGridPromptList.pkg"
+        Function_Return ""
+    End_Function
+
+    // Returns the package a "Use <pkg>" directive names (the first token after "Use "),
+    // or "" when sLine is not a Use directive (blank, a comment, or code). The "Use"
+    // keyword match is case-insensitive; the returned name keeps its source casing. A
+    // trailing // comment or extra tokens after the package name are ignored.
+    Function UsePackageOnLine String sLine Returns String
+        String  sTrim sRest
+        Integer iPos
+
+        Move (Trim(sLine)) to sTrim
+        If (Lowercase(Left(sTrim, 4)) <> "use ") ;
+            Function_Return ""
+        // Everything after the "Use " keyword (positions 5..end).
+        Move (Trim(Mid(sTrim, Length(sTrim), 5))) to sRest
+        If (sRest = "") ;
+            Function_Return ""
+        Move (Pos(" ", sRest)) to iPos
+        If (iPos > 0) ;
+            Move (Left(sRest, (iPos - 1))) to sRest
+        Move (Pos("//", sRest)) to iPos
+        If (iPos > 0) ;
+            Move (Left(sRest, (iPos - 1))) to sRest
+        Function_Return (Trim(sRest))
+    End_Function
+
+    /* Does anything in the converted output still need the legacy package? Both the catalogue and
+       the probe belong to ghoFuncLib, not here: cRefactorFuncLib._EnsureUsePackage has asked this
+       exact question since the Edit -> cTextEdit converter dropped a Dftxtwin Use out from under an
+       Import_Class_Protocol and cost a 388-error run. Its answer is the one to trust - it masks
+       comments and literals and matches the class name ANYWHERE in real code, not just in an
+       "is a" declaration, which is precisely how that one got through.
+
+       So this is a two-line forwarder, and Dftable.pkg / Dfsellst.pkg are registered in that same
+       canonical catalogue (_ClassesProvidedByPackage). An unregistered package yields an empty
+       class list and reads as still needed, so its Use is left alone - the safe direction. */
+    Function LegacyPackageStillUsed String[] ByRef asOutput String sLegacyPkg Returns Boolean
+        Boolean  bStillUsed
+        String[] asClasses
+        Get _ClassesProvidedByPackage of ghoFuncLib sLegacyPkg to asClasses
+        If (SizeOfArray(asClasses) = 0) ;
+            Function_Return True
+        Get _CodeNamesAnyClass of ghoFuncLib (&asOutput) asClasses to bStillUsed
+        Function_Return bStillUsed
+    End_Function
+
+    // After a successful conversion, make sure the file "Use"s the package that defines
+    // the NEW grid class - otherwise "Object X is a cDbCJGrid" is an undefined class and
+    // will not compile. Called from TransformSource only when >= 1 grid was converted.
+    //   - target package already Used  -> nothing added; a legacy Use that nothing needs
+    //     any more is COMMENTED OUT (it is what keeps the compiler reporting an obsolete
+    //     package for an already-converted file)
+    //   - dedicated legacy package Used -> swapped IN PLACE to the target package,
+    //     preserving its position + indentation (dbGrid's Dftable.pkg / dbList's
+    //     Dfsellst.pkg; Grid/List's Windows.pkg is foundational, psLegacyUsePackage
+    //     is "" for those, so it is never touched)
+    //   - EITHER of those, but the package still defines a class the file declares
+    //     (dbListRow is the live case) -> the legacy Use stays exactly as it is
+    //   - neither present              -> the target Use is appended to the leading Use
+    //     block (a file with no Use lines at all - a test fragment - is left alone)
+    // A custom target class (TargetUsePackageFor = "") leaves every Use line untouched.
+    Procedure FixUpUsePackage String[] ByRef asOutput
+        String   sTargetClass sTargetPkg sLegacyPkg sUsed sTrim sIndent sCommented
+        String[] asNew
+        Integer  iCount iSize iLegacyIdx iLastUse iInsertAt iOut iUseDepth
+        Boolean  bUseInBlock
+        Boolean  bTargetPresent bSeenCode bInserted bLegacyStillUsed
+
+        // Read the property into a local first - a bare property is not a valid
+        // function argument (must be read via Get, or accessed function-style).
+        Get psTargetGridClass to sTargetClass
+        Get TargetUsePackageFor sTargetClass to sTargetPkg
+        If (sTargetPkg = "") ;
+            Procedure_Return
+        Get psLegacyUsePackage to sLegacyPkg
+
+        Move -1    to iLegacyIdx
+        Move -1    to iLastUse
+        Move False to bTargetPresent
+        Move False to bSeenCode
+        Move (SizeOfArray(asOutput) - 1) to iSize
+        For iCount from 0 to iSize
+            If (bSeenCode = False) ;
+                Send rfUseAnchorStep asOutput[iCount] iCount (&iUseDepth) (&bUseInBlock) (&iLastUse)
+            Get UsePackageOnLine asOutput[iCount] to sUsed
+            If (sUsed <> "") Begin
+                If (Lowercase(sUsed) = Lowercase(sTargetPkg)) ;
+                    Move True to bTargetPresent
+                If (sLegacyPkg <> "" and Lowercase(sUsed) = Lowercase(sLegacyPkg) and iLegacyIdx = -1) ;
+                    Move iCount to iLegacyIdx
+            End
+            Else If (bSeenCode = False) Begin
+                // First real code line ends the leading Use block, so a stray later Use
+                // is not mistaken for a leading one. Skip blanks, // comments, /* ...
+                // and # preprocessor lines (which legally sit among the Use statements).
+                Move (Trim(asOutput[iCount])) to sTrim
+                If (sTrim <> "" and Left(sTrim, 2) <> "//" and Left(sTrim, 2) <> "/*" and Left(sTrim, 1) <> "#") ;
+                    Move True to bSeenCode
+            End
+        Loop
+
+        /* Is the legacy package still earning its Use? Asked ONCE, and it governs both branches
+           below - they are the same question with different answers available.
+
+           It used to be asked in neither. The "target already present" branch simply left the
+           legacy Use standing, on the reasoning that it was harmless; it is not. The compiler
+           goes on reporting the obsolete package (4536) for a file whose grids all converted
+           cleanly, which reads as "the refactoring did not work" and sends you looking for
+           legacy classes that are no longer there (Nils 2026-08-10). And the swap branch removed
+           the legacy Use unconditionally, which is the opposite hazard: a file that still
+           declares a dbListRow loses the package that defines it and stops compiling. */
+        Move False to bLegacyStillUsed
+        If (sLegacyPkg <> "" and iLegacyIdx >= 0) ;
+            Get LegacyPackageStillUsed (&asOutput) sLegacyPkg to bLegacyStillUsed
+
+        /* Target package already Used. Nothing to add - but if the legacy Use is now dead weight,
+           COMMENT IT OUT rather than delete it: the same reversible edit the converter makes to
+           every legacy property it drops, so a reviewer diffing the file can see what went and
+           put it back with two keystrokes if a build proves us wrong. */
+        If (bTargetPresent = True) Begin
+            // Via Get, not CommentOutLine(Self, ...): the function is defined further down this
+            // class, and a function-style call has to be able to see its declaration already.
+            If (sLegacyPkg <> "" and iLegacyIdx >= 0 and bLegacyStillUsed = False) Begin
+                Get CommentOutLine asOutput[iLegacyIdx] to sCommented
+                Move sCommented to asOutput[iLegacyIdx]
+            End
+            Procedure_Return
+        End
+
+        // Dedicated legacy Use present and nothing left that needs it: swap it in place for the
+        // target package. Still needed -> leave it alone and fall through, so the target Use is
+        // ADDED alongside it instead of replacing it.
+        If (sLegacyPkg <> "" and iLegacyIdx >= 0 and bLegacyStillUsed = False) Begin
+            Get GetIndent asOutput[iLegacyIdx] to sIndent
+            Move (sIndent + "Use " + sTargetPkg) to asOutput[iLegacyIdx]
+            Procedure_Return
+        End
+
+        // Neither present: append the target Use to the file's existing leading Use
+        // block. A file with NO Use statements at all (only ever a synthetic test
+        // fragment - real source that references the grid class already Uses some
+        // package) is left alone rather than sprouting a lone Use at line 1.
+        If (iLastUse < 0) ;
+            Procedure_Return
+        Move (iLastUse + 1) to iInsertAt
+        Move False to bInserted
+        Move 0 to iOut
+        For iCount from 0 to iSize
+            If (iCount = iInsertAt) Begin
+                Move ("Use " + sTargetPkg) to asNew[iOut]
+                Increment iOut
+                Move True to bInserted
+            End
+            Move asOutput[iCount] to asNew[iOut]
+            Increment iOut
+        Loop
+        If (bInserted = False) ;
+            Move ("Use " + sTargetPkg) to asNew[iOut]
+        Move asNew to asOutput
+    End_Procedure
+
+    /* WHAT A CONVERTED SUBCLASS OBJECT LEAVES BEHIND (Nils 2026-09-05, "tidy up those two listed things").
+       An object declared through a subclass of the legacy class - "Object oX is a cEditGrid", named in the
+       parameter (an EMPTY run leaves it as it is since 2026-10-03 - see SubclassToLeave) - is re-based on
+       the target class like any other, and two
+       things then hang loose: the subclass's own behaviour, which the target does not inherit, and the
+       file's "Use <that subclass's package>", which nothing may need any more. The first gets a TODO
+       as the object's first body line (SubclassMarkerLine) naming what it came from; the second is
+       commented out (RetireConvertedSubclassUses) when the run's class index says the package defines
+       nothing the file still names - a package may define more than the class it is named after, and
+       only the file's own text can tell. Without an index (the DFUnit runner, a batch run) the Use
+       stays: the safe direction, the same rule LegacyPackageStillUsed follows. */
+
+    // The class token after the article of a declaration line, in its own casing; "" when none.
+    Function LegacyClassOnLine String sTrimLine Returns String
+        Integer iIsA iArt iPos
+        String  sClass
+
+        Get IsAArticlePos (Lowercase(sTrimLine)) (&iArt) to iIsA
+        If (iIsA = 0) ;
+            Function_Return ""
+        Move (Trim(Mid(sTrimLine, CI_EOL, (iIsA + iArt)))) to sClass
+        Move (Pos(" ", sClass)) to iPos
+        If (iPos > 0) ;
+            Move (Left(sClass, (iPos - 1))) to sClass
+        Move (Pos("//", sClass)) to iPos
+        If (iPos > 0) ;
+            Move (Left(sClass, (iPos - 1))) to sClass
+        Function_Return (Trim(sClass))
+    End_Function
+
+    // The plain legacy class of this converter's family, as written: dbGrid / Grid / dbList / List.
+    Function PlainLegacyClassName Returns String
+        String sToken
+        Get psLegacyRootToken to sToken
+        If (sToken = "dbgrid") ;
+            Function_Return "dbGrid"
+        If (sToken = "grid") ;
+            Function_Return "Grid"
+        If (sToken = "dblist") ;
+            Function_Return "dbList"
+        If (sToken = "list") ;
+            Function_Return "List"
+        Function_Return sToken
+    End_Function
+
+    // The TODO that opens a converted SUBCLASS object's body. Worded without the declaration itself
+    // ("was a", never "is a"), so nothing scanning for object declarations trips over a comment.
+    Function SubclassMarkerLine String sIndent String sObjName String sOldClass Returns String
+        String sTarget
+        Get psTargetGridClass to sTarget
+        Function_Return (sIndent + "// TODO: " + sObjName + " was a " + sOldClass + " - a subclass of " + PlainLegacyClassName(Self) + " whose own behaviour this " + sTarget + " does not inherit; port it here, or subclass " + sTarget + " the same way.")
+    End_Function
+
+    // Every class one package file defines, per the run's class index - UPPERCASE, empty when unknown
+    // or when no engine runs (the DFUnit runner). A test fixture overrides this with a fixed answer.
+    Function ClassesOfPackage String sPkgLeaf Returns String[]
+        String[] asOut
+        If (ghoStatusLog = 0 or ghoFuncLib = 0) ;
+            Function_Return asOut
+        Get _ClassesDeclaredInPackage of ghoFuncLib sPkgLeaf to asOut
+        Function_Return asOut
+    End_Function
+
+    // A copy of the file with every Use line blanked, for the probe below.
+    Function _UseLinesBlanked String[] asLines Returns String[]
+        String sUsed
+        Integer i iSize
+        Move (SizeOfArray(asLines) - 1) to iSize
+        For i from 0 to iSize
+            Get UsePackageOnLine asLines[i] to sUsed
+            If (sUsed <> "") ;
+                Move "" to asLines[i]
+        Loop
+        Function_Return asLines
+    End_Function
+
+    /* After the conversion: comment out a "Use <pkg>" whose file name is one of the converted subclasses
+       (Use cEditGrid.pkg, once every cEditGrid object became a cCJGrid) - when the package defines
+       nothing the file still names in code. The probe runs over a copy with every Use line blanked:
+       the Use line itself names the class; comments and literals are masked by _CodeNamesAnyClass. */
+    Procedure RetireConvertedSubclassUses String[] ByRef asOutput String[] asOldClasses
+        String[] asProbe asClasses
+        String   sUsed sLeaf sCommented
+        Integer  i iSize iPos
+        Boolean  bStill bProbeMade
+
+        If (SizeOfArray(asOldClasses) = 0) ;
+            Procedure_Return
+        Move False to bProbeMade
+        Move (SizeOfArray(asOutput) - 1) to iSize
+        For i from 0 to iSize
+            Get UsePackageOnLine asOutput[i] to sUsed
+            If (sUsed <> "") Begin
+                Move (Lowercase(sUsed)) to sLeaf
+                Move (RightPos("\", sLeaf)) to iPos
+                If (iPos > 0) ;
+                    Move (Right(sLeaf, (Length(sLeaf) - iPos))) to sLeaf
+                Move (RightPos(".", sLeaf)) to iPos
+                If (iPos > 1) ;
+                    Move (Left(sLeaf, (iPos - 1))) to sLeaf
+                If (SearchArray(sLeaf, asOldClasses) <> -1) Begin
+                    Get ClassesOfPackage sUsed to asClasses
+                    If (SizeOfArray(asClasses) > 0) Begin
+                        If (bProbeMade = False) Begin
+                            Get _UseLinesBlanked asOutput to asProbe
+                            Move True to bProbeMade
+                        End
+                        Get _CodeNamesAnyClass of ghoFuncLib (&asProbe) asClasses to bStill
+                        If (bStill = False) Begin
+                            Get CommentOutLine asOutput[i] to sCommented
+                            Move sCommented to asOutput[i]
+                        End
+                    End
+                End
+            End
+        Loop
+    End_Procedure
+
     // *** Detection helpers ***
+
+    // Position + length of the declaration ARTICLE (" is a " / " is an ") in sLowLine. Legacy
+    // DataFlex accepts BOTH articles ('Object text_formatter is an edit' - WinServ 2026-07-17,
+    // natural English before a vowel-initial class; the class-names PARAMETER admits vowel-initial
+    // user subclasses everywhere), so every declaration matcher and splice must too. Returns the
+    // article's start position (0 = neither present); iArtLen ByRef = 6 for " is a ", 7 for
+    // " is an " - the class token starts iArtLen chars after the position.
+    Function IsAArticlePos String sLowLine Integer ByRef iArtLen Returns Integer
+        Integer iPos
+        Move (Pos(" is a ", sLowLine)) to iPos
+        Move 6 to iArtLen
+        If (iPos = 0) Begin
+            Move (Pos(" is an ", sLowLine)) to iPos
+            Move 7 to iArtLen
+        End
+        Function_Return iPos
+    End_Function
+
+    /* The subclasses an EMPTY parameter reaches, asked from the funclib - which the FT deep-scan driver
+       feeds with the "Class X is a <legacy>" pairs of the last scan (cBaseFuncLib.LearnedSubclassesOf). A
+       named parameter narrows the run to that class: the list is cleared. Called at the top of the base
+       ParseAndSetParameter, and by the Grid / List / dbList overrides' empty branch, which returns before
+       the base runs. */
+    Procedure _LoadLegacySubclasses String sParameter
+        String[] asSubs
+
+        Set pbEmptyParameter to (sParameter = "")
+        If (sParameter = "" and ghoFuncLib <> 0 and psLegacyRootToken(Self) <> "") ;
+            Get LearnedSubclassesOf of ghoFuncLib (psLegacyRootToken(Self)) to asSubs
+        Set pasLegacySubclasses to asSubs
+    End_Procedure
+
+    // Is sClassNameLc (lowercase) one of the subclasses the EMPTY parameter reaches? False after a named one.
+    Function IsLearnedLegacySubclass String sClassNameLc Returns Boolean
+        String[] asSubs
+
+        If (pbEmptyParameter(Self) = False) ;
+            Function_Return False
+        Get pasLegacySubclasses to asSubs
+        Function_Return (SearchArray(Lowercase(Trim(sClassNameLc)), asSubs) <> -1)
+    End_Function
+
+    /* A SUBCLASS OBJECT STAYS AS IT IS UNDER AN EMPTY PARAMETER (Nils 2026-10-03: "a subclass can't be
+       blindly swapped for a CodeJock grid class without first have converted the cEntryGrid subclass").
+       Until then an EMPTY run re-based such an object on the plain target class, with a TODO for what the
+       subclass added - and what a subclass adds is real behaviour: one workspace's MyDbGrid anchors the
+       grid and translates its labels, its cEntryGrid binds keys to row methods of its own. The swap lost
+       all of it in 2,126 objects across 1,142 files, and the program still compiled, except where it
+       called a method of the subclass. The dbList converter had refused this from the start (Nils
+       2026-07-03 - see RefactorDbListTocDbCJGridPromptList), until the empty parameter was widened on
+       2026-09-05.
+
+       So an EMPTY run converts the plain legacy class only. An object of any other class it detects - a
+       subclass the Deep Scan learned, or for dbGrid / dbList a name that ends in the token - passes
+       through as it is, and is counted for the run note. A NAMED parameter still converts the class it
+       names: that is how the objects follow once the subclass is ported - "MyDbGrid,AmDbCJGrid,
+       cDbCJGridColumn" re-bases them on the ported class. Returns the class to leave, "" to convert. */
+    Function SubclassToLeave String sTrimLine Returns String
+        String sOldClass
+
+        If (pbEmptyParameter(Self) = False) ;
+            Function_Return ""
+        Get LegacyClassOnLine sTrimLine to sOldClass
+        If (sOldClass = "" or Lowercase(sOldClass) = psLegacyRootToken(Self)) ;
+            Function_Return ""
+        Function_Return sOldClass
+    End_Function
+
+    /* Why the objects of sClass were left, and what to do instead - the end of its run note. A dbGrid, Grid
+       or dbList subclass has a converter of its own since 2026-10-04 - ConvertGridSubclassToCodeJock ports
+       the class in place and converts its objects with it; a List subclass is still ported by hand. */
+    Function SubclassLeftReason String sClass Returns String
+        String sTarget sWhy
+        Get psTargetGridClass to sTarget
+        Move ("a workspace subclass of " + PlainLegacyClassName(Self) + ", and a plain " + sTarget + " would lose what it adds.") to sWhy
+        If (psLegacyRootToken(Self) = "list") ;
+            Function_Return (sWhy + " Port " + sClass + " to a class based on " + sTarget + " first, then convert these objects with the parameter '" + sClass + ",<the new class>," + psTargetColumnClass(Self) + "'.")
+        Function_Return (sWhy + " Run ConvertGridSubclassToCodeJock with the parameter '" + sClass + "': it ports " + sClass + " to " + sTarget + " in place and converts these objects with it, or says in its run notes why it cannot.")
+    End_Function
+
+    // Counts one object of sClass that SubclassToLeave left as it is.
+    Procedure TallySubclassLeft String sClass
+        String[]  asKeys asNames
+        Integer[] aiCounts
+        Integer   iAt
+
+        Get pasSubclassLeftKeys   to asKeys
+        Get pasSubclassLeftNames  to asNames
+        Get paiSubclassLeftCounts to aiCounts
+        Move (SearchArray(Lowercase(sClass), asKeys)) to iAt
+        If (iAt = -1) Begin
+            Move (Lowercase(sClass)) to asKeys[-1]
+            Move sClass              to asNames[-1]
+            Move 1                   to aiCounts[-1]
+        End
+        Else ;
+            Move (aiCounts[iAt] + 1) to aiCounts[iAt]
+        Set pasSubclassLeftKeys   to asKeys
+        Set pasSubclassLeftNames  to asNames
+        Set paiSubclassLeftCounts to aiCounts
+    End_Procedure
+
+    Procedure _ClearSubclassesLeft
+        String[]  asNone
+        Integer[] aiNone
+        Set pasSubclassLeftKeys   to asNone
+        Set pasSubclassLeftNames  to asNone
+        Set paiSubclassLeftCounts to aiNone
+    End_Procedure
+
+    /* One run note per subclass whose objects the run left as they are, then the tally starts over. Keyed
+       on the running function (psExecutionContext), as NoteDeclinedGrid is; outside a run there is no
+       function to note into. */
+    Procedure NoteSubclassesLeft
+        String[]  asNames
+        Integer[] aiCounts
+        String    sFn
+        Integer   i iLast
+
+        Get psExecutionContext of ghoFuncLib to sFn
+        Get pasSubclassLeftNames  to asNames
+        Get paiSubclassLeftCounts to aiCounts
+        If (Trim(sFn) <> "") Begin
+            Move (SizeOfArray(asNames) - 1) to iLast
+            For i from 0 to iLast
+                Send AddRunNote of ghoFuncLib sFn (String(aiCounts[i]) + " object(s) of " + asNames[i] + " left as they are - " + (SubclassLeftReason(Self, asNames[i])))
+            Loop
+        End
+        Send _ClearSubclassesLeft
+    End_Procedure
 
     // Override in subclasses to detect the specific legacy grid class.
     // When psLegacyGridClass is set, should do an exact (case-insensitive) match.
-    // When psLegacyGridClass is empty, should fall back to a pattern check.
+    // When psLegacyGridClass is empty, should fall back to a pattern check - and take the
+    // learned subclasses too (IsLearnedLegacySubclass), as all four overrides do.
     // Base implementation always returns False.
     Function IsGridDeclaration String sTrimLower Returns Boolean
         Function_Return False
     End_Function
 
-    // Returns True when sTrimLower is an Object declaration of any kind.
+    // Returns True when sTrimLower is an Object declaration of any kind (either article).
     Function IsObjectDeclaration String sTrimLower Returns Boolean
-        Function_Return (Pos("object ", sTrimLower) = 1 and Pos(" is a ", sTrimLower) <> 0)
+        Integer iIsA iArt
+        If (Pos("object ", sTrimLower) <> 1) ;
+            Function_Return False
+        Get IsAArticlePos sTrimLower (&iArt) to iIsA
+        Function_Return (iIsA <> 0)
+    End_Function
+
+    // The class name an Object declaration names - lowercase, as sTrimLower is - or "" when sTrimLower is no
+    // Object declaration: "object ox is a cdbcjgrid { ... }" gives "cdbcjgrid". Either article ("is a" /
+    // "is an" - see IsAArticlePos); anything after a space (metadata tags) is dropped. The shared head of
+    // every IsGridDeclaration override.
+    Function DeclaredClassName String sTrimLower Returns String
+        Integer iIsA iArt
+        String  sClassName
+
+        If (Pos("object ", sTrimLower) <> 1) ;
+            Function_Return ""
+        Get IsAArticlePos sTrimLower (&iArt) to iIsA
+        If (iIsA = 0) ;
+            Function_Return ""
+        Move (Trim(Mid(sTrimLower, CI_EOL, (iIsA + iArt)))) to sClassName
+        Move (Pos(CS_S, sClassName)) to iIsA
+        If (iIsA > 0) ;
+            Move (Left(sClassName, iIsA - 1)) to sClassName
+        Function_Return sClassName
     End_Function
 
     // Returns True when sTrimLower is an Entry_Display procedure start.
@@ -266,7 +771,31 @@ Class cGridToCJGridBase is a cObject
         If (sTrimLower contains "main_file") Begin
             Function_Return True
         End
+        /* The embedded-prompt pair. Both DO have counterparts - Prompt_Button_Value and
+           Prompt_Button_Mode, declared in cCJGridColumn.pkg with the same "..." default - but they
+           live on the COLUMN, while the legacy properties sit on the GRID. That change of scope is
+           why this is a comment-out and not a rename: the value would have to be pushed into every
+           column object, which this line-level pass cannot do safely. Left unhandled they were
+           copied through verbatim into the converted object, where they do not compile (Nils
+           2026-08-04). LegacyOnlyGridPropertyHint names the counterpart. */
+        If (sTrimLower contains "psembeddedbuttonvalue") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "pbembeddedprompts") Begin
+            Function_Return True
+        End
         Function_Return False
+    End_Function
+
+    /* The closest cCJGrid equivalent of a legacy grid PROPERTY, or "" when there is none.
+       Mirrors LegacyOnlyGridMethodHint on the method side, so a commented-out property carries the
+       same actionable note a commented-out call does. */
+    Function LegacyOnlyGridPropertyHint String sTrimLower Returns String
+        If (sTrimLower contains "psembeddedbuttonvalue") ;
+            Function_Return "Prompt_Button_Value on the COLUMN object (cCJGridColumn), not on the grid"
+        If (sTrimLower contains "pbembeddedprompts") ;
+            Function_Return "Prompt_Button_Mode on the COLUMN object (PB_PromptAuto / PB_PromptOn / PB_PromptOff)"
+        Function_Return ""
     End_Function
 
     // Returns the leading whitespace of sLine (spaces / tabs), preserving exact
@@ -283,12 +812,14 @@ Class cGridToCJGridBase is a cObject
         Function_Return (Left(sLine, (Length(sLine) - Length(LTrim(sLine)))))
     End_Function
 
-    // Returns the line with its indentation preserved but content prefixed with "// ".
-    // Example: "    Set Main_File to Orders" -> "    // Set Main_File to Orders"
+    // Returns the line commented out with the '//' at COLUMN 1 and the original line - indentation
+    // included - preserved verbatim after it (Nils 2026-07-05: the old indent-then-'//' style
+    // scattered the markers across a commented block and made a commented Entry_Display read
+    // ragged). Uncommenting a block is then a uniform strip of the two leading chars; an
+    // already-commented line simply gains a second marker at the front ('//// ...').
+    // Example: "    Set Main_File to Orders" -> "//    Set Main_File to Orders"
     Function CommentOutLine String sLine Returns String
-        String sIndent
-        Get GetIndent sLine to sIndent
-        Function_Return (sIndent + "// " + Trim(sLine))
+        Function_Return ("//" + sLine)
     End_Function
 
     // Extracts the method name (second word) from a trimmed-lowercase procedure or
@@ -327,6 +858,75 @@ Class cGridToCJGridBase is a cObject
         End
         Move (Length(sOldLower)) to iLen
         Function_Return (Left(sLine, iPos - 1) + sNewName + Mid(sLine, CI_EOL, iPos + iLen))
+    End_Function
+
+    /* Rename ONE identifier - a converted Mouse_Click / Mouse_Down2 PARAMETER - everywhere on a body
+       line, as a WHOLE WORD, case-insensitively, outside string literals and comments, keeping the
+       rest of the line as typed. ReplaceMethodName above (a bare substring, first hit only) is right
+       for a method NAME on a Send/Forward line, but it was also used for these parameters - and a
+       legacy 'Procedure mouse_click Integer window Integer char_pos' body carrying
+       'Send SafeCloseView (Jobbreg_MultiWindow(Self))' came out as 'Jobbreg_MultiiRow(Self)' =
+       E 4328 undefined symbol, twice (WinServ PROJECT.vw, Nils 2026-08-17: the error count went UP
+       after the run). Boundaries: a non-identifier char - or the line's ends - on both sides
+       (_IsIdentifierChar's rule: letters, digits, '_'); a name inside "..." / '...' or after '//' is
+       data and is left alone. Every occurrence on the line, not just the first. */
+    Function ReplaceParamName String sLine String sOldName String sNewName Returns String
+        String sMask sLow sOldLow sCh sQuote
+        Integer i iLen iOldLen iPos iStart
+        Boolean bBefore bAfter
+
+        Move (Trim(sOldName)) to sOldName
+        If (sOldName = "" or sLine = "") ;
+            Function_Return sLine
+        // A position-aligned mask: string literal content and any // comment become spaces, so a
+        // hit can only land in code. DataFlex has no escape inside a literal - a quote of the same
+        // kind closes it.
+        Move sLine to sMask
+        Move (Length(sLine)) to iLen
+        Move "" to sQuote
+        Move 1 to i
+        While (i <= iLen)
+            Move (Mid(sLine, 1, i)) to sCh
+            If (sQuote <> "") Begin
+                If (sCh = sQuote) ;
+                    Move "" to sQuote
+                Else ;
+                    Move (Overstrike(" ", sMask, i)) to sMask
+            End
+            Else If (sCh = '"' or sCh = "'") Begin
+                Move sCh to sQuote
+            End
+            Else If (sCh = "/" and i < iLen) Begin
+                If (Mid(sLine, 1, i + 1) = "/") Begin
+                    Move (Left(sMask, i - 1) + Repeat(" ", iLen - i + 1)) to sMask
+                    Move iLen to i                      // the rest is comment - stop
+                End
+            End
+            Increment i
+        Loop
+        Move (Lowercase(sMask))    to sLow
+        Move (Lowercase(sOldName)) to sOldLow
+        Move (Length(sOldName))    to iOldLen
+        Move 1 to iStart
+        Repeat
+            Move 0 to iPos
+            If (iStart <= Length(sLow) - iOldLen + 1) ;
+                Move (Pos(sOldLow, sLow, iStart)) to iPos
+            If (iPos > 0) Begin
+                Move (iPos > 1 and _IsIdentifierChar(ghoFuncLib, Mid(sLow, 1, iPos - 1)))              to bBefore
+                Move ((iPos + iOldLen <= Length(sLow)) and _IsIdentifierChar(ghoFuncLib, Mid(sLow, 1, iPos + iOldLen))) to bAfter
+                If (bBefore = False and bAfter = False) Begin
+                    // Splice the RAW line and re-mask the same span in the mask, so later
+                    // positions stay aligned with the line.
+                    Move (Left(sLine, iPos - 1) + sNewName + Mid(sLine, CI_EOL, iPos + iOldLen)) to sLine
+                    Move (Left(sLow,  iPos - 1) + Lowercase(sNewName) + Mid(sLow,  CI_EOL, iPos + iOldLen)) to sLow
+                    Move (iPos + Length(sNewName)) to iStart
+                End
+                Else ;
+                    Move (iPos + 1) to iStart
+            End
+        Until (iPos = 0)
+        Function_Return sLine
     End_Function
 
     // Returns the cDbCJGrid replacement name for a legacy grid method that has a
@@ -414,6 +1014,15 @@ Class cGridToCJGridBase is a cObject
         If (sMethodLower = "refresh_page") Begin
             Function_Return True
         End
+        If (sMethodLower = "row_changing") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "column_combo_fill_list") Begin
+            Function_Return True
+        End
+        If (sMethodLower = "column_combo_description_value") Begin
+            Function_Return True
+        End
         If (sMethodLower = "request_new_index") Begin
             Function_Return True
         End
@@ -490,6 +1099,48 @@ Class cGridToCJGridBase is a cObject
         Function_Return False
     End_Function
 
+    /* A legacy grid method used as a CALL - "Send Refresh_Page (Current_Row(Self))".
+
+       IsLegacyOnlyGridMethod and LegacyOnlyGridMethodHint were only ever consulted for
+       DECLARATIONS, through ParseProcFuncName. A call site therefore sailed straight through and
+       into the converted output, where it does not compile: Nils, 2026-08-04, found exactly that
+       line surviving into refactored cDbCJGridPromptList code. The knowledge to handle it was
+       already here - the hint table has said "RefreshDataFromDD (note: parameters differ)" all
+       along - it was just never reached from the call-site path.
+
+       Reuses those same two tables rather than starting a second list, so every entry already
+       curated there is covered at call sites too, not only the one that was reported. */
+    Function TryRewriteLegacyGridCall String sLine String sLower String[] ByRef asOutput Returns Boolean
+        String  sMethod sHint sIndent
+        Integer iPos
+        Boolean bLegacyOnly
+
+        If (Left(sLower, 5) <> "send ") ;
+            Function_Return False
+        Move (Trim(Mid(sLower, (Length(sLower) - 5), 6))) to sMethod
+        Move (Pos(" ", sMethod)) to iPos
+        If (iPos > 0) ;
+            Move (Trim(Left(sMethod, (iPos - 1)))) to sMethod
+        Move (Trim(Replaces("(", sMethod, ""))) to sMethod
+        If (sMethod = "") ;
+            Function_Return False
+
+        Get IsLegacyOnlyGridMethod sMethod to bLegacyOnly
+        If (bLegacyOnly = False) ;
+            Function_Return False
+
+        // Commented out, not deleted: the call and the advice sit together, which is what makes
+        // the TODO actionable. Same choice as the declaration path.
+        Get CommentOutLine sLine to sLine
+        Move sLine to asOutput[SizeOfArray(asOutput)]
+        Get LegacyOnlyGridMethodHint sMethod to sHint
+        If (sHint <> "") Begin
+            Get GetIndent sLine to sIndent
+            Move (sIndent + "// TODO: closest cCJGrid equivalent is " + sHint) to asOutput[SizeOfArray(asOutput)]
+        End
+        Function_Return True
+    End_Function
+
     // Returns a hint naming the closest cCJGrid equivalent of a legacy grid method,
     // or "" when no close equivalent exists.
     Function LegacyOnlyGridMethodHint String sMethodLower Returns String
@@ -498,6 +1149,15 @@ Class cGridToCJGridBase is a cObject
         End
         If (sMethodLower = "refresh_page") Begin
             Function_Return "RefreshDataFromDD (note: parameters differ)"
+        End
+        If (sMethodLower = "row_changing") Begin
+            Function_Return "OnRowChanging (same two-row signature, but it RETURNS BOOLEAN where Row_Changing returned Integer)"
+        End
+        If (sMethodLower = "column_combo_fill_list") Begin
+            Function_Return "ComboFillList on the COLUMN object (the column index parameter goes away - each column fills itself)"
+        End
+        If (sMethodLower = "column_combo_description_value") Begin
+            Function_Return "ComboDescriptionValue on the COLUMN object (same eMode/sDescVal/sDataVal, without the leading column index)"
         End
         If (sMethodLower = "request_new_index") Begin
             Function_Return "ChangeOrdering"
@@ -521,6 +1181,12 @@ Class cGridToCJGridBase is a cObject
             Function_Return False
         End
         If (sTrimLower contains "peresizecolumn") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "static_state") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "initial_column") Begin
             Function_Return True
         End
         If (sTrimLower contains "prompt_button_mode") Begin
@@ -574,6 +1240,18 @@ Class cGridToCJGridBase is a cObject
         If (sTrimLower contains "currentcelltextcolor") Begin
             Function_Return True
         End
+        If (sTrimLower contains "highlight_row_color") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "current_item_color") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "select_mode") Begin
+            Function_Return True
+        End
+        If (sTrimLower contains "highlight_state") Begin
+            Function_Return True
+        End
         Function_Return False
     End_Function
 
@@ -596,6 +1274,22 @@ Class cGridToCJGridBase is a cObject
             If (sValLower = "rcnone" or sValLower = "0") Begin
                 Move (sIndent + "Set pbAllowColumnResize to False") to asResult[0]
             End
+            Function_Return asResult
+        End
+
+        // Static_State -> pbStaticData. Same meaning: the list holds all its data at once and does
+        // not re-read (cCJGrid: "if true, load all data at once and it is static").
+        If (sTrimLower contains "static_state") Begin
+            Move (sIndent + "Set pbStaticData to " + sBoolVal) to asResult[0]
+            Function_Return asResult
+        End
+
+        /* Initial_Column -> piInitialColumn. Verified same concept (the legacy declaration calls it
+           the "dflt refresh col"), but THE DEFAULTS DIFFER - legacy 0, cCJGrid -1 - so the value is
+           carried across verbatim rather than assumed, and a source line that merely restated the
+           legacy default now says 0 explicitly instead of silently meaning something else. */
+        If (sTrimLower contains "initial_column") Begin
+            Move (sIndent + "Set piInitialColumn to " + Trim(sValue)) to asResult[0]
             Function_Return asResult
         End
 
@@ -660,26 +1354,40 @@ Class cGridToCJGridBase is a cObject
             Function_Return asResult
         End
 
+        /* Highlight_Row_State: "the current row will be displayed in this object's CurrentRowColor" (the
+           DataFlex help). A cCJGrid colours a row with piHighlightBackColor only when the row is SELECTED, and
+           its rows cannot be selected by default (pbSelectionEnable False) - so the focus rectangle alone
+           (pbShowRowFocus) converted 1,355 of one workspace's grids with their row colour set and never shown.
+           Both, then (Nils 2026-10-04: "use pbSelectionEnable and keep pbShowRowFocus"). The dbList converter
+           keeps the rectangle only: a prompt list selects its rows itself. */
         If (sTrimLower contains "highlight_row_state") Begin
-            Move (sIndent + "Set pbShowRowFocus to " + sBoolVal) to asResult[0]
+            Move (sIndent + "Set pbShowRowFocus to " + sBoolVal)    to asResult[0]
+            Move (sIndent + "Set pbSelectionEnable to " + sBoolVal) to asResult[1]
             Function_Return asResult
         End
 
         If (sTrimLower contains "gridline_mode") Begin
-            If (sValLower = "grid_visible_none" or sValLower = "0") Begin
-                Move (sIndent + "Set peHorizontalGridStyle to xtpGridNoLines") to asResult[0]
-                Move (sIndent + "Set peVerticalGridStyle   to xtpGridNoLines") to asResult[1]
-            End
-            Else If (sValLower = "grid_visible_horz" or sValLower = "1") Begin
-                Move (sIndent + "Set peHorizontalGridStyle to xtpGridSolid") to asResult[0]
-            End
-            Else If (sValLower = "grid_visible_vert" or sValLower = "2") Begin
-                Move (sIndent + "Set peVerticalGridStyle to xtpGridSolid") to asResult[0]
-            End
-            Else If (sValLower = "grid_visible_both" or sValLower = "3") Begin
-                Move (sIndent + "Set peHorizontalGridStyle to xtpGridSolid") to asResult[0]
-                Move (sIndent + "Set peVerticalGridStyle   to xtpGridSolid") to asResult[1]
-            End
+            /* THE FOUR VALUES gridline_mode TAKES, each written both ways the source can spell
+               it - the DataFlex constant name and the bare ordinal. A Case puts the four side by
+               side, which is how the mapping is checked: none/horz/vert/both against 0/1/2/3.
+               No arm can match another and none is a default, so an unrecognised value falls
+               through writing nothing - deliberately, as before. */
+            Case Begin
+                Case (sValLower = "grid_visible_none" or sValLower = "0")
+                    Move (sIndent + "Set peHorizontalGridStyle to xtpGridNoLines") to asResult[0]
+                    Move (sIndent + "Set peVerticalGridStyle   to xtpGridNoLines") to asResult[1]
+                    Case Break
+                Case (sValLower = "grid_visible_horz" or sValLower = "1")
+                    Move (sIndent + "Set peHorizontalGridStyle to xtpGridSolid") to asResult[0]
+                    Case Break
+                Case (sValLower = "grid_visible_vert" or sValLower = "2")
+                    Move (sIndent + "Set peVerticalGridStyle to xtpGridSolid") to asResult[0]
+                    Case Break
+                Case (sValLower = "grid_visible_both" or sValLower = "3")
+                    Move (sIndent + "Set peHorizontalGridStyle to xtpGridSolid") to asResult[0]
+                    Move (sIndent + "Set peVerticalGridStyle   to xtpGridSolid") to asResult[1]
+                    Case Break
+            Case End
             Function_Return asResult
         End
 
@@ -703,21 +1411,142 @@ Class cGridToCJGridBase is a cObject
             Function_Return asResult
         End
 
+        /* THE OLDER NAMES of CurrentRowColor and CurrentCellColor (2026-10-04). DataFlex 26 still has both
+           pairs, and code written before the rename uses the old ones - Highlight_Row_Color in 1,465 of one
+           workspace's grids, Current_Item_Color in 48 - so they reached the CodeJock grid untranslated. Same
+           properties, same counterparts. */
+        If (sTrimLower contains "highlight_row_color") Begin
+            Move (sIndent + "Set piHighlightBackColor to " + sValue) to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "current_item_color") Begin
+            Move (sIndent + "Set piFocusCellBackColor to " + sValue) to asResult[0]
+            Function_Return asResult
+        End
+
+        // Select_Mode as the Grid converter has always mapped it (cGridToCJGrid): only Multi_Select has a
+        // counterpart, the rest is removed. Here for dbGrid, dbList and List; a Grid handles it first, itself.
+        If (sTrimLower contains "select_mode") Begin
+            If (sValLower contains "multi_select") ;
+                Move (sIndent + "Set pbMultipleSelection to True") to asResult[0]
+            Function_Return asResult
+        End
+
+        If (sTrimLower contains "highlight_state") Begin
+            Move (sIndent + "// TODO: Highlight_State has no cCJGrid counterpart - pbShowRowFocus and piFocusCellBackColor set how the current row and cell show. Was: " + Trim(sLine)) to asResult[0]
+            Function_Return asResult
+        End
+
         Function_Return asResult  // Unrecognised translatable -- drop.
+    End_Function
+
+    /* The CodeJock lines for a legacy "Set Numeric_Mask [Item] N to <left> <right> [<template>]", or its twin
+       Currency_Mask (bCurrency) - 2026-10-04. The column's own CreateNumericMask / CreateCurrencyMask take the
+       same two digit counts and set the data type, the mask and the length from them (cCJGridColumn.pkg); a
+       template after the pair builds the mask the way the legacy message did, through Number_Default_Mask.
+       sOf is "" inside the column object, or " of <columnObject>" for a line written after the column
+       objects; sWas is the legacy line, for the TODO a value that is not a pair leaves. Until this the dbGrid
+       converter put the value itself into psMask ("Set psMask to 12 2", which is no mask) and the Grid
+       converter left the legacy line in the CodeJock grid. */
+    Function NumericMaskLines String sIndent String sValue String sOf Boolean bCurrency String sWas Returns String[]
+        String[] asSplit asTok asOut
+        String   sRest sCode
+        Integer  i iCut iPos
+
+        /* THE VALUE ENDS AT A COMMENT (2026-10-31). ParseValueAfterTo hands over everything after 'to', so 'Set
+           Currency_Mask Item 6 to 10 2 // Amount' made the comment the template - 'Number_Default_Mask(10, 2, //
+           Amount)', error 4346, in every view that commented its masks. The function library's line scanner
+           says where the code ends, outside any string; the text is cut there, so a template string stays. */
+        If (Pos("//", sValue) > 0) Begin
+            Get _CodeOnlyLine of ghoFuncLib sValue to sCode
+            Move (Length(sCode)) to iCut
+            Move (Pos("//", Mid(sValue, Length(sValue), (iCut + 1)))) to iPos
+            If (iPos > 0) ;
+                Move (Left(sValue, (iCut + iPos - 1))) to sValue
+        End
+        Move (StrSplitToArray(Trim(sValue), " ")) to asSplit
+        For i from 0 to (SizeOfArray(asSplit) - 1)
+            If (asSplit[i] <> "") ;
+                Move asSplit[i] to asTok[SizeOfArray(asTok)]
+        Loop
+        If (SizeOfArray(asTok) < 2) Begin
+            Move (sIndent + "// TODO: " + If(bCurrency, "Currency_Mask", "Numeric_Mask") + " takes the digits left and right of the decimal separator - set this column's mask by hand (" + If(bCurrency, "CreateCurrencyMask", "CreateNumericMask") + "). Was: " + sWas) to asOut[SizeOfArray(asOut)]
+            Function_Return asOut
+        End
+        Move (sIndent + "Send " + If(bCurrency, "CreateCurrencyMask", "CreateNumericMask") + sOf + " " + asTok[0] + " " + asTok[1]) to asOut[SizeOfArray(asOut)]
+        If (SizeOfArray(asTok) > 2) Begin
+            Move "" to sRest
+            For i from 2 to (SizeOfArray(asTok) - 1)
+                Move (sRest + If((sRest = ""), "", " ") + asTok[i]) to sRest
+            Loop
+            Move (sIndent + "Set psMask" + sOf + " to (Number_Default_Mask(" + asTok[0] + ", " + asTok[1] + ", " + sRest + "))") to asOut[SizeOfArray(asOut)]
+        End
+        Function_Return asOut
+    End_Function
+
+    // Collect the NAMES declared with a type keyword from a (trimmed lowercase) line - both a
+    // method SIGNATURE ("procedure entry_display integer ifile integer itype") and a body var
+    // declaration ("integer iitem icolor"). Once a type keyword has been seen, every following
+    // token collects as a name until the next type keyword; an end-comment stops the walk.
+    // Feeds the Entry_Display hoist guard: these names are METHOD LOCALS, illegal at object level.
+    Procedure CollectTypedNames String sTrimLower String[] ByRef asNames
+        String[] asWords
+        String sWord sTypes
+        Integer i iSize
+        Boolean bTypeSeen
+
+        Move " integer number string boolean date datetime handle variant real currency longptr ulongptr pointer uchar ushort uinteger bigint " to sTypes
+        Move (StrSplitToArray(sTrimLower, " ")) to asWords
+        Move (SizeOfArray(asWords) - 1) to iSize
+        Move False to bTypeSeen
+        For i from 0 to iSize
+            Move (Trim(asWords[i])) to sWord
+            If (Left(sWord, 2) = "//") ;
+                Move iSize to i
+            Else If (sWord <> "") Begin
+                If (sTypes contains (" " + sWord + " ")) ;
+                    Move True to bTypeSeen
+                Else If (bTypeSeen = True) ;
+                    Move sWord to asNames[SizeOfArray(asNames)]
+            End
+        Loop
+    End_Procedure
+
+    // True when the value part (after " to ") of a legacy grid-property Set references one of the
+    // collected method locals (whole-word). Such a Set cannot be hoisted to object level - the
+    // local does not exist there and the compiler reads it as an unresolved message
+    // (iColor -> MSG_ICOLOR, error 4306; LegacyApp replay 2026-07-24).
+    Function EntryDisplayLocalInValue String sTrimLower String[] asLocals Returns Boolean
+        String sValue
+        Integer i iSize iPos
+        Move (Pos(" to ", sTrimLower)) to iPos
+        If (iPos = 0) ;
+            Function_Return False
+        Move (Mid(sTrimLower, (Length(sTrimLower)), (iPos + 4))) to sValue
+        Move (SizeOfArray(asLocals) - 1) to iSize
+        For i from 0 to iSize
+            If (_FindKeywordPos(ghoFuncLib, sValue, asLocals[i], True, 1) > 0) ;
+                Function_Return True
+        Loop
+        Function_Return False
     End_Function
 
     // *** Parsing helpers ***
 
     // Replace the class name in sLine with the target grid class from psTargetGridClass.
+    // Either article matches; the output keeps the line through the article's 'a' (original
+    // casing preserved) - an "is an <Old>" therefore normalises to "is a <New>" (every target
+    // class is consonant-initial).
     Function ReplaceGridClassName String sLine String sTrimLower Returns String
-        Integer iIsA
+        Integer iIsA iArt
         String  sLeading sTargetClass
 
-        Move (Pos(" is a ", Lowercase(sLine))) to iIsA
+        Get IsAArticlePos (Lowercase(sLine)) (&iArt) to iIsA
         If (iIsA = 0) Begin
             Function_Return sLine
         End
-        Move (Left(sLine, (iIsA + 5))) to sLeading
+        Move (Left(sLine, (iIsA + 4)) + " ") to sLeading
         Get psTargetGridClass to sTargetClass
         Function_Return (sLeading + sTargetClass)
     End_Function
@@ -765,28 +1594,21 @@ Class cGridToCJGridBase is a cObject
         Function_Return (_DigitsToIntOrMinus1(Self,sToken))
     End_Function
 
-    // Extract a quoted label string from "Set Header_Label [Item] N to "Label"".
-    // Strips the surrounding double-quotes from the value.
-    // Uses an explicit closing-quote search so that a trailing end comment
-    // (e.g. Set Header_Label Item 0 to "Name" // was "Full Name") is stripped
-    // correctly, without being confused by "//" appearing inside the label text.
+    // Extract the EMITTABLE psCaption value from "Set Header_Label [Item] N to <value>".
+    // A quoted string literal is returned WITH its quotes (a trailing end comment after the closing
+    // quote is dropped, via an explicit closing-quote search so "//" inside the label text is safe).
+    // A non-quoted value - an expression like (fFindLabelText("X")), a variable, or a constant - comes
+    // back VERBATIM. Callers emit `Set psCaption to <this>` AS-IS; they must NOT re-wrap it in quotes
+    // (that turned the expression into the broken Set psCaption to "(fFindLabelText("X"))" - Nils 2026-07-07).
     Function ParseHeaderLabel String sOrigLine Returns String
         String  sVal
         Integer iPos
         Get ParseValueAfterTo sOrigLine to sVal
         If (Left(sVal, 1) = '"' and Length(sVal) >= 2) Begin
-            // Locate the closing quote by searching from position 2 onwards.
-            // iPos is the position of '"' within Mid(sVal, CI_EOL, 2), so
-            // Mid(sVal, iPos-1, 2) extracts the label text without outer quotes.
+            // Closing-quote position (search from char 2); keep the whole "..." and drop any end comment.
             Move (Pos('"', Mid(sVal, CI_EOL, 2))) to iPos
-            If (iPos > 0) Begin
-                Move (Mid(sVal, iPos - 1, 2)) to sVal
-            End
-            Else Begin
-                // No closing quote found (malformed line): fall back to stripping
-                // first and last character as before.
-                Move (Mid(sVal, (Length(sVal) - 2), 2)) to sVal
-            End
+            If (iPos > 0) ;
+                Move (Left(sVal, iPos + 1)) to sVal
         End
         Function_Return sVal
     End_Function
@@ -857,11 +1679,124 @@ Class cGridToCJGridBase is a cObject
 
     // *** Subclass hooks -- override in derived classes ***
 
+    /* DECLINE HOOK - answered by the subclass BEFORE a grid object is touched. "" means convert it;
+       anything else is the reason it must stay as written: TransformSource then passes the whole
+       object through verbatim (not counted, no Use line added for it) and names it in the run notes
+       through NoteDeclinedGrid. The base declines nothing. */
+    Function GridDeclineReason String sGridIndent Integer iGridStartLine Returns String
+        Function_Return ""
+    End_Function
+
+    /* The run note for a grid the subclass declined: "<file>: <object> left as <Class> - <reason>".
+       The summary line counts converted objects only, so without this a grid that stayed legacy would
+       read as an oversight instead of a decision. Keyed on the running function (psExecutionContext),
+       as TransformFiles keys its summary unit; outside a run there is no function to note into. */
+    Procedure NoteDeclinedGrid String sTrimLine String sReason
+        String  sFn sFile sObj sClass
+        Integer iPos
+
+        Get psExecutionContext of ghoFuncLib to sFn
+        If (Trim(sFn) = "") ;
+            Procedure_Return
+        Get psFileName to sFile
+        Move (RightPos("\", sFile)) to iPos
+        If (iPos > 0) ;
+            Move (Mid(sFile, (Length(sFile) - iPos), (iPos + 1))) to sFile
+        If (Trim(sFile) <> "") ;
+            Move (Trim(sFile) + ": ") to sFile
+        Get _NthWord of ghoFuncLib sTrimLine 2 to sObj
+        Get LegacyClassOnLine sTrimLine to sClass
+        If (sClass = "") ;
+            Move "its class" to sClass
+        Send AddRunNote of ghoFuncLib sFn (sFile + sObj + " left as " + sClass + " - " + sReason)
+    End_Procedure
+
+    /* THE MARKER IS THE OUTCOME (2026-09-07). A declined grid that carried only a run note came back on every
+       Check as the same rows and was declined again by every plan run - three rounds of the same 16 rows on
+       one workspace. The Deep Scan and the analyzer's verify step both honour a '// TODO (DFRefactor)' comment
+       line directly above a declaration (cDeepScanner.ScanLines, cModAnalyzer.VerifySkipMarker), so the reason
+       is written there as well - once: when the line above the object in the SOURCE already carries a
+       DFRefactor marker, nothing is added, and a re-run stays byte-identical. */
+    Procedure AppendDeclineMarker String[] ByRef asOutput String sGridIndent String sReason Integer iGridStartLine
+        String[] asSource
+        String sAbove
+
+        If (iGridStartLine > 0) Begin
+            Get pasSource to asSource
+            Move (Lowercase(Trim(asSource[iGridStartLine - 1]))) to sAbove
+            If (Left(sAbove, 2) = "//" and (sAbove contains "dfrefactor") and ((sAbove contains "todo") or (sAbove contains "note"))) ;
+                Procedure_Return
+        End
+        Move (sGridIndent + "// TODO (DFRefactor): NOT converted - " + sReason) to asOutput[SizeOfArray(asOutput)]
+        Set piDeclineMarkers to (piDeclineMarkers(Self) + 1)
+    End_Procedure
+
+    // Is the current file worth writing back? When something converted - or when a decline marker was
+    // added: the marker is what keeps the next Check from offering the same grid again, and a file with
+    // nothing converted was never written, so the same rows returned run after run (2026-09-07).
+    Function FileNeedsWrite Integer iGridsConverted Returns Boolean
+        Function_Return (iGridsConverted > 0 or piDeclineMarkers(Self) > 0)
+    End_Function
+
     // Called when a grid declaration is detected and processed.
     // iGridStartLine is the zero-based index of the grid declaration line in pasSource.
     // Subclasses reset their per-grid state (column arrays etc.) here, and may use
     // iGridStartLine to perform their own forward pre-scan of the grid body.
     Procedure OnGridStarted String sGridIndent Integer iGridStartLine
+    End_Procedure
+
+    // True when the method body starting AFTER iFrom declares a local named sName (whole word,
+    // on a type-keyword declaration line), up to its End_Procedure / End_Function.
+    //
+    // WHY (Nils 2026-07-26, LegacyApp): converting Mouse_Click emits
+    // 'Procedure OnRowDoubleClick Integer iRow Integer iCol' - and if the ORIGINAL body already
+    // declared its own local named iRow or iCol (this codebase writes 'Get Current_Col to iCol'
+    // everywhere), the injected PARAMETER and that local collide:
+    //     ERROR 4345 Type check error ICOL, SHOULD NOT BE DEFINED
+    //     ERROR 4332 Symbol already defined  ICOL
+    // Reproduced standalone against DF25 - a cCJGrid object whose OnRowDoubleClick body declares
+    // 'Integer iCol' fails to compile with exactly that pair. The parameter names are OURS, so we
+    // move them out of the way rather than renaming the customer's variable (see MouseParamNames).
+    Function MethodBodyDeclaresLocal String[] ByRef asLines Integer iFrom String sName Returns Boolean
+        String[] asNames asEmpty
+        String   sLow sWant
+        Integer  i iLast j
+
+        Move (Lowercase(Trim(sName))) to sWant
+        Move (SizeOfArray(asLines) - 1) to iLast
+        For i from (iFrom + 1) to iLast
+            Move (Lowercase(Trim(asLines[i]))) to sLow
+            If (Left(sLow, 13) = "end_procedure" or Left(sLow, 12) = "end_function") ;
+                Function_Return False
+            If (Left(sLow, 2) <> "//") Begin
+                // CollectTypedNames yields the NAMES on a type-keyword declaration line and
+                // nothing on an ordinary statement - so a mere USE of the name never matches.
+                Move asEmpty to asNames
+                Send CollectTypedNames sLow (&asNames)
+                For j from 0 to (SizeOfArray(asNames) - 1)
+                    If (asNames[j] = sWant) ;
+                        Function_Return True
+                Loop
+            End
+        Loop
+        Function_Return False
+    End_Function
+
+    // The parameter names to give a converted Mouse_Click / Mouse_Down2. Normally iRow / iCol -
+    // the names cCJGrid itself uses - but when the body already declares one of them as its own
+    // local, that name is taken and we step aside (iGridRow / iGridCol). Returns both ByRef.
+    Procedure MouseParamNames String[] ByRef asLines Integer iFrom String ByRef sRowName String ByRef sColName
+        Boolean bRowTaken bColTaken
+        Move "iRow" to sRowName
+        Move "iCol" to sColName
+        Get MethodBodyDeclaresLocal (&asLines) iFrom "iRow" to bRowTaken
+        Get MethodBodyDeclaresLocal (&asLines) iFrom "iCol" to bColTaken
+        If (bRowTaken = True or bColTaken = True) Begin
+            // Rename BOTH together - a signature reading 'Integer iRow Integer iGridCol' would be
+            // needlessly confusing, and the pair is always read as a pair.
+            Move "iGridRow" to sRowName
+            Move "iGridCol" to sColName
+        End
     End_Procedure
 
     // Called for each source line at nesting level 1 (direct grid body content)
@@ -874,6 +1809,13 @@ Class cGridToCJGridBase is a cObject
     // Called just before the grid's own End_Object is emitted.
     // Subclasses flush any buffered column objects into asOutput here.
     Procedure OnBeforeGridEndObject String[] ByRef asOutput String sGridIndent
+    End_Procedure
+
+    // Called once at the end of TransformSource - AFTER every grid in the file converted -
+    // with the complete output. Subclasses apply FILE-WIDE fix-ups here: e.g. renaming the
+    // EXTERNAL callers of a data loader the conversion renamed to LoadData ('Send
+    // FillArticleList of (oGrid(Self))' was left dangling - Sublager_clear_order 2026-07-25).
+    Procedure OnAfterTransformSource String[] ByRef asOutput
     End_Procedure
 
     // Emits translatable grid properties collected from Entry_Display during
@@ -922,25 +1864,121 @@ Class cGridToCJGridBase is a cObject
 
     // Scans pasSource, transforms every matching grid object it finds, writes
     // the result back to pasSource.  Returns the number of grids transformed.
+    /* A DataFlex declaration may be split over a ';' continuation:
+
+           Object oCustomers ;
+               is a Grid
+
+       and every IsGridDeclaration override starts with Pos("object ", ...) = 1, so the half
+       carrying the class name was never recognised and the object stayed a Grid. The compiler is
+       not fooled - it reports 4537 "Obsolete class: GRID" against the CONTINUATION line, which
+       does not look like a declaration, so the warning also reads as if it points nowhere useful
+       (Nils 2026-08-10, after the converted file kept warning).
+
+       Joining the two halves into one line before the main pass is what makes the rest of the
+       machine work unchanged: every splice point, indent calculation and body scan downstream
+       assumes a declaration is one line, and teaching all of them about a second line would be a
+       far larger change than removing the second line.
+
+       NARROW ON PURPOSE. A continuation is joined ONLY when the result is a declaration of the
+       legacy class this converter is looking for - IsGridDeclaration decides, the same authority
+       the main loop uses. A ';' continuation anywhere else in the file, including one that
+       completes an Object declaration of some OTHER class, is left exactly as written: this is a
+       refactoring tool, and reflowing lines it was not asked to touch is how a diff becomes
+       unreviewable. The joined line keeps the first half's indentation and drops the ';'. */
+    Procedure JoinContinuedGridDeclarations String[] ByRef asSource
+        String[] asNew
+        String   sLine sNext sHead sJoined sIndent
+        Integer  iCount iSize iOut
+        Boolean  bIsGrid
+
+        Move (SizeOfArray(asSource) - 1) to iSize
+        Move 0 to iOut
+        Move 0 to iCount
+        While (iCount <= iSize)
+            Move asSource[iCount] to sLine
+            Move False to bIsGrid
+            /* Candidate: an "Object ..." line ENDING in ';', with a following line that opens with
+               the article. The ';' must be the last character - a line carrying a trailing comment
+               after it is left alone rather than joined, because the join would have to decide
+               where that comment now belongs and there is no answer that is obviously right. Those
+               stay unconverted, exactly as before; nothing regresses. */
+            If (iCount < iSize) Begin
+                Move (Trim(sLine)) to sHead
+                If (Right(sHead, 1) = ";" and Pos("object ", Lowercase(sHead)) = 1) Begin
+                    Move (Trim(asSource[iCount + 1])) to sNext
+                    If (Pos("is a ", Lowercase(sNext)) = 1 or Pos("is an ", Lowercase(sNext)) = 1) Begin
+                        // Drop the ';' and glue the halves with a single space.
+                        Move (Trim(Left(sHead, (Length(sHead) - 1)))) to sHead
+                        Get GetIndent sLine to sIndent
+                        Move (sIndent + sHead + " " + sNext) to sJoined
+                        Get IsGridDeclaration (Lowercase(Trim(sJoined))) to bIsGrid
+                    End
+                End
+            End
+            If (bIsGrid = True) Begin
+                Move sJoined to asNew[iOut]
+                Increment iOut
+                Move (iCount + 2) to iCount    // both halves consumed
+            End
+            Else Begin
+                Move sLine to asNew[iOut]
+                Increment iOut
+                Increment iCount
+            End
+        Loop
+        Move asNew to asSource
+    End_Procedure
+
+    /* THE CONVERSION, WITH THE TEXT MASKED (2026-10-30): a block comment's, a report image's and a string's text and
+       the macro code are masked away while the grids are converted and put back after (cRefactorFuncLib's
+       MaskForTransform) - a commented-out grid is no grid, and its text is never refactored. Measured the day it
+       came: each of the four converters converted a grid commented out or in a report image. A masked line the
+       conversion removed is put back where it was, and the run notes name the file. */
     Function TransformSource Returns Integer
+        String[] asSource
+        tWholeFileMask Mask
+        Integer iGrids iMacro iLost
+
+        Get pasSource to asSource
+        Get MaskForTransform of ghoFuncLib (&asSource) (&Mask) to iMacro
+        Set pasSource to asSource
+        Get _TransformMaskedSource to iGrids
+        Get pasSource to asSource
+        Get UnmaskAfterTransform of ghoFuncLib (&asSource) (&Mask) to iLost
+        Set pasSource to asSource
+        If (iLost > 0) ;
+            Send AddRunNote of ghoFuncLib (psExecutionContext(ghoFuncLib)) (psFileName(Self) + ":" * String(iLost) * "line(s) of comment, image or string text or macro code the conversion had removed were put back where they were - check the file.")
+        Function_Return iGrids
+    End_Function
+
+    Function _TransformMaskedSource Returns Integer
         String[] asSource asOutput asTranslated asEntryDisplayProps asEmpty
+        String[] asScanLocals
         String  sLine sTrimLine sLower sGridIndent sValue sSingleIndent
         String  sMethodName sOldMethodName sNewMethodName sHint sLineIndent
         String  sScanLine sScanLower
-        String  sMouseClickOldP1 sMouseClickOldP2
+        String  sOldClass sSubclassMarker
+        String[] asOldClasses
+        String  sMouseClickOldP1 sMouseClickOldP2 sMouseRowName sMouseColName
+        String  sPropIndent sPropHint sDecline
         Integer iCount iSize iGridsChanged iGridInnerNest iTr iTrSize
-        Integer iScan iScanSize iScanNest iProcDepth
+        Integer iScan iScanSize iScanNest iProcDepth iPassThrough
         Boolean bInEntryDisplay bSkip bFound bOK bScanFound
         Boolean bInRenameProcedure bInLegacyOnlyMethod
-        Boolean bScanInEntryDisplay bScanDone
+        Boolean bScanInEntryDisplay bScanDone bScanLocalHit
 
         Get pasSource to asSource
+        Send JoinContinuedGridDeclarations (&asSource)
         Move 0 to iGridsChanged
         Move 0 to iGridInnerNest
         Move 0 to iProcDepth
+        Move 0 to iPassThrough
         Move False to bInEntryDisplay
         Move False to bInRenameProcedure
         Move False to bInLegacyOnlyMethod
+        Move "" to sSubclassMarker
+        Set piDeclineMarkers to 0
 
         Move (SizeOfArray(asSource)) to iSize
         Decrement iSize
@@ -951,8 +1989,22 @@ Class cGridToCJGridBase is a cObject
             Move (Lowercase(sTrimLine)) to sLower
             Move False to bSkip
 
+            // A grid the subclass DECLINED (GridDeclineReason) passes through verbatim to its own
+            // End_Object, nested objects included - not one line of it is rewritten or counted.
+            If (iPassThrough > 0) Begin
+                Get IsObjectDeclaration sLower to bFound
+                If (bFound = True) Begin
+                    Increment iPassThrough
+                End
+                Else If (Left(sLower, 10) = "end_object") Begin
+                    Decrement iPassThrough
+                End
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+            End
+
             // NOT inside any grid
-            If (iGridInnerNest = 0) Begin
+            If (bSkip = False and iGridInnerNest = 0) Begin
                 // Track procedure/function nesting at this TOP scope, so a grid declared
                 // inside a Procedure body (e.g. Construct_Object) is detected. Procedure
                 // lines INSIDE a grid body never reach here (they run at iGridInnerNest >= 1),
@@ -967,6 +2019,46 @@ Class cGridToCJGridBase is a cObject
                 Get IsGridDeclaration sLower to bFound
                 If (bFound = True) Begin
                     Move (Replace(sTrimLine, sLine, "")) to sGridIndent
+                    // An object of the workspace's own subclass, under an EMPTY parameter, stays as it is
+                    // (SubclassToLeave): passed through untouched and counted for the run note - no marker
+                    // above it, and nothing written for it.
+                    Get SubclassToLeave sTrimLine to sOldClass
+                    If (sOldClass <> "") Begin
+                        Send TallySubclassLeft sOldClass
+                        Move 1 to iPassThrough
+                        Move False to bFound
+                    End
+                    // The subclass may DECLINE this object (no column definitions it can read - see
+                    // cGridToCJGrid.GridDeclineReason): it is named in the run notes and passed through
+                    // untouched, so nothing below runs for it and it is not counted.
+                    Else Begin
+                        Get GridDeclineReason sGridIndent iCount to sDecline
+                        If (sDecline <> "") Begin
+                            Send NoteDeclinedGrid sTrimLine sDecline
+                            // ...and the same reason as a skip-marker above the object, so the next Check stays
+                            // quiet about it instead of offering the row again (see AppendDeclineMarker).
+                            Send AppendDeclineMarker (&asOutput) sGridIndent sDecline iCount
+                            Move 1 to iPassThrough
+                            Move False to bFound
+                        End
+                    End
+                End
+                If (bFound = True) Begin
+                    // A SUBCLASS object (learned from the scan, or named in the parameter) gets a TODO
+                    // as its first body line naming the class it came from - what that class added is
+                    // not inherited by the target - and the class is remembered for RetireConvertedSubclassUses.
+                    Get LegacyClassOnLine sTrimLine to sOldClass
+                    Move "" to sSubclassMarker
+                    /* ...unless the class itself was ported IN PLACE (ConvertGridSubclassToCodeJock, 2026-10-04): the
+                       parameter then names the same class twice ("X,X,XColumn"), the object keeps "is a X", and what
+                       X adds came along with the class - so no TODO, and no Use of X's package to retire. */
+                    If (sOldClass <> "" and Lowercase(sOldClass) <> psLegacyRootToken(Self) and Lowercase(sOldClass) <> Lowercase(psTargetGridClass(Self))) Begin
+                        Get MakeSingleIndent to sSingleIndent
+                        Get _NthWord of ghoFuncLib sTrimLine 2 to sValue
+                        Get SubclassMarkerLine (sGridIndent + sSingleIndent) sValue sOldClass to sSubclassMarker
+                        If (SearchArray(Lowercase(sOldClass), asOldClasses) = -1) ;
+                            Move (Lowercase(sOldClass)) to asOldClasses[SizeOfArray(asOldClasses)]
+                    End
                     Get ReplaceGridClassName sLine sLower to sLine
                     Move 1 to iGridInnerNest
                     Increment iGridsChanged
@@ -1015,15 +2107,27 @@ Class cGridToCJGridBase is a cObject
                                         Move False to bScanInEntryDisplay
                                     End
                                     Else Begin
+                                        // Names declared inside the body are METHOD LOCALS too.
+                                        Send CollectTypedNames sScanLower (&asScanLocals)
                                         Get IsTranslatableGridProperty sScanLower to bScanFound
                                         If (bScanFound = True) Begin
-                                            Get TranslateGridProperty sScanLine sScanLower to asTranslated
-                                            Move (SizeOfArray(asTranslated)) to iTrSize
-                                            Decrement iTrSize
-                                            For iTr from 0 to iTrSize
-                                                Get MakeSingleIndent to sSingleIndent
-                                                Move (sGridIndent + sSingleIndent + Trim(asTranslated[iTr])) to asEntryDisplayProps[SizeOfArray(asEntryDisplayProps)]
-                                            Loop
+                                            Get EntryDisplayLocalInValue sScanLower asScanLocals to bScanLocalHit
+                                            Get MakeSingleIndent to sSingleIndent
+                                            If (bScanLocalHit = True) Begin
+                                                // A method local has no object-level meaning; hoisting it
+                                                // compiles as an unresolved message (error 4306). Decline
+                                                // and leave a note pointing at the preserved original.
+                                                Move (sGridIndent + sSingleIndent + "// NOT hoisted (value uses an Entry_Display local): " + Trim(sScanLine)) to asEntryDisplayProps[SizeOfArray(asEntryDisplayProps)]
+                                                Move (sGridIndent + sSingleIndent + "// Per-row/per-cell colors need hand work - see the commented-out Entry_Display below for the original logic.") to asEntryDisplayProps[SizeOfArray(asEntryDisplayProps)]
+                                            End
+                                            Else Begin
+                                                Get TranslateGridProperty sScanLine sScanLower to asTranslated
+                                                Move (SizeOfArray(asTranslated)) to iTrSize
+                                                Decrement iTrSize
+                                                For iTr from 0 to iTrSize
+                                                    Move (sGridIndent + sSingleIndent + Trim(asTranslated[iTr])) to asEntryDisplayProps[SizeOfArray(asEntryDisplayProps)]
+                                                Loop
+                                            End
                                         End
                                     End
                                 End
@@ -1031,6 +2135,9 @@ Class cGridToCJGridBase is a cObject
                                     Get IsEntryDisplayProcedure sScanLower to bScanFound
                                     If (bScanFound = True) Begin
                                         Move True to bScanInEntryDisplay
+                                        // The signature's parameter names are method locals as well.
+                                        Move asEmpty to asScanLocals
+                                        Send CollectTypedNames sScanLower (&asScanLocals)
                                     End
                                 End
                             End
@@ -1040,6 +2147,11 @@ Class cGridToCJGridBase is a cObject
                     Set pasEntryDisplayExtracted to asEntryDisplayProps
                 End
                 Move sLine to asOutput[SizeOfArray(asOutput)]
+                // ...and, once, the subclass TODO right under a converted subclass object's header.
+                If (sSubclassMarker <> "") Begin
+                    Move sSubclassMarker to asOutput[SizeOfArray(asOutput)]
+                    Move "" to sSubclassMarker
+                End
                 Move True to bSkip
             End
 
@@ -1060,34 +2172,68 @@ Class cGridToCJGridBase is a cObject
             If (bSkip = False and bInRenameProcedure = True) Begin
                 If (Left(sLower, 13) = "end_procedure" or Left(sLower, 12) = "end_function") Begin
                     Move False to bInRenameProcedure
+                    Move sLine to asOutput[SizeOfArray(asOutput)]
                 End
-                Else Begin
-                    If (sLower contains ("forward send " + sOldMethodName) or ;
-                        sLower contains ("forward get "  + sOldMethodName)) Begin
-                        If (sOldMethodName = "mouse_click" or sOldMethodName = "mouse_down2") Begin
-                            // Replace the entire Forward Send/Get with the correct new signature,
-                            // including the renamed iRow / iCol parameters.
-                            Get GetIndent sLine to sLineIndent
-                            Move (sLineIndent + "Forward Send " + sNewMethodName + " iRow iCol") to sLine
-                        End
-                        Else Begin
-                            Get ReplaceMethodName sLine sOldMethodName sNewMethodName to sLine
-                        End
+                Else If (sLower contains ("forward send " + sOldMethodName) or ;
+                         sLower contains ("forward get "  + sOldMethodName)) Begin
+                    If (sOldMethodName = "mouse_click" or sOldMethodName = "mouse_down2") Begin
+                        // Replace the entire Forward Send/Get with the correct new signature,
+                        // including the renamed iRow / iCol parameters.
+                        Get GetIndent sLine to sLineIndent
+                        Move (sLineIndent + "Forward Send " + sNewMethodName + CS_S + sMouseRowName + CS_S + sMouseColName) to sLine
                     End
                     Else Begin
-                        // For Mouse_Click / Mouse_Down2 bodies: replace old parameter names
-                        // with iRow / iCol throughout the method body.
-                        If (sOldMethodName = "mouse_click" or sOldMethodName = "mouse_down2") Begin
-                            If (sMouseClickOldP1 <> "") Begin
-                                Get ReplaceMethodName sLine (Lowercase(sMouseClickOldP1)) "iRow" to sLine
-                            End
-                            If (sMouseClickOldP2 <> "") Begin
-                                Get ReplaceMethodName sLine (Lowercase(sMouseClickOldP2)) "iCol" to sLine
-                            End
+                        Get ReplaceMethodName sLine sOldMethodName sNewMethodName to sLine
+                    End
+                    Move sLine to asOutput[SizeOfArray(asOutput)]
+                End
+                Else Begin
+                    // For Mouse_Click / Mouse_Down2 bodies: replace old parameter names
+                    // with iRow / iCol throughout the method body - WHOLE identifiers only
+                    // (ReplaceParamName; a bare substring swap turned Jobbreg_MultiWindow
+                    // into Jobbreg_MultiiRow - WinServ 2026-08-17).
+                    If (sOldMethodName = "mouse_click" or sOldMethodName = "mouse_down2") Begin
+                        If (sMouseClickOldP1 <> "") Begin
+                            Get ReplaceParamName sLine sMouseClickOldP1 sMouseRowName to sLine
+                        End
+                        If (sMouseClickOldP2 <> "") Begin
+                            Get ReplaceParamName sLine sMouseClickOldP2 sMouseColName to sLine
+                        End
+                    End
+                    // A legacy grid-only property INSIDE the converted method body (e.g.
+                    // Set Auto_Index_State / Set Seed_List_State) has no equivalent on the
+                    // cCJGrid class and would not compile. Handle it EXACTLY as at grid level
+                    // so the two paths never diverge: subclass translation (mapping or a TODO
+                    // hint) FIRST - which is where the dbList-specific properties live - then a
+                    // comment-out property, then DROP a pure legacy property, else emit the
+                    // (param-substituted) line. (Nils: Auto_Index_State + Seed_List_State,
+                    // 2026-07-05 - the base-only handling missed the subclass-translated ones.)
+                    Get IsTranslatableGridProperty sLower to bOK
+                    If (bOK = True) Begin
+                        Get TranslateGridProperty sLine sLower to asTranslated
+                        Move (SizeOfArray(asTranslated)) to iTrSize
+                        Decrement iTrSize
+                        For iTr from 0 to iTrSize
+                            Move asTranslated[iTr] to asOutput[SizeOfArray(asOutput)]
+                        Loop
+                    End
+                    Else Begin
+                        Get IsCommentOutGridProperty sLower to bOK
+                        If (bOK = True) Begin
+                            Get GetIndent sLine to sPropIndent
+                            Get CommentOutLine sLine to sLine
+                            Move sLine to asOutput[SizeOfArray(asOutput)]
+                            Get LegacyOnlyGridPropertyHint sLower to sPropHint
+                            If (sPropHint <> "") ;
+                                Move (sPropIndent + "// TODO: closest cCJGrid equivalent is " + sPropHint) to asOutput[SizeOfArray(asOutput)]
+                        End
+                        Else Begin
+                            Get IsLegacyGridProperty sLower to bOK
+                            If (bOK = False) ;
+                                Move sLine to asOutput[SizeOfArray(asOutput)]
                         End
                     End
                 End
-                Move sLine to asOutput[SizeOfArray(asOutput)]
                 Move True to bSkip
             End
 
@@ -1129,9 +2275,14 @@ Class cGridToCJGridBase is a cObject
                 Move True to bSkip
             End
 
-            // Direct grid content: Define constant removal
+            // Direct grid content: Define constants are PRESERVED (pass-through). They were REMOVED as
+            // "column index constants no longer needed" until Nils' LegacyApp dbGrid0 run (2026-07-03): the
+            // preserved procedures still REFERENCE them ('Set Item_Option Item (BI+list0041w_Amount)...'),
+            // so deleting the Define broke 5 views with ~145 'Undefined symbol' errors (list0041 alone lost
+            // 14 constants). A Define is free if unused - keep it, never delete user code silently.
             If (bSkip = False) Begin
                 If (Left(sLower, 7) = "define ") Begin
+                    Move sLine to asOutput[SizeOfArray(asOutput)]
                     Move True to bSkip
                 End
             End
@@ -1203,16 +2354,21 @@ Class cGridToCJGridBase is a cObject
                                             If (iTrSize > 0) Move (Left(sMouseClickOldP2, iTrSize - 1)) to sMouseClickOldP2
                                         End
                                     End
+                                    // Parameter names: iRow / iCol unless the body already declares
+                                    // one of them as its own local, in which case OUR names step
+                                    // aside (see MouseParamNames - the collision is a hard compile
+                                    // error, 4332/4345, Nils 2026-07-26).
+                                    Send MouseParamNames (&asSource) iCount (&sMouseRowName) (&sMouseColName)
                                     // Choose new name and emit conversion comment + new declaration.
                                     If (sMethodName = "mouse_click") Begin
                                         Move "OnRowDoubleClick" to sNewMethodName
-                                        Move (sLineIndent + "// Converted from Mouse_Click: iRow = row index, iCol = column index.") to asOutput[SizeOfArray(asOutput)]
-                                        Move (sLineIndent + "Procedure OnRowDoubleClick Integer iRow Integer iCol") to asOutput[SizeOfArray(asOutput)]
+                                        Move (sLineIndent + "// Converted from Mouse_Click: " + sMouseRowName + " = row index, " + sMouseColName + " = column index.") to asOutput[SizeOfArray(asOutput)]
+                                        Move (sLineIndent + "Procedure OnRowDoubleClick Integer " + sMouseRowName + " Integer " + sMouseColName) to asOutput[SizeOfArray(asOutput)]
                                     End
                                     Else Begin
                                         Move "OnRowRightClick" to sNewMethodName
-                                        Move (sLineIndent + "// Converted from Mouse_Down2: iRow = row index, iCol = column index.") to asOutput[SizeOfArray(asOutput)]
-                                        Move (sLineIndent + "Procedure OnRowRightClick Integer iRow Integer iCol") to asOutput[SizeOfArray(asOutput)]
+                                        Move (sLineIndent + "// Converted from Mouse_Down2: " + sMouseRowName + " = row index, " + sMouseColName + " = column index.") to asOutput[SizeOfArray(asOutput)]
+                                        Move (sLineIndent + "Procedure OnRowRightClick Integer " + sMouseRowName + " Integer " + sMouseColName) to asOutput[SizeOfArray(asOutput)]
                                     End
                                     Move sMethodName to sOldMethodName
                                     Move True to bInRenameProcedure
@@ -1253,8 +2409,12 @@ Class cGridToCJGridBase is a cObject
                         Else Begin
                             Get IsCommentOutGridProperty sLower to bOK
                             If (bOK = True) Begin
+                                Get GetIndent sLine to sPropIndent
                                 Get CommentOutLine sLine to sLine
                                 Move sLine to asOutput[SizeOfArray(asOutput)]
+                                Get LegacyOnlyGridPropertyHint sLower to sPropHint
+                                If (sPropHint <> "") ;
+                                    Move (sPropIndent + "// TODO: closest cCJGrid equivalent is " + sPropHint) to asOutput[SizeOfArray(asOutput)]
                                 Move True to bSkip
                             End
                             Else Begin
@@ -1271,6 +2431,15 @@ Class cGridToCJGridBase is a cObject
             End
         Loop
 
+        // Ensure the converted file Uses the package that defines the new grid class
+        // (adds it, or swaps out the dedicated legacy package). Only when something was
+        // actually converted - an untouched file keeps its Use lines verbatim.
+        If (iGridsChanged > 0) Begin
+            Send FixUpUsePackage (&asOutput)
+            Send RetireConvertedSubclassUses (&asOutput) asOldClasses
+            Send OnAfterTransformSource (&asOutput)
+        End
+
         Set pasSource to asOutput
         Function_Return iGridsChanged
     End_Function
@@ -1280,17 +2449,22 @@ Class cGridToCJGridBase is a cObject
     // Validates sParameter, loops over asFiles, calls ReadFile / TransformSource /
     // WriteFile for each, accumulates counts.
     Function TransformFiles String[] asFiles String sParameter Returns Integer
-        String  sFilePath
+        String  sFilePath sFn
         Integer iCount iSize iGrids iTotalGrids iTotalFiles
-        Boolean bOK
+        Boolean bOK bCancel
 
         Get ParseAndSetParameter sParameter to bOK
         If (bOK = False) Begin
             Function_Return 0
         End
+        // What this converter COUNTS is grid objects, not files - its summary line says so.
+        Get psExecutionContext of ghoFuncLib to sFn
+        If (sFn <> "") ;
+            Send SetSummaryUnit of ghoFuncLib sFn "grid object(s)"
 
         Move 0 to iTotalGrids
         Move 0 to iTotalFiles
+        Send _ClearSubclassesLeft
         Move (SizeOfArray(asFiles)) to iSize
         Set piMaximumTot of ghoStatusPanel to iSize
 
@@ -1299,13 +2473,17 @@ Class cGridToCJGridBase is a cObject
             For iCount from 0 to iSize
                 Move asFiles[iCount] to sFilePath
                 Set Caption_Text of ghoStatusPanel to ("Grid conversion - File No:" * String(iCount + 1) * "of:" * String(iSize + 1))
-                Set Title_Text   of ghoStatusPanel to ("Converting Grid objects in:" * sFilePath)
-                Set Message_Text of ghoStatusPanel to (ParseFileName(sFilePath))
+                // Panel field conventions (see RefactorStatusPanel.pkg): the full path goes to the
+                // multi-line TableName line; Message_Text stays the ENGINE's "Function: <name>"
+                // (this used to overwrite it with the bare file name).
+                Set Title_Text   of ghoStatusPanel to "Converting Grid objects in:"
+                Set TableName_Text of ghoStatusPanel to sFilePath
 
                 Send ReadFile sFilePath
                 Get TransformSource to iGrids
 
-                If (iGrids > 0) Begin
+                // Written when something converted - or when a decline marker was added (FileNeedsWrite).
+                If (FileNeedsWrite(Self, iGrids) = True) Begin
                     If (pbReadOnly(ghoFuncLib) = False) Begin
                         Send WriteFile
                     End
@@ -1314,14 +2492,60 @@ Class cGridToCJGridBase is a cObject
                 End
 
                 Send DoAdvanceTot of ghoStatusPanel
+                // Mid-run cancel (the Cancel button): a *All function gets ONE call for all
+                // files, so the engine's per-file Cancel_Check cannot fire while we convert.
+                // Poll the safe accessor (NEVER Cancel_Check - it consumes the signal) and
+                // bail; the engine's outer Cancel_Check then runs the confirm pipeline once.
+                // Files already converted stay converted, like any engine cancel.
+                Get pbUserCancelRequested of ghoEngine to bCancel
+                If (bCancel = True) ;
+                    Move iSize to iCount
             Loop
         End
 
-        Set Title_Text   of ghoStatusPanel to ""
-        Set Message_Text of ghoStatusPanel to ""
+        // One note per subclass whose objects the run left as they are (SubclassToLeave).
+        Send NoteSubclassesLeft
+        Set Title_Text     of ghoStatusPanel to ""
+        Set TableName_Text of ghoStatusPanel to ""
         Set piChangedFiles to iTotalFiles
         Set piChangedGrids to iTotalGrids
         Function_Return iTotalGrids
+    End_Function
+
+    // *** Trailing line-comment split (shared by every grid/list flavour) ***
+    //
+    // Both converters have to separate a source line's CODE from its trailing "// note"
+    // before rebuilding the line, and for the same reason: whatever they append would
+    // otherwise land INSIDE the comment. The db flavour hit it on an Entry_Item field spec
+    // ("Table.Field // comment" read as a calculated expression); the non-db flavour hit it
+    // on "Send Add_Item Msg_None sStatus  //Status", where the generated " to TheData[iRow]
+    // .sValue[iCol1]" was appended AFTER the comment and so was commented out - leaving a
+    // one-argument "Move sStatus" that the compiler rejects with "ARGUMENT REQUIRED"
+    // (LegacyApp, Nils 2026-07-26). One copy here rather than one per flavour.
+    //
+    // First "//" wins (leftmost match). Note this differs from cBaseFuncLib._RemoveEndComment,
+    // which uses RightPos (rightmost match). A "//" inside a string literal is a rare edge
+    // case that the rest of the tool treats the same way.
+    Function StripTrailingComment String sSpec Returns String
+        Integer iPos
+        Move (Pos(CS_CommentSymbol, sSpec)) to iPos
+        If (iPos > 0) Begin
+            Move (Left(sSpec, iPos - 1)) to sSpec
+        End
+        Function_Return (Trim(sSpec))
+    End_Function
+
+    // Companion to StripTrailingComment: returns the trailing line comment ("// ...",
+    // trimmed), or "" when there is none. Kept aside so it can be re-attached to the
+    // generated line without ever participating in classification, column-name derivation
+    // or value parsing - the user's annotation survives the conversion.
+    Function ExtractTrailingComment String sSpec Returns String
+        Integer iPos
+        Move (Pos(CS_CommentSymbol, sSpec)) to iPos
+        If (iPos = 0) Begin
+            Function_Return ""
+        End
+        Function_Return (Trim(Mid(sSpec, CI_EOL, iPos)))
     End_Function
 
 End_Class

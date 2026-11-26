@@ -1,0 +1,242 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cSchemePreview
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-27
+//
+// Description : The Editor Settings dialog's colour preview - a REAL Scintilla control.
+//
+//               What it replaces (Nils, 2026-07-27): cEditorPreview in the library's THColorer.pkg,
+//               a cRichEdit with a hand-written imitation of Scintilla's styling, driven from the
+//               dialog by ninety lines of "add a keyword, add a space, add a string, add an operator".
+//               Every colour decision the editor made had a second implementation there, reading
+//               gtColorer[] a second time, and the two could only ever be kept in step by hand. They
+//               were not: the packed-string work went in, the scheme started writing CI_NoColour where
+//               the old code left 0, and the preview - which fed those numbers straight into a
+//               RichEdit's TextBackColor - died with Error 50 the moment the dialog opened.
+//
+//               A preview whose whole job is "show what the editor will look like" should not be a
+//               re-implementation of the editor. This one is the editor's own rendering class
+//               (cScintillaSchemeView) with the interactive parts left off, running the real DataFlex
+//               lexer over a sample of real DataFlex source. There is no imitation left to drift, and
+//               the fake margins the dialog used to draw beside it - a Container3d for the left margin
+//               and a TextBox with "01 02 03..." typed into it for the line numbers - are now the
+//               control's own margins, styled by the same scheme entries as the editor's.
+//
+//               The one thing it does differently from the editor is WHERE the colours come from.
+//               The editor paints the SAVED settings; the preview paints the scheme the dialog is
+//               currently editing, so an unsaved change shows immediately. That is the LoadCurrentScheme
+//               seam, and it is the only override needed.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use cScintillaSchemeView.pkg
+
+Class cSchemePreview is a cScintillaSchemeView
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+
+        // The scheme being edited, owned by the dialog. Zero until ShowScheme is called,
+        // which is why every path here guards on it.
+        Property Handle phoEditingScheme 0
+        // The editor font, as face and point size - the dialog parses its own
+        // "11pt; 0; Consolas" setting and passes the parts, so this package needs to
+        // know nothing about that format.
+        Property String  psPreviewFontFace "Courier New"
+        Property Integer piPreviewFontSize 10
+
+        // A preview is looked at, not typed in. Non-focusable also means the four keys
+        // the bridge claims from the control host (Tab, Shift+Tab, Enter, Insert) never
+        // reach it - in a modal dialog, a control that swallowed Tab would trap focus.
+        Set Focus_Mode  to NonFocusable
+        Set pbUtf8Mode  to False
+        Set pbOemMode   to True
+        // The bridge registers the editor as a drop target. A read-only sample of
+        // canned source has nothing to do with a dropped file.
+        Set piDragAcceptFilesState to False
+    End_Procedure
+
+    // ==================================================================================
+    // The two seams from cScintillaSchemeView.
+    // ==================================================================================
+
+    /* Paint what the dialog is editing, not what is saved. The scheme is COPIED rather
+       than pointed at: ApplySelectionAppearance loads the built-in declaration into the
+       scheme it is holding and then reloads to undo that, which would scribble on the
+       dialog's own edit buffer if the two were the same object. SerializeScheme/DeserializeScheme is
+       the copy - the same text form the settings file stores. */
+    Procedure LoadCurrentScheme
+        Handle hoEditing hoMine
+        String sScheme
+        Get phoEditingScheme to hoEditing
+        If (hoEditing = 0) ;
+            Procedure_Return
+        Get phoColourScheme to hoMine
+        Get SerializeScheme of hoEditing to sScheme
+        Send DeserializeScheme of hoMine sScheme
+    End_Procedure
+
+    Function ActiveSchemeName Returns String
+        Handle hoEditing
+        Get phoEditingScheme to hoEditing
+        If (hoEditing = 0) ;
+            Function_Return ""
+        Function_Return (psSchemeName(hoEditing))
+    End_Function
+
+    // ==================================================================================
+    // Setup.
+    // ==================================================================================
+
+    // The language only. The editor's SetLexer additionally registers its command table,
+    // its hotkeys and the engine wiring; none of that belongs to a preview.
+    Procedure SetLexer
+        Send ApplyLanguage
+    End_Procedure
+
+    /* Margins, font and codepage. Line numbers and the fold margin are on - the scheme
+       has a Line Numbers entry and a Left Margin entry, and being able to see what they
+       do is half of what a preview is for.
+
+       The BOOKMARK margin is deliberately off, even though the scheme has a Bookmarks
+       element. That element does not currently reach anything: ApplyFoldingStyle gives
+       the bookmark marker a pixmap from the image DLL, or a fixed red if the DLL has
+       none, and never asks the scheme. Drawing a bookmark here would show a colour the
+       user cannot change from the entry that claims to change it. Making the editor
+       honour it is a separate change; pretending it already does is not.
+
+       Scrollbars are off: the sample is written to fit. */
+    Procedure SetAdjustments Boolean bIsPaged
+        String sFace
+
+        Send ShowLineNumbers True
+        Send EnableFolding   True
+        Send ShowHorizontalScrollBar False
+        Send ShowVerticalScrollBar   False
+        Send SetTabWidth 4
+        Send EditorMessage SCI_SETCODEPAGE 0        // single-byte, matching pbOemMode
+
+        // NUL-terminated: Scintilla reads the face name as a C string. (The editor's
+        // own SCI_STYLESETFONT call passes an unterminated DataFlex string and gets
+        // away with it, which is luck rather than contract - see the note on the call
+        // tip font in cScintillaSchemeView.)
+        Move (Trim(psPreviewFontFace(Self)) + Character(0)) to sFace
+        Send EditorMessage SCI_STYLESETFONT STYLE_DEFAULT (AddressOf(sFace))
+        Send EditorMessage SCI_STYLESETSIZE STYLE_DEFAULT (piPreviewFontSize(Self))
+        Send EditorMessage SCI_STYLESETCHARACTERSET STYLE_DEFAULT SC_CHARSET_OEM
+    End_Procedure
+
+    // The bridge's last post-page hook: by here the lexer and the scheme have been
+    // applied, so the sample can go in and be coloured.
+    Procedure OnPaged
+        Send LoadSampleSource
+    End_Procedure
+
+    // ==================================================================================
+    // The sample.
+    // ==================================================================================
+
+    /* Real DataFlex source, chosen so the lexer produces one of every token type the
+       Colors page can change: a comment, a meta-tag, two preprocessor lines, scope
+       keywords, keywords, an identifier, a string, a decimal and a hex number,
+       operators - and a deliberately unterminated string on the last line, which is the
+       only way to see the "String Typing" element.
+
+       Written as one string rather than an array because SetDocumentText takes the whole
+       document, and because keeping it in one place makes it obvious that it is a
+       sample and not something the user can edit. */
+    Function SampleSource Returns String
+        String sNL sOut
+
+        Move (Character(13) + Character(10)) to sNL
+        Move ""                                                                to sOut
+        // Single-quoted where the line itself contains double quotes - DataFlex has no
+        // doubled-quote escape.
+        Move (sOut + "// A sample of DataFlex source"                     + sNL) to sOut
+        Move (sOut + "#IFDEF Is$Windows"                                  + sNL) to sOut
+        Move (sOut + ""                                                   + sNL) to sOut
+        Move (sOut + '{ Description = "What a meta-tag looks like" }'     + sNL) to sOut
+        Move (sOut + "Function SampleValue Integer iCount Returns String" + sNL) to sOut
+        Move (sOut + "    String sResult"                                 + sNL) to sOut
+        Move (sOut + '    Move ("Hello" * "World!") to sResult'           + sNL) to sOut
+        Move (sOut + "    Move (iCount * 1.25 + $0F) to iCount"           + sNL) to sOut
+        Move (sOut + "    If (iCount > 10) ;"                             + sNL) to sOut
+        Move (sOut + "        Move (Uppercase(sResult)) to sResult"       + sNL) to sOut
+        Move (sOut + "    Function_Return sResult"                        + sNL) to sOut
+        Move (sOut + "End_Function"                                       + sNL) to sOut
+        Move (sOut + ""                                                   + sNL) to sOut
+        Move (sOut + "#ENDIF"                                             + sNL) to sOut
+        Move (sOut + '        Move "an unterminated string'               + sNL) to sOut
+        Function_Return sOut
+    End_Function
+
+    /* Load the sample and turn on the two things a scheme styles that plain text cannot
+       show by itself: the highlighted-line wash, and a matched and an unmatched brace.
+       Scintilla draws the brace styles only for positions it has been TOLD about. */
+    Procedure LoadSampleSource
+        Integer iLine iOpen iClose iBad
+
+        Send SetReadOnlyState False
+        Send SetDocumentText (SampleSource(Self))
+        Send SetReadOnlyState True
+
+        Send EditorMessage SCI_MARKERADD 6 SC_MARKNUM_LINEHIGHLIGHT
+
+        /* The parenthesis pair wrapping the two strings, and the closing brace of the
+           arithmetic on the next line shown as unmatched - both by position, which is
+           the only thing SCI_BRACEHIGHLIGHT understands. The offsets are into
+
+               line 6:  "    Move ("Hello" * "World!") to sResult"
+                             col 9 = (                col 28 = )
+               line 7:  "    Move (iCount * 1.25 + $0F) to iCount"
+                                                       col 29 = )
+
+           so they move if SampleSource does. The lexer never reports a brace as bad
+           here - the sample is well formed - which is why the unmatched colour has to
+           be demonstrated on a brace that is actually fine. */
+        Get EditorMessage SCI_POSITIONFROMLINE 6 to iLine
+        Move (iLine + 9)  to iOpen
+        Move (iLine + 28) to iClose
+        Send EditorMessage SCI_BRACEHIGHLIGHT iOpen iClose
+        Get EditorMessage SCI_POSITIONFROMLINE 7 to iLine
+        Move (iLine + 29) to iBad
+        Send EditorMessage SCI_BRACEBADLIGHT iBad
+
+        Send ColouriseRange 0 -1
+    End_Procedure
+
+    // ==================================================================================
+    // What the dialog drives.
+    // ==================================================================================
+
+    /* Repaint. ONE entry point, taking everything the Colors page can change: the scheme
+       it is editing, and the font the user has picked but not yet saved. Called after
+       every change on that page - a colour, a checkbox, a theme, the font - so it does
+       the whole job each time rather than trying to work out what moved.
+
+       Complete matters more than clever here: the scheme decides the token colours, the
+       margins, the fold markers, the selection and the highlighted line, and half of
+       those are set up in ApplyFoldingStyle rather than ApplyColourScheme. The order is
+       the bridge's - font and margins, then the scheme, then the fold markers, which
+       read their colours from it - and ApplyColourScheme's STYLECLEARALL is what spreads
+       a new font across every style.
+
+       Silently does nothing before the control has a window: the dialog repaints from
+       Add_Focus, which can run before paging, and the post-page hooks apply all of this
+       anyway once the window exists. */
+    Procedure ShowScheme Handle hoScheme String sFace Integer iSize
+        Set phoEditingScheme  to hoScheme
+        Set psPreviewFontFace to sFace
+        Set piPreviewFontSize to iSize
+        If (Window_Handle(Self) = 0) ;
+            Procedure_Return
+        Send SetAdjustments False
+        Send ApplyColourScheme
+        Send ApplyFoldingStyle
+        Send LoadSampleSource
+    End_Procedure
+
+End_Class

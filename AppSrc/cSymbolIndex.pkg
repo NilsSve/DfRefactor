@@ -1,0 +1,513 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cSymbolIndex
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-09-10
+//
+// Description : Name -> defining file and line, for every DEFINITION under a set of folders:
+//               classes, structs, methods, objects, defines, globals, properties, macro
+//               commands, enum members, legacy types and Gosub labels. The resolver behind the
+//               editor's Go to definition.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use RefactorFileIO.pkg
+Use cEncodingHelpers.pkg         // rfReadEncodedFileAsStringArray - OEM, ANSI and UTF-8 alike
+Use cJsonObject.pkg              // the .sws.lock
+
+// One definition, as DefinitionsOf hands it back.
+Struct tSymbolDef
+    String  sName    // as written in the source
+    String  sKind    // Class, Struct, Procedure, Procedure Set, Function, Object, Define, Global,
+                     // Property, Command, Replace, Enum, Type or Label
+    String  sFile    // full path
+    Integer iLine    // 1-based
+End_Struct
+
+/*  cSymbolIndex - which file, and which line, DEFINES a given name.
+
+    THE SAME SHAPE AS cClassPackageIndex, for the same reasons: content-built (a name says nothing
+    about the file that defines it - 76% of the DataFlex classes live in a file not named after
+    them, and a procedure never is), a sorted array of packed keys searched by a manual lower
+    bound (a name defined in several places appears several times and every one is returned -
+    ranking them is the caller's business), and a STANDALONE class the console suite can create
+    without an editor or the funclib (UnitTests declares "Object oApplication is a
+    cApplication"; anything hung off cRefactorApplication is out of its reach).
+
+    Keys are "UPPERNAME|Kind|line|fullpath|Name". Uppercased first because DataFlex names are
+    case-blind and so is a search for one; the definition's own spelling rides at the end (a
+    Windows path cannot contain a bar, so the last bar always finds it) and comes back in
+    tSymbolDef.sName.
+
+    WHAT COUNTS AS A DEFINITION is the statement at the START of a line - the same rule the
+    compiler applies. DefinitionsFromLines skips comment lines and the comment blocks that begin at a line
+    start; a block comment opened after code on the same line is not tracked, which is the one
+    known way a commented-out Procedure could be indexed (rare, and a wrong hit is a wasted
+    click rather than a wrong edit). Register_Procedure / Register_Function are declarations,
+    not definitions, and are not indexed; neither are locals - a Go to definition for those is a
+    within-the-file question the editor can answer without an index. */
+Class cSymbolIndex is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Property String[] pasKeys                // "UPPERNAME|Kind|line|fullpath|Name", sorted
+        Property Boolean  pbIndexLoaded  False
+        Property Integer  piFilesIndexed 0
+        Property Integer  piLinesScanned 0
+        // The files an index reads. Every DataFlex source extension the workspace filters know,
+        // plus headers and macro files; a workspace that keeps source under another extension can
+        // widen this before BuildIndex.
+        Property String   psFileMasks    "*.pkg;*.src;*.vw;*.dg;*.sl;*.rv;*.dd;*.inc;*.bp;*.mn;*.mnu;*.cl;*.wo;*.nui;*.utl;*.h;*.mac"
+        // Whether _IndexFolder walks into subfolders. BuildIndex does; BuildIndexEx takes a flat
+        // list too, for a caller whose folder list is ALREADY every subfolder (the application's
+        // source scope, which also leaves out the backup and non-source folders a walk would find).
+        Property Boolean  pbRecurseFolders True
+    End_Procedure
+
+    // Nth (1-based) space-delimited word of an already tab-normalised, trimmed line; "" when there
+    // are fewer. Local on purpose - this class stays clear of the funclib.
+    { Visibility=Private }
+    Function _NthWordOf String sText Integer iN Returns String
+        String sWord
+        Integer iPos i
+
+        For i from 1 to iN
+            Move (Trim(sText)) to sText
+            If (sText = "") ;
+                Function_Return ""
+            Move (Pos(" ", sText)) to iPos
+            If (iPos = 0) Begin
+                Move sText to sWord
+                Move ""    to sText
+            End
+            Else Begin
+                Move (Left(sText, (iPos - 1))) to sWord
+                Move (Replace(sWord, sText, "")) to sText
+            End
+        Loop
+        Function_Return sWord
+    End_Function
+
+    // Appends one key. Nothing is appended for an empty name - a "Procedure" with nothing after it
+    // is a broken line, not a definition of "".
+    { Visibility=Private }
+    Procedure _AddDef String sName String sKind Integer iLine String sFile String[] ByRef asKeys
+        If (sName <> "") ;
+            Move (Uppercase(sName) + "|" + sKind + "|" + String(iLine) + "|" + sFile + "|" + sName) to asKeys[SizeOfArray(asKeys)]
+    End_Procedure
+
+    /* THE SCANNER. Appends a key for every definition in asLines (a file's lines, 0-based; the key
+       carries the 1-based line) and returns how many it added. Pure - the folder walk hands it
+       one file at a time, and the tests hand it arrays.
+
+       Cheap by construction, because it runs over every line of every file in scope: one Trim per
+       line, a tab normalisation only when the line has a tab, a two-character comment gate, and
+       the first word alone decides whether the rest of the line is looked at. */
+    Function DefinitionsFromLines String[] ByRef asLines String sFile String[] ByRef asKeys Returns Integer
+        String sT s2 sW1 sW2 sW3 sName
+        Integer i iMax iLine iBefore iPos
+        Boolean bInBlock bInEnum
+
+        Move (SizeOfArray(asKeys)) to iBefore
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move (Trim(asLines[i])) to sT
+            If (sT <> "") Begin
+                If (Pos(Character(9), sT) > 0) ;
+                    Move (Trim(Replaces(Character(9), sT, " "))) to sT
+                Move (i + 1) to iLine
+                Move (Left(sT, 2)) to s2
+                If (bInBlock = True) Begin
+                    If (Pos("*/", sT) > 0) ;
+                        Move False to bInBlock
+                End
+                Else If (s2 = "//") Begin
+                    // a comment line
+                End
+                Else If (s2 = "/*") Begin
+                    If (Pos("*/", sT) = 0) ;
+                        Move True to bInBlock
+                End
+                Else If (bInEnum = True) Begin
+                    // Inside Enum_List every line is a member ("eFoo" or "eFoo for 5") until the end.
+                    If (Lowercase(Left(sT, 13)) = "end_enum_list") ;
+                        Move False to bInEnum
+                    Else ;
+                        Send _AddDef (_NthWordOf(Self, sT, 1)) "Enum" iLine sFile (&asKeys)
+                End
+                Else Begin
+                    Move (Lowercase(_NthWordOf(Self, sT, 1))) to sW1
+                    Case Begin
+                        Case (sW1 = "procedure")
+                            Get _NthWordOf sT 2 to sW2
+                            If (Lowercase(sW2) = "set") ;
+                                Send _AddDef (_NthWordOf(Self, sT, 3)) "Procedure Set" iLine sFile (&asKeys)
+                            Else ;
+                                Send _AddDef sW2 "Procedure" iLine sFile (&asKeys)
+                            Case Break
+                        Case (sW1 = "function")
+                            Send _AddDef (_NthWordOf(Self, sT, 2)) "Function" iLine sFile (&asKeys)
+                            Case Break
+                        Case (sW1 = "class")
+                            // "Class X is a Y" - word 3 must be "is", or this is not a definition.
+                            Get _NthWordOf sT 3 to sW3
+                            If (Lowercase(sW3) = "is") ;
+                                Send _AddDef (_NthWordOf(Self, sT, 2)) "Class" iLine sFile (&asKeys)
+                            Case Break
+                        Case (sW1 = "object")
+                            Get _NthWordOf sT 3 to sW3
+                            If (Lowercase(sW3) = "is") ;
+                                Send _AddDef (_NthWordOf(Self, sT, 2)) "Object" iLine sFile (&asKeys)
+                            Case Break
+                        Case (sW1 = "struct")
+                            Send _AddDef (_NthWordOf(Self, sT, 2)) "Struct" iLine sFile (&asKeys)
+                            Case Break
+                        Case (sW1 = "define")
+                            Send _AddDef (_NthWordOf(Self, sT, 2)) "Define" iLine sFile (&asKeys)
+                            Case Break
+                        Case (sW1 = "property")
+                            // "Property <Type> <Name>", with a visibility keyword allowed on either
+                            // side of the name in older code.
+                            Get _NthWordOf sT 3 to sW3
+                            Move (Lowercase(sW3)) to sW2
+                            If (sW2 = "public" or sW2 = "private" or sW2 = "protected") ;
+                                Get _NthWordOf sT 4 to sW3
+                            Send _AddDef sW3 "Property" iLine sFile (&asKeys)
+                            Case Break
+                        Case (sW1 = "global_variable")
+                            Send _AddDef (_NthWordOf(Self, sT, 3)) "Global" iLine sFile (&asKeys)
+                            Case Break
+                        Case (sW1 = "enum_list")
+                            Move True to bInEnum
+                            Case Break
+                        Case (sW1 = (Character(35) + "command"))
+                            Send _AddDef (_NthWordOf(Self, sT, 2)) "Command" iLine sFile (&asKeys)
+                            Case Break
+                        Case (sW1 = (Character(35) + "replace"))
+                            Send _AddDef (_NthWordOf(Self, sT, 2)) "Replace" iLine sFile (&asKeys)
+                            Case Break
+                        Case (sW1 = "type")
+                            Send _AddDef (_NthWordOf(Self, sT, 2)) "Type" iLine sFile (&asKeys)
+                            Case Break
+                        Case Else
+                            // A Gosub label: one word, ending in a colon, nothing else on the line.
+                            If (Right(sT, 1) = ":" and Length(sT) > 1) Begin
+                                If (Pos(" ", sT) = 0) ;
+                                    Send _AddDef (Left(sT, (Length(sT) - 1))) "Label" iLine sFile (&asKeys)
+                            End
+                    Case End
+                End
+            End
+        Loop
+        Set piLinesScanned to (piLinesScanned(Self) + iMax + 1)
+        Function_Return (SizeOfArray(asKeys) - iBefore)
+    End_Function
+
+    // Every file under sFolder (recursive) matching one of psFileMasks, scanned into asKeys.
+    { Visibility=Private }
+    Procedure _IndexFolder String sFolder String[] ByRef asKeys
+        tRFSearchResult[] aFiles
+        String[] asLines asMasks
+        String sMask sPath
+        Integer m mMax i iMax iVoid iFiles
+
+        If (sFolder = "") ;
+            Procedure_Return
+        If (rfDirectoryExists(sFolder) = False) ;
+            Procedure_Return
+        If (Right(sFolder, 1) <> "\") ;
+            Move (sFolder + "\") to sFolder
+        Move (StrSplitToArray(psFileMasks(Self), ";")) to asMasks
+        Move (SizeOfArray(asMasks) - 1) to mMax
+        Get piFilesIndexed to iFiles
+        For m from 0 to mMax
+            Move (sFolder + Trim(asMasks[m])) to sMask
+            If (pbRecurseFolders(Self) = True) ;
+                Get rfFileSearchRecursive sMask DIRMODE_FILES_ONLY False to aFiles
+            Else ;
+                Get rfFileSearch sMask DIRMODE_FILES_ONLY False to aFiles
+            Move (SizeOfArray(aFiles) - 1) to iMax
+            For i from 0 to iMax
+                // The recursive search answers full paths, the flat one bare leaf names.
+                Move aFiles[i].sFilename to sPath
+                If (Pos("\", sPath) = 0) ;
+                    Move (sFolder + sPath) to sPath
+                Move (rfReadEncodedFileAsStringArray(sPath)) to asLines
+                Get DefinitionsFromLines (&asLines) sPath (&asKeys) to iVoid
+                Increment iFiles
+            Loop
+        Loop
+        Set piFilesIndexed to iFiles
+    End_Procedure
+
+    /* Builds the index over asFolders - each read once, every file once - and returns the number
+       of definitions. A folder given twice, or a folder and its own subfolder, is indexed twice;
+       callers pass a deduplicated set (the application's source-folder list already is one). */
+    // Two lists: folders to walk into, and folders to take as they are. BuildIndex below is the
+    // one-list form, routed by pbRecurseFolders - defined after this one, which it calls.
+    Function BuildIndexEx String[] ByRef asRecursive String[] ByRef asFlat Returns Integer
+        String[] asKeys
+        Boolean bWas
+        Integer i iMax
+
+        Set piFilesIndexed to 0
+        Set piLinesScanned to 0
+        Get pbRecurseFolders to bWas
+        Set pbRecurseFolders to True
+        Move (SizeOfArray(asRecursive) - 1) to iMax
+        For i from 0 to iMax
+            Send _IndexFolder asRecursive[i] (&asKeys)
+        Loop
+        Set pbRecurseFolders to False
+        Move (SizeOfArray(asFlat) - 1) to iMax
+        For i from 0 to iMax
+            Send _IndexFolder asFlat[i] (&asKeys)
+        Loop
+        Set pbRecurseFolders to bWas
+        Move (SortArray(asKeys)) to asKeys
+        Set pasKeys to asKeys
+        Set pbIndexLoaded to True
+        Function_Return (SizeOfArray(asKeys))
+    End_Function
+
+    Function BuildIndex String[] ByRef asFolders Returns Integer
+        String[] asNone
+        If (pbRecurseFolders(Self) = True) ;
+            Function_Return (BuildIndexEx(Self, &asFolders, &asNone))
+        Function_Return (BuildIndexEx(Self, &asNone, &asFolders))
+    End_Function
+
+    // Index of the first key >= sPrefix, or SizeOfArray when none - a manual lower bound, because
+    // BinarySearchArray only finds exact matches and a name may have several entries.
+    { Visibility=Private }
+    Function _LowerBound String[] ByRef asSorted String sPrefix Returns Integer
+        Integer iLo iHi iMid
+        Move 0 to iLo
+        Move (SizeOfArray(asSorted)) to iHi
+        While (iLo < iHi)
+            Move ((iLo + iHi) / 2) to iMid
+            If (asSorted[iMid] < sPrefix) ;
+                Move (iMid + 1) to iLo
+            Else ;
+                Move iMid to iHi
+        Loop
+        Function_Return iLo
+    End_Function
+
+    // One packed key back into a tSymbolDef: "UPPERNAME|Kind|line|file|Name" - three bars from
+    // the left, then the LAST bar splits the file from the spelling.
+    { Visibility=Private }
+    Function _DefFromKey String sKey Returns tSymbolDef
+        tSymbolDef Def
+        Integer iBar
+        String sRest
+
+        Move (Pos("|", sKey)) to iBar
+        Move (Mid(sKey, (Length(sKey) - iBar), (iBar + 1))) to sRest           // Kind|line|file|Name
+        Move (Pos("|", sRest)) to iBar
+        Move (Left(sRest, (iBar - 1))) to Def.sKind
+        Move (Mid(sRest, (Length(sRest) - iBar), (iBar + 1))) to sRest         // line|file|Name
+        Move (Pos("|", sRest)) to iBar
+        Move (Cast(Left(sRest, (iBar - 1)), Integer)) to Def.iLine
+        Move (Mid(sRest, (Length(sRest) - iBar), (iBar + 1))) to sRest         // file|Name
+        Move (RightPos("|", sRest)) to iBar
+        Move (Left(sRest, (iBar - 1))) to Def.sFile
+        Move (Mid(sRest, (Length(sRest) - iBar), (iBar + 1))) to Def.sName
+        Function_Return Def
+    End_Function
+
+    /* Every definition of sName, in key order (kind, then line, then file) - empty when unknown,
+       several when the name is defined more than once, which for a method is the normal case.
+       Case-insensitive, as the language is. */
+    Function DefinitionsOf String sName Returns tSymbolDef[]
+        String[] asKeys
+        tSymbolDef[] aOut
+        String sPrefix sKey
+        Integer i iMax iLen
+
+        Move (Trim(sName)) to sName
+        If (sName = "") ;
+            Function_Return aOut
+        Move (Uppercase(sName) + "|") to sPrefix
+        Get pasKeys to asKeys
+        Move (Length(sPrefix)) to iLen
+        Move (SizeOfArray(asKeys)) to iMax
+        Move (_LowerBound(Self, &asKeys, sPrefix)) to i
+        While (i < iMax)
+            Move asKeys[i] to sKey
+            If (Left(sKey, iLen) <> sPrefix) ;
+                Move iMax to i
+            Else Begin
+                Move (_DefFromKey(Self, sKey)) to aOut[SizeOfArray(aOut)]
+                Increment i
+            End
+        Loop
+        Function_Return aOut
+    End_Function
+
+    /* The definitions of sName in asLines - the editor's LIVE buffer of the file being edited,
+       so the answer for that file is never stale however far the index is behind it. */
+    Function DefinitionsInLines String[] ByRef asLines String sFile String sName Returns tSymbolDef[]
+        String[] asKeys
+        tSymbolDef[] aOut
+        String sPrefix
+        Integer i iMax iLen iVoid
+
+        Move (Uppercase(Trim(sName)) + "|") to sPrefix
+        If (sPrefix = "|") ;
+            Function_Return aOut
+        Get DefinitionsFromLines (&asLines) sFile (&asKeys) to iVoid
+        Move (Length(sPrefix)) to iLen
+        Move (SizeOfArray(asKeys) - 1) to iMax
+        For i from 0 to iMax
+            If (Left(asKeys[i], iLen) = sPrefix) ;
+                Move (_DefFromKey(Self, asKeys[i])) to aOut[SizeOfArray(aOut)]
+        Loop
+        Function_Return aOut
+    End_Function
+
+    /* ONE FILE'S DEFINITIONS REPLACED - the save-time refresh. Every key naming sFile is dropped
+       (case-blind: the editor's spelling of a path and the folder walk's can differ in case) and
+       the file is scanned afresh from asLines - the buffer just written, not a re-read. Measured
+       on 126,040 keys: the filter about 140 ms, the re-sort about 80 ms. */
+    Procedure ReplaceFileDefinitions String sFile String[] ByRef asLines
+        String[] asKeys asKeep
+        String sNeedle sKey
+        Integer i iMax iKept iVoid
+
+        Move ("|" + Lowercase(Trim(sFile)) + "|") to sNeedle
+        Get pasKeys to asKeys
+        Move (SizeOfArray(asKeys) - 1) to iMax
+        Move (ResizeArray(asKeep, (iMax + 1))) to asKeep
+        Move 0 to iKept
+        For i from 0 to iMax
+            Move asKeys[i] to sKey
+            If (Pos(sNeedle, Lowercase(sKey)) = 0) Begin
+                Move sKey to asKeep[iKept]
+                Increment iKept
+            End
+        Loop
+        Move (ResizeArray(asKeep, iKept)) to asKeep
+        Get DefinitionsFromLines (&asLines) sFile (&asKeep) to iVoid
+        Move (SortArray(asKeep)) to asKeep
+        Set pasKeys to asKeep
+    End_Procedure
+
+    // The tier a definition's file falls in for RankDefinitions - all four arguments lowercase,
+    // the two folders with their trailing backslash.
+    { Visibility=Private }
+    Function _TierOf String sFile String sHere String sHereFolder String sPkg Returns Integer
+        If (sHere <> "" and sFile = sHere) ;
+            Function_Return 0
+        If (sHereFolder <> "" and Left(sFile, Length(sHereFolder)) = sHereFolder) ;
+            Function_Return 1
+        If (sPkg <> "" and Left(sFile, Length(sPkg)) = sPkg) ;
+            Function_Return 3
+        Function_Return 2
+    End_Function
+
+    /* THE ORDER A USER WANTS THEM IN: the file being edited first, then its folder, then the rest
+       of the workspace and its libraries, and the DataFlex install's Pkg folder last - a
+       Construct_Object has 573 definitions in Pkg alone, and the one meant is almost never
+       there. Stable within a tier, so DefinitionsOf's order (kind, line, file) survives. */
+    Function RankDefinitions tSymbolDef[] aDefs String sCurrentFile String sPkgFolder Returns tSymbolDef[]
+        tSymbolDef[] aOut
+        String sHere sHereFolder sPkg sFile
+        Integer i iMax iTier iPos
+
+        Move (Lowercase(Trim(sCurrentFile))) to sHere
+        Move (RightPos("\", sHere)) to iPos
+        If (iPos > 0) ;
+            Move (Left(sHere, iPos)) to sHereFolder
+        Move (Lowercase(Trim(sPkgFolder))) to sPkg
+        If (sPkg <> "" and Right(sPkg, 1) <> "\") ;
+            Move (sPkg + "\") to sPkg
+        Move (SizeOfArray(aDefs) - 1) to iMax
+        For iTier from 0 to 3
+            For i from 0 to iMax
+                Move (Lowercase(aDefs[i].sFile)) to sFile
+                If (_TierOf(Self, sFile, sHere, sHereFolder, sPkg) = iTier) ;
+                    Move aDefs[i] to aOut[SizeOfArray(aOut)]
+            Loop
+        Loop
+        Function_Return aOut
+    End_Function
+
+    /* THE PACKAGES A DF26 WORKSPACE IS PINNED TO, read from the text of its <ws>.sws.lock: the
+       FULL transitive set - a package's own dependencies included, which the .sws never names -
+       each entry's "ref" being the commit df-cli checked out under DfPkg. The refactoring scope
+       leaves DfPkg out on purpose (a checkout is not a place to refactor); a definition lookup
+       must include it, or a class from a library's own library is "not found" with its Use line
+       in plain sight (Nils 2026-09-10, the first run). Returns the refs; "" or a lock without a
+       dependencies member returns none. */
+    Function LockPinnedRefs String sLockJson Returns String[]
+        Handle hoJson hoDeps hoDep
+        String[] asRefs
+        String sKey sRef
+        Boolean bOk bHas
+        Integer i iMax
+
+        If (Trim(sLockJson) = "") ;
+            Function_Return asRefs
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Get ParseString of hoJson sLockJson to bOk
+        If (bOk = True) Begin
+            Get HasMember of hoJson "dependencies" to bHas
+            If (bHas = True) Begin
+                Get Member of hoJson "dependencies" to hoDeps
+                Get MemberCount of hoDeps to iMax
+                Decrement iMax
+                For i from 0 to iMax
+                    Get MemberNameByIndex of hoDeps i to sKey
+                    Get Member of hoDeps sKey to hoDep
+                    Get HasMember of hoDep "ref" to bHas
+                    If (bHas = True) Begin
+                        Get MemberValue of hoDep "ref" to sRef
+                        If (Trim(sRef) <> "") ;
+                            Move (Trim(sRef)) to asRefs[SizeOfArray(asRefs)]
+                    End
+                Loop
+            End
+        End
+        Send Destroy of hoJson
+        Function_Return asRefs
+    End_Function
+
+    /* The DfPkg checkout folders under sHome whose names end in "-<ref>", for the refs given. The
+       folder is FOUND, not derived (cLibraryInventory says why): df-cli names it
+       "<Owner>_<sws stem>-<version>" by folding rules of its own, and matching the tail is what
+       stays right however it spells the rest. A stale checkout - the previous commit, left
+       behind by an upgrade - is not matched, because its ref is not in the lock. */
+    Function DfPkgCheckoutsFor String sHome String[] asRefs Returns String[]
+        tRFSearchResult[] aDirs
+        String[] asOut
+        String sDfPkg sDir sRef
+        Integer i iMax r rMax
+
+        If (sHome = "" or SizeOfArray(asRefs) = 0) ;
+            Function_Return asOut
+        If (Right(sHome, 1) <> "\") ;
+            Move (sHome + "\") to sHome
+        Move (sHome + "DfPkg") to sDfPkg
+        If (rfDirectoryExists(sDfPkg) = False) ;
+            Function_Return asOut
+        Move (rfFileSearch((sDfPkg + "\*"), DIRMODE_DIRECTORIES_ONLY, False)) to aDirs
+        Move (SizeOfArray(aDirs) - 1) to iMax
+        Move (SizeOfArray(asRefs) - 1) to rMax
+        For r from 0 to rMax
+            Move (Lowercase(Trim(asRefs[r]))) to sRef
+            If (sRef <> "") Begin
+                For i from 0 to iMax
+                    Move (Trim(aDirs[i].sFilename)) to sDir
+                    If (Lowercase(Right(sDir, (Length(sRef) + 1))) = ("-" + sRef)) ;
+                        Move (sDfPkg + "\" + sDir) to asOut[SizeOfArray(asOut)]
+                Loop
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+End_Class

@@ -1,0 +1,853 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cFTLibraryReport
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-31
+//
+// Description : FlexTron dashboard: the libraries report tile - markup builders and the
+//               plumbing that fills them.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use cLibraryInventory.pkg
+Use cShadowedPackageFiles.pkg    // OrphanedLibraryFolders - the library folders a package replaced
+Use RDCRunProgram.pkg          // RDCOpenUrl - the 'Open Containing Folder' button
+Use FTMarkupBuilders.pkg         // the HTML vocabulary - OpenHtml, IconLabel, the builders
+Use FTDashIcons.pkg              // DashIcon - the inline SVG glyphs
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+Use RefactorConstants.h.pkg      // CS_SpanEnd / CS_DivEnd - the closing-tag constants
+Use OutputDockFT.dg              // the analyzer grid of ghoModAnalyzerDock - LibraryMessageCounts reads its messages, so the dock is defined before this compiles
+
+/*  cFTLibraryReport - the shared-library DATA behind the Libraries tile: the tile's own counts, the compiler-message tally per library, the dependency scan, and the
+    HTML fragments a screen builds its rows from.
+
+    THE REPORT ITSELF MOVED OUT, 2026-08-11. It lived here as a ghoConfirmDialog body - one body and
+    two chips - beside a separate Library Maintenance dialog that edited the same [Libraries] list.
+    Two surfaces over one subject, reached one after the other, and reading DIFFERENT SOURCES: this
+    one dropped every entry whose .sws did not resolve, so it could not show the rows most in need of
+    an edit. They are now one dialog (MaintainLibrariesFT.dg), built on the raw entries, and the tile
+    opens it directly. What stayed here is everything that is data rather than screen.
+
+    LIFTED OUT OF THE DASHBOARD VIEW (2026-07-31). The guided trail borrowed seven members from
+    oDashboard_vw - tile markup, this report, and the Deep Scan driver itself - so the old Dashboard
+    was not a peer screen but the trail's implementation host, and nothing could be stripped from it
+    without risking the guided flow. This is the first slice moved out.
+
+    Its OWN package rather than a shared dumping ground: the library readout belongs with the
+    library code, the same way the scan driver belongs with the scanner. Same de-coupling, better
+    result.
+
+    A class plus one global object, so either view calls it directly instead of through the other.
+*/
+/*  cLibraryInventoryApp - cLibraryInventory with the JSON hooks filled in.
+
+    THE DOCUMENTED ESCAPE HATCH, taken. cLibraryInventory leaves SwsJsonVersion and
+    SwsJsonLibraryEntries as stubs on purpose: parsing a DF26 JSON .sws needs cJsonObject and the
+    reader that owns it (cRefactorApplication.ReadSwsJsonFile), and a ghoApplication reference in
+    that class would make it unusable from the console test runner, which declares a plain
+    cApplication - every call would return nothing, silently. So the base class stays testable and
+    the app-side subclass supplies the half that needs the app.
+
+    CREATE THIS, NOT cLibraryInventory, anywhere inside the FT application. A plain cLibraryInventory
+    still works and simply reports a JSON workspace as having no libraries - which is why every
+    creation site in this package and in MaintainLibrariesFT.dg names this class instead.
+
+    PER FILE, NEVER PER WORKSPACE (Nils 2026-08-12). A JSON workspace routinely references libraries
+    whose own .sws files are still INI - the DF26 Studio converts the workspace it migrates and
+    leaves the libraries alone (verified 2026-08-05: 1 JSON against 103 INI). Both overrides
+    therefore test the FILE they were handed, and the INI readers in the base class go on serving
+    every library that is still INI. Mixed workspaces are the normal case, not an edge one.
+*/
+Class cLibraryInventoryApp is a cLibraryInventory
+
+    // The "df" member of a JSON .sws - the JSON counterpart of [Properties] Version=. Guarded on
+    // existence because ReadSwsJsonFile pops an Info_Box on a missing file, and this is asked for
+    // every library a workspace declares, including the ones that are not there.
+    Function SwsJsonVersion String sSwsFile Returns String
+        tSwsFile Sws
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return ""
+        If (SwsFormatOf(Self, sSwsFile) <> eSwsJson) ;
+            Function_Return ""
+        Get ReadSwsJsonFile of ghoApplication sSwsFile to Sws
+        Function_Return Sws.sDfVersion
+    End_Function
+
+    /* The "dependencies" array as plain entry strings - the JSON counterpart of [Libraries].
+
+       OBJECT-FORM DEPENDENCIES ARE SKIPPED HERE, and the writer refuses any file that has one, so
+       the two halves agree: what cannot be shown as a path is never silently rewritten as one. A
+       git/cloud dependency has no path to resolve, no version to read off disk and no folder to
+       scan for siblings - listing it would produce a row that is "not found" for the wrong reason.
+
+       Paths come back with forward slashes, as df-cli writes them. Nothing converts them:
+       NormalizePath folds "/" to "\" before every comparison, and _ResolvePath collapses the
+       leading "../" through the same call - so a JSON entry resolves exactly like an INI one. */
+    Function SwsJsonLibraryEntries String sSwsFile Returns String[]
+        tSwsFile Sws
+        String[] asOut
+        String sPath
+        Integer i iMax
+
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return asOut
+        Get ReadSwsJsonFile of ghoApplication sSwsFile to Sws
+        Move (SizeOfArray(Sws.aDependencies) - 1) to iMax
+        For i from 0 to iMax
+            If (Sws.aDependencies[i].bIsObject = False) Begin
+                Move (Trim(Sws.aDependencies[i].sPath)) to sPath
+                If (sPath <> "") ;
+                    Move sPath to asOut[-1]
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* The df-min / df-max a package declares in its own df.sws - the app-side half of the hook.
+
+       Guarded on existence AND on the file being JSON: a package's manifest always is, and
+       ReadSwsJsonFile pops an Info_Box on a missing file, which this must never do - it is asked
+       once per package row, including rows whose cache entry is absent. */
+    Procedure SwsPackageDfRange String sSwsFile String ByRef sMin String ByRef sMax
+        tSwsFile Sws
+
+        Move "" to sMin
+        Move "" to sMax
+        If (sSwsFile = "") ;
+            Procedure_Return
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Procedure_Return
+        If (SwsFormatOf(Self, sSwsFile) <> eSwsJson) ;
+            Procedure_Return
+        Get ReadSwsJsonFile of ghoApplication sSwsFile to Sws
+        Move Sws.Package.sDfMin to sMin
+        Move Sws.Package.sDfMax to sMax
+    End_Procedure
+
+    // The git/file OBJECT dependencies this workspace declares - the ones SwsJsonLibraryEntries
+    // leaves out. Counted so a screen can say they exist rather than quietly listing fewer rows
+    // than the file has.
+    Function SwsJsonObjectDependencyCount String sSwsFile Returns Integer
+        tSwsFile Sws
+        Integer i iMax iCount
+
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return 0
+        If (SwsFormatOf(Self, sSwsFile) <> eSwsJson) ;
+            Function_Return 0
+        Get ReadSwsJsonFile of ghoApplication sSwsFile to Sws
+        Move 0 to iCount
+        Move (SizeOfArray(Sws.aDependencies) - 1) to iMax
+        For i from 0 to iMax
+            If (Sws.aDependencies[i].bIsObject = True) ;
+                Increment iCount
+        Loop
+        Function_Return iCount
+    End_Function
+
+    /* The object dependencies themselves, in file order.
+
+       sName is what df-cli calls the package - the key "package uninstall" wants - derived as
+       <owner>/<sws stem> from the source url and the sws path, which is how df-cli named
+       https://github.com/NilsSve/Library-DUF.git + DUFLibrary26.0.sws as NilsSve/DUFLibrary26.0.
+       A DERIVATION, and stated as one: df-cli config knows the real names, so if a repository is
+       ever laid out in a way this gets wrong, that is where to read them from instead. */
+    Function SwsJsonObjectDependencies String sSwsFile Returns tSwsDependency[]
+        tSwsFile Sws
+        tSwsDependency[] aOut aNone
+        Integer i iMax iRow
+
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return aNone
+        If (SwsFormatOf(Self, sSwsFile) <> eSwsJson) ;
+            Function_Return aNone
+        Get ReadSwsJsonFile of ghoApplication sSwsFile to Sws
+        Move (SizeOfArray(Sws.aDependencies) - 1) to iMax
+        For i from 0 to iMax
+            If (Sws.aDependencies[i].bIsObject = True) Begin
+                Move (SizeOfArray(aOut)) to iRow
+                Move Sws.aDependencies[i] to aOut[iRow]
+            End
+        Loop
+        Function_Return aOut
+    End_Function
+
+    // The workspace overrides, as read from the JSON. Guarded on existence and on format for the
+    // same reason as its neighbours: ReadSwsJsonFile pops an Info_Box on a missing file.
+    Function SwsJsonOverrides String sSwsFile Returns tSwsOverride[]
+        tSwsFile Sws
+        tSwsOverride[] aNone
+
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return aNone
+        If (SwsFormatOf(Self, sSwsFile) <> eSwsJson) ;
+            Function_Return aNone
+        Get ReadSwsJsonFile of ghoApplication sSwsFile to Sws
+        Function_Return Sws.aOverrides
+    End_Function
+End_Class
+
+// From here on the inventory created through giLibraryInventoryClass reads a JSON workspace file too
+// (see the note at that variable, cLibraryInventory.pkg).
+Move (RefClass(cLibraryInventoryApp)) to giLibraryInventoryClass
+
+Class cFTLibraryReport is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // Memo for the tile half - see RefreshLibraryCounts. Keyed "<lowercased .sws>|<target
+        // version>" so it self-invalidates when either changes.
+        Property String  psLibCountKey  ""
+        // True when the .sws is DF26 JSON. Kept from the count pass so the sub-line can drop the
+        // version talk on a workspace where it means nothing - see LibraryTileHtml.
+        Property Boolean pbLibJsonForm  False
+        Property Integer piLibTotal     0
+        Property Integer piLibAttention 0
+        // Git / cloud PACKAGES. Counted apart from piLibTotal because they are a different
+        // population: they carry no .sws version this tile can judge, so they belong in what the
+        // workspace HAS, never in the denominator of what needs a build. See LibraryTileHtml.
+        Property Integer piLibPackages  0
+        /* THE LIBRARY FOLDERS A PACKAGE REPLACED that are still on disk (Nils 2026-09-10, after
+           migrating a workspace from libraries to packages: "it would be more logical to have this
+           on the Libraries tile"). Counted inside RefreshLibraryCounts, so it rides that memo -
+           whose key carries the .sws MTIME, which is exactly what moves when libraries are swapped
+           for packages. The folders themselves are kept for the dialog's Retire folders button. */
+        Property Integer  piLibStale    0
+        Property String[] pasLibStaleFolder
+        /* Usage results for the CURRENT report showing only. ShowLibraryReport re-enters itself once
+           with these set, so the row loop has one place to read them from and the report has one
+           renderer instead of two that could drift. Deliberately not cached across openings: they
+           describe source that a refactoring run may have rewritten in between, and a stale
+           dependency count reads exactly like a fresh one. */
+        Property tLibraryUsage[] pUsages
+        Property Boolean         pbHaveUsages False
+        /* THE UPDATE ANSWER, pushed in from OUTSIDE rather than fetched here (2026-09-10).
+
+           WorkspaceUpdateScan lives in cDfCliPackages.pkg, which Uses THIS file - so this class
+           cannot call it without a circular Use. That is not merely a workaround: the scan spawns
+           processes and touches the network, and a tile BUILDER that did any of that would run it
+           on every repaint. The scan is arranged by the boards, once, and leaves its verdict here
+           for the builder to read.
+
+           psUpdScanKey IS THE WORKSPACE THE ANSWER IS ABOUT, and LibraryTileHtml refuses an answer
+           that does not name the workspace it is painting. Loading a second workspace would
+           otherwise show the first one's verdict until the new scan finished.
+
+           pbUpdAnswered is separate from piUpdBehind because nothing-behind and could-not-check
+           are the same number and must never become the same sentence. */
+        Property String  psUpdScanKey  ""
+        Property Integer piUpdBehind   0
+        Property Boolean pbUpdAnswered False
+    End_Procedure
+
+    /* Record what a scan found. sSwsFile is what the answer is ABOUT, not merely context - see
+       psUpdScanKey. bAnswered False parks a "we asked and nothing could tell us" result, which
+       stops the board asking again this session while leaving the tile silent. */
+    Procedure SetUpdateResult String sSwsFile Integer iBehind Boolean bAnswered
+        Set psUpdScanKey  to (Lowercase(Trim(sSwsFile)))
+        Set piUpdBehind   to iBehind
+        Set pbUpdAnswered to bAnswered
+    End_Procedure
+
+    /*  FORGET THE ANSWER - the dependency array it described has moved.
+
+        Clears the KEY, not just the numbers, and that distinction is the whole point: a key left
+        naming this workspace would make UpdateScanDone True, the boards would decline to re-arm,
+        and the tile would stay silent about updates for the rest of the session. Cleared, the
+        next board refresh arms a fresh scan by itself. A dependency change is exactly when
+        re-asking is worth the round trip.
+
+        Callers that know MORE than "something moved" should follow this with SetUpdateResult -
+        an upgrade knows precisely which row went current and can restate the count rather than
+        pay for a scan to rediscover it. */
+    Procedure InvalidateUpdateResult
+        Set psUpdScanKey  to ""
+        Set piUpdBehind   to 0
+        Set pbUpdAnswered to False
+    End_Procedure
+
+    // Has this workspace been scanned already? The boards ask before arming, so opening the same
+    // workspace twice in one session costs one scan and not two.
+    Function UpdateScanDone String sSwsFile Returns Boolean
+        String sKey sSeen
+        Move (Lowercase(Trim(sSwsFile))) to sKey
+        Get psUpdScanKey to sSeen
+        Function_Return (sKey <> "" and sKey = sSeen)
+    End_Function
+
+    /* WHO DEPENDS ON WHAT: every DIRECT Use of a library's packages, across the workspace's own
+       source. The report can say "no 26.0 build - needs a newer copy" without the user having any
+       idea what that costs them; this is the answer to "how much of my code cares?", and 3 files
+       versus 300 is the difference between a swap and a project.
+
+       DIRECT ONLY (Nils 2026-08-01). A file that Use's vwin32fh itself is the user's problem; one
+       that reaches it through VDFQuery is VDFQuery's, and folding the two together would overstate
+       the work AND point at files the user cannot usefully change.
+
+       THE LIBRARY'S OWN SOURCE IS EXCLUDED - a library's packages Use each other constantly, and
+       counting that as "usage" would report a library as heavily depended upon by nobody but itself.
+       Files are dropped by folder prefix, which is exact: the inventory already resolved every
+       library's folder.
+
+       Runs on demand from the report, never on the tile paint: this reads every source file in
+       scope, which is Deep-Scan-sized work and has to be asked for. Panel-driven and cancellable on
+       the same gate the scan uses (Check_StatusPanel; the panel's Cancel does not close it). */
+    /* One library's dependency summary for its report row: the file count, then the files
+       themselves with the line the Use sits on.
+
+       CAPPED AT EIGHT, and it says so when it caps. A workspace can Use a library from a hundred
+       files and the row is not the place to list them - but a silent "..." would read as the whole
+       answer, and the count above it is what the user is actually deciding on. (No silent caps: the
+       same rule the Deep Scan's own reporting follows.)
+
+       Counted by FILE, not by Use: a file naming three of a library's packages is one file to open
+       and one file to fix, and reporting 3 would inflate every number the user reasons with. */
+    /* A path as a "show me" link: reveals it in Windows Explorer, dialog stays up.
+
+       & and < are escaped because a path is DATA here, not markup, and it lands in an HTML
+       attribute. "R&D" is a perfectly ordinary folder name and an unescaped & would silently
+       truncate the link - the sort of thing that works on every machine but the one that has it. */
+    Function PathLinkHtml String sPath String sLabel String sCls Returns String
+        String sSafe
+
+        Move (Replaces("&", sPath, "&amp;")) to sSafe
+        Move (Replaces("<", sSafe, "&lt;"))  to sSafe
+        Move (Replaces("&", sLabel, "&amp;")) to sLabel
+        Move (Replaces("<", sLabel, "&lt;"))  to sLabel
+        Function_Return ((SpanOpenClick(("ml-plink" * sCls), ("cfmdir:" + sSafe), "", "Show in Windows Explorer")) ;
+            + sLabel + CS_SpanEnd)
+    End_Function
+
+    /* The nearest ancestor of sPath that actually EXISTS, or "" if none does.
+
+       RDCRevealInExplorer refuses a path that is not on disk - a deliberate guard so a dialog body
+       cannot launch something - which means a link to a MISSING file silently does nothing. That is
+       the wrong behaviour for a report whose entire subject is files that are absent: the useful
+       answer is "here is how far down the path does exist", because seeing that
+       E:\LEGACYAPP6\Libraries is missing while E:\LEGACYAPP6 is fine is the whole diagnosis.
+       Nils 2026-08-05. */
+    Function NearestExistingFolder String sPath Returns String
+        String sTry
+        Integer iPos iGuard
+
+        Move sPath to sTry
+        If (Right(sTry, 1) = "\") ;
+            Move (Left(sTry, Length(sTry) - 1)) to sTry
+        Move 0 to iGuard
+        While (sTry <> "" and iGuard < 64)
+            If (vFolderExists(sTry) <> 0) ;
+                Function_Return sTry
+            If (vFilePathExists(sTry) <> 0) ;
+                Function_Return sTry
+            Move (RightPos("\", sTry)) to iPos
+            If (iPos = 0) Begin
+                Move "" to sTry
+            End
+            Else Begin
+                Move (Left(sTry, iPos - 1)) to sTry
+                // "C:" is not a folder - restore the separator so the drive root is testable.
+                If (Right(sTry, 1) = ":") ;
+                    Move (sTry + "\") to sTry
+            End
+            Increment iGuard
+        Loop
+        Function_Return ""
+    End_Function
+
+    Function UsageCellHtml String sLibName Returns String
+        tLibraryUsage[] aUse
+        String[] asSeen
+        String sHtml sBase sLow sLink
+        Integer i iMax iPos iFiles iShown
+
+        Get pUsages to aUse
+        Move (SizeOfArray(aUse) - 1) to iMax
+        Move 0 to iFiles
+        Move 0 to iShown
+        Move "" to sHtml
+        For i from 0 to iMax
+            If (aUse[i].sLibName = sLibName) Begin
+                Move (Lowercase(aUse[i].sFile)) to sLow
+                If ((SearchArray(sLow, asSeen)) = -1) Begin
+                    Move sLow to asSeen[-1]
+                    Increment iFiles
+                    If (iShown < 8) Begin
+                        Move (RightPos("\", aUse[i].sFile)) to iPos
+                        If (iPos > 0) ;
+                            Move (Mid(aUse[i].sFile, (Length(aUse[i].sFile) - iPos), (iPos + 1))) to sBase
+                        Else ;
+                            Move aUse[i].sFile to sBase
+                        Get PathLinkHtml aUse[i].sFile sBase "ml-plink-file" to sLink
+                        Move (sHtml + (DivOpen("ml-use ml-use-file")) + sLink ;
+                              + ' ' + (SpanOpen("ml-use ml-use-line")) + 'line ' + String(aUse[i].iLine) + (CS_SpanEnd + CS_DivEnd)) to sHtml
+                        Increment iShown
+                    End
+                End
+            End
+        Loop
+        If (iFiles = 0) ;
+            Function_Return ((DivOpen("ml-use ml-use-none")) + 'used by no file directly' + CS_DivEnd)
+        If (iFiles > iShown) ;
+            Move (sHtml + (DivOpen("ml-use ml-use-more")) + 'and ' + String(iFiles - iShown) + (' more' + CS_DivEnd)) to sHtml
+        Function_Return ((DivOpen("ml-use ml-use-head")) + 'used directly by ' ;
+                         + String(iFiles) + ' file' + (If(iFiles = 1, "", "s")) + CS_DivEnd + sHtml)
+    End_Function
+
+    Function ScanLibraryUsages tLibraryInfo[] ByRef aLibs Boolean ByRef bCancelled Returns tLibraryUsage[]
+        tLibraryUsage[] aUse
+        tLibraryUsage   U
+        tRefactorFiles  RFiles
+        String[]        asFolders asLines asLibFolders
+
+        String[][]      aasPkgs
+        String          sFile sLow sPkg
+        Handle          ho hoStatusBar
+        Integer         iLib iLibMax iFile iFileLast iLine iLineMax iCheck i
+        Boolean         bPaint bMine
+
+        Move False to bCancelled
+        Move (SizeOfArray(aLibs) - 1) to iLibMax
+        If (iLibMax < 0) ;
+            Function_Return aUse
+
+        // One package-name set per library, plus its folder for the exclusion test below.
+        Get Create (RefClass(cLibraryInventoryApp)) to ho
+        For iLib from 0 to iLibMax
+            Get LibraryPackageNames of ho aLibs[iLib].sFolder to aasPkgs[iLib]
+            Move (Lowercase(vFolderFormat(aLibs[iLib].sFolder))) to asLibFolders[iLib]
+        Loop
+        Send Destroy of ho
+
+        // Scope: the user's selected folders, else the whole workspace - the same resolution every
+        // guided action uses, so "usages" means the same set of files as everything else on the board.
+        Get pasSelectedFolders of ghoApplication to asFolders
+        If (SizeOfArray(asFolders) = 0) ;
+            Get WholeWorkspaceSourceFolders of ghoApplication to asFolders
+        If (SizeOfArray(asFolders) = 0) ;
+            Function_Return aUse
+        Get AllSourceFiles of ghoApplication asFolders SysFile.FileExtensionFilter to RFiles
+        Move (SizeOfArray(RFiles.asFullFileNames) - 1) to iFileLast
+        If (iFileLast < 0) ;
+            Function_Return aUse
+
+        Get Statusbar_Id of (phoMainPanel(ghoApplication)) to hoStatusBar
+        Send Cursor_Wait of Cursor_Control
+        Send StartStatusPanel of ghoStatusPanel "Libraries - finding which files use them..." "" (iFileLast + 1) (iFileLast + 1)
+        For iFile from 0 to iFileLast
+            Move RFiles.asFullFileNames[iFile] to sFile
+            Move (Lowercase(sFile)) to sLow
+            // A file INSIDE a library is that library's own business, not a usage of it.
+            Move False to bMine
+            For i from 0 to iLibMax
+                If (asLibFolders[i] <> "" and (Pos(asLibFolders[i], sLow)) = 1) ;
+                    Move True to bMine
+            Loop
+            If (bMine = False) Begin
+                Move (rfReadEncodedFileAsStringArray(sFile)) to asLines
+                Move (SizeOfArray(asLines) - 1) to iLineMax
+                Get Create (RefClass(cLibraryInventoryApp)) to ho
+                For iLine from 0 to iLineMax
+                    Get UsedPackageOnLine of ho asLines[iLine] to sPkg
+                    If (sPkg <> "") Begin
+                        For iLib from 0 to iLibMax
+                            If ((SearchArray(sPkg, aasPkgs[iLib])) <> -1) Begin
+                                Move aLibs[iLib].sName to U.sLibName
+                                Move sFile             to U.sFile
+                                Move (iLine + 1)       to U.iLine
+                                Move sPkg              to U.sPackage
+                                Move U to aUse[-1]
+                            End
+                        Loop
+                    End
+                Loop
+                Send Destroy of ho
+            End
+            // Same time-driven paint + cancel gate as the Deep Scan (see cFTDeepScanDriver): the
+            // per-file work here is a read and a line walk, so paying four message pumps per file
+            // would cost more than the scan.
+            Get PanelPaintDue of ghoStatusPanel to bPaint
+            If (bPaint = True) Begin
+                Set Caption_Text of ghoStatusPanel to ("Libraries - File No:" * String(iFile + 1) * "of:" * String(iFileLast + 1))
+                Set TableName_Text of ghoStatusPanel to sFile
+                Set StatusText of hoStatusBar to ("Finding library usages: file " + String(iFile + 1) + " of " + String(iFileLast + 1))
+                Send PumpMsgQueue of Desktop
+            End
+            Set piPositionTot of ghoStatusPanel to (iFile + 1)
+            Move 0 to iCheck
+            If (bPaint = True) ;
+                Get Check_StatusPanel of ghoStatusPanel to iCheck
+            If (iCheck = MSG_CANCEL) Begin
+                Move True to bCancelled
+                Move (ResizeArray(aUse, 0)) to aUse
+                Send Cursor_Ready of Cursor_Control
+                Set StatusText of hoStatusBar to "Ready."
+                Function_Return aUse
+            End
+        Loop
+        Send Stop_StatusPanel of ghoStatusPanel
+        Send Cursor_Ready of Cursor_Control
+        Set StatusText of hoStatusBar to "Ready."
+        Function_Return aUse
+    End_Function
+
+    /* THE LIBRARIES TILE: the libraries this workspace uses, and whether they can meet the target.
+
+       ITS OWN TILE since 2026-09-10 (Nils: "three tiles with a gap"). It was the right HALF of the
+       Target tile, divided by a rule, because a library's verdict is a consequence of the target
+       version rather than a peer setting. That reading has not changed - it still sits immediately
+       right of Target so the dependency reads left to right, and wears that tile's exact gold - but
+       a half of a half had no room to say a second, independent thing, and the row levels its
+       children now (.dash-cols), which it could not when the halves were merged.
+
+       The sub-line is the whole point: a bare "Libraries" says nothing, while "2 of 5 need a 26.0
+       build" is the answer without opening anything. */
+    { Visibility=Private }
+    Function LibraryTileHtml Returns String
+        String sWS sTarget sSub sSkin sHas sUpd sStale
+        Integer iBehind iStale
+        Boolean bAnswered
+        Integer iTotal iAttn iPkgs
+        Boolean bJson
+
+        Get psSWSFile of ghoApplication to sWS
+        Get psTargetDfVersion of ghoApplication to sTarget
+        Move "" to sSkin
+        If (sWS = "") Begin
+            Move "Load a workspace to see them" to sSub
+        End
+        Else Begin
+            Send RefreshLibraryCounts
+            Get piLibTotal to iTotal
+            Get piLibAttention to iAttn
+            Get piLibPackages to iPkgs
+            Get pbLibJsonForm to bJson
+
+            /* WHAT THE WORKSPACE HAS, in one phrase - "2 libraries and 3 packages". Built first
+               because three of the four branches below want it. Singular forms because "1 librarys"
+               in a dashboard reads as a bug in everything else too. */
+            Move "" to sHas
+            If (iTotal > 0) ;
+                Move (String(iTotal) + (If(iTotal = 1, " library", " libraries"))) to sHas
+            If (iPkgs > 0) Begin
+                If (sHas <> "") ;
+                    Move (sHas + " and ") to sHas
+                Move (sHas + String(iPkgs) + (If(iPkgs = 1, " package", " packages"))) to sHas
+            End
+
+            If (iTotal = 0 and iPkgs = 0) Begin
+                Move "None declared by this workspace" to sSub
+            End
+            Else If (iTotal = 0) Begin
+                // Packages only: nothing here carries a .sws version, so there is no verdict to
+                // give and none is implied. Not an attention state - it is a normal DF26 workspace.
+                Move sHas to sSub
+                Move " ok" to sSkin
+            End
+            Else If (sTarget = "") Begin
+                Move (sHas + " " + CS_EmDash + " pick a compiler for a verdict") to sSub
+            End
+            Else If (iAttn > 0) Begin
+                /* THE DENOMINATOR IS iTotal, NOT iTotal + iPkgs. A package pins its own version and
+                   has no .sws for this tile to judge, so counting it among the ones that "need a
+                   build" would put it in a verdict nobody formed about it. */
+                Move (String(iAttn) + " of " + String(iTotal) + " need a " + sTarget + " build") to sSub
+                Move " attn" to sSkin
+            End
+            Else If (bJson = True) Begin
+                /* NO VERSION TALK ON A DF26 WORKSPACE (Nils 2026-08-14: "the version is of no
+                   interest as it is a DF 26 workspace"). Its dependencies are packages pinned by
+                   commit and libraries the package handler resolved, so "all on 26.0" restates the
+                   format rather than telling anyone anything. What it has is the useful fact; the
+                   green skin already carries "and nothing needs attention". */
+                Move sHas to sSub
+                Move " ok" to sSkin
+            End
+            Else Begin
+                // A legacy INI workspace still gets the version, where it is the whole question.
+                Move ("All " + String(iTotal) + " are on " + sTarget) to sSub
+                Move " ok" to sSkin
+            End
+        End
+        /* THE SECOND LINE: what a remote says, and NOTHING when nothing said anything.
+
+           Three states, not two. Behind is the actionable one and wears the warning colour;
+           checked-and-current earns a quiet line, because a user whose workspace was just scanned
+           deserves an answer rather than an unchanged-looking tile. The third state - no scan yet,
+           no network, no git on PATH, a df-cli that would not read the workspace, or a workspace
+           whose dependencies are every one of them local paths - renders NOTHING. Silence is
+           honest; "up to date" would be a claim, and it would be made in exactly the cases where
+           it is most likely to be false.
+
+           "Package", not "library": a path entry has no remote to ask. Most entries in a legacy
+           workspace are paths, so a line saying "libraries" would describe rows nothing looked at. */
+        /* THE THIRD LINE: a library folder a package replaced, still on disk. Above the update
+           line because it is the older and more misleading state - the build reads the package,
+           so anything changed in these folders never reaches it. Silent when there are none,
+           which is every tidy workspace. */
+        Move "" to sStale
+        If (sWS <> "") Begin
+            Get piLibStale to iStale
+            If (iStale > 0) ;
+                Move ((DivOpen("dash-p dash-stale")) + String(iStale) ;
+                    + (If(iStale = 1, " replaced library folder", " replaced library folders")) ;
+                    + " on disk" + CS_DivEnd) to sStale
+        End
+        Move "" to sUpd
+        If (sWS <> "" and (UpdateScanDone(Self, sWS)) = True) Begin
+            Get pbUpdAnswered to bAnswered
+            Get piUpdBehind   to iBehind
+            If (bAnswered = True) Begin
+                If (iBehind > 0) ;
+                    Move ((DivOpen("dash-p dash-upd-behind")) + String(iBehind) ;
+                        + (If(iBehind = 1, " package needs", " packages need")) + " an update" + CS_DivEnd) to sUpd
+                Else ;
+                    Move ((DivOpen("dash-p dash-upd-ok")) + "Packages up to date" + CS_DivEnd) to sUpd
+            End
+        End
+        Function_Return ((ClickableHtml("div", ('dash-tile t-libs' + sSkin), "libraries", "", ((DivOpen("dash-ico")) + (DashIcon(CS_GlyphStack))), "The shared libraries this workspace uses, and whether each has a build for the target DataFlex version. Library code is maintained upstream and is never refactored in place - it is replaced.")) + (((DivOpen("dash-txt")) + (DivOpen("dash-h")) + 'Libraries') + CS_DivEnd + (DivOpen("dash-p"))) + sSub + CS_DivEnd + sStale + sUpd + (CS_DivEnd + CS_DivEnd))
+    End_Function
+
+    /* Counts for the tile half, memoised on (workspace + target version).
+
+       The inventory does a directory search plus a read of every sibling .sws per library - about
+       30 small file reads for 5 libraries - and the tile re-renders on every dashboard entry, every
+       workspace load and after every compiler change. Recomputing each time is exactly the shape of
+       the pinned-indicator regression (24s of a 55s Analyze), so it is computed once per
+       (workspace, target) pair and the key self-invalidates when either changes. */
+    { Visibility=Private }
+    Procedure RefreshLibraryCounts
+        tLibraryInfo[] aLibs
+        String[] asSeenLibs
+        Handle ho
+        String sWS sTarget sKey sSeen sSeenKey
+        Integer i iMax iAttn iTotal iPkgs iFormat
+        tSwsDependency[] aPkgGraph
+        String[] asPkgVia
+        Integer[] aiPkgDepth
+        String sPkgHome
+
+        Get psSWSFile of ghoApplication to sWS
+        Get psTargetDfVersion of ghoApplication to sTarget
+        /* THE FILE'S OWN STAMP IS PART OF THE KEY (Nils 2026-08-15: after retargeting five
+           libraries to 26.0 and pressing OK, the tile still said "8 of 8 need a 26.0 build").
+           The memo keyed on (workspace + target) alone, and neither changes when the .sws is
+           EDITED - so a Libraries-dialog OK, which rewrites the very file these counts describe,
+           left the tile serving the pre-edit numbers forever. rfFileDate is one FindFirstFile,
+           which is nothing next to the tree walk it guards; a rewrite changes the stamp and the
+           memo misses on the next paint, as it must. */
+        Move (Lowercase(sWS) + "|" + sTarget + "|" + String(rfFileDate(sWS))) to sKey
+        Get psLibCountKey to sSeen
+        If (sKey = sSeen) ;
+            Procedure_Return
+
+        /* WorkspaceLibraryEntries, NOT WorkspaceLibraryInventory (2026-08-11). The inventory keeps
+           only entries whose .sws resolves, so a workspace declaring six libraries with two missing
+           painted "All 4 are on 26.0" - a green tile over a workspace that will not build, and a
+           total that silently disagreed with the file. A missing entry is now counted, and counted
+           as needing attention: it is the most actionable state a row can be in. */
+        /* THE TREE, so a broken CHAIN reaches the tile (2026-08-12). A library's Version= describes
+           itself and not what it depends on, so WebAppSrc-Library-DF250 counted as one tidy library
+           on E:\WinServ while the seven it declares sit on 19.1 - the tile was green over a
+           workspace that cannot build. A library whose own dependencies undercut it now counts as
+           needing attention.
+
+           THE TOTAL STAYS THE WORKSPACE'S OWN count. The tile reports what this workspace declares
+           - which is what the user edits - and the chain sharpens the attention half rather than
+           inflating the denominator. The memo keeps the extra reads off the paint path. */
+        Get Create (RefClass(cLibraryInventoryApp)) to ho
+        Get WorkspaceLibraryTree of ho sWS sTarget CI_LibraryTreeMaxDepth to aLibs
+        /* PACKAGES ARE LIBRARIES TOO, and the tree cannot see them (Nils 2026-08-14: "the number of
+           libraries + packages is far more than 1").
+
+           WorkspaceLibraryTree is built from SwsLibraryEntries, which reports only the STRING
+           dependencies - a git or cloud package is an object with no path to resolve, so it never
+           reaches the tree. On his DF26 WinServ that left one path entry and two git packages, and
+           the tile said "All 1". The same reader/writer asymmetry that made the JSON writer delete
+           packages made this tile fail to count them. */
+        /* THE WHOLE GRAPH, not just the entries this workspace names (Nils 2026-08-21, on a
+           tile reading "1 package" beside a dialog listing four).
+
+           SwsJsonObjectDependencyCount answers the DIRECT count, which is what the .sws
+           records - but a package brings its own dependencies with it and those are installed
+           too. Order Entry names DUF alone and ends up with DUF, RDCToolsLib, DFAbout and
+           vWin32fh. Counting only the named one repeats the mistake this file already fixed
+           for LIBRARIES: a number that matches nothing else on screen.
+
+           ExpandPackageGraph is the SAME walk the Libraries dialog lists from, deliberately -
+           a second copy of that loop is how the tile and the dialog drift apart again. The
+           home folder is the .sws's own, which is where DfPkg sits. */
+        Move (Left(sWS, RightPos("\", sWS))) to sPkgHome
+        Get ExpandPackageGraph of ho sWS sPkgHome (&aPkgGraph) (&asPkgVia) (&aiPkgDepth) to iPkgs
+        Get SwsFormatOf of ho sWS to iFormat
+        Send Destroy of ho
+        /* EVERY LIBRARY IN THE CHAIN, not just the ones this workspace names directly
+           (Nils 2026-08-14: "one major library + four nested libraries = 5 + 2 packages").
+
+           The total used to be the workspace's OWN entries, on the reasoning that those are what the
+           user edits, with a nested problem folded into its parent through iChainBehind. On his
+           WinServ that produced "1" over a workspace carrying five libraries and two packages - a
+           number that matched no other count on screen, least of all the Libraries dialog's own list.
+           What the workspace COMPILES is the honest measure, and it is the one the dialog shows.
+
+           Counting every depth also retires the iChainBehind roll-up here: a late nested library now
+           counts once, as itself, instead of once as its parent's chain flag. Adding both would have
+           counted the same problem twice.
+
+           Deduplicated on the RESOLVED .sws, because a library reached through two parents is one
+           library - and a workspace that (like his did) references two versions of the same library
+           pulls in two separate chains, which would otherwise inflate the total with rows the user
+           would count once. */
+        Move 0 to iAttn
+        Move 0 to iTotal
+        Move (SizeOfArray(aLibs) - 1) to iMax
+        For i from 0 to iMax
+            Move (Lowercase(Trim(aLibs[i].sRefSwsFile))) to sSeenKey
+            If (sSeenKey = "") ;
+                Move (Lowercase(Trim(aLibs[i].sName)) + "|" + String(i)) to sSeenKey
+            If (SearchArray(sSeenKey, asSeenLibs) = -1) Begin
+                Move sSeenKey to asSeenLibs[-1]
+                Increment iTotal
+                /* THE SAME RULE THE DIALOG APPLIES (MaintainLibrariesFT.AttentionCount, 2026-08-15):
+                   on a DF26 JSON workspace a version verdict is not formed - each dependency pins
+                   its own version - so only what is broken in ANY format counts: not-found, and a
+                   package that itself refuses the target. Without this the tile said "8 of 8 need
+                   a 26.0 build" over eight libraries that need nothing, and disagreed with the
+                   dialog it opens. INI workspaces keep the full verdict; there it is the question. */
+                If (iFormat = eSwsJson) Begin
+                    If (aLibs[i].eStatus = eLibNotFound or aLibs[i].eStatus = eLibUnreadable or aLibs[i].eStatus = eLibPackageMismatch) ;
+                        Increment iAttn
+                End
+                Else If (aLibs[i].eStatus = eLibRetargetLocal or aLibs[i].eStatus = eLibNoLocalBuild or aLibs[i].eStatus = eLibNotFound or aLibs[i].eStatus = eLibUnreadable or aLibs[i].eStatus = eLibPackageMismatch) ;
+                    Increment iAttn
+            End
+        Loop
+        Set piLibTotal     to iTotal
+        Set piLibAttention to iAttn
+        Set piLibPackages  to iPkgs
+        Set pbLibJsonForm  to (iFormat = eSwsJson)
+        Send RescanStaleLibraryFolders
+        Set psLibCountKey  to sKey
+    End_Function
+
+    /* Re-reads which <home>\Libraries children a package has replaced and nothing declares, and
+       stores the count and the folders. Called from RefreshLibraryCounts (so the tile pays for it
+       once per workspace, on the same memo) and again by the Libraries dialog after a retire.
+
+       CHEAP WHEN THERE IS NOTHING: no Libraries folder, no walk at all - which is every workspace
+       that never had one, and every one already tidied. It only reaches the file system for the
+       few folders that are both undeclared and matched to a package. */
+    Procedure RescanStaleLibraryFolders
+        Handle ho
+        String[] asFolder asPkg asDeclared
+        Integer[] aiSame aiDiffer aiOnly
+        String sHome sSws
+        Integer iN
+
+        Move 0 to iN
+        Get psHomeTarget of ghoApplication to sHome
+        Get psSWSFile    of ghoApplication to sSws
+        /* THE DECLARED SET COMES FROM THE RESOLVER, never from the .sws text: a git dependency's
+           URL names the library it replaced, so a "does the .sws mention it" test would call every
+           replaced folder declared for ever. GetWorkspaceLibrarySourceFolders follows local
+           dependencies and skips git ones, which is exactly the distinction wanted. */
+        If (sSws <> "") ;
+            Get GetWorkspaceLibrarySourceFolders of ghoApplication sSws to asDeclared
+        Get Create (RefClass(cShadowedPackageFiles)) to ho
+        If (ho <> 0) Begin
+            Get OrphanedLibraryFolders of ho sHome asDeclared (&asFolder) (&asPkg) ;
+                (&aiSame) (&aiDiffer) (&aiOnly) to iN
+            Send Destroy of ho
+        End
+        Set pasLibStaleFolder to asFolder
+        Set piLibStale        to iN
+    End_Procedure
+
+    /* How many library folders a package has replaced, for a caller outside this object - the
+       Libraries dialog's Retire folders button. Goes through the MEMO, so asking on every repaint
+       of that dialog costs one string compare; RefreshLibraryCounts stays private. */
+    Function StaleLibraryFolderCount Returns Integer
+        Send RefreshLibraryCounts
+        Function_Return (piLibStale(Self))
+    End_Function
+
+    // Forces the next tile paint - and the next read of piLibStale - to re-scan. Sent after a
+    // retire, which changes the answer without touching the .sws the memo key watches.
+    Procedure InvalidateLibraryCounts
+        Set psLibCountKey to ""
+    End_Procedure
+
+
+    /* Compiler messages per library, tallied from the analyzer's own scoped message set.
+
+       This is the other half of the same fact: "vwin32fh has no 26.0 build" and "47 messages inside
+       vwin32fh files" are one problem stated twice, and the report is where they meet. The rows stay
+       in the grid - nothing is hidden, and their count is what makes the library row worth reading.
+
+       Returns False when the analyzer has no data, which the caller must distinguish from a genuine
+       zero: "no messages" and "not analyzed yet" look identical in a count and mean opposite things.
+
+       paScopedMessages is the analyzer's single parsed set, already read cross-object this way by
+       the plan builder (StartAutoSelect). */
+    // No longer private: the Library Maintenance dialog is the screen that renders these now
+    // (cFTLibraryReport kept the DATA when the report moved into a real dialog, 2026-08-11).
+    Function LibraryMessageCounts String[] ByRef asNames Integer[] ByRef aiCounts Returns Boolean
+        tCompileError[] aMsgs
+        Handle hoAn
+        String sLib
+        Integer i iMax iAt
+
+        If (ghoModAnalyzerDock = 0) ;
+            Function_Return False
+        Get paScopedMessages of (oModAnalyzer_grd(ghoModAnalyzerDock)) to aMsgs
+        Move (SizeOfArray(aMsgs) - 1) to iMax
+        If (iMax < 0) ;
+            Function_Return False
+
+        Get Create (RefClass(cModAnalyzer)) to hoAn
+        For i from 0 to iMax
+            Get LibraryOwningFile of hoAn aMsgs[i].sFileName to sLib
+            If (sLib <> "") Begin
+                Move (SearchArray(sLib, asNames)) to iAt
+                If (iAt = -1) Begin
+                    Move sLib to asNames[-1]
+                    Move 1 to aiCounts[-1]
+                End
+                Else ;
+                    Move (aiCounts[iAt] + 1) to aiCounts[iAt]
+            End
+        Loop
+        Send Destroy of hoAn
+        Function_Return True
+    End_Function
+
+    // "19.1, 25.0" - the versions a library copy offers, or "-" when it declares none.
+    // Not private, same reason as LibraryMessageCounts above - the dialog renders this column.
+    Function _VersionListText String[] ByRef asVers Returns String
+        String sOut
+        Integer i iMax
+        Move (SizeOfArray(asVers) - 1) to iMax
+        If (iMax < 0) ;
+            Function_Return "-"
+        Move "" to sOut
+        For i from 0 to iMax
+            If (sOut <> "") ;
+                Move (sOut + ", ") to sOut
+            Move (sOut + asVers[i]) to sOut
+        Loop
+        Function_Return sOut
+    End_Function
+End_Class
+
+// One instance. Both the Dashboard and the guided trail call through this handle.
+#IFNDEF ghoLibraryReport
+    Global_Variable Handle ghoLibraryReport
+    Move 0 to ghoLibraryReport
+#ENDIF
+
+Object oLibraryReport is a cFTLibraryReport
+    Move Self to ghoLibraryReport
+End_Object

@@ -1,0 +1,211 @@
+//****************************************************************************
+// $Module type: Program
+// $Module name: FunctionHelpGen
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-23
+//
+// Description : SERVICE PROGRAM - maintainer tool, not shipped to end users.
+//
+//               Writes the reference half of the user manual straight out of the function
+//               meta-tags: one markdown file per { MethodType }, ready to paste into the
+//               matching HelpNDoc topic. Run it after adding or changing a refactoring
+//               function, and the manual cannot drift away from the code again.
+//
+// WHY THE DOCUMENTATION IS GENERATED AT ALL:
+//     It was hand-written until 2026-08-23, and by then five of the function names in the
+//     shipped help had stopped existing - one page still described behaviour the code had
+//     deliberately abandoned months earlier. Nothing in the build could notice. Generating the
+//     entries from the tags removes the whole class of problem.
+//
+// WHAT THIS MEANS WHEN AN ENTRY READS BADLY:
+//     Fix the function's { Description }, not the generated file. The generated files are
+//     OUTPUT and are overwritten on every run. The Description is also what the Select
+//     Functions picker shows in its Summary column and what the Modernization Analyzer uses as
+//     its suggested-fix hint, so one edit improves three surfaces at once. Mind the size budget
+//     while editing - see the header of oRefactorFuncLib.pkg, and run MetaTagCheck afterwards.
+//
+// WHY THIS IS A SEPARATE PROGRAM FROM MetaTagCheck:
+//     The two have opposite dependency needs. This one WANTS the function library linked, so it
+//     can read pFuncLibArray - the already-parsed registration data, which is exactly what the
+//     engine, the picker and the analyzer see. MetaTagCheck must NOT link it, because its whole
+//     job is to work when oRefactorFuncLib.pkg is broken. Keep them apart.
+//
+// Output: <workspace home>\FunctionHelp\  - one .md per function type, plus a log.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use DFAllEnt.pkg
+Use File_dlg.pkg
+Use cRDCCJCommandBarSystem.pkg
+Use vwin32fh.pkg
+Use RefactorConstants.h.pkg
+Use FTThemeColors.pkg
+
+Object oHtmlHelp is a cHtmlHelp
+    Set pbAlwaysOnTop to False
+End_Object
+
+/* MESSAGE STUBS FOR THE LINKER.
+
+   The function library and the engine send a handful of messages that only exist inside the
+   DFRefactor / TestBench view code - the editor's host panel, its status bar and its file
+   picker. None of them is reached while generating documentation (no editor object is created
+   and no refactoring run happens), but the linker still demands the message names exist, and
+   reports every one as "Forward reference not resolved".
+
+   Register_Procedure / Register_Function declare the name without providing an implementation,
+   which is precisely what is wanted: the link resolves, and if one of these were ever actually
+   sent here it would be an error rather than silently doing nothing in a fake object.
+*/
+Register_Procedure SelectSourceFile
+Register_Procedure Set UTF8Text String sText
+Register_Procedure ODEOEditContextMenu     // EngineErrorLog.dg - its grid's context menu
+Register_Procedure StartRefactoreCode      // SelectFunctions.vw - the run button (sic)
+
+Use cRefactorApplication.pkg
+Object oApplication is a cRefactorApplication
+    Set psProduct to "DFRefactor Function Help Generator"
+    Set psCompany to "RDC Tools International"
+    Set pbWorkspaceMode to False
+
+    /* Writes every documented function to <home>\FunctionHelp\, one file per { MethodType },
+       and a log naming the counts and everything deliberately left out.
+
+       The seven types are paired with the help page each belongs to in PARALLEL arrays - keep
+       them aligned. eAllFunctions is absent because it is a picker filter, not a real type, and
+       eRemoveFunctionAll because no function uses it.
+    */
+    Procedure GenerateHelp
+        String sHome sFolder sLog sFile sMsg sCRLF sName
+        String[] asFileName asOtherLogFiles
+        Integer[] aiType
+        tFuncLib[] FuncLibArray
+        Integer iCh iType iTypeLast iFn iFnLast iInFile iTotal iSkipped
+        Boolean bOk
+
+        Get psHome of (phoWorkspace(ghoApplication)) to sHome
+        Move (vFolderFormat(sHome) + CS_FunctionHelpFolder + CS_DirSeparator) to sFolder
+        If (rfDirectoryExists(sFolder) = False) Begin
+            Move (rfDirectoryCreateEx(sFolder, False)) to bOk
+            If (bOk = False) Begin
+                Send Stop_Box ("Could not create:" * sFolder) "Function help"
+                Procedure_Return
+            End
+        End
+
+        Move (sFolder + CS_FunctionHelpLogFile) to sLog
+        Get rfOpenOutput sLog to iCh
+        If (iCh < 0) Begin
+            Send Stop_Box ("Could not write:" * sLog) "Function help"
+            Procedure_Return
+        End
+
+        Writeln channel iCh "Generated function reference"
+        Writeln channel iCh ""
+        Writeln channel iCh ("Written to: " + sFolder)
+        Writeln channel iCh ""
+        Writeln channel iCh "One markdown file per function type, built from the registered meta-tags. These files"
+        Writeln channel iCh "are OUTPUT - editing them achieves nothing, they are overwritten on the next run. To"
+        Writeln channel iCh "improve an entry, edit that function's { Description }: the same text also feeds the"
+        Writeln channel iCh "Select Functions picker and the Modernization Analyzer's suggested-fix hint."
+        Writeln channel iCh ""
+
+        Move eStandardFunction  to aiType[0]
+        Move eRemoveFunction    to aiType[1]
+        Move eEditorFunction    to aiType[2]
+        Move eReportFunction    to aiType[3]
+        Move eReportFunctionAll to aiType[4]
+        Move eOtherFunction     to aiType[5]
+        Move eOtherFunctionAll  to aiType[6]
+        Move "Standard - Line by Line.md" to asFileName[0]
+        Move "Remove - Line by Line.md"   to asFileName[1]
+        Move "Editor - One File.md"       to asFileName[2]
+        Move "Report - One File.md"       to asFileName[3]
+        Move "Report - All Files.md"      to asFileName[4]
+        Move "Other - One File.md"        to asFileName[5]
+        Move "Other - All Files.md"       to asFileName[6]
+
+        Get pFuncLibArray of ghoFuncLib to FuncLibArray
+        Move 0 to iTotal
+        Move 0 to iSkipped
+        Move (SizeOfArray(aiType)) to iTypeLast
+        Decrement iTypeLast
+        For iType from 0 to iTypeLast
+            Move (sFolder + asFileName[iType]) to sFile
+            Get _WriteFunctionHelpFile of ghoFuncLib FuncLibArray aiType[iType] sFile to iInFile
+            Writeln channel iCh (Pad(asFileName[iType], 30) + String(iInFile) + " function(s)")
+            Add iInFile to iTotal
+        Loop
+
+        // Name what was left out, so a missing function is never a mystery.
+        Move (SizeOfArray(FuncLibArray)) to iFnLast
+        Decrement iFnLast
+        For iFn from 0 to iFnLast
+            If (FuncLibArray[iFn].bNoDoc = True or FuncLibArray[iFn].bPrivate = True) Begin
+                If (iSkipped = 0) Begin
+                    Writeln channel iCh ""
+                    Writeln channel iCh "Left out of the documentation:"
+                End
+                Move FuncLibArray[iFn].sName to sName
+                If (FuncLibArray[iFn].bNoDoc = True) Begin
+                    Writeln channel iCh ("  " + sName + "   { NoDoc = True }")
+                End
+                Else Begin
+                    Writeln channel iCh ("  " + sName + "   { Private = True } - not part of the shipped set")
+                End
+                Increment iSkipped
+            End
+        Loop
+
+        Writeln channel iCh ""
+        Writeln channel iCh ("Total: " + String(iTotal) + " function(s) documented, " + String(iSkipped) + " left out.")
+        Send rfCloseOutput iCh
+
+        Move ((Character(13)) + (Character(10))) to sCRLF
+        Move ("Documented" * String(iTotal) * "function(s)," * String(iSkipped) * "left out.") to sMsg
+        Move (sMsg + sCRLF + sCRLF + "Written to:" * sFolder) to sMsg
+        Send Info_Box sMsg "Function help"
+        Send RDCRevealInExplorer sFolder
+    End_Procedure
+
+End_Object
+
+Object oMain is a Panel
+    Set Label to "DFRefactor Function Help Generator"
+    // No UI is needed - the work runs at startup and the panel never shows.
+    Set Location to -40 -30
+    Set Size to 3 6
+
+    Object oClientArea is a ClientArea
+        /* oMainRefactorObjects creates ghoFuncLib and ghoEngine. Always at the top of the
+           ClientArea - RegisterInterface fills pFuncLibArray as these objects are constructed,
+           so the generation below cannot run before this line. */
+        Use oMainRefactorObjects.pkg
+
+        /* THE FUNCTION LIBRARY CANNOT BE LINKED ON ITS OWN. Its Editor-type functions and the
+           engine send messages defined by the editor, the command bar and several views -
+           RefactorReIndent, GotoLine, LoadFile, IsFileTimeNewer, ActionText, SelectSourceFile
+           and more - and every one of them is a "Forward reference not resolved" link error if
+           its class is missing. The list below is TestBench's, which is known to resolve them
+           all; the classes only need to be DEFINED, no object of them is created here.
+
+           This dependency weight is exactly why MetaTagCheck is a separate program: it must
+           still run when this chain will not compile. */
+        Use cRefactorScintillaEditor.pkg  // LoadFile / IsFileTimeNewer / FileModTime
+        Use cRefactorEditorCommands.pkg   // RefactorReIndent / RefactorNormalizeCase / GotoLine
+        Use cUnitCommandBar.pkg           // ActionText / NumberOfEditorLines / ...Characters
+        Use ScintillaParameters.dg
+        Use cRefactorEditorSettings.pkg   // must follow the editor chain - it repoints ghoEditorProperties
+        Use CompilerOutput.dg
+        Use EngineErrorLog.dg
+        Use EngineLogFile.dg
+        Use ProgramSetup.dg
+        Use ShowOtherLogFiles.dg
+        Use SelectFunctions.vw
+    End_Object
+
+End_Object
+
+Send GenerateHelp of ghoApplication

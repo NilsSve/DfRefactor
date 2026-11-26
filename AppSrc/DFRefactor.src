@@ -20,6 +20,9 @@ Use File_dlg.pkg
 Use gFormatNumbers.pkg
 Use vWin32fh.pkg
 Use RefactorConstants.h.pkg
+// Shared files (cWSTextBox, cCmdLinkButton, SelectWorkspace) ask for theme colours through these.
+// This build never seeds giFTThemeMode, so they return the original dark constants - no change.
+Use FTThemeColors.pkg
 Use cWorkspaceMenuItem.pkg
 Use cEncodingHelpers.pkg
 
@@ -71,10 +74,7 @@ End_Procedure
 External_Function GetACP "GetACP" kernel32.dll Returns Integer
 Register_Procedure DoChangeFontSize
 
-Enum_List
-    Define CI_CleanupSource
-    Define CI_CodeIndenter
-End_Enum_List
+// CI_CleanupSource / CI_CodeIndenter: RefactorConstants.h.pkg
 
 Declare_Datafile FolderSelHea
 Use cFunctionsDataDictionary.dd
@@ -86,7 +86,6 @@ Object oApplication is a cRefactorApplication
     Set peHelpType to htHtmlHelp
     Set psHelpFile to "DFRefactor.chm"
 
-    Property String[] pasCmdLineSetSelectedFolders 
     Property String psCmdLineIniFile ""
     
     Procedure OnWorkspaceOpened
@@ -267,7 +266,13 @@ Object oApplication is a cRefactorApplication
                     Move True to bBatch
                     Case Break
                 
-                Case (sArgument = CS_CmdConfigFile1 or sArgument = CS_CmdConfigFile2 or sArgument = CS_CmdConfigFile3)
+                /* /bm is THE documented switch now; /c, -c and --console still work but are no
+                   longer advertised (Nils 2026-08-03: two flags that both meant batch mode was
+                   the confusion). Keeping them costs one line and breaks nobody's script - and
+                   it also revives every Run-...ps1 generated before today, which emitted /bm
+                   against a parser that did not accept it. */
+                Case (sArgument = CS_BatchModeShort or sArgument = CS_BatchModeLong or ;
+                      sArgument = CS_CmdConfigFile1 or sArgument = CS_CmdConfigFile2 or sArgument = CS_CmdConfigFile3)
                     Get Argument of hoCmdLine (iCount +1) to sCmdLineIniFile
                     Get ParseFolderName sCmdLineIniFile to sPath
                     If (sPath = "") Begin
@@ -304,7 +309,7 @@ Object oApplication is a cRefactorApplication
 
             Append sParamText "\n *.sws workspace file:"
             Append sParamText '\n/sws "C:\Projects\DF20\My_Folder\MySWSFile.sws"'
-            Append sParamText "\nMandatory, if not the /c flag is used."
+            Append sParamText "\nMandatory, unless /bm supplies an ini-file that names the workspace."
             
             Append sParamText "\n\nSingle Source File:"
             Append sParamText "\n/f or /file - A single file name with full path."
@@ -316,18 +321,21 @@ Object oApplication is a cRefactorApplication
             Append sParamText "\nThe semi-comma separated list with folders will be added to those previously saved for the workspace."
             Append sParamText "\n/d AppSrc;DDSrc;AppHtml;Libraries (only together with the /sws param)"
 
-            Append sParamText "\n\nBatch mode - Automatically start and run a refactoring silently:"
-            Append sParamText "\nThe running program's UI will be shown on screen, but there will be no user interaction."
-            Append sParamText "\n/batch"
-            Append sParamText "\nIf omitted, program will start, display the passed parameters, but *will not* start automatically."
+            Append sParamText "\n\nBATCH MODE - start and run a refactoring with no user interaction."
+            Append sParamText "\nThe program's UI is shown while it runs, but nothing is asked of the user."
 
-            Append sParamText '\n\n/c or /config - Use an ini-file:'
-            Append sParamText "\n/c " CS_CmdIniFileName 
-            Append sParamText "\nThat is the default ini-file name."
-            Append sParamText "\nThe default location is the Home folder. Else the full path and name must be specified."
-            Append sParamText "\nNote: If the /c or /config flag is used, it overrules the /batch flag, to always be true."
-            Append sParamText "\nTop Tip: On the 'Program Settings' dialog, there is an 'Export to ini-file' button, that exports current"
-            Append sParamText "\nworkpace settings to an ini-file of choice, so there is no need to create one from scratch."
+            Append sParamText "\n\n/bm <ini file> - run the settings held in an ini-file. This is the usual way."
+            Append sParamText "\n/bm " CS_CmdIniFileName
+            Append sParamText "\nA bare file name is looked for in the program's Programs folder; otherwise pass a full path."
+            Append sParamText "\nAn ini-file already names the workspace, folders, filters and functions, so /sws is not needed with it."
+            Append sParamText "\nThe run writes STATUS=SUCCESS or STATUS=FAILED to the result file the ini-file names,"
+            Append sParamText "\nand exits with code 0 on success, 1 on failure - so a build can check either."
+
+            Append sParamText "\n\n/b or /batch - run the settings already stored for the workspace, with no ini-file."
+            Append sParamText "\nIf neither flag is given, the program starts, shows the parameters it was passed, and waits."
+
+            Append sParamText "\n\nTop Tip: the main toolbar's Export dialog writes an ini-file for the current workspace,"
+            Append sParamText "\ntogether with a ready-to-run <ini name>_RUN.ps1 beside it - no need to write one from scratch."
 
             Send Info_Box sParamText
             Abort 
@@ -386,8 +394,17 @@ Object oApplication is a cRefactorApplication
                 Send UpdateWorkspaceSelectorDisplay sSWSFile
             End
             Else Begin
-                Send Stop_Box "You need to specify an .sws file on the command line! Program will now stop."
-                Abort    
+                /* /sws TOGETHER WITH /bm IS LEGAL - it names the workspace the INI does not.
+                   This used to Abort with "You need to specify an .sws file on the command line!",
+                   which is the opposite of what had just happened: we are inside If (sSWSFile <> "")
+                   and the user HAD passed one. The feature was built and then walled off - the INI
+                   read below takes (psSWSFile(Self)) as its DEFAULT, which is only meaningful if the
+                   command line could have supplied it, and the abort made that unreachable.
+
+                   Recorded, not displayed: ReadCmdLineIniFile does the workspace switch once, with
+                   the INI's own [SWS File Section] winning when it has one and this as the fallback.
+                   Doing the switch here as well would load a workspace twice per run. */
+                Set psSWSFile to sSWSFile
             End
         End
         Else If (sSourceFile <> "") Begin
@@ -396,8 +413,9 @@ Object oApplication is a cRefactorApplication
         End
         If (sFolders <> "") Begin
             Move (StrSplitToArray(sFolders, ";")) to asFolders
-            Set pasCmdLineSetSelectedFolders to asFolders
-        End 
+            Set pasSelectedFolders to asFolders
+            Set pasCmdLineFolders  to asFolders
+        End
         If (bBatch = True) Begin
             Set pbBatchMode to True
         End
@@ -410,7 +428,7 @@ Object oApplication is a cRefactorApplication
     // Helper message for: Command Line Interface:
     Procedure ReadCmdLineIniFile String sCmdLineIniFile
         Handle hoIni hoDD
-        String sSWSFile sUserName sFolder sFilters sFunction sFileName sText
+        String sSWSFile sUserName sFolder sFilters sFunction sFileName sText sResultFile sSingleFile
         String[] asFolders asFunctions
         Boolean bFolders bExists
         Integer iCount iSize
@@ -433,16 +451,21 @@ Object oApplication is a cRefactorApplication
         Else Begin           
             Get psSWSFile to sFileName
             If (sFileName = "") Begin 
-                If (sCmdLineIniFile <> "")
-                Send Stop_Box ("The .sws file is missing from the ini-file and has not been specified on the command line. Cannot continue. Program will now close.")
-                Abort
+                // Begin/End on purpose: this used to be a bare "If (sCmdLineIniFile <> "")" with no
+                // block, so it guarded only the message and the Abort ran unconditionally. Harmless
+                // while sCmdLineIniFile is always set here, but it reads as - and would behave as -
+                // a silent exit the moment that stops being true.
+                If (sCmdLineIniFile <> "") Begin
+                    Send Stop_Box ("The .sws file is missing from the ini-file and has not been specified on the command line. Cannot continue. Program will now close.")
+                    Abort
+                End
             End
         End
 
         // User Name:
         Get ReadString of hoIni CS_CmdIniUserSection CS_CmdIniUserName "" to sUserName
         If (sUserName <> "") Begin
-            Set psUsername to sUserName
+            Set psUserName to sUserName
         End
                 
         // Folders:
@@ -457,15 +480,14 @@ Object oApplication is a cRefactorApplication
             End
         Loop
         // Update Folders table selections
-        Set pasCmdLineSetSelectedFolders to asFolders
+        Set pasSelectedFolders to asFolders
+        Set pasCmdLineFolders  to asFolders
             
         // Filters:
         Get ReadString of hoIni CS_CmdIniFileFilterSection CS_CmdIniFileFilters "" to sFilters
-        If (sFilters <> "") Begin
-            Open SysFile
-            Move sFilters to SysFile.FileExtensionFilter
-            SaveRecord SysFile
-        End
+        // Kept, not written: ApplyCmdLineSelections puts it into SysFile from the batch block, just before the run,
+        // and RestoreCmdLineSelections puts the user's own back after it (2026-11-20).
+        Set psCmdLineFilter to (Trim(sFilters))
         
         // Functions:
         For iCount from 1 to iSize
@@ -477,17 +499,53 @@ Object oApplication is a cRefactorApplication
                 Move sFunction to asFunctions[-1]
             End
         Loop
-        // Update Functions table selections
+        // The specs, kept whole: ApplyCmdLineSelections ticks the names, and the parameter half has to reach the
+        // table before the run too (ApplyCmdLineFunctionParameters) - both driven from the batch block.
+        Set pasCmdLineFunctionSpecs to asFunctions
         Get Create (RefClass(cFunctionsDataDictionary)) to hoDD
-        Send UnSelectAllRecords of hoDD
-        Send SelectRecordsFromStringArray of hoDD asFunctions    
-        
-        Send Destroy of hoDD        
+        /* The ticks are NOT changed here (2026-11-20): ApplyCmdLineSelections ticks the INI's functions from the
+           batch block, just before the run, and RestoreCmdLineSelections puts the user's own back after it. This
+           ran while the command line was parsed, and a run that stopped before the batch block left the user's
+           ticks replaced for good. */
+        // Say what the INI asked for that is not there - a moved folder and a name this build no
+        // longer has both make an unattended run quietly do LESS than asked, and every readout
+        // afterwards reads as an honest success. Surfaced in the run summary by CollectSummary.
+        Send ValidateCmdLineIniSelections asFolders asFunctions hoDD
+
+        Send Destroy of hoDD
+        // Result file: optional path where this run records its outcome (STATUS=SUCCESS/FAILED) so a
+        // build / toolchain can check it alongside the process exit code. "" = don't write one.
+        Get ReadString of hoIni CS_CmdIniResultSection CS_CmdIniResultFile "" to sResultFile
+        Set psBatchResultFile to sResultFile
+
+        /* [Single File Section] - OPTIONAL, and it takes precedence over the .sws, exactly as the
+           constant's own comment has always claimed. It was never written by an exporter nor read
+           by either reader, so the header promised a feature that did not exist (Nils 2026-08-03).
+
+           Read LAST, because it OVERRIDES: the .sws block above has already set pbWorkspaceMode
+           True and the folders are already loaded, and naming one file narrows the run to it. The
+           workspace still matters - it supplies the backup folder and the paths - so this replaces
+           the SCOPE of the run, not its context. That is also how the program behaves interactively.
+
+           A named file that is not there FAILS the run rather than quietly falling back to scanning
+           the whole workspace: doing a different job from the one the INI asked for, and reporting
+           SUCCESS, is the worst of the options. ExitBatchWithCode (not a Stop_Box) because a
+           headless run must never wait for a click - it writes STATUS=FAILED and exits non-zero. */
+        Get ReadString of hoIni CS_CmdIniSingleFileSection CS_CmdIniSingleFileName "" to sSingleFile
+        Move (Trim(sSingleFile)) to sSingleFile
         Send Destroy of hoIni
+        If (sSingleFile <> "") Begin
+            Get vFilePathExists sSingleFile to bExists
+            If (bExists = False) ;
+                Send ExitBatchWithCode eEngineError ("INI [Single File Section]: the file named there does not exist, so there was nothing to refactor -" * sSingleFile)
+            Set pbWorkspaceMode to False
+            Send OnFileNameUpdate sSingleFile
+        End
     End_Procedure
     
 End_Object
 
+// Includes automatic database update logic:
 Use DoDatabaseUpdateStuff.pkg
                                 
 Use SelectWorkspace.dg
@@ -503,8 +561,9 @@ Declare_Datafile SysFile
 Declare_Datafile StatLog
 Register_Object oSysfile_DD
 
-Use cSciLexer.h
-Use oEditorProperties.pkg
+Use ScintillaLexerApi.h.pkg
+Use cRefactorEditorSettings.pkg
+Use cRefactorEditorSettings.pkg   // JSON-backed settings: repoints ghoEditorProperties (must follow oEditorProperties.pkg)
 Use oEditContextMenu.pkg
 Use oDEOEditContextMenu.pkg
 
@@ -799,7 +858,7 @@ Object oMain is a Panel
 
             Object oRedo_MenuItem is a cCJMenuItem
                 Set psToolTip to "Redo"
-                Set psDescription to "Redo last editor action (Ctrl+Z)"
+                Set psDescription to "Redo last editor action (Ctrl+Y)"
                 Set psImage to "ActionRedo.ico"
                 Set pbActiveUpdate to True
 
@@ -1143,6 +1202,30 @@ Object oMain is a Panel
 
             End_Object
 
+            /* Compiler Settings, reachable from THIS program at last. The dialog is SysFile-backed,
+               so the choice was always shared - what this program lacked was any way to CHANGE it,
+               and a wrong or missing compiler meant starting TestBench or the FlexTron board to
+               repair something both of them then read back.
+
+               CompilerSetup.dg, not its FT twin: this menu belongs to the public program, and that
+               file split is what keeps FlexTron out of the published repo.
+
+               The same block as TestBench.src's, which got it first (Nils 2026-08-28) - and where
+               the comment describing TestBench belongs. */
+            Object oCompilerSetup_Menuitem is a cCJMenuItem
+                Set psCaption to "&Compiler Settings"
+                Set psToolTip to "Compiler settings"
+                Set psDescription to "Select the compiler and its options for Test Compile"
+                Set psImage to "CompileProjectSetup.ico"
+                Set peControlStyle to xtpButtonIcon
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Forward Send OnExecute vCommandBarControl
+                    Send Popup of (oCompilerSetup_dg(Client_Id(ghoCommandBars)))
+                End_Procedure
+
+            End_Object
+
             Object oScintillaEditorSettings_Mentuitem is a cCJMenuItem
                 Set psToolTip to "Editor Settings" 
                 Set psCaption to "E&ditor Settings"
@@ -1199,13 +1282,13 @@ Object oMain is a Panel
             End_Object
 
             Object oSuggestion_MenuItem is a cCJMenuItem
-                Set psTooltip to "Suggest"
+                Set psToolTip to "Suggest"
                 Set psDescription to "Suggest a feature, or report a bug..."
                 Set psImage to "Suggestion.ico"
                 Set pbControlBeginGroup to True
 
                 Procedure OnExecute Variant vCommandBarControl
-                    Runprogram Shell Background "https://github.com/NilsSve/DfRefactor/issues"
+                    Runprogram Shell Background "https://github.com/NilsSve/DfRefactor/issues/new/choose"
                 End_Procedure
 
             End_Object
@@ -1219,7 +1302,7 @@ Object oMain is a Panel
                 Set pbActiveUpdate to True
 
                 Procedure OnExecute Variant vCommandBarControl
-                    Runprogram Shell Background "https://www.rdctools.com/DFRefactor/index.html"
+                    Runprogram Shell Background "https://www.rdctools.com/HTMLHELPDFRefactor/index.html"
                 End_Procedure
 
                 Function IsEnabled Returns Boolean
@@ -1236,7 +1319,7 @@ Object oMain is a Panel
                     Set psCaption to "Online HTML Help"
                     Set psImage to "ActionHelpInternet.ico"
                     Procedure OnExecute Variant vCommandBarControl
-                        Runprogram Shell Background "https://www.rdctools.com/DFRefactor/index.html"
+                        Runprogram Shell Background "https://www.rdctools.com/HTMLHELPDFRefactor/index.html"
                     End_Procedure
 
                 End_Object
@@ -1265,8 +1348,12 @@ Object oMain is a Panel
         End_Object
 
         Object oStatusBar is a cCJStatusBar
-            Set StatusBar_Id to Self
+            Set Statusbar_Id to Self
 
+            // NOTE (2026-07-26): unlike DFRefactorFT.src, StatusText here writes to pane 1, so the
+            // view name on pane 2 (phoViewPane) is ALREADY separated from it - the collision Nils
+            // hit in FT (a view activation wiping the analyze's "Total XXs") cannot happen in this
+            // layout. Left as it is on purpose; do not "align" the two without checking StatusText.
             Object oStatusPane1 is a cCJStatusBarPane
                 Set piID to sbpIDIdlePane
                 Set pbStyleStretch to True
@@ -1335,11 +1422,11 @@ Object oMain is a Panel
         // *** Other program files: ***
 //        Use Dd_debug.dg
         Use ProgramSetup.dg
-//        Use CompilerSetup.dg
         Use ScintillaParameters.dg
         Use EngineErrorLog.dg
         Use BackupFiles.dg
         Use EngineLogFile.dg
+        Use CompilerSetup.dg
         Use ShowOtherLogFiles.dg
         Use CmdLineIniFileExporter.dg
         
@@ -1349,7 +1436,6 @@ Object oMain is a Panel
         Use SelectFoldersView.vw
         Use SelectFunctions.vw
 
-        Use oEditorProperties.pkg
         Use StdAbout.pkg
 
         Procedure Activate_About  
@@ -1417,7 +1503,7 @@ Object oMain is a Panel
         Move False to Err
         // (Removed a blunt recursive Request_Save_No_Clear broadcast that scooped unsaved grid
         // selections before the run; the selection grids now auto-save on checkbox/Parameter change -
-        // see cRefactorDbCJGrid / cRDCDbCJGridFT OnComItemCheck / OnComValueChanged - so it is gone.)
+        // see cRefactorDbCJGrid / cFTDbCJGrid OnComItemCheck / OnComValueChanged - so it is gone.)
         Get CollectFileData of ghoApplication (oFolderSelDtl_DD(Self)) to RefactorFiles
         Get phoEditor of ghoApplication to hoEditor
         If (Err = True) Begin
@@ -1497,10 +1583,7 @@ Object oMain is a Panel
     On_Key Key_F2          Send ActivateSave
     On_Key Key_Ctrl+Key_F4 Send ActivateBrowseDialog
 
-    // On_Key constant for Ctrl+Shift+Tab
-    #IFNDEF C_CtrlShiftTab
-        Define C_CtrlShiftTab for 7170
-    #ENDIF
+    // On_Key constant for Ctrl+Shift+Tab: C_CtrlShiftTab, RefactorConstants.h.pkg
 
     Procedure End_Construct_Object
         Forward Send End_Construct_Object
@@ -1513,6 +1596,7 @@ End_Object
 
 Procedure OnStartup
     String sSWSFile
+    Handle hoBatchDD
     
     Get psSWSFile of ghoApplication to sSWSFile
     If (sSWSFile <> "") Begin
@@ -1524,7 +1608,21 @@ Procedure OnStartup
     Set Icon of (phoMainPanel(ghoApplication)) to "DFRefactor.ico"
     
     If (pbBatchMode(ghoEngine) = True) Begin
+        // The INI's per-function parameters go into the table before the run (the engine
+        // reads them from FunctionsA.Parameter) and the user's own values go back after -
+        // a batch run must leave the standing configuration as it found it.
+        Get Create (RefClass(cFunctionsDataDictionary)) to hoBatchDD
+        Send ApplyCmdLineFunctionParameters of ghoApplication hoBatchDD
+        // ...and the INI's function ticks and file filter, the user's own saved first (2026-11-20).
+        Send ApplyCmdLineSelections of ghoApplication hoBatchDD
         Send StartRefactoreCode
+        Send RestoreCmdLineFunctionParameters of ghoApplication
+        Send RestoreCmdLineSelections of ghoApplication
+        Send Destroy of hoBatchDD
+        // A batch run that gets back here never reached ExitBatchWithCode: it stopped before the engine ran
+        // (a blank file filter, for one). Exit with STATUS=FAILED rather than go on to Start_UI and wait with
+        // the window open (live run, 2026-10-24).
+        Send ExitBatchWithCode of ghoApplication eEngineError "The run stopped before any file was refactored: check the CmdLine INI's folders, file filter and functions."
     End
     Else Begin
         Send Activate_oEditorView_vw of (Client_Id(ghoCommandBars))

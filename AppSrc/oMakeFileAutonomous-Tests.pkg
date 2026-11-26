@@ -1,0 +1,320 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oMakeFileAutonomous-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-31
+//
+// Description : Unit tests for cClassPackageIndex - the class -> defining-package map and the file-autonomy
+//               transform behind MakeFileAutonomous.
+//
+//               The index is seeded from LINES rather than from disk, so the tests never depend on a DataFlex
+//               install being present. The one fact that made this function necessary is baked into the
+//               fixture: a class does NOT generally live in a file named after it. Of the 1,208 class
+//               definitions in DataFlex 25's Pkg folder only 24% do, so "Use cFoo.pkg" for class cFoo is
+//               wrong three times in four - which is why every case here resolves through the index.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+    Object oMakeFileAutonomous_Tests is a cTestFixture
+        Set psFunctionName to "MakeFileAutonomous"
+
+        // Seeds an index directly: sDefs is "CLASS=file.pkg" entries separated by ';'.
+        Function _Index String sDefs Returns Handle
+            Handle ho
+            String[] asPairs asKeys
+            String sPair
+            Integer i iMax iPos
+
+            Get Create (RefClass(cClassPackageIndex)) to ho
+            Move (StrSplitToArray(sDefs, ";")) to asPairs
+            Move (SizeOfArray(asPairs) - 1) to iMax
+            For i from 0 to iMax
+                Move asPairs[i] to sPair
+                Move (Pos("=", sPair)) to iPos
+                // Class UPPERCASED (the index's key form); the package keeps its own case, which is
+                // what gets emitted - a Use line should name the file as it is spelled on disk.
+                If (iPos > 0) ;
+                    Move (Uppercase(Trim(Left(sPair, (iPos - 1)))) + "|" + Trim(Mid(sPair, (Length(sPair) - iPos), (iPos + 1)))) to asKeys[SizeOfArray(asKeys)]
+            Loop
+            Move (SortArray(asKeys)) to asKeys
+            Set pasClassKeys of ho to asKeys
+            Function_Return ho
+        End_Function
+
+        /* The whole contract: a class whose package is NOT named after it resolves through the
+           index; one already Used is not added twice; the new lines land after the LAST existing
+           Use, at column zero, with no #IFDEF anywhere near them. */
+        {Published = True}
+        Procedure MakeFileAutonomous_AddsUseForInstantiatedClasses
+            Handle ho
+            String[] asCode asAmb asUnk
+            Integer iCount
+
+            Get _Index "cWebForm=AllWebControlClasses.pkg;cTextEdit=cTextEdit.pkg;cCJGrid=cCJGridClasses.pkg" to ho
+            Move "// A view header comment"              to asCode[0]
+            Move "Use cTextEdit.pkg"                     to asCode[1]
+            Move ""                                      to asCode[2]
+            Move "Object oView is a dbView"              to asCode[3]
+            Move "    Object oGrid is a cCJGrid"         to asCode[4]
+            Move "    End_Object"                        to asCode[5]
+            Move "    Object oEd is a cTextEdit"         to asCode[6]
+            Move "    End_Object"                        to asCode[7]
+            Move "End_Object"                            to asCode[8]
+            Get AddMissingUses of ho (&asCode) (&asAmb) (&asUnk) to iCount
+
+            // cCJGrid lives in a package NOT named after it - only the index could know that.
+            Send AssertIAreEqual 1 iCount
+            Send AssertSAreEqual "Use cCJGridClasses.pkg" asCode[2]
+            // Straight after the last existing Use, so the file's include order barely moves.
+            Send AssertSAreEqual "Use cTextEdit.pkg" asCode[1]
+            // Already Used -> never repeated. dbView is unknown to the index -> left alone.
+            Send Assert (SearchArray("DBVIEW", asUnk) <> -1)
+            Send Destroy of ho
+        End_Procedure
+
+        /* DECLINES. Each of these is a case where guessing would produce a file that compiles into
+           something other than what the author meant, so the function leaves it alone and says so.
+           The ambiguous case is not hypothetical: a workspace using both VDFQuery and vwin32fh has
+           vWin32fh's classes defined twice over. */
+        {Published = True}
+        Procedure MakeFileAutonomous_DeclinesRatherThanGuesses
+            Handle ho
+            String[] asCode asAmb asUnk
+            Integer iCount
+
+            Get _Index "cvFileDialogs=vWin32fh.pkg;cvFileDialogs=VDFQueryFileDlg.pkg;cKnown=cKnown.pkg" to ho
+            Move "Use cKnown.pkg"                          to asCode[0]
+            Move "Object oA is a cvFileDialogs"            to asCode[1]   // two packages -> declined
+            Move "End_Object"                              to asCode[2]
+            Move "Object oB is a cNeverHeardOf"            to asCode[3]   // no package -> declined
+            Move "End_Object"                              to asCode[4]
+            Move "Object oC is a cKnown"                   to asCode[5]   // already Used -> nothing
+            Move "End_Object"                              to asCode[6]
+            Get AddMissingUses of ho (&asCode) (&asAmb) (&asUnk) to iCount
+            Send AssertIAreEqual 0 iCount
+            Send Assert (SearchArray("CVFILEDIALOGS", asAmb) <> -1) "ambiguous class was not reported"
+            Send Assert (SearchArray("CNEVERHEARDOF", asUnk) <> -1) "unknown class was not reported"
+            Send AssertIAreEqual 7 (SizeOfArray(asCode))   // untouched
+            Send Destroy of ho
+        End_Procedure
+
+        // A class DEFINED in this very file needs no Use - and its own base class still does.
+        {Published = True}
+        Procedure MakeFileAutonomous_LocalClassNeedsNoUse
+            Handle ho
+            String[] asCode asAmb asUnk
+            Integer iCount
+
+            Get _Index "cMyGrid=SomewhereElse.pkg;cCJGrid=cCJGridClasses.pkg" to ho
+            Move "Use cCJGridClasses.pkg"           to asCode[0]
+            Move "Class cMyGrid is a cCJGrid"       to asCode[1]
+            Move "End_Class"                        to asCode[2]
+            Move "Object oG is a cMyGrid"           to asCode[3]
+            Move "End_Object"                       to asCode[4]
+            Get AddMissingUses of ho (&asCode) (&asAmb) (&asUnk) to iCount
+            // cMyGrid is defined right here; SomewhereElse.pkg must NOT be pulled in.
+            Send AssertIAreEqual 0 iCount
+            Send AssertIAreEqual 5 (SizeOfArray(asCode))
+            Send Destroy of ho
+        End_Procedure
+
+        /* A BASE CLASS, AND A CLASS A METHOD IS ADDED TO, NEED THEIR PACKAGE TOO (2026-11-01): 'Class cMyList is a dbList'
+           and 'Procedure Clear_All for dbGrid' compile only once dbList and dbGrid are defined, but only objects and
+           RefClass were counted - one workspace's lookup class had no Use for the package dbList lives in, and every
+           program failed on it. A base class the file defines itself needs nothing. */
+        {Published = True}
+        Procedure MakeFileAutonomous_BaseAndForClassesNeedTheirPackage
+            Handle ho
+            String[] asCode asAmb asUnk
+            Integer iCount
+
+            Get _Index "dbList=Dfsellst.pkg;dbGrid=Dftable.pkg;CheckBox=Windows.pkg" to ho
+            Move "// A class package"                   to asCode[0]
+            Move "Class cMyList is a dbList"            to asCode[1]
+            Move "End_Class"                            to asCode[2]
+            Move "Class cMyList2 is a cMyList"          to asCode[3]
+            Move "End_Class"                            to asCode[4]
+            Move "Class cMyBox is an CheckBox"          to asCode[5]
+            Move "End_Class"                            to asCode[6]
+            Move "Procedure Clear_All for dbGrid"       to asCode[7]
+            Move "    Forward Send Clear_All"           to asCode[8]
+            Move "End_Procedure"                        to asCode[9]
+            Get AddMissingUses of ho (&asCode) (&asAmb) (&asUnk) to iCount
+            Send AssertIAreEqual 3 iCount
+            Send AssertSAreEqual "// A class package"          asCode[0]
+            Send AssertSAreEqual "Use Dfsellst.pkg"            asCode[1]
+            Send AssertSAreEqual "Use Dftable.pkg"             asCode[2]
+            Send AssertSAreEqual "Use Windows.pkg"             asCode[3]
+            Send AssertSAreEqual "Class cMyList is a dbList"   asCode[4]
+            Send AssertIAreEqual 0 (SizeOfArray(asUnk))
+            Send Destroy of ho
+        End_Procedure
+
+        /* A NEW USE GOES BEFORE THE FIRST LINE THAT NEEDS IT (2026-11-01): a shared package added methods to dbGrid at
+           line 349 and had Uses down to line 626; 'Use Dftable.pkg' after the last of them came too late. The Use for a
+           class used above the last Use goes after the last Use above that line; one used below every Use still goes
+           after the last one. */
+        {Published = True}
+        Procedure MakeFileAutonomous_UseGoesBeforeTheFirstLineThatNeedsIt
+            Handle ho
+            String[] asCode asAmb asUnk
+            Integer iCount
+
+            Get _Index "dbGrid=Dftable.pkg;cThing=Thing.pkg" to ho
+            Move "Use DfAllEnt.pkg"                 to asCode[0]
+            Move ""                                 to asCode[1]
+            Move "Procedure Clear_All for dbGrid"   to asCode[2]
+            Move "    Forward Send Clear_All"       to asCode[3]
+            Move "End_Procedure"                    to asCode[4]
+            Move "Use Custom.inc"                   to asCode[5]
+            Move "Object oX is a cThing"            to asCode[6]
+            Move "End_Object"                       to asCode[7]
+            Get AddMissingUses of ho (&asCode) (&asAmb) (&asUnk) to iCount
+            Send AssertIAreEqual 2 iCount
+            Send AssertSAreEqual "Use DfAllEnt.pkg"                 asCode[0]
+            Send AssertSAreEqual "Use Dftable.pkg"                  asCode[1]
+            Send AssertSAreEqual "Procedure Clear_All for dbGrid"   asCode[3]
+            Send AssertSAreEqual "Use Custom.inc"                   asCode[6]
+            Send AssertSAreEqual "Use Thing.pkg"                    asCode[7]
+            Send AssertSAreEqual "Object oX is a cThing"            asCode[8]
+            Send Destroy of ho
+        End_Procedure
+
+        /* A NEW USE COMPILES IN EVERY CASE (2026-11-02). After a Use inside an #IF it landed in that arm: 18 of them in one
+           package, which then still failed on the classes they were for. It goes after the #ENDIF; and with no Use above
+           that compiles in every case - a whole-file guard - above the guard. */
+        {Published = True}
+        Procedure MakeFileAutonomous_NewUseStaysOutOfAConditional
+            Handle ho
+            String[] asCode asEmpty asAmb asUnk
+            String sCondOpen sCondClose
+            Integer iCount
+
+            Move (Character(35) + "IFDEF SOME_FLAG") to sCondOpen
+            Move (Character(35) + "ENDIF") to sCondClose
+            Get _Index "cThing=Thing.pkg" to ho
+            Move "Use DfAllEnt.pkg"        to asCode[0]
+            Move sCondOpen                       to asCode[1]
+            Move "  Use Extra.pkg"         to asCode[2]
+            Move sCondClose                      to asCode[3]
+            Move "Object oX is a cThing"   to asCode[4]
+            Move "End_Object"              to asCode[5]
+            Get AddMissingUses of ho (&asCode) (&asAmb) (&asUnk) to iCount
+            Send AssertIAreEqual 1 iCount
+            Send AssertSAreEqual sCondClose             asCode[3]
+            Send AssertSAreEqual "Use Thing.pkg"  asCode[4]
+
+            Move asEmpty to asCode
+            Move sCondOpen                       to asCode[0]
+            Move "  Use Extra.pkg"         to asCode[1]
+            Move "Object oX is a cThing"   to asCode[2]
+            Move "End_Object"              to asCode[3]
+            Move sCondClose                      to asCode[4]
+            Get AddMissingUses of ho (&asCode) (&asAmb) (&asUnk) to iCount
+            Send AssertIAreEqual 1 iCount
+            Send AssertSAreEqual "Use Thing.pkg"  asCode[0]
+            Send AssertSAreEqual sCondOpen              asCode[1]
+            Send Destroy of ho
+        End_Procedure
+
+        // RefClass(cFoo) instantiates just as an Object block does.
+        {Published = True}
+        Procedure MakeFileAutonomous_RefClassCountsAsInstantiation
+            Handle ho
+            String[] asCode asAmb asUnk
+            Integer iCount
+            Get _Index "cTimer=cTimerClasses.pkg" to ho
+            Move "Use Windows.pkg"                                  to asCode[0]
+            Move "Procedure Foo"                                    to asCode[1]
+            Move "    Get Create (RefClass(cTimer)) to hoTimer"     to asCode[2]
+            Move "End_Procedure"                                    to asCode[3]
+            Get AddMissingUses of ho (&asCode) (&asAmb) (&asUnk) to iCount
+            Send AssertIAreEqual 1 iCount
+            Send AssertSAreEqual "Use cTimerClasses.pkg" asCode[1]
+            Send Destroy of ho
+        End_Procedure
+
+        // A file with no Use at all gets the block UNDER its header comment, not above it.
+        {Published = True}
+        Procedure MakeFileAutonomous_NoExistingUseGoesUnderTheHeader
+            Handle ho
+            String[] asCode asAmb asUnk
+            Integer iCount
+            Get _Index "cThing=cThingClasses.pkg" to ho
+            Move "// Copyright header"          to asCode[0]
+            Move "// second header line"        to asCode[1]
+            Move "Object oT is a cThing"        to asCode[2]
+            Move "End_Object"                   to asCode[3]
+            Get AddMissingUses of ho (&asCode) (&asAmb) (&asUnk) to iCount
+            Send AssertIAreEqual 1 iCount
+            Send AssertSAreEqual "// second header line" asCode[1]
+            Send AssertSAreEqual "Use cThingClasses.pkg" asCode[2]
+            Send Destroy of ho
+        End_Procedure
+
+        // The index reports EVERY definition of a class, which is what makes ambiguity detectable.
+        {Published = True}
+        Procedure MakeFileAutonomous_IndexFindsAllDefiningPackages
+            Handle ho
+            String[] asPkgs
+            Get _Index "cA=one.pkg;cB=two.pkg;cA=three.pkg" to ho
+            Get PackagesForClass of ho "cA" to asPkgs
+            Send AssertIAreEqual 2 (SizeOfArray(asPkgs))
+            Get PackagesForClass of ho "CB" to asPkgs        // case-insensitive
+            Send AssertIAreEqual 1 (SizeOfArray(asPkgs))
+            Send AssertSAreEqual "two.pkg" asPkgs[0]
+            Get PackagesForClass of ho "cNope" to asPkgs
+            Send AssertIAreEqual 0 (SizeOfArray(asPkgs))
+            Send Destroy of ho
+        End_Procedure
+
+        // "Class X is a Y" is a definition; a mention of the word elsewhere is not.
+        {Published = True}
+        Procedure MakeFileAutonomous_ClassDefinitionDetection
+            Handle ho
+            String[] asLines asNames
+            Get Create (RefClass(cClassPackageIndex)) to ho
+            Move "Class cReal is a cBase"                    to asLines[0]
+            Move "// Class cCommented is a cBase"            to asLines[1]
+            Move "    Move (Class_Name) to sText"            to asLines[2]
+            Move "Class cAlso is an cBase"                   to asLines[3]
+            Get ClassNamesFromLines of ho (&asLines) to asNames
+            Send AssertIAreEqual 2 (SizeOfArray(asNames))
+            Send AssertSAreEqual "cReal" asNames[0]
+            Send AssertSAreEqual "cAlso" asNames[1]
+            Send Destroy of ho
+        End_Procedure
+
+        /* THE EXTENSION SCOPE (2026-08-28): the default widened to vw;dg;rv;sl;pkg;src - Nils's
+           call, retiring the 2026-07-31 ".src is never touched" block (its include-order lesson
+           lives on as the after-the-last-Use placement, pinned above). A blank parameter means
+           the default; an explicit narrow list still excludes; dots, commas and case are
+           tolerated; a file with no extension is out of scope. */
+        {Published = True}
+        Procedure MakeFileAutonomous_DefaultScopeIncludesSrcAndPkg
+            Boolean bIn
+            Get _MfaExtensionInScope of ghoFuncLib "C:\WS\AppSrc\WinServ.src" "" to bIn
+            Send Assert bIn "a .src must be in the DEFAULT scope"
+            Get _MfaExtensionInScope of ghoFuncLib "C:\WS\AppSrc\cHelper.pkg" "" to bIn
+            Send Assert bIn "a .pkg must be in the DEFAULT scope"
+            Get _MfaExtensionInScope of ghoFuncLib "C:\WS\AppSrc\Order.vw" "" to bIn
+            Send Assert bIn
+        End_Procedure
+
+        {Published = True}
+        Procedure MakeFileAutonomous_ExplicitListStillNarrows
+            Boolean bIn
+            Get _MfaExtensionInScope of ghoFuncLib "C:\WS\AppSrc\WinServ.src" "vw;dg" to bIn
+            Send Assert (bIn = False) "an explicit vw;dg list must exclude .src"
+            Get _MfaExtensionInScope of ghoFuncLib "C:\WS\AppSrc\Order.vw" ".VW, dg" to bIn
+            Send Assert bIn "dots, commas and case must be tolerated"
+            Get _MfaExtensionInScope of ghoFuncLib "C:\WS\AppSrc\NoExtension" "" to bIn
+            Send Assert (bIn = False) "a file with no extension is out of scope"
+        End_Procedure
+
+        Procedure TearDown
+            Send _InitializeFuncLib of ghoFuncLib
+        End_Procedure
+    End_Object

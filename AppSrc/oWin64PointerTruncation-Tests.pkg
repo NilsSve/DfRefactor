@@ -1,10 +1,21 @@
-﻿    // Unit tests for Win64PointerTruncation (the cWin64PointerTruncation worker's
-    // AuditFile). It is REPORT-ONLY - asCode is never modified - and flags a
-    // pointer-sized value moved into a 32-bit Integer/DWord:
-    //   Move <Pointer/Address var or param> to <Integer/DWord var>
-    //   Move (AddressOf(...))               to <Integer/DWord var>
-    // Each test resets the lexer first (ClearFuncLibProperties, as the wrapper does
-    // per file), creates the worker, runs the audit, and asserts the finding count.
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oWin64PointerTruncation-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-06-02
+//
+// Description : Unit tests for Win64PointerTruncation (the cWin64PointerTruncation worker's
+//               AuditFile). It is REPORT-ONLY - asCode is never modified - and flags a
+//               pointer-sized value moved into a 32-bit Integer/DWord:
+//                 Move <Pointer/Address var or param> to <Integer/DWord var>
+//                 Move (AddressOf(...))               to <Integer/DWord var>
+//               Each test resets the lexer first (ClearFuncLibProperties, as the wrapper does
+//               per file), creates the worker, runs the audit, and asserts the finding count.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
     Object oWin64PointerTruncation is a cTestFixture
         Set psFunctionName to "Win64PointerTruncation"
 
@@ -19,6 +30,127 @@
             Send Destroy of ho
             Function_Return iCount
         End_Function
+
+        // Helper for the fix (2026-11-12): reset the lexer, retype, return the count; asCode comes back changed.
+        Function RunRetype String[] ByRef asCode Returns Integer
+            Handle  ho
+            Integer iCount
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get Create (RefClass(cWin64PointerTruncation)) to ho
+            Get RetypePointerTargets of ho (&asCode) to iCount
+            Send Destroy of ho
+            Function_Return iCount
+        End_Function
+
+        /* Win64IntegerToLongPtr (2026-11-12): compile error 4539 on a 64-bit build, "use Longptr instead
+           of Integer". An AddressOf() result into a local Integer: the type word changes, nothing else. */
+        {Published = True}
+        Procedure Win64IntegerToLongPtr_AddressOfIntoInteger
+            String[] asCode
+            Integer iCount
+            Move "Procedure Foo"                         to asCode[0]
+            Move "    String sBuf"                       to asCode[1]
+            Move "    Integer  iAddr   // the buffer"    to asCode[2]
+            Move "    Move (AddressOf(sBuf)) to iAddr"   to asCode[3]
+            Move "End_Procedure"                         to asCode[4]
+            Get RunRetype (&asCode) to iCount
+            Send AssertIAreEqual 1 iCount
+            Send AssertIAreEqual 5 (SizeOfArray(asCode))
+            Send AssertSAreEqual "    LongPtr  iAddr   // the buffer" asCode[2]
+            Send AssertSAreEqual "    Move (AddressOf(sBuf)) to iAddr" asCode[3]
+        End_Procedure
+
+        // The shape that was found: a line naming two Integers. The other keeps its type, and a LongPtr line follows.
+        {Published = True}
+        Procedure Win64IntegerToLongPtr_SharedDeclarationSplits
+            String[] asCode
+            Integer iCount
+            Move "Function APS_OemToChar Global String OemStr Returns String" to asCode[0]
+            Move "  Integer OemAdress CharAdress // addresses"               to asCode[1]
+            Move "  Move (AddressOf(OemStr)) to OemAdress"                    to asCode[2]
+            Move "  Function_Return OemStr"                                   to asCode[3]
+            Move "End_Function"                                               to asCode[4]
+            Get RunRetype (&asCode) to iCount
+            Send AssertIAreEqual 1 iCount
+            Send AssertIAreEqual 6 (SizeOfArray(asCode))
+            Send AssertSAreEqual "  Integer CharAdress // addresses" asCode[1]
+            Send AssertSAreEqual "  LongPtr OemAdress" asCode[2]
+            Send AssertSAreEqual "  Move (AddressOf(OemStr)) to OemAdress" asCode[3]
+        End_Procedure
+
+        // A declared Pointer into a DWord: the same error, the same fix.
+        {Published = True}
+        Procedure Win64IntegerToLongPtr_PointerIntoDWord
+            String[] asCode
+            Integer iCount
+            Move "Procedure Foo"           to asCode[0]
+            Move "    Pointer pBuf"        to asCode[1]
+            Move "    DWord dwVal"         to asCode[2]
+            Move "    Move pBuf to dwVal"  to asCode[3]
+            Move "End_Procedure"           to asCode[4]
+            Get RunRetype (&asCode) to iCount
+            Send AssertIAreEqual 1 iCount
+            Send AssertSAreEqual "    LongPtr dwVal" asCode[2]
+        End_Procedure
+
+        /* LEFT FOR A HAND FIX: a parameter (its callers would change), a variable passed ByRef, and an
+           Integer that only ever receives Integers. Nothing changes. */
+        {Published = True}
+        Procedure Win64IntegerToLongPtr_LeavesWhatItCannotProve
+            String[] asCode asBefore
+            Integer iCount
+            Move "Procedure Foo Integer iParam"            to asCode[0]
+            Move "    String sBuf"                         to asCode[1]
+            Move "    Integer iRef iPlain"                 to asCode[2]
+            Move "    Move (AddressOf(sBuf)) to iParam"    to asCode[3]
+            Move "    Move (AddressOf(sBuf)) to iRef"      to asCode[4]
+            Move "    Send Bar (&iRef)"                    to asCode[5]
+            Move "    Move 3 to iPlain"                    to asCode[6]
+            Move "End_Procedure"                           to asCode[7]
+            Move asCode to asBefore
+            Get RunRetype (&asCode) to iCount
+            Send AssertIAreEqual 0 iCount
+            Send AssertArrayAreEqual asBefore asCode
+        End_Procedure
+
+        /* PER METHOD: the same name in two methods is two variables. Only the method that moves a pointer
+           into it has its declaration retyped; the second, declared lower in the file, is untouched. */
+        {Published = True}
+        Procedure Win64IntegerToLongPtr_OnlyTheMethodThatNeedsIt
+            String[] asCode
+            Integer iCount
+            Move "Procedure First"                       to asCode[0]
+            Move "    String sBuf"                       to asCode[1]
+            Move "    Integer iAddr"                     to asCode[2]
+            Move "    Move (AddressOf(sBuf)) to iAddr"   to asCode[3]
+            Move "End_Procedure"                         to asCode[4]
+            Move "Procedure Second"                      to asCode[5]
+            Move "    Integer iAddr"                     to asCode[6]
+            Move "    Move 1 to iAddr"                   to asCode[7]
+            Move "End_Procedure"                         to asCode[8]
+            Get RunRetype (&asCode) to iCount
+            Send AssertIAreEqual 1 iCount
+            Send AssertSAreEqual "    LongPtr iAddr" asCode[2]
+            Send AssertSAreEqual "    Integer iAddr" asCode[6]
+        End_Procedure
+
+        // THROUGH THE ENGINE'S OWN CALL (RunWholeFileFunction masks macro code first): the same result.
+        {Published = True}
+        Procedure Win64IntegerToLongPtr_ThroughTheEngine
+            String[] asCode
+            Integer iCount iFn iMacro iLost
+            Move "Procedure Foo"                         to asCode[0]
+            Move "    String sBuf"                       to asCode[1]
+            Move "    Integer iAddr"                     to asCode[2]
+            Move "    Move (AddressOf(sBuf)) to iAddr"   to asCode[3]
+            Move "End_Procedure"                         to asCode[4]
+            Send ClearFuncLibProperties of ghoFuncLib
+            Move (RefFunc(Win64IntegerToLongPtr)) to iFn
+            Get RunWholeFileFunction of ghoFuncLib iFn (&asCode) "" (&iMacro) (&iLost) to iCount
+            Send AssertIAreEqual 1 iCount
+            Send AssertIAreEqual 0 iLost
+            Send AssertSAreEqual "    LongPtr iAddr" asCode[2]
+        End_Procedure
 
         // Pointer local -> Integer local: flagged.
         {Published = True}

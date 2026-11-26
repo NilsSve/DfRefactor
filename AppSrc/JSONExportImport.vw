@@ -85,9 +85,9 @@ Object oJSONExportImport is a cRDCDbView
             Set Size to 12 34
             Set Location to 33 59
             Set Label to "ID"
-            Set Label_Justification_mode to jMode_right
+            Set Label_Justification_Mode to jMode_right
             Set Label_Col_Offset to 2
-            Set Label_row_Offset to 0
+            Set Label_Row_Offset to 0
             Set Prompt_Button_Mode to PB_PromptOn
         End_Object 
       
@@ -96,9 +96,9 @@ Object oJSONExportImport is a cRDCDbView
             Set Size to 12 250
             Set Location to 46 59
             Set Label to "Name"
-            Set Label_Justification_mode to jMode_right
+            Set Label_Justification_Mode to jMode_right
             Set Label_Col_Offset to 2
-            Set Label_row_Offset to 0  
+            Set Label_Row_Offset to 0  
         End_Object 
      
         Object oFunctionsFunction_SummaryText is a dbForm
@@ -106,9 +106,9 @@ Object oJSONExportImport is a cRDCDbView
             Set Size to 12 250
             Set Location to 61 59
             Set Label to "Summary Text"
-            Set Label_Justification_mode to jMode_right
+            Set Label_Justification_Mode to jMode_right
             Set Label_Col_Offset to 2
-            Set Label_row_Offset to 0
+            Set Label_Row_Offset to 0
             Set Enabled_State to False
         End_Object 
         
@@ -634,7 +634,7 @@ Object oJSONExportImport is a cRDCDbView
                 Integer iSize iErrors iRetval 
                 Boolean bExists
                 
-                Get YesNo_Box ("The Json import will make changes to your" * CS_FunctionLibraryFile * "and" * CS_UnitTestsFile * "files, but a backup copy will first be created in the" * CS_ImportBackupFolder * "folder.\n\nBe sure to Save any changes in the Studio before you commence!\nContinue?") to iRetval
+                Get YesNo_Box ("The Json import will make changes to the" * CS_FunctionLibraryFile * "and" * CS_UnitTestsFile * "files, but a backup copy will first be created in the" * CS_ImportBackupFolder * "folder.\n\nBe sure to Save any changes in the Studio before you commence!\nContinue?") to iRetval
                 If (iRetval <> MBR_Yes) Begin
                     Procedure_Return
                 End

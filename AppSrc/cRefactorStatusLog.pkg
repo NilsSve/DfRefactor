@@ -2,6 +2,7 @@
 Use RefactorConstants.h.pkg   // for ghoFuncLib - the error logger reads psExecutionContext of it
 Declare_Datafile StatLog
 Declare_Datafile Functions
+Declare_Datafile DFLastID     // the last-used-ID pool (DUF 1_8): StatLog.ID is allocated from it here
 
 Global_Variable Handle ghoStatusLog
 Move 0 to ghoStatusLog
@@ -17,8 +18,15 @@ Class cRefactorStatusLog is a StatusDbLog
         Property Boolean pbStatusLogState True
         Move Self to ghoStatusLog
         Open StatLog
-        
+        Open DFLastID
+
         Property Boolean pbInSavingMode False
+        // Recursion guard for the duplicate-record retry in Error_Report: the retry's own
+        // SaveRecord failing must never re-enter the retry (2026-07-11).
+        Property Boolean pbInRetry False
+        // The Time stamp of the last entry this process wrote - the next entry must not repeat it
+        // (Index.1 faults 28 on a same-millisecond, same-FunctionName pair; see Log_Status).
+        Property String psLastStamp ""
     End_Procedure                    
     
     Function IsCritical Integer iError Returns Boolean
@@ -67,7 +75,7 @@ Class cRefactorStatusLog is a StatusDbLog
     
     Procedure Log_Status String sText
         Integer iDateFormat
-        String sFunctionName sErrMsg 
+        String sFunctionName sErrMsg sLastStamp
         DateTime dtCurrentDateTime
         Date dDate
         Integer OldError                    // We must trap errors that occur
@@ -83,10 +91,19 @@ Class cRefactorStatusLog is a StatusDbLog
         Get_Attribute DF_DATE_FORMAT to iDateFormat
         Set_Attribute DF_DATE_FORMAT to DF_DATE_MILITARY
         
-        Get ErrorDescription LastErr "" to sErrMsg
-        If (sErrMsg <> "") ;
-            Append sText sErrMsg
-        Append sText ". Err Line: " ErrLine
+        /* DECORATE WITH THE ERROR STATE ONLY WHEN THERE IS ONE (Nils 2026-08-03).
+           This used to append unconditionally, and `ErrorDescription 0 ""` returns
+           "Error number out of range." - so every entry logged while nothing was wrong
+           ended with that phrase plus ". Err Line: 0". Harmless-looking on a genuine error
+           entry, actively misleading on an informational one: MakeFileAutonomous's
+           "no package found for X - left alone." arrived reading like a crash report.
+           Errors themselves are unaffected - LastErr is non-zero exactly then. */
+        If (LastErr <> 0) Begin
+            Get ErrorDescription LastErr "" to sErrMsg
+            If (sErrMsg <> "") ;
+                Append sText sErrMsg
+            Append sText ". Err Line: " ErrLine
+        End
         
         Clear StatLog
         Get psExecutionContext of ghoFuncLib to sFunctionName
@@ -98,12 +115,41 @@ Class cRefactorStatusLog is a StatusDbLog
         Move (CurrentDateTime()) to dtCurrentDateTime
         Move dDate               to StatLog.Date
         Move dtCurrentDateTime   to StatLog.Time
-        Move sText               to StatLog.Description 
-        CallStackDump               StatLog.Stack 
+        /* THE STAMP MUST DIFFER FROM THE PREVIOUS ENTRY'S (measured 2026-08-16, the logger's own tests).
+           Index.1 is (Time, FunctionName, Recnum) and should be unique by construction - it is not: two
+           entries in the SAME MILLISECOND with the same FunctionName fault err 28 on the second save,
+           Recnum segment notwithstanding (it is a DESCENDING Recnum segment, which is the likeliest
+           reason the DAT driver does not treat it as the tie-breaker). Reproduced ~50% on two
+           back-to-back Log_Status calls; 0/16 with a distinct millisecond or a distinct FunctionName;
+           a full reindex changed nothing. That is the "weird" 28 the retry below has papered over
+           for years - at ONE SECOND per collision (its Sleep 1). So: if this stamp equals the last
+           one written by this process, spin to the next millisecond and re-stamp. Costs at most a
+           millisecond, keeps the retry as the last resort it was meant to be, and the stamp stays
+           truthful (it is the actual save time). */
+        Get psLastStamp to sLastStamp
+        While (Trim(StatLog.Time) = sLastStamp)
+            Move (CurrentDateTime()) to dtCurrentDateTime
+            Move dtCurrentDateTime   to StatLog.Time
+        Loop
+        Set psLastStamp to (Trim(StatLog.Time))
+        Move sText               to StatLog.Description
+        CallStackDump               StatLog.Stack
         // Serialize the insert. Not strictly required for a new record, but it
         // keeps the recnum allocation + index update atomic under the rapid
         // back-to-back logging where the "Duplicate records" failures appear.
-        Lock
+        //
+        // ALLOCATE THE ID HERE. Since DUF 1_8 (2026-08-14) StatLog.ID sits ALONE in Index.2 -
+        // a unique index - and this is a raw SaveRecord, which bypasses the data dictionary's
+        // Field_Auto_Increment: an unassigned ID stores 0, and every entry after the first
+        // faults err 28 (duplicate) against the first one - the same trap cFolderSelDtl's
+        // alias save documents. So the logger draws its ID from DFLastID itself, exactly as
+        // the DD would: reread the pool, take the next number, save both under one lock.
+        // DFLastID is a SYSTEM file - one record, no Find; Reread refreshes it, and the first
+        // save ever creates it.
+        Reread DFLastID                 // Reread IS the lock (the canonical idiom) - never nest it inside a Lock
+            Increment DFLastID.StatLogID
+            Move DFLastID.StatLogID to StatLog.ID
+            SaveRecord DFLastID
             SaveRecord StatLog
         Unlock
 
@@ -129,24 +175,35 @@ Class cRefactorStatusLog is a StatusDbLog
         
         If (pbInSavingMode(Self) = False) Begin
             //Forward send Error_Report iErrorNumber iErrLine ErrMsg
-            Send Error_report of desktop iErrorNumber iErrLine sErrorText
+            Send Error_Report of desktop iErrorNumber iErrLine sErrorText
             Procedure_Return
         End
         
-        // This is weird! Even though Recnum is part of the index, it can happen
-        // that a "Duplicate Record" error is generated by the Log_Status above.
-        // This happens only during heavy load with a big workspace with hundred/thousands
-        // of files.
-        // When an error happens within the Log_Status message above we end up here, 
-        // as otherwise there would be a recursion.
-        // So we wait a second, get a new datetime value and attempt to save again.
-        // The question is why is this happening?
-        
+        // MEASURED 2026-08-16 (until then: "This is weird! Even though Recnum is part of the index, it can
+        // happen that a Duplicate Record error is generated ... only during heavy load"): the 28 comes from
+        // Index.1 (Time, FunctionName, Recnum) when two entries share the same MILLISECOND and the same
+        // FunctionName - the DAT driver does not let the (descending) Recnum segment break the tie. Log_Status
+        // now guarantees a distinct stamp per entry, so this retry is back to being the last resort - for a
+        // TORN save (an aborted run leaves an orphan index key whose data record never landed; a later save
+        // that reuses the freed recnum collides with it; a reindex of StatLog clears the standing orphans).
+        //
+        // The retry below must obey two rules (Nils's LegacyApp3 run 2026-07-11, where the old
+        // version misbehaved on both):
+        //   1. LOSSLESS - the original message is what matters; the internal error is only
+        //      appended. (The old code overwrote FunctionName/Description with "Internal
+        //      Error No: 28", fabricating a phantom row and losing the real error.)
+        //   2. ONE ATTEMPT - if the retry's own SaveRecord fails too, drop the entry.
+        //      The error logger must never cascade.
+        If (pbInRetry(Self) = True) ;
+            Procedure_Return
+        Set pbInRetry to True
         Sleep 1
-        Move (CurrentDateTime()) to StatLog.Time 
-        Move ("Internal Error No:" * String(iErrorNumber)) to StatLog.FunctionName 
-        Move sErrorText to StatLog.Description
+        Move (CurrentDateTime()) to StatLog.Time
+        // The ADDRESS goes in too (map it through the .prn): it names WHICH statement faulted, which is
+        // the one fact a spurious 28 never gave us (2026-08-16, chasing it with the logger's own tests).
+        Move (Trim(StatLog.Description) * "[log retry after internal error" * String(iErrorNumber) * "at" * String(iErrLine) + "]") to StatLog.Description
         SaveRecord StatLog
+        Set pbInRetry to False
     End_Procedure
     
 End_Class

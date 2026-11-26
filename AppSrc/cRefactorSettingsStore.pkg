@@ -1,0 +1,269 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cRefactorSettingsStore
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-27
+//
+// Description : The editor settings' in-memory store, brought home from SciControlLib.
+//
+//               WHAT IT REPLACES. cIniManager.pkg's cIniProperties kept the store as FOUR parallel
+//               Array objects - oTags, oTagTypes, oTagValues, oTagConnectedObjects - indexed in
+//               lockstep, with each tag's rows in a dynamically created child Array object whose
+//               handle was stashed as a value in a third array. Reading a sub-value meant walking
+//               three levels of object handles. Nothing about that shape was wrong in 2001; it is
+//               simply what you did before DataFlex had structs.
+//
+//               It is a struct now, and NOT a new one: tRefEdSetFile already exists in
+//               RefactorConstants.h.pkg, because the JSON conversion needed a serializable model of
+//               exactly this. cRefactorEditorSettings has been converting the Array-of-Arrays INTO
+//               that struct to save (StoreAsStruct) and back OUT of it to load (LoadStoreFromStruct)
+//               - about 120 lines whose entire job was crossing between two representations of the
+//               same thing. Make the struct the store and both conversions stop existing.
+//
+//                   tRefEdSetFile
+//                     └── aTags[]        tRefEdSetTag   { sTag, bMulti, aRows[] }
+//                           └── aRows[]  tRefEdSetRow   { aValues[] }
+//                                 └── aValues[]  tRefEdSetValue { asParts[] }
+//
+//               A single-value tag is simply a tag with one row. A row's own value is sub-value 0;
+//               the sub-properties are 1..n, in the order they were declared - that ordering is what
+//               an existing ScintillaEdit.json is written against and is pinned by tests.
+//
+//               ON THE "\n" SPLIT. asParts holds the value split on the LITERAL two-character
+//               sequence backslash-n, which is the join the language definitions use to pack a
+//               keyword list into one setting (VDF's is 264 entries). DataFlex does not process
+//               backslash escapes in string literals, so "\n" here really is two characters. Splitting
+//               it is what lets the JSON hold a readable array instead of one 3000-character line;
+//               nothing above this class should know or care, so every accessor here takes and
+//               returns the JOINED string.
+//
+//               PERFORMANCE NOTE. DataFlex passes struct arrays BY VALUE, so every Get of pTheStore
+//               deep-copies the whole store. That is deliberate and fine here - settings are read at
+//               startup and while a dialog is open, never in a loop over source lines. Do not reach
+//               for this class as a general-purpose map.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg     // tRefEdSetFile / tRefEdSetTag / tRefEdSetRow / tRefEdSetValue
+
+#IFNDEF CS_SettingsPartJoin
+Define CS_SettingsPartJoin for "\n"      // the LITERAL two characters, not a newline
+#ENDIF
+
+Class cRefactorSettingsStore is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Property tRefEdSetFile pTheStore
+    End_Procedure
+
+    // ==================================================================================
+    // The tag registry
+    // ==================================================================================
+
+    // Tags are matched case-INSENSITIVELY and stored as given. The old store uppercased
+    // on the way in, which is why an ini file's tags are all caps; nothing depends on
+    // the stored casing, only on the lookup being case-blind.
+    Function TagIndex String sTag Returns Integer
+        Integer iC iCount
+        tRefEdSetFile TheStore
+
+        Move (Uppercase(Trim(sTag))) to sTag
+        Get pTheStore to TheStore
+        Move (SizeOfArray(TheStore.aTags)) to iCount
+        For iC from 0 to (iCount - 1)
+            If (Uppercase(TheStore.aTags[iC].sTag) = sTag) ;
+                Function_Return iC
+        Loop
+        Function_Return -1
+    End_Function
+
+    // Register a tag if it is not there yet. Idempotent - the property layer calls this
+    // for every one of its members at construction, and a load calls it again per tag.
+    Procedure AddTag String sTag Boolean bMulti
+        Integer iAt iNew
+        tRefEdSetFile TheStore
+
+        Get TagIndex sTag to iAt
+        If (iAt >= 0) ;
+            Procedure_Return
+        Get pTheStore to TheStore
+        Move (SizeOfArray(TheStore.aTags)) to iNew
+        Move (Uppercase(Trim(sTag))) to TheStore.aTags[iNew].sTag
+        Move bMulti                  to TheStore.aTags[iNew].bMulti
+        Set pTheStore to TheStore
+    End_Procedure
+
+    Function IsMultiTag String sTag Returns Boolean
+        Integer iAt
+        tRefEdSetFile TheStore
+        Get TagIndex sTag to iAt
+        If (iAt < 0) ;
+            Function_Return False
+        Get pTheStore to TheStore
+        Function_Return TheStore.aTags[iAt].bMulti
+    End_Function
+
+    // ==================================================================================
+    // Values
+    // ==================================================================================
+
+    /* How many rows a tag has. A single-value tag answers 1 once it has been written to
+       and 0 before - the old store answered 1 unconditionally for single tags, which
+       nothing relied on and which hid "never set" from callers.
+
+       An UNREGISTERED tag answers 0, not -1 and not 1. The old IniValueCount indexed its
+       parallel arrays with the -1 that Find_Element returns for a miss and let whatever
+       came back decide, which is the kind of thing that only ever surfaces as a strange
+       number much later. */
+    Function IniValueCount String sTag Returns Integer
+        Integer iAt
+        tRefEdSetFile TheStore
+        Get TagIndex sTag to iAt
+        If (iAt < 0) ;
+            Function_Return 0
+        Get pTheStore to TheStore
+        Function_Return (SizeOfArray(TheStore.aTags[iAt].aRows))
+    End_Function
+
+    // One sub-value of one row, joined back into the string callers expect. Anything out
+    // of range reads as "" rather than raising - a setting that was never written is not
+    // an error, it is a default, and the property layer above supplies that default.
+    Function IniValueEx String sTag Integer iRow Integer iSub Returns String
+        Integer iAt iC iCount
+        String  sOut
+        tRefEdSetFile TheStore
+
+        Get TagIndex sTag to iAt
+        If (iAt < 0 or iRow < 0 or iSub < 0) ;
+            Function_Return ""
+        Get pTheStore to TheStore
+        If (iRow >= SizeOfArray(TheStore.aTags[iAt].aRows)) ;
+            Function_Return ""
+        If (iSub >= SizeOfArray(TheStore.aTags[iAt].aRows[iRow].aValues)) ;
+            Function_Return ""
+
+        Move (SizeOfArray(TheStore.aTags[iAt].aRows[iRow].aValues[iSub].asParts)) to iCount
+        Move "" to sOut
+        For iC from 0 to (iCount - 1)
+            If (iC > 0) ;
+                Move (sOut + CS_SettingsPartJoin) to sOut
+            Move (sOut + TheStore.aTags[iAt].aRows[iRow].aValues[iSub].asParts[iC]) to sOut
+        Loop
+        Function_Return sOut
+    End_Function
+
+    // Row 0's sub-value - the single-tag shorthand.
+    Function IniValue String sTag Integer iSub Returns String
+        Function_Return (IniValueEx(Self, sTag, 0, iSub))
+    End_Function
+
+    /* Write one sub-value, growing the tag, its rows and that row's values as needed so
+       a caller can append at index Count without ceremony. Rows in between are created
+       empty rather than skipped: a struct array with a hole in it reads as garbage, and
+       the settings dialog appends at Count often enough that an off-by-one here would be
+       felt immediately. */
+    Procedure SetIniValue String sTag Integer iRow Integer iSub String sValue
+        Integer iAt iC
+        tRefEdSetFile TheStore
+
+        If (iRow < 0 or iSub < 0) ;
+            Procedure_Return
+        Send AddTag sTag (iRow > 0)         // first write at row > 0 implies a multi tag
+        Get TagIndex sTag to iAt
+        Get pTheStore to TheStore
+
+        If (iRow >= SizeOfArray(TheStore.aTags[iAt].aRows)) ;
+            Move (ResizeArray(TheStore.aTags[iAt].aRows, iRow + 1)) to TheStore.aTags[iAt].aRows
+        If (iSub >= SizeOfArray(TheStore.aTags[iAt].aRows[iRow].aValues)) ;
+            Move (ResizeArray(TheStore.aTags[iAt].aRows[iRow].aValues, iSub + 1)) to TheStore.aTags[iAt].aRows[iRow].aValues
+
+        Move (StrSplitToArray(sValue, CS_SettingsPartJoin)) to TheStore.aTags[iAt].aRows[iRow].aValues[iSub].asParts
+        Set pTheStore to TheStore
+    End_Procedure
+
+    // Drop a row and close the gap. Out of range is a no-op.
+    Procedure DeleteItem String sTag Integer iRow
+        Integer iAt iC iCount
+        tRefEdSetFile TheStore
+
+        Get TagIndex sTag to iAt
+        If (iAt < 0 or iRow < 0) ;
+            Procedure_Return
+        Get pTheStore to TheStore
+        Move (SizeOfArray(TheStore.aTags[iAt].aRows)) to iCount
+        If (iRow >= iCount) ;
+            Procedure_Return
+        For iC from iRow to (iCount - 2)
+            Move TheStore.aTags[iAt].aRows[iC + 1] to TheStore.aTags[iAt].aRows[iC]
+        Loop
+        Move (ResizeArray(TheStore.aTags[iAt].aRows, iCount - 1)) to TheStore.aTags[iAt].aRows
+        Set pTheStore to TheStore
+    End_Procedure
+
+    Procedure DeleteAllItems String sTag
+        Integer iAt
+        tRefEdSetFile TheStore
+        tRefEdSetRow[] Empty
+
+        Get TagIndex sTag to iAt
+        If (iAt < 0) ;
+            Procedure_Return
+        Get pTheStore to TheStore
+        Move Empty to TheStore.aTags[iAt].aRows
+        Set pTheStore to TheStore
+    End_Procedure
+
+    // Everything forgotten - used before a load so a re-read does not merge into what is
+    // already there. The registration the property layer did is dropped too and is
+    // re-established by the load, or by the next write.
+    Procedure ClearStore
+        tRefEdSetFile Empty
+        Set pTheStore to Empty
+    End_Procedure
+
+    // ==================================================================================
+    // The unused-lines channel.
+    //
+    // Forward compatibility, and the reason it exists is worth keeping in view: a tag
+    // this build does not register - because a NEWER build wrote it - must survive being
+    // read and written back by this one. Without it, running an older DFRefactor once
+    // would quietly delete the newer one's settings. The old store kept these in an
+    // oUnusedLines Array object; here they are just a string array on the struct, which
+    // is also how they reach the JSON.
+    // ==================================================================================
+
+    Procedure AddUnusedLine String sLine
+        Integer iAt
+        tRefEdSetFile TheStore
+        Get pTheStore to TheStore
+        Move (SizeOfArray(TheStore.asUnusedLines)) to iAt
+        Move sLine to TheStore.asUnusedLines[iAt]
+        Set pTheStore to TheStore
+    End_Procedure
+
+    Function UnusedLineCount Returns Integer
+        tRefEdSetFile TheStore
+        Get pTheStore to TheStore
+        Function_Return (SizeOfArray(TheStore.asUnusedLines))
+    End_Function
+
+    Function UnusedLine Integer iAt Returns String
+        tRefEdSetFile TheStore
+        Get pTheStore to TheStore
+        If (iAt < 0 or iAt >= SizeOfArray(TheStore.asUnusedLines)) ;
+            Function_Return ""
+        Function_Return TheStore.asUnusedLines[iAt]
+    End_Function
+
+    Procedure ClearUnusedLines
+        tRefEdSetFile TheStore
+        String[] Empty
+        Get pTheStore to TheStore
+        Move Empty to TheStore.asUnusedLines
+        Set pTheStore to TheStore
+    End_Procedure
+
+End_Class

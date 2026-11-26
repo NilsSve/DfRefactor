@@ -1,0 +1,197 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cWorkspaceFile
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-05
+//
+// Description : The .sws format boundary: reads INI workspace files into tSwsFile, picks the
+//               own-.sws candidate in a folder (format-preferring), and carries the
+//               "pOwnSws may never be empty" guard rule (OwnSwsGuardText).
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use RefactorFileIO.pkg
+Use cLibraryInventory.pkg
+
+/*  cWorkspaceFile - read a .sws ONCE, whatever shape it is on disk, into one tSwsFile.
+
+    THE BOUNDARY. Format detection belongs here and nowhere else. The alternative - every consumer
+    sniffing the file for itself - is how a codebase ends up with several readers that each get it
+    slightly wrong, and this one already had four (GetWorkspaceProjects for the Programs combo,
+    WorkspaceConfigFile, SwsLibraryEntries, DeclaredCopyItems). Two of them gave an INI-only answer
+    for a file they could not read, in different wrong ways: an empty [Libraries] list became "this
+    workspace declares no libraries", and an empty path list became a copy plan with nothing in it.
+    Read once, at the edge; everything downstream stays format-blind.
+
+    WHY BOTH FORMATS ARE LIVE AT ONCE. The DF26 Studio converts a WORKSPACE .sws to JSON when it
+    migrates one, but leaves LIBRARY .sws files as INI - verified 2026-08-05, 1 JSON against 103 INI
+    under DF26. The format is a fact about the FILE, never about the DataFlex version, and one
+    workspace routinely references files of the other kind.
+
+    A STANDALONE CLASS, like cLibraryInventory and cWorkspaceCopyPlan: UnitTests builds a
+    plain cApplication, so anything on cRefactorApplication is unreachable from the suite. The parser
+    lives here and is tested; the APP holds the resulting struct as a property.
+
+    Extends cLibraryInventory for its .sws section reading - the INI half is that class's existing,
+    proven parsing rather than a second implementation of it.
+*/
+Class cWorkspaceFile is a cLibraryInventory
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+    End_Procedure
+
+    // SwsFormatOf is INHERITED from cLibraryInventory - it belongs with the .sws parsing, so every
+    // reader of a .sws gets the same answer rather than each deciding for itself.
+
+    // The workspace name a .sws carries no field for: its own filename, without the extension.
+    Function _NameFromPath String sSwsFile Returns String
+        String sName
+        Integer iPos
+        Move (RightPos("\", sSwsFile)) to iPos
+        If (iPos > 0) ;
+            Move (Right(sSwsFile, (Length(sSwsFile) - iPos))) to sName
+        Else ;
+            Move sSwsFile to sName
+        Move (RightPos(".", sName)) to iPos
+        If (iPos > 1) ;
+            Move (Left(sName, iPos - 1)) to sName
+        Function_Return sName
+    End_Function
+
+    /* Read sSwsFile into a tSwsFile, filling as much as the format allows.
+
+       bParsed is the contract. True only when the file was actually read, so a consumer can tell
+       "this workspace declares nothing" from "nobody has read it yet" - a distinction already got
+       wrong twice here, each time producing a confident statement that was the opposite of the truth.
+
+       THE INI HALF IS COMPLETE. The JSON half fills format, name and the parse flag only: the real
+       JSON reader (ReadSwsJsonFile) lives on cRefactorApplication, and reaching for it from here
+       would drag ghoApplication into a class that exists to stay out of its way. The app-level owner
+       passes the parsed document in. Until it does, a JSON workspace reports its format honestly and
+       claims nothing about its contents - which is the whole point of bParsed. */
+    Function ReadWorkspaceFile String sSwsFile Returns tSwsFile
+        tSwsFile Sws
+        String sValue
+
+        Move eSwsIni to Sws.eSwsFormat
+        Move False to Sws.bParsed
+        If (sSwsFile = "" or vFilePathExists(sSwsFile) = 0) ;
+            Function_Return Sws
+
+        Get SwsFormatOf sSwsFile to Sws.eSwsFormat
+        Get _NameFromPath sSwsFile to Sws.sWorkspaceName
+
+        If (Sws.eSwsFormat = eSwsJson) ;
+            Function_Return Sws
+
+        Get SwsSectionValue sSwsFile "Properties" "Version" to sValue
+        Move (Trim(sValue)) to Sws.sDfVersion
+        Get _ReadIniPaths sSwsFile to Sws.Paths
+        Move True to Sws.bParsed
+        Function_Return Sws
+    End_Function
+
+    /* Split one .ws path value into its parts.
+
+       A path key may name SEVERAL folders separated by ";" - and that is the whole reason this
+       class exists in the shape it does. tWorkspacePaths kept one String per key and was filled
+       with the first entry only, so every caller that scanned "the" AppSrc folder scanned one of
+       however many were declared. */
+    Function _SplitPathList String sValue String sHome Returns String[]
+        String[] asOut asParts
+        String sPart
+        Integer i iMax
+
+        Move (StrSplitToArray(Trim(sValue), ";")) to asParts
+        Move (SizeOfArray(asParts) - 1) to iMax
+        For i from 0 to iMax
+            Move (Trim(asParts[i])) to sPart
+            If (sPart <> "") Begin
+                Get _ResolvePath sHome sPart to sPart
+                Move sPart to asOut[SizeOfArray(asOut)]
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* The INI half of tSwsPaths: the [Workspace] section of the .ws the .sws points at, read into
+       the same ARRAYS the JSON reader fills.
+
+       Paths come back RESOLVED to absolute, because every consumer wants them that way and doing it
+       once here is what stops each of them re-deriving the home. Anchoring is the subtle part and
+       WorkspaceHomeFromConfig owns it: Home= is relative to the .ws FILE, every other key to HOME.
+
+       A JSON workspace never reaches here - ReadWorkspaceFile returns before this - so this is
+       purely the legacy shape. */
+    Function _ReadIniPaths String sSwsFile Returns tSwsPaths
+        tSwsPaths Paths
+        String[] asEntries
+        String sWsFile sHome sEntry sKey sValue sLow
+        Integer i iMax iPos
+
+        Get WorkspaceConfigFile sSwsFile to sWsFile
+        If (sWsFile = "") ;
+            Function_Return Paths
+        Move sWsFile to Paths.sConfigFile
+        Get WorkspaceHomeFromConfig sWsFile to sHome
+
+        Get SwsSectionEntries sWsFile "Workspace" to asEntries
+        Move (SizeOfArray(asEntries) - 1) to iMax
+        For i from 0 to iMax
+            Move asEntries[i] to sEntry
+            Move (Pos("=", sEntry)) to iPos
+            If (iPos > 1) Begin
+                Move (Trim(Left(sEntry, iPos - 1))) to sKey
+                Move (Trim(Mid(sEntry, (Length(sEntry) - iPos), (iPos + 1)))) to sValue
+                Move (Lowercase(sKey)) to sLow
+                If (sValue <> "") Begin
+                    If (sLow = "appsrcpath")  Get _SplitPathList sValue sHome to Paths.asAppSrc
+                    If (sLow = "ddsrcpath")   Get _SplitPathList sValue sHome to Paths.asDdSrc
+                    If (sLow = "datapath")    Get _SplitPathList sValue sHome to Paths.asData
+                    If (sLow = "apphtmlpath") Get _SplitPathList sValue sHome to Paths.asAppHtml
+                    If (sLow = "bitmappath")  Get _SplitPathList sValue sHome to Paths.asBitmap
+                    If (sLow = "programpath") Get _SplitPathList sValue sHome to Paths.asPrograms
+                    If (sLow = "helppath")    Get _SplitPathList sValue sHome to Paths.asHelp
+                    If (sLow = "idesrcpath") ;
+                        Get _ResolvePath sHome sValue to Paths.sIdeSrc
+                    If (sLow = "filelist") ;
+                        Get _ResolvePath sHome sValue to Paths.sFileList
+                End
+            End
+        Loop
+        Function_Return Paths
+    End_Function
+
+    /* pOwnSws MAY NEVER BE EMPTY (Nils 2026-08-29). DFRefactor's own workspace is the
+       ground its file paths, its Test Compile dialect pick and its package plumbing all
+       stand on; a pOwnSws that is unparsed, pathless or project-less is ALWAYS a program
+       defect (a regression), never a user-setup situation. The 2026-08-28 BOM incident
+       sailed through precisely because nothing said so: ParseUtf8 refused the BOM-damaged
+       .sws, pOwnSws came back empty, and the compile dialect gate guessed "assume listed"
+       three layers downstream. Returns "" for a healthy struct, else the message the
+       caller must raise. Pure, and on the format-boundary class, so the rule is testable
+       from the DFUnit runner. */
+    Function OwnSwsGuardText tSwsFile Sws Returns String
+        String sWhat sPath
+
+        Move (Trim(Sws.RuntimePaths.sSwsPath)) to sPath
+        Move "" to sWhat
+        If (Sws.bParsed = False) ;
+            Move "was never read, or did not parse (an unreadable or BOM-damaged file comes back exactly like this)" to sWhat
+        If (sWhat = "" and sPath = "") ;
+            Move "parsed, but carries no path to itself" to sWhat
+        If (sWhat = "" and SizeOfArray(Sws.aProjects) = 0) ;
+            Move "parsed, but lists no projects - the parse lost data" to sWhat
+        If (sWhat = "") ;
+            Function_Return ""
+        If (sPath = "") ;
+            Move "(no .sws file was located)" to sPath
+        Function_Return ("REGRESSION: DFRefactor's own workspace (pOwnSws)" * sWhat * "-" * sPath * ;
+            "- this is a program defect, never a setup issue. Please report it.")
+    End_Function
+
+End_Class

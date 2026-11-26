@@ -1,0 +1,420 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cListToCJGrid
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-06-27
+//
+// Description : Copyright (c) 2026 Nils Svedmyr, RDC Tools International
+//               cListToCJGrid.pkg
+//
+//               Non-data-aware subclass of cGridToCJGrid.
+//               Converts legacy List objects (List, cList, or any subclass) to cCJGrid.
+//
+//               A legacy List is a SINGLE-COLUMN item list. Its items are populated EITHER:
+//               (a) programmatically, in a method that calls Send Add_Item (often with
+//               Send Delete_Data / Set Dynamic_Update_State / Set Current_Item), like a
+//               legacy Grid -- so this class inherits the Grid conversion engine from
+//               cGridToCJGrid to convert the BODY: each Send Add_Item becomes a TheData
+//               row, Current_Item / Value / mouse handlers convert. UNLIKE the Grid
+//               converter, the fill method KEEPS its original name + parameters (a List's
+//               fill is called from OTHER objects, Send <name> of oList <data>, so renaming
+//               it to LoadData / dropping the param would break those callers), and NO
+//               Activating stub is generated (the external caller still drives the fill); OR
+//               (b) statically, in an
+//               Item_List
+//               On_Item "text" send <message>
+//               ...
+//               End_Item_List
+//               block. cCJGrid is data-driven (no Item_List), so this class collects the
+//               On_Item prompts and generates a LoadData that loads each as a row.
+//
+//               On top of the inherited Grid engine, this class adds ONLY the List-specific bits:
+//
+//               1. Default classes List -> cCJGrid / cCJGridColumn, and detection of any class
+//               ending in "list" (but NOT "dblist" -- those belong to
+//               cDbListTocDbCJGridPromptList).
+//               2. A List has no Form_Width columns, so it would yield ZERO cCJGridColumn
+//               objects. OnGridStarted injects ONE synthetic column (paiNdColFormWidths =
+//               {100}) so the engine emits a single oCol1 and treats every Add_Item as a
+//               new single-column row.
+//               3. A single-column list has no column header -> Set pbShowHeader to False.
+//               4. The static Item_List / On_Item / End_Item_List block (the one construct the
+//               Grid engine does not know) is collected and turned into a LoadData in
+//               OnBeforeGridEndObject (only when no Add_Item data-load proc was found).
+//               5. Bare Send statements inside a CUSTOM event procedure (OnChange, Mouse_Up,
+//               Mouse_Down, ...) are PRESERVED. The Grid engine comments out grid-body
+//               Send statements as fill artifacts; inside a real event handler that would
+//               silently drop behaviour, so this class shields them.
+//
+//               sParameter: comma-separated "OldListClass,NewGridClass[,NewColumnClass]".
+//               Empty -> detect any "*list" (not "*dblist") and target cCJGrid / cCJGridColumn.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use cGridToCJGrid.pkg
+
+Class cListToCJGrid is a cGridToCJGrid
+
+    // The Grid engine declines an UN-renameable data loader (setter/parameterized) because its
+    // rename mangles the signature. THIS converter forwards into the rename and then RESTORES
+    // the original declaration (RestoreFillProcSignature) - only the body is modernized - so
+    // the rename is safe here even for a parameterized fill method (the programmatic-fill flow).
+    Function AllowUnrenameableDataLoad Returns Boolean
+        Function_Return True
+    End_Function
+
+    // A List's one column is implicit (it has no Form_Width / Header_Label), so the Grid engine's
+    // "no column definitions" decline never applies here - OnGridStarted injects that column itself.
+    Function GridDeclineReason String sGridIndent Integer iGridStartLine Returns String
+        Function_Return ""
+    End_Function
+
+    Procedure Construct_Object
+        Forward Send Construct_Object       // inherits the Grid engine's Nd* state properties
+        Set psLegacyRootToken   to "list"   // the Deep Scan's root token - an EMPTY parameter takes its learned subclasses
+        Set psLegacyGridClass   to "List"
+        Set psTargetGridClass   to "cCJGrid"
+        Set psTargetColumnClass to "cCJGridColumn"
+        // Per-list state (reset by OnGridStarted).
+        Property String[] pasLtItemTexts            // collected static On_Item prompts
+        Property Boolean  pbLtInItemList     False  // inside an Item_List ... End_Item_List block
+        Property Boolean  pbLtHadStaticItems False  // an Item_List block was seen (use the static LoadData path)
+        Property Boolean  pbLtHadComplex     False  // an On_Item with a non-literal prompt or a non-None message
+        Property Boolean  pbLtHeaderPending  False  // one-shot: still need to emit Set pbShowHeader to False
+        Property Boolean  pbLtInPreservedProc False // inside a custom (non-data-load, non-mouse) procedure body
+        Property Integer  piLtDataLoadIfDepth 0     // nesting depth inside a dropped If(Item_count) cursor guard
+    End_Procedure
+
+    // *** Parameter parsing (override) ***
+
+    // Empty sParameter restores ALL three List defaults; a 2-part param resets the column class first.
+    Function ParseAndSetParameter String sParameter Returns Boolean
+        Boolean bOK
+        If (sParameter = "") Begin
+            Set psLegacyGridClass   to "List"
+            Set psTargetGridClass   to "cCJGrid"
+            Set psTargetColumnClass to "cCJGridColumn"
+            Send _LoadLegacySubclasses ""      // the learned List subclasses ride the empty parameter (2026-09-05)
+            Function_Return True
+        End
+        Set psTargetColumnClass to "cCJGridColumn"
+        Forward Get ParseAndSetParameter sParameter to bOK
+        Function_Return bOK
+    End_Function
+
+    // *** IsGridDeclaration override ***
+
+    // True for "object X is a <OldListClass>". Default: exact (case-insensitive) match on "List" - plus,
+    // after an EMPTY parameter, the List subclasses the Deep Scan learned (IsLearnedLegacySubclass).
+    // When psLegacyGridClass is empty, pattern-match any class ending in "list" but NOT "dblist".
+    Function IsGridDeclaration String sTrimLower Returns Boolean
+        String sClassName sLegacy
+
+        Get DeclaredClassName sTrimLower to sClassName
+        If (sClassName = "") ;
+            Function_Return False
+
+        Get psLegacyGridClass to sLegacy
+        // Pattern branch is UNREACHABLE - ParseAndSetParameter (override above) maps an empty sParameter to the
+        // exact default "List", never "", so exact-match (below) always runs and "list" never equals the modern
+        // "cCJGrid"/"cDbCJGridPromptList" output (that is what keeps it idempotent). If ever made live, ALSO
+        // exclude the modern CodeJock classes (they contain "cjgrid"), or it re-detects converted lists. Nils 2026-07-07.
+        If (sLegacy = "") ;
+            Function_Return (Right(sClassName, 4) = "list" and Right(sClassName, 6) <> "dblist")
+        Function_Return (sClassName = Lowercase(sLegacy) or IsLearnedLegacySubclass(Self, sClassName))
+    End_Function
+
+    // *** Subclass hook overrides ***
+
+    // Run the Grid engine's prescan + reset, then inject the single synthetic column
+    // and arm the List-specific state.
+    Procedure OnGridStarted String sGridIndent Integer iGridStartLine
+        Integer[] aiOneCol
+        String[]  asOneLabel asEmpty
+
+        Forward Send OnGridStarted sGridIndent iGridStartLine
+        // A List is single-column with no Form_Width: inject one column so the engine
+        // emits exactly one oCol1 and treats each Add_Item as a new single-column row.
+        Move 100 to aiOneCol[0]
+        Set paiNdColFormWidths   to aiOneCol
+        Move "" to asOneLabel[0]
+        Set pasNdColHeaderLabels to asOneLabel
+        Set pbNdPendingColumns   to True
+        // List state.
+        Set pasLtItemTexts     to asEmpty
+        Set pbLtInItemList     to False
+        Set pbLtHadStaticItems to False
+        Set pbLtHadComplex     to False
+        Set pbLtHeaderPending  to True
+        Set pbLtInPreservedProc to False
+        Set piLtDataLoadIfDepth to 0
+    End_Procedure
+
+    // Returns the text between the first pair of double-quotes in sLine, or "".
+    Function FirstQuotedString String sLine Returns String
+        Integer iQ1 iQ2
+        String  sRest
+        Move (Pos('"', sLine)) to iQ1
+        If (iQ1 = 0) ;
+            Function_Return ""
+        Move (Mid(sLine, CI_EOL, (iQ1 + 1))) to sRest
+        Move (Pos('"', sRest)) to iQ2
+        If (iQ2 = 0) ;
+            Function_Return ""
+        Function_Return (Left(sRest, iQ2 - 1))
+    End_Function
+
+    // Adds the List-specific handling in front of the inherited Grid engine:
+    //   - one-shot Set pbShowHeader to False
+    //   - Item_List / On_Item / End_Item_List collection (consumed here)
+    //   - shield bare Send statements inside a custom event procedure
+    // Everything else is delegated to cGridToCJGrid (Add_Item -> LoadData, Current_Item,
+    // mouse handlers, property/column collection, ...).
+    Procedure OnHandleGridLine String sLine String sTrimLine String sLower String[] ByRef asOutput String sGridIndent Boolean ByRef bSkip
+        String   sProcName sDataLoadName sText sSingle
+        String[] asItems
+        Boolean  bInList
+        Integer  iDepth
+
+        // One-shot: hide the single-column List's header on the first body line.
+        If (pbLtHeaderPending(Self) = True) Begin
+            Get MakeSingleIndent to sSingle
+            Move (sGridIndent + sSingle + "Set pbShowHeader to False   // single-column list (no column header)") to asOutput[SizeOfArray(asOutput)]
+            Set pbLtHeaderPending to False
+        End
+
+        // Comment lines: let the Grid engine pass them through.
+        If (Left(sLower, 2) <> "//") Begin
+            Get pbLtInItemList to bInList
+            If (bInList = True) Begin
+                // Inside Item_List ... End_Item_List: collect On_Item prompts, consume every line.
+                If (sLower = "end_item_list") Begin
+                    Set pbLtInItemList to False
+                    Move True to bSkip
+                    Procedure_Return
+                End
+                If (Left(sLower, 8) = "on_item ") Begin
+                    Get FirstQuotedString sLine to sText
+                    If (sText <> "") Begin
+                        Get pasLtItemTexts to asItems
+                        Move sText to asItems[SizeOfArray(asItems)]
+                        Set pasLtItemTexts to asItems
+                    End
+                    Else ;
+                        Set pbLtHadComplex to True
+                    If ((sLower contains "send ") and not(sLower contains "send none")) ;
+                        Set pbLtHadComplex to True
+                End
+                Move True to bSkip
+                Procedure_Return
+            End
+            If (sLower = "item_list") Begin
+                Set pbLtInItemList     to True
+                Set pbLtHadStaticItems to True
+                Move True to bSkip
+                Procedure_Return
+            End
+
+            // Inside the data-load proc body, AFTER its var-decl section: drop the redundant
+            // 'If (Item_count(Self)) Set Current_item to N' cursor idiom - the generated
+            // 'Send MoveToFirstRow' (in the If iRow<>0 block) already selects the first row.
+            If (pbNdInDataLoadProc(Self) = True and pbNdInProcVarDecl(Self) = False) Begin
+                Get piLtDataLoadIfDepth to iDepth
+                If (iDepth > 0) Begin
+                    If (Left(sLower, 13) = "end_procedure") Begin
+                        // Safety: a malformed guard left the depth open at proc end - reset and let
+                        // End_Procedure through to the engine (never consume it).
+                        Set piLtDataLoadIfDepth to 0
+                    End
+                    Else Begin
+                        // Consume everything inside the dropped guard, tracking Begin/End nesting.
+                        If (Right(sLower, 5) = "begin") ;
+                            Set piLtDataLoadIfDepth to (iDepth + 1)
+                        Else If (sLower = "end" or Left(sLower, 4) = "end ") ;
+                            Set piLtDataLoadIfDepth to (iDepth - 1)
+                        Move True to bSkip
+                        Procedure_Return
+                    End
+                End
+                // Single-line 'If (Item_count(Self)) Set Current_item to N' -> drop the line.
+                If (Left(sLower, 3) = "if " and (sLower contains "item_count") and (sLower contains "current_item")) Begin
+                    Move True to bSkip
+                    Procedure_Return
+                End
+                // Begin/End-block 'If (Item_count(Self)) Begin ... End' guard -> drop the whole block.
+                If (Left(sLower, 3) = "if " and (sLower contains "item_count") and Right(sLower, 5) = "begin") Begin
+                    Get MakeSingleIndent to sSingle
+                    Move (sGridIndent + sSingle + sSingle + "// Dropped redundant Item_count cursor guard - Send MoveToFirstRow already selects the first row.") to asOutput[SizeOfArray(asOutput)]
+                    Set piLtDataLoadIfDepth to 1
+                    Move True to bSkip
+                    Procedure_Return
+                End
+                // Standalone 'Set Current_item to N' -> drop (redundant cursor positioning).
+                If (Left(sLower, 4) = "set " and sLower contains "current_item") Begin
+                    Move True to bSkip
+                    Procedure_Return
+                End
+            End
+
+            // Track custom-procedure scope so the engine's "comment out bare Send" rule
+            // does not silently drop behaviour inside a real event handler.
+            If (Left(sLower, 10) = "procedure ") Begin
+                Get ParseProcFuncName sLower to sProcName
+                Get psNdDataLoadProcName to sDataLoadName
+                If (sProcName = sDataLoadName and sDataLoadName <> "") Begin
+                    // The fill method (it calls Send Add_Item). The Grid engine would rename it to
+                    // LoadData and strip its parameter - but for a List that BREAKS the callers: the
+                    // method is invoked from OTHER objects (Send <name> of oList <data>). So forward
+                    // (to convert the BODY: Add_Item -> TheData rows + set the data-load state), then
+                    // restore the ORIGINAL signature (name + parameters). No Activating stub is
+                    // generated for it (see OnBeforeGridEndObject) - the external caller drives the fill.
+                    Set pbLtInPreservedProc to False
+                    Forward Send OnHandleGridLine sLine sTrimLine sLower (&asOutput) sGridIndent (&bSkip)
+                    Send RestoreFillProcSignature (&asOutput) sLine
+                    Procedure_Return
+                End
+                If (sProcName = "mouse_click" or sProcName = "mouse_down2") ;
+                    Set pbLtInPreservedProc to False
+                Else ;
+                    Set pbLtInPreservedProc to True
+            End
+            Else If (Left(sLower, 13) = "end_procedure") Begin
+                Set pbLtInPreservedProc  to False
+                Set piLtDataLoadIfDepth  to 0
+            End
+            Else If (pbLtInPreservedProc(Self) = True and Left(sLower, 5) = "send ") Begin
+                // Preserve a bare Send inside a custom event procedure (OnChange, Mouse_Up, ...).
+                Move sLine to asOutput[SizeOfArray(asOutput)]
+                Move True to bSkip
+                Procedure_Return
+            End
+        End
+
+        // Delegate to the full Grid conversion engine.
+        Forward Send OnHandleGridLine sLine sTrimLine sLower (&asOutput) sGridIndent (&bSkip)
+    End_Procedure
+
+    // The Grid engine renamed the fill method's declaration to 'Procedure LoadData <params>' (now the
+    // last line in asOutput) when it activated the body conversion. Restore the ORIGINAL declaration
+    // (sOrigLine) - same name + parameters - so the external callers (Send <name> of oList <data>)
+    // still resolve. Only the BODY is modernized (the engine already turned its Add_Item statements
+    // into TheData rows). Defensive: act only when a LoadData declaration is actually the last line.
+    Procedure RestoreFillProcSignature String[] ByRef asOutput String sOrigLine
+        String[] asNames
+        Integer iLast
+
+        Move (SizeOfArray(asOutput) - 1) to iLast
+        If (iLast < 0) ;
+            Procedure_Return
+        If (Lowercase(Trim(asOutput[iLast])) contains "procedure loaddata") Begin
+            Move sOrigLine to asOutput[iLast]
+            // The restore also undoes the rename BOOKKEEPING: the Grid engine recorded the
+            // old name for the external-caller sweep (OnAfterTransformSource), but the name
+            // still exists here - sweeping would re-rename the restored declaration AND its
+            // callers (the ProgrammaticFill suite caught exactly that).
+            Get pasNdRenamedLoaders to asNames
+            If (SizeOfArray(asNames) > 0) Begin
+                Move (ResizeArray(asNames, (SizeOfArray(asNames) - 1))) to asNames
+                Set pasNdRenamedLoaders to asNames
+            End
+        End
+    End_Procedure
+
+    // Just before the List's End_Object. For a programmatic (Add_Item) fill, let the Grid
+    // engine emit its column + LoadData/Activating. For a static Item_List, the engine found
+    // no data-load proc, so emit the column + a LoadData built from the collected prompts.
+    Procedure OnBeforeGridEndObject String[] ByRef asOutput String sGridIndent
+        Boolean  bStatic bConverted
+        String   sSingle s2 s3
+        String[] asItems
+        Integer  i iCount iProcDepth
+
+        Get MakeSingleIndent to sSingle
+        Move (sGridIndent + sSingle)           to s2     // grid + 1 (procedure level)
+        Move (sGridIndent + sSingle + sSingle) to s3     // grid + 2 (procedure-body level)
+
+        // If the List had no body lines at all, the one-shot header never fired - emit it now.
+        If (pbLtHeaderPending(Self) = True) Begin
+            Move (s2 + "Set pbShowHeader to False   // single-column list (no column header)") to asOutput[SizeOfArray(asOutput)]
+            Set pbLtHeaderPending to False
+        End
+
+        Get pbLtHadStaticItems to bStatic
+        If (bStatic = False) Begin
+            // Programmatic fill: the fill method kept its name + parameters and was converted in place
+            // (it is called externally with the data), so emit just the single column - NO LoadData /
+            // Activating stub (there is no parameterless LoadData to call on activation). When NO fill
+            // method was found at all, let the Grid engine emit its rich LoadData / Activating template.
+            Get pbNdDataLoadConverted to bConverted
+            If (bConverted = True) Begin
+                If (pbNdPendingColumns(Self) = True) Begin
+                    Send AppendColumnObjects (&asOutput) sGridIndent
+                    Set pbNdPendingColumns to False
+                End
+                Procedure_Return
+            End
+            Forward Send OnBeforeGridEndObject (&asOutput) sGridIndent
+            Procedure_Return
+        End
+
+        // Static Item_List: emit the single column first.
+        If (pbNdPendingColumns(Self) = True) Begin
+            Send AppendColumnObjects (&asOutput) sGridIndent
+            Set pbNdPendingColumns to False
+        End
+
+        Get pasLtItemTexts    to asItems
+        Move (SizeOfArray(asItems)) to iCount
+        Get piProcDepthAtGrid to iProcDepth
+
+        If (iProcDepth > 0) Begin
+            // Grid nested in a procedure body: a generated Procedure LoadData would nest a
+            // procedure inside a procedure (illegal). Leave the items as a TODO instead.
+            Move ""                                                                                       to asOutput[SizeOfArray(asOutput)]
+            Move (s2 + "// TODO: this List's Item_List items could not become a LoadData here (the grid")  to asOutput[SizeOfArray(asOutput)]
+            Move (s2 + "//   sits inside a procedure body). Add 'Procedure LoadData' at CLASS scope and")   to asOutput[SizeOfArray(asOutput)]
+            Move (s2 + "//   call it from an 'Activating' procedure. Items were:")                          to asOutput[SizeOfArray(asOutput)]
+            For i from 0 to (iCount - 1)
+                Move (s2 + '//     "' + asItems[i] + '"')                                                  to asOutput[SizeOfArray(asOutput)]
+            Loop
+            Procedure_Return
+        End
+
+        // Build a LoadData that loads each collected prompt as a row.
+        Move ""                                                                                       to asOutput[SizeOfArray(asOutput)]
+        Move (s2 + "// Loads the items the legacy List held in its Item_List (cCJGrid is data-driven).") to asOutput[SizeOfArray(asOutput)]
+        Move (s2 + "Procedure LoadData")                                                               to asOutput[SizeOfArray(asOutput)]
+        Move (s3 + "tDataSourceRow[] TheData TheDataEmpty")                                            to asOutput[SizeOfArray(asOutput)]
+        Move (s3 + "Integer iRow iCol1")                                                              to asOutput[SizeOfArray(asOutput)]
+        Move (s3 + "Get piColumnId of oCol1 to iCol1")                                                to asOutput[SizeOfArray(asOutput)]
+        Move (s3 + "Move 0 to iRow")                                                                  to asOutput[SizeOfArray(asOutput)]
+        For i from 0 to (iCount - 1)
+            Move (s3 + 'Move "' + asItems[i] + '" to TheData[iRow].sValue[iCol1]')                     to asOutput[SizeOfArray(asOutput)]
+            Move (s3 + "Increment iRow")                                                              to asOutput[SizeOfArray(asOutput)]
+        Loop
+        Send AppendLoadDataIfElse (&asOutput) sGridIndent
+        Move (s2 + "End_Procedure")                                                                   to asOutput[SizeOfArray(asOutput)]
+
+        If (pbLtHadComplex(Self) = True) Begin
+            Move ""                                                                                       to asOutput[SizeOfArray(asOutput)]
+            Move (s2 + "// TODO: Some On_Item entries used a non-literal prompt or sent a message on")      to asOutput[SizeOfArray(asOutput)]
+            Move (s2 + "//   selection. cCJGrid has no per-item message - handle selection in")             to asOutput[SizeOfArray(asOutput)]
+            Move (s2 + "//   'Procedure OnRowChange Integer iOldRow Integer iNewRow'.")                     to asOutput[SizeOfArray(asOutput)]
+        End
+
+        Send AppendActivatingStub (&asOutput) sGridIndent
+    End_Procedure
+
+    // *** Public interface ***
+
+    // Transforms all List objects in asFiles to cCJGrid (single cCJGridColumn + LoadData).
+    // Returns the number of List objects transformed.
+    Function TransformListToCJGrid String[] asFiles String sParameter Returns Integer
+        Integer iResult
+        Get TransformFiles asFiles sParameter to iResult
+        Function_Return iResult
+    End_Function
+
+End_Class

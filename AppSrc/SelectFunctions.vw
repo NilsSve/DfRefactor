@@ -3,14 +3,18 @@ Use cCJGridColumnRowIndicator.pkg
 Use cRDCSuggestionsBaseClasses.pkg
 Use cRDCDbView.pkg
 Use cRDCDbHeaderGroup.pkg
-Use cRefactorDbCJGrid.pkg
+Use cRDCDbCJGrid.pkg
 Use cRDCDbCJGridColumn.pkg
+Use cFunctionParameterColumn.pkg // the Parameter column: the in-cell combo per row, the REQUIRED tooltip
 Use cRDCDbForm.pkg
 Use cRDCComboForm.pkg
 
 Use cSysFileDataDictionary.dd
 Use cFunctionsDataDictionary.dd
 
+// The Parameter column names these two, which are defined after it in the grid.
+Register_Object oFunctions_ParameterHelp
+Register_Object oFunctions_ParameterValidation
 Register_Function MyDelete_Confirmation Returns Integer
 
 Activate_View Activate_oSelectFunctions_vw for oSelectFunctions_vw
@@ -51,7 +55,7 @@ Object oSelectFunctions_vw is a cRDCDbView
         Set Border_Style to Border_None
         Set peAnchors to anAll
 
-        Object oFunctionSelection_grd is a cRefactorDbCJGrid
+        Object oFunctionSelection_grd is a cRDCDbCJGrid
             Set Size to 159 620
             Set Location to 27 10  
             Set Ordering to 2
@@ -88,8 +92,8 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Function OnGetTooltip Integer iRow String sValue String sText Returns String
                     Get RowValue of oFunctions_Function_Help iRow to sText
                     If (sText <> "") Begin
-                        Move (Replaces("\r\n", sText, CS_CRLF)) to sText
-                        Move (Replaces("\n", sText, CS_CRLF)) to sText
+                        Move (Replaces("\r\n", sText, C_NewLine)) to sText
+                        Move (Replaces("\n", sText, C_NewLine)) to sText
                     End
                     Function_Return sText
                 End_Function
@@ -106,8 +110,8 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Function OnGetTooltip Integer iRow String sValue String sText Returns String
                     Get RowValue of oFunctions_Function_Help iRow to sText
                     If (sText <> "") Begin
-                        Move (Replaces("\r\n", sText, CS_CRLF)) to sText
-                        Move (Replaces("\n", sText, CS_CRLF)) to sText
+                        Move (Replaces("\r\n", sText, C_NewLine)) to sText
+                        Move (Replaces("\n", sText, C_NewLine)) to sText
                     End
                     Function_Return sText
                 End_Function
@@ -148,7 +152,7 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Entry_Item Functions.FnGroup
                 Set piWidth to 100
                 Set psCaption to "Group"
-                Set psToolTip to "The functional group this refactoring belongs to: Modernization (brings legacy code up to current DataFlex), Cleanup (tidies or removes), or Other. Set via the function's { FnGroup } meta-tag."
+                Set psToolTip to "The functional group this refactoring belongs to: Modernization (brings legacy code up to current DataFlex), x64 + Unicode (64-bit/Unicode migration readiness), Cleanup (tidies or removes), or Other. Set via the function's { FnGroup } meta-tag."
                 Set Status_Help to (psToolTip(Self))
                 Set peHeaderAlignment to xtpAlignmentCenter
                 Set peTextAlignment to xtpAlignmentCenter
@@ -164,62 +168,24 @@ Object oSelectFunctions_vw is a cRDCDbView
 
             End_Object
 
-            Object oFunctions_Parameter is a cRDCDbCJGridColumn
+            Object oFunctions_Parameter is a cFunctionParameterColumn
                 Entry_Item Functions.Parameter
                 Set piWidth to 122
-                Set psCaption to "Parameter"
                 Set psToolTip to "Click for dropdown choices when there is a value. For some functions an extra parameter is passed. You can only change existing values. Hover the mouse over a value to see valid values to be selected from."
                 Set Status_Help to (psToolTip(Self))
-                Set peHeaderAlignment to xtpAlignmentCenter  
-                Set pbComboButton to True 
-                // pbEditable *must* be set after the pbComboButton setting.
-                Set pbEditable to True
-                Set pbComboEntryState to False 
-    
-                Procedure ComboFillList
-                    String sParameterList
-                    String[] asParameters
-                    Integer iSize iCount
 
-                    Get Field_Current_Value of (Main_DD(Self)) Field Functions.ParameterValidation to sParameterList
-                    // "ANY" signals a free-text parameter: the user may type any value.
-                    If (Trim(Lowercase(sParameterList)) = "any") Begin
-                        Set pbComboButton     to False
-                        Set pbComboEntryState to True
-                    End
-                    Else If (sParameterList <> "") Begin
-                        Set pbComboButton     to True
-                        Set pbComboEntryState to True
-                        Send ComboDeleteData
-                        Get StrSplitToArray sParameterList "," to asParameters
-                        Move (SizeOfArray(asParameters)) to iSize
-                        Decrement iSize
-                        For iCount from 0 to iSize
-                            Send ComboAddItem asParameters[iCount] iCount
-                        Loop
-                    End
-                    Else Begin
-                        Set pbComboButton     to False
-                        Set pbComboEntryState to False
-                    End
-                End_Procedure
-
-                Procedure OnEntry
-                    Send ComboFillList
-                End_Procedure 
-                
-                Function OnGetTooltip Integer iRow String sValue String sText Returns String
-                    Get RowValue of oFunctions_ParameterHelp iRow to sText
-                    If (sText <> "") Begin
-                        Move (Replaces("\r\n", sText, CS_CRLF)) to sText
-                        Move (Replaces("\n", sText, CS_CRLF)) to sText
-                    End 
-                    Else Begin
-                        Move "For some functions an extra parameter is used. You can only select from existing values, unless the the meta-data for the function has been set to { EnumList = 'ANY' }. Hover the mouse over an item to see all valid values to select from." to sText
-                    End
-                    Function_Return sText
+                // The grid's columns the class reads: the values list, the row's help, the name (for REQUIRED).
+                Function ParameterValidationColumn Returns Handle
+                    Function_Return (oFunctions_ParameterValidation(Self))
                 End_Function
-    
+
+                Function ParameterHelpColumn Returns Handle
+                    Function_Return (oFunctions_ParameterHelp(Self))
+                End_Function
+
+                Function FunctionNameColumn Returns Handle
+                    Function_Return (oFunctions_Function_Name(Self))
+                End_Function
             End_Object
 
             Object oFunctions_Selected is a cRDCDbCJGridColumn
@@ -249,10 +215,25 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Set pbShowInFieldChooser to False
             End_Object
 
+            // Hidden: the Parameter combo reads its list from here, per row (ComboFillListForRow).
+            Object oFunctions_ParameterValidation is a cRDCDbCJGridColumn
+                Entry_Item Functions.ParameterValidation
+                Set piWidth to 150
+                Set psCaption to "Parameter Validation"
+                Set pbVisible to False
+                Set pbShowInFieldChooser to False
+            End_Object
+
             // Save the Parameter combo edit immediately (see cRefactorDbCJGrid.OnComValueChanged) so a
             // change followed by an immediate "Start refactoring" is not lost. The Select checkbox is
             // auto-saved via the grid's phoCheckbox_Col (oFunctions_Selected).
             Set phoSaveOnChangeColumn to oFunctions_Parameter
+
+            // The Parameter combo's list follows the ROW, not the cell entry - see ComboFillListForRow.
+            Procedure OnRowChanged Integer iOldRow Integer iNewSelectedRow
+                Forward Send OnRowChanged iOldRow iNewSelectedRow
+                Send ComboFillListForRow of oFunctions_Parameter iNewSelectedRow
+            End_Procedure
 
             // The Functions.Function_Name column is a cDbCJGridColumnSuggestion
             // That class has a bug were it is possible to enter something in
@@ -293,6 +274,22 @@ Object oSelectFunctions_vw is a cRDCDbView
                 Forward Send Activating
             End_Procedure 
             
+        End_Object
+
+        // Run the selected functions right here, without returning to the dashboard (Nils 2026-07-13:
+        // the Single File flow "land on Select Functions, then activate the dashboard again, then hit
+        // Run" was confusing). Same action as the "Start Refactoring" toolbar item / Ctrl+F5 and the
+        // dashboard's Run Refactoring button (StartRefactoreCode); placed on the LEFT of the existing
+        // Select-All/None/Invert strip (which is right-anchored), so it reads as the primary action.
+        Object oRunRefactor_btn is a Button
+            Set Size to 14 96
+            Set Location to 10 4
+            Set Label to "Run Refactoring"
+            Set peAnchors to anTopLeft
+            Set Status_Help to "Run the selected refactoring functions now, on the loaded file or selected folders - no need to go back to the dashboard (same as Start Refactoring / Ctrl+F5)."
+            Procedure OnClick
+                Send StartRefactoreCode of ghoCommandBars
+            End_Procedure
         End_Object
 
         Object oSelectAll_btn is a Button

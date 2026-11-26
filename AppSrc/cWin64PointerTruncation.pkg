@@ -21,6 +21,11 @@
 //               preceding method that mismatched its End_ keyword, which leaves
 //               the lexer stuck in-method).
 //
+//               THE ONE FIX IT MAKES (2026-11-12): RetypePointerTargets, the worker of
+//               Win64IntegerToLongPtr, changes the TYPE of a local Integer/DWord that
+//               receives such a pointer to LongPtr - compile error 4539 on a 64-bit
+//               build, and the compiler's own advice. AuditFile stays report-only.
+//
 //               Report-only, so a stray false positive is harmless. Deliberately
 //               OUT OF SCOPE (v1): a pointer RETURNED by a function call (no
 //               return-type knowledge), an Integer merely NAMED like a handle
@@ -36,18 +41,13 @@
 //****************************************************************************
 Use cApplication.pkg
 Use cRefactorFuncLib.pkg
+Use cPointerConverterBase.pkg   // the type test, the name sets and the signature walk the three pointer converters share
 
-Class cWin64PointerTruncation is a cObject
+Class cWin64PointerTruncation is a cPointerConverterBase
 
     Procedure Construct_Object
         Forward Send Construct_Object
     End_Procedure
-
-    // Pointer-sized native type - the SOURCE that gets truncated.
-    Function IsPointerLikeType String sType Returns Boolean
-        Move (Lowercase(Trim(sType))) to sType
-        Function_Return (sType = "pointer" or sType = "address")
-    End_Function
 
     // 32-bit integer types that TRUNCATE a pointer on x64. Integer is always
     // 32-bit; DWord is an alias for the 32-bit UInteger.
@@ -56,30 +56,12 @@ Class cWin64PointerTruncation is a cObject
         Function_Return (sType = "integer" or sType = "dword" or sType = "uinteger")
     End_Function
 
-    // Case-insensitive membership test. asNames already holds lowercased names.
-    Function NameInArray String[] asNames String sName Returns Boolean
-        Integer iCount iMax
-        Move (Lowercase(Trim(sName))) to sName
-        Move (SizeOfArray(asNames)) to iMax
-        Decrement iMax
-        For iCount from 0 to iMax
-            If (asNames[iCount] = sName) ;
-                Function_Return True
-        Loop
-        Function_Return False
-    End_Function
-
-    // Append a name (lowercased, non-blank) to a name set.
-    Procedure AddName String[] ByRef asNames String sName
-        Move (Lowercase(Trim(sName))) to sName
-        If (sName <> "") ;
-            Move sName to asNames[SizeOfArray(asNames)]
-    End_Procedure
-
     // Parse a Procedure/Function signature (overstruck) and collect its
     // Pointer/Address parameter names into asPointerVars and its
     // Integer/DWord/UInteger parameter names into asIntVars. Form is
     // <Type> [ByRef|ByVal] <name> repeated; a Function's list ends at "Returns".
+    // Overrides cPointerConverterBase's walk, whose second set is the Strings; this audit's is
+    // the 32-bit integers.
     Procedure CollectParameters String sOverSignature String[] ByRef asPointerVars String[] ByRef asIntVars
         String[] asTokens
         Integer  iIdx iNum
@@ -126,7 +108,7 @@ Class cWin64PointerTruncation is a cObject
         Integer  iCount iMax iFound iItems iIdx
         String   sLine sOver sType sVars sName sId1 sId2 sId1LC sReason
         String[] asPointerVars asIntVars asVars asTokens
-        Boolean  bInMethod bIsProcDecl bIsFuncDecl bPtr bInt bIgnore bId2Int bId1Ptr
+        Boolean  bInMethod bIsProcDecl bIsFuncDecl bPtr bInt bIgnore bId2Int bId1Ptr bWorthScanning
         tTokenizer TokenizerData
 
         Move 0 to iFound
@@ -135,7 +117,28 @@ Class cWin64PointerTruncation is a cObject
             Function_Return 0
         Decrement iMax
 
+        // FILE PRE-GATE (Nils 2026-07-16, the LegacyApp2 "very slow" report): a finding REQUIRES a
+        // Pointer/Address declaration or parameter, or an AddressOf() source - so a file that never
+        // mentions "pointer" or "address" (case-insensitive; "address" also covers AddressOf) cannot
+        // produce one. The per-line Tokenizer below is the audit's entire cost, and MOST legacy files
+        // never touch pointers - the canonical _FileContainsText gate (cBaseFuncLib) skips them
+        // without tokenizing a single line. Over-inclusion is harmless (a stray "EmailAddress" just
+        // means the file gets the normal scan). Same gate as cUnicodePointerToString.
+        Get _FileContainsText of ghoFuncLib (&asCode) "pointer" to bWorthScanning
+        If (bWorthScanning = False) ;
+            Get _FileContainsText of ghoFuncLib (&asCode) "address" to bWorthScanning
+        If (bWorthScanning = False) ;
+            Function_Return 0
+
         For iCount from 0 to iMax
+            // Per-line panel nudge every ~20 lines (the whole-file progress-bar contract - a *All
+            // report gets ONE call for all files, so nothing else moves the panel while a big file
+            // scans and it looked FROZEN; Nils 2026-07-16, LegacyApp2). Active_State-guarded no-op in
+            // batch mode / the unit-test runner where no panel shows.
+            If (Mod(iCount, 20) = 0 and Active_State(ghoStatusPanel) = True) Begin
+                Send Update_StatusPanel of ghoStatusPanel ("Source line:" * String(iCount + 1) * "of:" * String(iMax + 1))
+                Set piPosition of ghoProgressBar to (iCount + 1)
+            End
             Move asCode[iCount] to sLine
             Get Tokenizer of ghoFuncLib sLine to TokenizerData
             Move TokenizerData.sOverstrikeLine to sOver
@@ -209,7 +212,233 @@ Class cWin64PointerTruncation is a cObject
             End
         Loop
 
+        // The in-loop bar update is sub-sampled, and a short file may never hit a sample
+        // point, so drive the file's progress bar to the end here (the reference pattern -
+        // cUnicodePointerToString).
+        If (Active_State(ghoStatusPanel) = True) ;
+            Set piPosition of ghoProgressBar to (iMax + 1)
+
         Function_Return iFound
+    End_Function
+
+    /* The method that just ended, into the queue: every name it moved a pointer into (asHit) that it
+       DECLARED itself (asDeclName, at aiDeclLine) and never passed ByRef (asByRef). Keyed
+       "<line>|<name>", once each. A parameter or a global is in no declaration list here, so it never
+       queues. The method's lists are emptied for the next. */
+    Procedure _QueueRetypes String[] ByRef asDeclName Integer[] ByRef aiDeclLine String[] ByRef asHit ;
+            String[] ByRef asByRef String[] ByRef asEditKey
+        Integer i iLast iAt
+        String sKey
+
+        Move (SizeOfArray(asHit) - 1) to iLast
+        For i from 0 to iLast
+            If (SearchArray(asHit[i], asByRef) = -1) Begin
+                Move (SearchArray(asHit[i], asDeclName)) to iAt
+                If (iAt <> -1) Begin
+                    Move (String(aiDeclLine[iAt]) + "|" + asHit[i]) to sKey
+                    If (SearchArray(sKey, asEditKey) = -1) ;
+                        Move sKey to asEditKey[SizeOfArray(asEditKey)]
+                End
+            End
+        Loop
+        Move (ResizeArray(asDeclName, 0)) to asDeclName
+        Move (ResizeArray(aiDeclLine, 0)) to aiDeclLine
+        Move (ResizeArray(asHit, 0))      to asHit
+        Move (ResizeArray(asByRef, 0))    to asByRef
+    End_Procedure
+
+    /* PURE. One declaration line, retyped for the names in asNames (lowercased): one line when it
+       declares nothing else - only its type word changes, so the spacing and any comment stay - or
+       two when it does: the line keeps its other names and its comment, and a "LongPtr" line with
+       the moved names follows at the same indentation. */
+    Function _RetypedDeclaration String sLine String[] asNames Returns String[]
+        String[] asOut asTok asKeep asMoved
+        String sIndent sCode sComment sTok sRest
+        Integer i iLast iAt iLen
+
+        Move 0 to iLen
+        While (iLen < Length(sLine) and (Mid(sLine, 1, (iLen + 1)) = " " or Mid(sLine, 1, (iLen + 1)) = Character(9)))
+            Increment iLen
+        Loop
+        Move (Left(sLine, iLen)) to sIndent
+        Move (Right(sLine, (Length(sLine) - iLen))) to sRest
+        Move (Pos("//", sRest)) to iAt
+        Move "" to sComment
+        Move sRest to sCode
+        If (iAt > 0) Begin
+            Move (Right(sRest, (Length(sRest) - iAt + 1))) to sComment
+            Move (Left(sRest, (iAt - 1))) to sCode
+        End
+        Move (StrSplitToArray(Trim(Replaces(Character(9), sCode, " ")), " ")) to asTok
+        Move (SizeOfArray(asTok) - 1) to iLast
+        For i from 1 to iLast
+            Move (Trim(asTok[i])) to sTok
+            If (sTok <> "") Begin
+                If (SearchArray(Lowercase(sTok), asNames) <> -1) ;
+                    Move sTok to asMoved[SizeOfArray(asMoved)]
+                Else ;
+                    Move sTok to asKeep[SizeOfArray(asKeep)]
+            End
+        Loop
+        If (SizeOfArray(asMoved) = 0 or iLast < 1) Begin
+            Move sLine to asOut[0]
+            Function_Return asOut
+        End
+        If (SizeOfArray(asKeep) = 0) Begin
+            // the type word alone changes: everything after it stays as written
+            Move (sIndent + "LongPtr" + Right(sRest, (Length(sRest) - Length(asTok[0])))) to asOut[0]
+            Function_Return asOut
+        End
+        Move (sIndent + asTok[0] + " " + StrJoinFromArray(asKeep, " ")) to asOut[0]
+        If (sComment <> "") ;
+            Move (asOut[0] + " " + sComment) to asOut[0]
+        Move (sIndent + "LongPtr " + StrJoinFromArray(asMoved, " ")) to asOut[1]
+        Function_Return asOut
+    End_Function
+
+    /* THE FIX HALF (2026-11-12), the worker of Win64IntegerToLongPtr. On a 64-bit build every finding
+       of AuditFile is compile error 4539, "Conversion from 64-bit pointer to integer is not allowed,
+       use Longptr instead of Integer". This follows the compiler's advice where it is safe: an
+       Integer / DWord / UInteger DECLARED IN THE SAME METHOD that a bare "Move <source> to <name>"
+       hands AddressOf(...) or a declared Pointer/Address becomes LongPtr.
+
+       MEASURED before it was written (DF26 compiles, x64 and x86): a LongPtr compiles everywhere that
+       Integer did - arithmetic, a Move to and from Integer, DWord and Pointer, an Integer, DWord or
+       Pointer parameter of a function or procedure, a comparison, String(), a For loop, an array
+       index. So the retype cannot add an error, and the pointer stops losing its high half in the
+       variable. (A later Move of it into an Integer still truncates - the audit still says so.)
+
+       LEFT AS IT WAS, for a hand fix the audit lists: a parameter (a signature change reaches every
+       caller), a global or a property (other files read it), a variable passed ByRef (&name) anywhere
+       in its method, a "Local" declaration, an array declaration, and any Move not in the bare
+       four-word form. Returns the number of names retyped. The caller resets the lexer first. */
+    Function RetypePointerTargets String[] ByRef asCode Returns Integer
+        Integer  iCount iMax iItems iIdx iAt iEnd i iLast iLine iPrev iRetyped
+        String   sLine sOver sType sVars sName sId1 sId2 sLow sFirst sKey
+        String[] asPointerVars asIntVars asVars asTokens asDeclName asHit asByRef asEditKey asNames asNew
+        Integer[] aiDeclLine aiLines
+        Boolean  bInMethod bIsProcDecl bIsFuncDecl bPtr bInt bIgnore bWorthScanning bArray
+        tTokenizer TokenizerData
+
+        Move (SizeOfArray(asCode)) to iMax
+        If (iMax = 0) ;
+            Function_Return 0
+        Decrement iMax
+        // The audit's own gate: no AddressOf, Pointer or Address anywhere, nothing to retype.
+        Get _FileContainsText of ghoFuncLib (&asCode) "pointer" to bWorthScanning
+        If (bWorthScanning = False) ;
+            Get _FileContainsText of ghoFuncLib (&asCode) "address" to bWorthScanning
+        If (bWorthScanning = False) ;
+            Function_Return 0
+
+        For iCount from 0 to iMax
+            If (Mod(iCount, 20) = 0 and Active_State(ghoStatusPanel) = True) Begin
+                Send Update_StatusPanel of ghoStatusPanel ("Source line:" * String(iCount + 1) * "of:" * String(iMax + 1))
+                Set piPosition of ghoProgressBar to (iCount + 1)
+            End
+            Move asCode[iCount] to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Move TokenizerData.sOverstrikeLine to sOver
+            Move (TokenizerData.bIsInProcedure = True or TokenizerData.bIsInFunction = True) to bInMethod
+
+            Get _IsProcedureDeclaration of ghoFuncLib sOver to bIsProcDecl
+            Get _IsFunctionDeclaration  of ghoFuncLib sOver to bIsFuncDecl
+            If (bIsProcDecl = True or bIsFuncDecl = True) Begin
+                Send _QueueRetypes (&asDeclName) (&aiDeclLine) (&asHit) (&asByRef) (&asEditKey)
+                Move (ResizeArray(asPointerVars, 0)) to asPointerVars
+                Move (ResizeArray(asIntVars, 0))     to asIntVars
+                Send CollectParameters sOver (&asPointerVars) (&asIntVars)
+            End
+            Else If (bInMethod = True) Begin
+                If (TokenizerData.bIsVariableDeclaration = True) Begin
+                    Move (Lowercase(Trim(sOver))) to sFirst
+                    Get RemoveLocalKeyWord  of ghoFuncLib (&sOver) "" to bIgnore
+                    Get _RetrieveFirstToken of ghoFuncLib sOver to sType
+                    Get _RemoveFirstToken   of ghoFuncLib sOver to sVars
+                    Get IsPointerLikeType   sType to bPtr
+                    Get IsTruncatingIntType sType to bInt
+                    If (bPtr = True or bInt = True) Begin
+                        Move (StrSplitToArray(Trim(sVars), CS_S)) to asVars
+                        Move (Pos("[", sVars) > 0) to bArray
+                        Move (SizeOfArray(asVars) - 1) to iItems
+                        For iIdx from 0 to iItems
+                            Move (Trim(asVars[iIdx])) to sName
+                            If (sName <> "") Begin
+                                If (bPtr = True) ;
+                                    Send AddName (&asPointerVars) sName
+                                If (bInt = True) Begin
+                                    Send AddName (&asIntVars) sName
+                                    // a retype candidate: declared here, plainly
+                                    If (Left(sFirst, 6) <> "local " and bArray = False) Begin
+                                        Move (Lowercase(sName)) to asDeclName[SizeOfArray(asDeclName)]
+                                        Move iCount             to aiDeclLine[SizeOfArray(aiDeclLine)]
+                                    End
+                                End
+                            End
+                        Loop
+                    End
+                End
+                Else Begin
+                    // a name passed ByRef anywhere in the method is not retyped: (&name)
+                    Move (Lowercase(sOver)) to sLow
+                    Move (Pos("(&", sLow)) to iAt
+                    While (iAt > 0)
+                        Move (Right(sLow, (Length(sLow) - iAt - 1))) to sLow
+                        Move (Pos(")", sLow)) to iEnd
+                        If (iEnd > 1) ;
+                            Send AddName (&asByRef) (Left(sLow, (iEnd - 1)))
+                        Move (Pos("(&", sLow)) to iAt
+                    Loop
+                    // the bare form: Move <id1> to <id2>
+                    Move (StrSplitToArray(Trim(sOver), CS_S)) to asTokens
+                    If (SizeOfArray(asTokens) = 4) Begin
+                        If (Lowercase(asTokens[0]) = "move" and Lowercase(asTokens[2]) = "to") Begin
+                            Move asTokens[1] to sId1
+                            Move asTokens[3] to sId2
+                            If (NameInArray(Self, asIntVars, sId2) = True) Begin
+                                If (NameInArray(Self, asPointerVars, sId1) = True or (Lowercase(sId1) contains "addressof")) ;
+                                    Send AddName (&asHit) sId2
+                            End
+                        End
+                    End
+                End
+            End
+        Loop
+        Send _QueueRetypes (&asDeclName) (&aiDeclLine) (&asHit) (&asByRef) (&asEditKey)
+
+        Move 0 to iRetyped
+        If (SizeOfArray(asEditKey) > 0) Begin
+            // the declaration lines, from the bottom up: a split adds a line below its own
+            Move (SizeOfArray(asEditKey) - 1) to iLast
+            For i from 0 to iLast
+                Move (Left(asEditKey[i], (Pos("|", asEditKey[i]) - 1))) to aiLines[i]
+            Loop
+            Move (SortArray(aiLines)) to aiLines
+            Move -1 to iPrev
+            For iIdx from 0 to iLast
+                Move aiLines[iLast - iIdx] to iLine
+                If (iLine <> iPrev) Begin
+                    Move iLine to iPrev
+                    Move (ResizeArray(asNames, 0)) to asNames
+                    For i from 0 to iLast
+                        Move asEditKey[i] to sKey
+                        If (Left(sKey, (Pos("|", sKey) - 1)) = String(iLine)) ;
+                            Move (Right(sKey, (Length(sKey) - Pos("|", sKey)))) to asNames[SizeOfArray(asNames)]
+                    Loop
+                    Get _RetypedDeclaration asCode[iLine] asNames to asNew
+                    If (SizeOfArray(asNew) > 0 and asNew[0] <> asCode[iLine]) Begin
+                        Move (iRetyped + SizeOfArray(asNames)) to iRetyped
+                        Move asNew[0] to asCode[iLine]
+                        If (SizeOfArray(asNew) > 1) ;
+                            Move (InsertInArray(asCode, (iLine + 1), asNew[1])) to asCode
+                    End
+                End
+            Loop
+        End
+
+        If (Active_State(ghoStatusPanel) = True) ;
+            Set piPosition of ghoProgressBar to (iMax + 1)
+        Function_Return iRetyped
     End_Function
 
 End_Class

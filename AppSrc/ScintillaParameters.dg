@@ -6,10 +6,22 @@ Use Colr_Dlg.pkg
 Use cTextEdit.pkg
 Use Font_dlg.pkg
 
-Use cRDCModalPanel.pkg
-Use oEditorProperties.pkg
-Use THColorer.pkg
-Use THDialog.pkg
+Use cFTModalPanel.pkg
+Use cRefactorEditorSettings.pkg     // the settings contract this dialog edits
+Use RefactorLineSplit.pkg           // RefactorSplitLine - replaces the library's
+                                    // Array-derived cLineParser
+Use cRefactorHotKeys.pkg            // the Keyboard page: oSciCommandHotKeys,
+                                    // tSciCommandHotKey, tShortCut, KeysToString.
+                                    // Arrived transitively through
+                                    // oEditorProperties before; named explicitly now.
+Use ScintillaSettingsControls.pkg
+// THColorer.pkg used to be Used here. It is gone from DFRefactor entirely: this was its
+// last entry point, and with the preview rebuilt nothing was left of it but three theme
+// NAME constants (TH_DefSchema_White_Str and friends) that cEditorColourScheme already
+// declares as CS_ThemeWhite and friends - the same strings, twice.
+Use cEditorColourScheme.pkg         // where the built-in themes are declared
+Use cSchemePreview.pkg              // the preview: a real Scintilla control, same renderer
+                                    // as the editor
 Use cSCWsGrid.pkg
 Use RefactorConstants.h.pkg
 Use cRDCHeaderGroup.pkg
@@ -50,12 +62,128 @@ Function ScintillaReadableFontFormat Global String sFace Returns String
     Function_Return (FontSpecs.sFontName + "," * String(FontSpecs.iSize) + "pt")
 End_Function
 
-Object oScintillaParameters_dg is a cRDCModalPanel
+Object oScintillaParameters_dg is a cFTModalPanel
     Set Size to 258 447
     Set Label to "Editor Settings"
     Set piMinSize to 238 439
     Set Location to 2 2
     Set Icon to "EditorSettings.ico"
+    // Its own colours, not the FT panel's: a colour box shows the chosen colour in its Color, which the
+    // panel's colouring of its children would paint over (cFTModalPanel's FTColorChildren).
+    Set pbFTColorChildren to False
+
+    // The built-in themes, declared readably in cEditorColourScheme.pkg. This dialog asks
+    // it what the built-ins are and what each one looks like; nothing here holds a theme.
+    Object oColorSchemeSource is a cEditorColourScheme
+    End_Object
+
+    /* The scheme being EDITED - the Colors page's working copy, loaded on Popup and
+       written back by SaveEntries. Every control on that page reads and writes this
+       object and then asks the preview to repaint from it, which is what makes an
+       unsaved change visible.
+
+       It replaces gtColorer[], the global array of structs the page used to edit in
+       place. That array was shared with the editor, so "the Colors page" and "what is
+       on screen" were the same storage and a cancelled dialog had already changed the
+       editor. A working copy cannot do that. */
+    Object oEditingScheme is a cEditorColourScheme
+    End_Object
+
+    /* ---- Color-schema resolution (Nils 2026-07-27) --------------------------------------
+       ONE resolver, CUSTOM FIRST. A user-saved schema may carry the same name as a shipped
+       default ("Lucas" is both a built-in AND a custom row saved years ago), and the old
+       OnChange resolved built-ins first: selecting "Lucas" applied the shipped palette
+       (background 025,025,025 - near black) over the custom lime one the workspace had
+       lived with for years - "that changed the Lucas theme to be black". The custom row
+       itself was never touched (verified byte-identical against the frozen ini); only the
+       APPLIED colors were wrong. The user's own definition outranks the shipped default.
+
+       Returns True when the name resolved; sSchema/sFontStyles carry the palette. Built-in
+       constants may pack colors and font styles into one comma-joined string - split here,
+       once, instead of at every caller. */
+    Function ResolveColorSchema String sName String ByRef sSchema String ByRef sFontStyles Returns Boolean
+        Integer iC iPos
+
+        Get FindColorSchema of ghoEditorProperties sName to iC
+        If (iC >= 0) Begin
+            Get psColorSchemas.psSchemaColors     of ghoEditorProperties Item iC to sSchema
+            Get psColorSchemas.psSchemaFontStyles of ghoEditorProperties Item iC to sFontStyles
+            Function_Return True
+        End
+        // Built-ins come from cEditorColourScheme, which is where they are declared -
+        // readably, one line per element - rather than from packed string constants.
+        // The packed pair it hands back is a transitional adapter: the rest of this
+        // dialog and the settings store still speak that format.
+        Move "" to sSchema
+        If (IsBuiltIn(oColorSchemeSource(Self), sName) = False) ;
+            Function_Return False
+        Send LoadBuiltIn of oColorSchemeSource sName
+        Get LegacyPackedColors     of oColorSchemeSource to sSchema
+        Get LegacyPackedFontStyles of oColorSchemeSource to sFontStyles
+        Function_Return True
+    End_Function
+
+    /* Load a named scheme into a scheme OBJECT - the same custom-first rule as
+       ResolveColorSchema, but landing in the object the page edits rather than in a pair
+       of strings.
+
+       An UNSHADOWED built-in is loaded from its DECLARATION rather than through
+       ResolveColorSchema, which hands back the packed pair. The declaration is the
+       source of truth and the packed pair is a lossy view of it: 42 colour slots and 17
+       font-style slots, with nowhere to put a selection text colour or a selection
+       alpha. None of the shipped built-ins sets either today - they all leave the
+       selection to be derived - so nothing is lost right now. The point is that the
+       first one to set it would lose it silently, and there is no reason to send a
+       theme out through a narrower format and back when it is right there in code.
+
+       A custom has nothing else to be read from, so it does take that route.
+       LoadFromSettings sniffs, so a schema saved by an older build still reads. */
+    Function LoadSchemaInto Handle hoScheme String sName Returns Boolean
+        Boolean bFound
+        Integer iC
+        String  sColors sFontStyles
+
+        Get FindColorSchema of ghoEditorProperties sName to iC
+        If (iC < 0 and IsBuiltIn(hoScheme, sName)) Begin
+            Send LoadBuiltIn of hoScheme sName
+            Function_Return True
+        End
+        Get ResolveColorSchema sName (&sColors) (&sFontStyles) to bFound
+        If (bFound = False) ;
+            Function_Return False
+        Send LoadFromSettings of hoScheme sName sColors sFontStyles
+        Function_Return True
+    End_Function
+
+    /* The Color Theme combo's list: built-ins first (skipping any SHADOWED by a custom of
+       the same name - matching the resolver, so the one visible "Lucas" IS the custom one),
+       then the customs, themselves deduplicated. The old fill appended both lists blindly,
+       which is where the two "Lucas" entries came from. Pure list-builder: testable. */
+    Function SchemaComboNames Returns String[]
+        Integer iC iCount
+        String sStr
+        String[] asBuiltin asCustom asNames
+
+        Get psColorSchemas.Count of ghoEditorProperties to iCount
+        For iC from 0 to (iCount - 1)
+            Get psColorSchemas of ghoEditorProperties Item iC to sStr
+            If (Trim(sStr) <> "") Begin
+                If (SearchArray(sStr, asCustom, Desktop, RefFunc(DFSTRICMP)) = -1) ;
+                    Move sStr to asCustom[SizeOfArray(asCustom)]
+            End
+        Loop
+        // The built-in list comes from the scheme class, so adding a theme there puts it
+        // in this combo with no second list to remember to update.
+        Get BuiltInNames of oColorSchemeSource to asBuiltin
+        For iC from 0 to (SizeOfArray(asBuiltin) - 1)
+            If (SearchArray(asBuiltin[iC], asCustom, Desktop, RefFunc(DFSTRICMP)) = -1) ;
+                Move asBuiltin[iC] to asNames[SizeOfArray(asNames)]
+        Loop
+        For iC from 0 to (SizeOfArray(asCustom) - 1)
+            Move asCustom[iC] to asNames[SizeOfArray(asNames)]
+        Loop
+        Function_Return asNames
+    End_Function
 
     Object oImages_lst is a cImageList32
         Set piMaxImages to 4
@@ -93,53 +221,70 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set pbExplorerStyle to True
                     Set peAnchors to anTopBottomLeft
 
-                    // Initializes colorer and populates the Tree
+                    /* One row per element the scheme class knows about, in its own
+                       order, with the element enum as the item data. The list used to
+                       come from gtColorer[], which meant adding an element to the
+                       scheme and adding it to this tree were two separate edits that
+                       could disagree. */
                     Procedure OnCreateTree
                         Handle  hItem
-                        Integer iItem iItems
-                        // This line is how it is in the Hammer:
-                        Send Register_Color_Elements
-                        Move (SizeOfArray(gtColorer)) to iItems
-                        For iItem from 0 to (iItems-1)
-                            Get AddTreeItem gtColorer[iItem].sName 0 iItem 0 0 to hItem
+                        Integer eElement iItems
+
+                        Get ElementCount of oEditingScheme to iItems
+                        For eElement from 0 to (iItems - 1)
+                            Get AddTreeItem (ElementName(oEditingScheme, eElement)) 0 eElement 0 0 to hItem
                         Loop
                         Set Visible_State of oColor         to False
                         Set Visible_State of oBackground    to False
                     End_Procedure
 
+                    /* Show the selected element's appearance. Which controls apply is
+                       the scheme's answer, not a local table: the page has no background
+                       of its own, the margins and the selection carry no font, and the
+                       selection's second colour is worked out from the scheme rather
+                       than picked (see ResolvedSelectionBackColor). */
                     Procedure OnItemChanged Handle hItem Handle hItemOld
-                        Integer iIndex
-                        String  sLabel
+                        Boolean bHasBack bHasFont
+                        Integer eElement
+                        tEditorStyle Appearance
 
-                        // Collect Item Data of the selected Colorer Item
-                        Get ItemData  hItem to iIndex
-                        Get ItemLabel hItem to sLabel
+                        Get ItemData hItem to eElement
+                        Get StyleFor          of oEditingScheme eElement to Appearance
+                        Get ElementHasBackColor of oEditingScheme eElement to bHasBack
+                        Get ElementHasFontStyle of oEditingScheme eElement to bHasFont
 
-                        // Manage color pickers
-                        Set Visible_State of oColor         to gtColorer[iIndex].iForeOff
-                        Set Visible_State of oBackground    to gtColorer[iIndex].iBackOff
-                        Set Visible_State of oFontBold      to gtColorer[iIndex].iBackOff
-                        Set Visible_State of oFontItalics   to gtColorer[iIndex].iBackOff
-                        Set Visible_State of oFontUnderline to gtColorer[iIndex].iBackOff
+                        Set Visible_State of oColor         to True
+                        Set Visible_State of oBackground    to bHasBack
+                        Set Visible_State of oFontBold      to bHasFont
+                        Set Visible_State of oFontItalics   to bHasFont
+                        Set Visible_State of oFontUnderline to bHasFont
 
-                        // Show the current color if applicable
-                        Set piColorerIndex of oColor        to iIndex
-                        Set piColorerIndex of oBackground   to iIndex
-                        If (gtColorer[iIndex].iForeOff) ;
-                            Set SlectedColor of oColor      to gtColorer[iIndex].iForeC
-                        If (gtColorer[iIndex].iBackOff) ;
-                            Set SlectedColor of oBackground to gtColorer[iIndex].iBackC
+                        Set piColorerIndex of oColor         to eElement
+                        Set piColorerIndex of oBackground    to eElement
+                        Set piColorerIndex of oFontBold      to eElement
+                        Set piColorerIndex of oFontItalics   to eElement
+                        Set piColorerIndex of oFontUnderline to eElement
 
-                        // Font flags
-                        Set piColorerIndex of oFontBold      to iIndex
-                        Set piColorerIndex of oFontItalics   to iIndex
-                        Set piColorerIndex of oFontUnderline to iIndex
-                        Set Checked_State  of oFontBold      to gtColorer[iIndex].iBold
-                        Set Checked_State  of oFontItalics   to gtColorer[iIndex].iItalics
-                        Set Checked_State  of oFontUnderline to gtColorer[iIndex].iUnderline
+                        Set SelectedColor of oColor to Appearance.iForeColor
+                        If (bHasBack) ;
+                            Set SelectedColor of oBackground to Appearance.iBackColor
+                        Set Checked_State of oFontBold      to Appearance.bBold
+                        Set Checked_State of oFontItalics   to Appearance.bItalic
+                        Set Checked_State of oFontUnderline to Appearance.bUnderline
 
-                        // Notify color picker about current colorer element
                         Send mGeneratePreview
+                    End_Procedure
+
+                    /* Re-read the selected element from the scheme. Needed whenever the
+                       scheme changed underneath the tree without the SELECTION changing
+                       - picking a theme, or opening the dialog - because the pickers
+                       otherwise keep showing the previous theme's colours. */
+                    Procedure RefreshElementControls
+                        Handle hItem
+                        Get CurrentTreeItem to hItem
+                        If (hItem = 0) ;
+                            Procedure_Return
+                        Send OnItemChanged hItem 0
                     End_Procedure
 
                     On_Key Key_Up_Arrow Send Up
@@ -156,7 +301,7 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Procedure OnColorChange
                         Integer iColor
                         Get SelectedColor to iColor
-                        Move iColor to gtColorer[piColorerIndex(Self)].iForeC
+                        Send SetElementForeColor of oEditingScheme (piColorerIndex(Self)) iColor
                         Send mGeneratePreview
                         Delegate Send NotifyChange
                     End_Procedure
@@ -169,7 +314,7 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Procedure OnColorChange
                         Integer iColor
                         Get SelectedColor to iColor
-                        Move iColor to gtColorer[piColorerIndex(Self)].iBackC
+                        Send SetElementBackColor of oEditingScheme (piColorerIndex(Self)) iColor
                         Send mGeneratePreview
                         Delegate Send NotifyChange
                     End_Procedure
@@ -183,8 +328,10 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set FontWeight to fw_Bold
                     Set Visible_State to False
                     Procedure OnChange
+                        Boolean bOn
                         If (Focus(Desktop)=Self) Begin
-                            Get Checked_State to gtColorer[piColorerIndex(Self)].iBold
+                            Get Checked_State to bOn
+                            Send SetElementBold of oEditingScheme (piColorerIndex(Self)) bOn
                             Send mGeneratePreview
                             Delegate Send NotifyChange
                         End
@@ -199,8 +346,10 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set FontItalics to True
                     Set Visible_State to False
                     Procedure OnChange
+                        Boolean bOn
                         If (Focus(Desktop)=Self) Begin
-                            Get Checked_State to gtColorer[piColorerIndex(Self)].iItalics
+                            Get Checked_State to bOn
+                            Send SetElementItalic of oEditingScheme (piColorerIndex(Self)) bOn
                             Send mGeneratePreview
                             Delegate Send NotifyChange
                         End
@@ -214,49 +363,41 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set Label to "Underline"
                     Set FontUnderline to True
                     Set Visible_State to False
+                    /* Underline is stored and round-trips, but Scintilla's DataFlex
+                       lexer styles do not draw it - it was a CodeMax feature. The
+                       checkbox stays because a scheme file may carry the flag and
+                       silently dropping a user's setting is worse than a control whose
+                       effect the preview cannot show. */
                     Procedure OnChange
+                        Boolean bOn
                         If (Focus(Desktop)=Self) Begin
-                            Get Checked_State to gtColorer[piColorerIndex(Self)].iUnderline
+                            Get Checked_State to bOn
+                            Send SetElementUnderline of oEditingScheme (piColorerIndex(Self)) bOn
                             Send mGeneratePreview
                             Delegate Send NotifyChange
                         End
                     End_Procedure
                 End_Object
 
+                /* The preview. It used to be three objects - a Container3d painted with
+                   the Left Margin colour, a TextBox with "01 02 03..." typed into its
+                   label standing in for the line-number margin, and a RichEdit
+                   (cEditorPreview) imitating Scintilla's syntax colouring token by
+                   token from ninety lines of Add* calls below.
+
+                   It is now one real Scintilla control running the real DataFlex lexer
+                   through the editor's own rendering class, so its margins are margins
+                   and its colours are the colours the editor will use. See
+                   cSchemePreview.pkg. */
                 Object oPreview is a Container3d
                     Set Size to 157 190
                     Set Location to 46 232
                     Set Border_Style to Border_ClientEdge
-                    Set Color to clWhite
                     Set peAnchors to anAll
 
-                    Object oLeftMarginPreview is a Container3d
-                        Set Size to 156 14
+                    Object oEditorPreview is a cSchemePreview
+                        Set Size to 155 188
                         Set Location to 0 0
-                        Set Border_Style to Border_None
-                        Set peAnchors to anAll
-                    End_Object
-
-                    Object oNumbersPreview is a TextBox
-                        Set Auto_Size_State to False
-                        Set Size to 179 12
-                        Set Location to 0 14
-                        Set Label to ("01"+Character(10)+"02"+Character(10)+"03"+Character(10)+"04"+Character(10)+"05"+ ;
-                            Character(10)+"06"+Character(10)+"07"+Character(10)+"08"+Character(10)+"09"+ ;
-                            Character(10)+"10"+Character(10)+"11"+Character(10)+"12"+Character(10)+"13"+ ;
-                            Character(10)+"14"+Character(10)+"15"+Character(10)+"16"+Character(10)+"17"+ ;
-                            Character(10)+"18"+Character(10)+"19")
-                        Set FontWeight to fw_Bold
-                        Set Color to clDkGray
-                        Set TextColor to clWhite
-                        Set Justification_Mode to JMode_Center
-                        Set Typeface to "Courier New"
-                        Set peAnchors to anTopBottomLeft
-                    End_Object
-
-                    Object oEditorPreview is a cEditorPreview
-                        Set Size to 162 158
-                        Set Location to 0 29
                         Set peAnchors to anAll
                     End_Object
 
@@ -273,26 +414,19 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set Label_Row_Offset to 1
 
                     Procedure Combo_Fill_List
-                        Integer iCount iC
-                        String  sStr sCur
+                        Integer iC
+                        String  sCur
+                        String[] asNames
 
-                        // Defauls Schemas
-                        Send Combo_Add_Item TH_DefSchema_White_Str
-                        Send Combo_Add_Item TH_DefSchema_Black_Str
-                        Send Combo_Add_Item TH_DefSchema_Blue_Str
-                        Send Combo_Add_Item TH_DefSchema_Lime_Str
-                        Send Combo_Add_Item TH_DefSchema_Serene_Str
-                        Send Combo_Add_Item TH_DefSchema_Sahara_Str
-                        Send Combo_Add_Item TH_DefSchema_Lucas_Str
-                        // Custom Schemas
-                        Get psColorSchemas.Count of ghoEditorProperties to iCount
-                        For iC from 0 to (iCount-1)
-                            Get psColorSchemas of ghoEditorProperties Item iC  to sStr
-                            Send Combo_Add_Item sStr
-                        End
+                        // Built-ins + customs, deduplicated - a custom SHADOWS a built-in of
+                        // the same name (see SchemaComboNames; the double "Lucas" fix).
+                        Get SchemaComboNames of (oScintillaParameters_dg(Self)) to asNames
+                        For iC from 0 to (SizeOfArray(asNames) - 1)
+                            Send Combo_Add_Item asNames[iC]
+                        Loop
                         Get psColorSchema of ghoEditorProperties to sCur
                         If (sCur = "") Begin
-                            Move TH_DefSchema_Lime_Str to sCur
+                            Move CS_ThemeLime to sCur
                             Set psColorSchema of ghoEditorProperties to sCur
                         End
 
@@ -301,54 +435,23 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     End_Procedure
 
                     Procedure OnChange
-                        Boolean bDefaultSchema
-                        String sName sSchema sFontStyles
-                        Integer iC iPos
+                        Boolean bFound
+                        String sName
 
                         If (Focus(Desktop) = Self) Begin
-                            Move True to bDefaultSchema
                             Get Value to sName
-                            Move TH_ColorSchema_White to sSchema
-                            Get psFontStyles of ghoEditorProperties to sFontStyles
-                            If (sName = TH_DefSchema_Black_Str) Begin
-                                Move TH_ColorSchema_Black to sSchema
-                            End
-                            Else If (sName = TH_DefSchema_Blue_Str) Begin
-                                Move TH_ColorSchema_Blue to sSchema
-                            End
-                            Else If (sName = TH_DefSchema_Lime_Str) Begin
-                                Move TH_ColorSchema_Lime to sSchema
-                            End
-                            Else If (sName=TH_DefSchema_Serene_Str) Begin
-                                Move TH_ColorSchema_Serene to sSchema
-                            End
-                            Else If (sName=TH_DefSchema_Sahara_Str) Begin
-                                Move TH_ColorSchema_Sahara to sSchema
-                            End
-                            Else If (sName=TH_DefSchema_Lucas_Str) Begin
-                                Move TH_ColorSchema_Lucas to sSchema
-                            End
-                            Else If (sName <> TH_DefSchema_White_Str) Begin
-                                Move False to bDefaultSchema
-                                Get FindColorSchema of ghoEditorProperties sName to iC
-                                If (iC >= 0) Begin
-                                    Get psColorSchemas.psSchemaColors       of ghoEditorProperties Item iC to sSchema
-                                    Get psColorSchemas.psSchemaFontStyles   of ghoEditorProperties Item iC to sFontStyles
-                                End
-                            End
-                            If (bDefaultSchema) Begin
-                                Move (Pos(",", sSchema)) to iPos
-                                If (iPos>0) Begin
-                                    Move (Right(sSchema, Length(sSchema) - iPos)) to sFontStyles
-                                    Move (Left(sSchema, (iPos - 1))) to sSchema
-                                End
-                                Else Begin
-                                    // use the default font style if not defined.
-                                    Move (Repeat('0', 3 * 16) + "000") to sFontStyles
-                                End
-                            End
+                            // CUSTOM FIRST, built-in fallback - the ONE rule (see
+                            // LoadSchemaInto and ResolveColorSchema under it; the "Lucas
+                            // turned black" fix). An unknown name falls back to White,
+                            // the old default.
+                            Get LoadSchemaInto of (oScintillaParameters_dg(Self)) oEditingScheme sName to bFound
+                            If (bFound = False) ;
+                                Get LoadSchemaInto of (oScintillaParameters_dg(Self)) oEditingScheme CS_ThemeWhite to bFound
+                            // Whatever it resolved to, the scheme is now called what the
+                            // combo says - that is the name SaveEntries writes under.
+                            Set psSchemeName of oEditingScheme to sName
 
-                            Send SetColorerCurrentStyles sSchema sFontStyles
+                            Send RefreshElementControls to oCategory
                             Send mGeneratePreview to oSchemaSelect
 
                             Delegate Send NotifyChange
@@ -464,136 +567,24 @@ Object oScintillaParameters_dg is a cRDCModalPanel
 
                 End_Object
 
+                /* Repaint the preview from the scheme being edited. Called after every
+                   change on this page - a colour, a font style, a theme, the font.
+
+                   This used to be a hundred and thirty lines: it re-coloured the two
+                   fake margin objects from gtColorer[], then rebuilt the sample text
+                   token by token with ninety Add* calls into a RichEdit, each one a
+                   hand-written guess at what Scintilla would do with that token. The
+                   preview is now the editor's own renderer, so all of that is one
+                   handover of the scheme plus the font the user has picked but not yet
+                   saved. */
                 Procedure mGeneratePreview
-                    Integer iForeColor iOriFore iSize
                     String sFont
                     tFontSpecs FontSpecs
 
-                    Set Dynamic_Update_State of oEditorPreview to False
-                    Send Delete_Data to oEditorPreview
-
-                    // General Appearance
-                    Move gtColorer[EC_WINDOW].iForeC  to iForeColor
-                    If (iForeColor<0) Begin
-                        Move clWhite to iForeColor
-                    End
-                    Set Color of oEditorPreview to iForeColor
-                    Set Color of oPreview to iForeColor
-
-                    // Left Marging
-                    Set Color               of oLeftMarginPreview   to gtColorer[EC_LEFTMARGIN].iForeC
-
-                    // Line Numbers
-                    Set TextColor           of oNumbersPreview      to gtColorer[EC_LINENUMBERS].iForeC //iForeColor
-                    Set Color               of oNumbersPreview      to gtColorer[EC_LINENUMBERS].iBackC //iBackColor
-                    Set FontWeight          of oNumbersPreview      to (gtColorer[EC_LINENUMBERS].iBold * 800)
-                    Set FontItalics         of oNumbersPreview      to gtColorer[EC_LINENUMBERS].iItalics
-                    Set FontUnderline       of oNumbersPreview      to gtColorer[EC_LINENUMBERS].iUnderline
-
-                    // Font
                     Get psEditorFont of oFontFace to sFont
                     Get ScintillaFontAsStruct sFont to FontSpecs
-                    Move FontSpecs.sFontName to sFont
-                    Move ((FontSpecs.iSize - 2) * 20) to iSize
-                    Set psTypeFace          of oEditorPreview to sFont
-                    Set piFontSize          of oEditorPreview to iSize
-
-                    // Elements
-                    Get TextColor           of oEditorPreview to iOriFore
-                    Send AddComment         to oEditorPreview (CS_CommentSymbol * _T("Pre-processor/Macro", 1055))
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddPreProcessor    to oEditorPreview "#COMMAND _DEBUG"
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddPreProcessor    to oEditorPreview "#ENDCOMMAND"
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddComment         to oEditorPreview (CS_CommentSymbol * _T("Metatags, Keywords, Strings", 1056))
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddMetaTag         to oEditorPreview ('{Description="'+ _T("Meta tag", 1057) +'"}')
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddScopeKeyword    to oEditorPreview "Function"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddText            to oEditorPreview "mFoo"
-                    Send AddText            to oEditorPreview " "
-                    Send AddKeyword         to oEditorPreview "Returns String"
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddSpacing         to oEditorPreview "    "
-                    Send AddKeyword         to oEditorPreview "String"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddText            to oEditorPreview "sRetVal"
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddSpacing         to oEditorPreview "    "
-                    Send AddKeyword         to oEditorPreview "Move"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddText            to oEditorPreview "("
-                    Send AddString          to oEditorPreview ('"'+_T("Hello", 1058)+'"')
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddOperator        to oEditorPreview "*"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddString          to oEditorPreview ('"'+_T("World!", 1059)+'"')
-                    Send AddText            to oEditorPreview ")"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddOperator        to oEditorPreview ";"
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddSpacing         to oEditorPreview "        "
-                    Send AddKeyword         to oEditorPreview "to"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddText            to oEditorPreview "sRetVal"
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddSpacing         to oEditorPreview "    "
-                    Send AddKeyword         to oEditorPreview "Function_Return"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddText            to oEditorPreview "sRetVal"
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddScopeKeyword    to oEditorPreview "End_Function"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddComment         to oEditorPreview "// mFoo"
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddComment         to oEditorPreview (CS_CommentSymbol * _T("Numbers & Braces", 1060))
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddKeyword         to oEditorPreview "Number"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddText            to oEditorPreview "nVal"
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddKeyword         to oEditorPreview "Move"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddBraceHLight     to oEditorPreview "("
-                    Send AddNumber          to oEditorPreview '1.23'
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddOperator        to oEditorPreview "+"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddText            to oEditorPreview "("
-                    Send AddNumber          to oEditorPreview '12'
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddOperator        to oEditorPreview "*"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddNumber          to oEditorPreview '$02'
-                    Send AddText            to oEditorPreview ")"
-                    Send AddBraceHLight     to oEditorPreview ")"
-                    Send AddUnmatchedBrace  to oEditorPreview ")"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddKeyword         to oEditorPreview "to"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddText            to oEditorPreview "nVal"
-
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddComment         to oEditorPreview (CS_CommentSymbol * _T("Typing String", 1061))
-                    Send AppendTextLn       to oEditorPreview ""
-                    Send AddKeyword         to oEditorPreview "Move"
-                    Send AddSpacing         to oEditorPreview " "
-                    Send AddStringTyping    to oEditorPreview ('"'+_T("Typing new String", 1062))
-                    Send AppendTextLn       to oEditorPreview ""
-
-                    Set TextColor   of oEditorPreview to iOriFore
-                    Set Enabled_State of oSave to False
-                    Send ChangeFontStyle     of oEditorPreview sFont FontSpecs.iSize
-                    Set Dynamic_Update_State of oEditorPreview to True
-                    Send Beginning_of_Data   of oEditorPreview
-                    // Make the line numbers line up with the new font
-                    Set Typeface        of oNumbersPreview to sFont
-                    Set FontPointHeight of oNumbersPreview to FontSpecs.iSize
+                    Send ShowScheme to oEditorPreview oEditingScheme ;
+                                       FontSpecs.sFontName FontSpecs.iSize
                 End_Procedure
 
                 Object oColorSelectionInfo_tb is a TextBox
@@ -616,46 +607,50 @@ Object oScintillaParameters_dg is a cRDCModalPanel
 
             End_Object
             
-            // Colors & Fonts
+            /* Colors & Fonts. The scheme is written in the READABLE form - one line per
+               element, "MetaTags=128,0,128;-;B" - which is what SerializeScheme produces and
+               what the editor reads back through LoadFromSettings.
+
+               It used to write the packed pair: a 504-character run of digits for the
+               colours and a second string for the font flags, positional, with each
+               element at a hardcoded offset. That format is still READ (LoadFromSettings
+               sniffs it, so an install that has never opened this dialog still renders),
+               but nothing writes it any more. psFontStyles is blanked deliberately -
+               the readable form carries the flags inline, and leaving the old string
+               behind would be a second copy of the same facts waiting to disagree. */
             Procedure SaveEntries
                 Integer iC
-                String sHotKey sColors sFontFace sFontStyles sSchemaName
-        
-                Get psColors of ghoEditorProperties to sColors
-                // Re-format to support Scintilla
-                If (Length(sColors) = CM_COLORS_STRSIZE) ;
-                    Move (sColors + Repeat('0', SC_COLORS_STRSIZE-CM_COLORS_STRSIZE)) to sColors
-                Get CurrentColors           to sColors
-                Get CurrentFontStyles       to sFontStyles
-                Get Value of oSchemaSelect  to sSchemaName
+                String sColors sFontFace sSchemaName
+
+                Get Value of oSchemaSelect to sSchemaName
                 If (sSchemaName <> "") Begin
-                    If ((sSchemaName <> TH_DefSchema_Black_Str)  and ;
-                        (sSchemaName <> TH_DefSchema_White_Str)  and ;
-                        (sSchemaName <> TH_DefSchema_Blue_Str)   and ;
-                        (sSchemaName <> TH_DefSchema_Serene_Str) and ;
-                        (sSchemaName <> TH_DefSchema_Sahara_Str) and ;
-                        (sSchemaName <> TH_DefSchema_Lucas_Str)  and ;
-                        (sSchemaName <> TH_DefSchema_Lime_Str)) Begin
+                    Set psSchemeName of oEditingScheme to sSchemaName
+                    Get SerializeScheme    of oEditingScheme to sColors
+                    // A built-in is not written back as a user scheme - it is already
+                    // declared in code. Asking the scheme class means this can never
+                    // fall out of step with the list the combo shows, which is how
+                    // "Lucas" ended up a name that could never be given colours.
+                    If (IsBuiltIn(oColorSchemeSource(Self), sSchemaName) = False) Begin
                         Get FindColorSchema of ghoEditorProperties sSchemaName to iC
                         If (iC < 0) Begin
                             Get psColorSchemas.Count           of ghoEditorProperties to iC
                         End
                         Set psColorSchemas                     of ghoEditorProperties Item iC  to sSchemaName
                         Set psColorSchemas.psSchemaColors      of ghoEditorProperties Item iC  to sColors
-                        Set psColorSchemas.psSchemaFontStyles  of ghoEditorProperties Item iC  to sFontStyles
+                        Set psColorSchemas.psSchemaFontStyles  of ghoEditorProperties Item iC  to ""
                     End
                     Set psColorSchema  of ghoEditorProperties  to sSchemaName
                     Set psColors       of ghoEditorProperties  to sColors
-                    Set psFontStyles   of ghoEditorProperties  to sFontStyles
+                    Set psFontStyles   of ghoEditorProperties  to ""
                 End
-        
+
                 // Font
                 Get psEditorFont of oFontFace   to sFontFace
                 If (sFontFace = "") Begin
                     Move "11pt; 0; Courier New" to sFontFace
                 End
                 Set psFontFace             of ghoEditorProperties to sFontFace
-        
+
             End_Procedure
         
             On_Key Key_F2           Send Request_SaveAllEntries
@@ -762,7 +757,7 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                             Send mRemoveLine
                         End
                         Else If (sStart = "" or sStop = "") Begin
-                            Send Stop_Box (_T("Scope 'Start' and 'Stop' keywords must be specified!", 1455)) (_T("Problem", 1474))
+                            Send Stop_Box "Scope 'Start' and 'Stop' keywords must be specified!" "Problem"
                         End
                         Else Begin
                             Send Up
@@ -845,7 +840,7 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set peAnchors to anTopBottom
                 End_Object
 
-                Object oKeywords is a cSCWsGrid
+                Object oKeywords is a cScintillaWordList
                     Set Size to 137 112
                     Set Location to 35 195
                     Set Header_Label 0 to "Keyword"
@@ -855,102 +850,15 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set GridLine_Mode to Grid_Visible_None
                     Set peAnchors to anTopBottom
 
-                    Property String  psSepCharacter "\n"
-
-                    Procedure mMoveUp
-                        Integer iItem
-                        String sValue
-                        Get Current_Item to iItem
-                        Get Value Item iItem to sValue
-                        If ((iItem=Item_Count(Self) -1) and sValue = "") Begin
-                            Send mRemoveLine
-                        End
-                        Else Begin
-                            Send Up
-                        End
+                    // The count label beside the list.
+                    Procedure UpdateCountLabel Integer iCount
+                        Set Label of oKeywordsInfo_tb to ("Keywords:" * String(iCount))
                     End_Procedure
-
-                    Procedure mMoveDown
-                        Integer iItem
-                        String sValue
-                        Get Current_Item to iItem
-                        Get Value Item iItem to sValue
-                        If (sValue <> "") Begin
-                            If (iItem=Item_Count(Self) -1) Begin
-                                Send Add_New_Line "" 0
-                            End
-                            Send Down
-                        End
-                    End_Procedure
-
-                    Procedure OnChange Integer iItem  
-                        Integer iKeywords
-                        Delegate Send NotifyChange
-                        Get Item_Count to iKeywords
-                        Set Label of oKeywordsInfo_tb to ("Keywords:" * String(iKeywords))
-                    End_Procedure
-
-                    Procedure Add_New_Line String sKeyword Integer iColor
-                        Send Add_Item Msg_None sKeyword
-                        If (iColor) Begin
-                            Set ItemTextColor (Item_Count(Self) -1) to iColor
-                        End
-                    End_Procedure
-
-                    Procedure mInsertLine
-                        Send Add_New_Line "" clRed
-                        Send onChange 0
-                        Send End_of_Data
-                    End_Procedure
-
-                    Procedure mRemoveLine
-                        Integer iRowBase
-                        If (Item_Count(Self) = 0) Begin
-                            Procedure_Return
-                        End
-                        Get Base_Row_Item (Current_Item(Self)) to iRowBase
-                        Send Delete_Item iRowBase
-                        Send OnChange 0
-                    End_Procedure
-
-                    Function GetValue Integer iColumn Returns String
-                        Integer iC iColumns
-                        String  sRet sSep
-                        Move (Low(Matrix_Size(Self))) to iColumns
-                        Get psSepCharacter to sSep
-                        If (sSep = "") Begin
-                            Move "\n" to sSep
-                        End
-                        For iC From 0 to (Item_Count(Self) -1)
-                            If (Value(Self, iC + iColumn) <> "") Begin
-                                If (sRet <> "") Begin
-                                    Move (sRet + sSep) to sRet
-                                End
-                                Move (sRet + Value(Self, iC + iColumn)) to sRet
-                            End
-                            Move (iC + iColumns - 1) to iC
-                        Loop
-                        Function_Return sRet
-                    End_Function
 
                     Procedure DoLoad tSCLanguage ByRef ltSCLanguage
-                        Integer iKeyword iKeywords
-
-                        Send Delete_Data
                         Move (SortArray(ltSCLanguage.saKeywords)) to ltSCLanguage.saKeywords
-                        Move (SizeOfArray(ltSCLanguage.saKeywords)) to iKeywords
-                        For iKeyword From 0 to (iKeywords - 1)
-                            Send Add_New_Line ltSCLanguage.saKeywords[iKeyword] 0
-                        Loop
-                        Set Label of oKeywordsInfo_tb to ("Keywords:" * String(iKeywords))
+                        Send LoadWords ltSCLanguage.saKeywords
                     End_Procedure
-
-                    On_Key Key_F2           Send Request_SaveAllEntries
-                    On_Key Key_Ctrl+Key_F2  Send Request_SaveAllEntries
-                    On_Key kCancel          Send Close_Panel
-                    On_Key kUpArrow         Send mMoveUp
-                    On_Key kDownArrow       Send mMoveDown
-                    On_Key Key_Tab          Send mMoveDown
                 End_Object
 
                 Object oKeywordsInfo_tb is a TextBox
@@ -990,7 +898,7 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set peAnchors to anTopBottom
                 End_Object
 
-                Object oOperators is a cSCWsGrid
+                Object oOperators is a cScintillaWordList
                     Set Size to 137 107
                     Set Location to 35 316
                     Set Header_Label 0 to "Operator"
@@ -1000,102 +908,15 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set GridLine_Mode to Grid_Visible_None
                     Set peAnchors to anTopBottom
 
-                    Property String psSepCharacter "\n"
-
-                    Procedure mMoveUp
-                        Integer iItem
-                        String sValue
-                        Get Current_Item to iItem
-                        Get Value Item iItem to sValue
-                        If ((iItem = Item_Count(Self) -1) and sValue = "") Begin
-                            Send mRemoveLine
-                        End
-                        Else Begin
-                            Send Up
-                        End
+                    // The count label beside the list.
+                    Procedure UpdateCountLabel Integer iCount
+                        Set Label of oOperatorsInfo_tb to ("Operators:" * String(iCount))
                     End_Procedure
-
-                    Procedure mMoveDown
-                        Integer iItem
-                        String sValue
-                        Get Current_Item to iItem
-                        Get Value Item iItem to sValue
-                        If (sValue <> "") Begin
-                            If (iItem = Item_Count(Self) -1) Begin
-                                Send Add_New_Line "" 0
-                            End
-                            Send Down
-                        End
-                    End_Procedure
-
-                    Procedure OnChange Integer iItem
-                        Integer iOperators
-                        Delegate Send NotifyChange
-                        Get Item_Count to iOperators
-                        Set Label of oOperatorsInfo_tb to ("Operators:" * String(iOperators))
-                    End_Procedure
-
-                    Procedure Add_New_Line String sOperator Integer iColor
-                        Send Add_Item Msg_None sOperator
-                        If (iColor) Begin
-                            Set ItemTextColor (Item_Count(Self) -1) to iColor
-                        End
-                    End_Procedure
-
-                    Procedure mInsertLine
-                        Send Add_New_Line "" clRed
-                        Send onChange 0
-                        Send End_of_Data
-                    End_Procedure
-
-                    Procedure mRemoveLine
-                        Integer iRowBase
-                        If (Item_Count(Self) = 0) Begin
-                            Procedure_Return
-                        End
-                        Get Base_Row_Item (Current_Item(Self)) to iRowBase
-                        Send Delete_Item iRowBase
-                        Send OnChange 0
-                    End_Procedure
-
-                    Function GetValue Integer iColumn Returns String
-                        Integer iC iColumns
-                        String  sRet sSep
-
-                        Move (Low(Matrix_Size(Self))) to iColumns
-                        Get psSepCharacter to sSep
-                        If (sSep = "") Begin
-                            Move "\n" to sSep
-                        End
-                        For iC From 0 to (Item_Count(Self) -1)
-                            If (Value(Self, iC + iColumn) <> "") Begin
-                                If (sRet <> "") Begin
-                                    Move (sRet + sSep) to sRet
-                                End
-                                Move (sRet + Value(Self, iC + iColumn)) to sRet
-                            End
-                            Move (iC + iColumns - 1) to iC
-                        Loop
-                        Function_Return sRet
-                    End_Function
 
                     Procedure DoLoad tSCLanguage ByRef ltSCLanguage
-                        Integer iOperator iOperators
-                        Send Delete_Data
                         Move (SortArray(ltSCLanguage.saOperators)) to ltSCLanguage.saOperators
-                        Move (SizeOfArray(ltSCLanguage.saOperators)) to iOperators
-                        For iOperator From 0 to (iOperators -1)
-                            Send Add_New_Line ltSCLanguage.saOperators[iOperator] 0
-                        Loop
-                        Set Label of oOperatorsInfo_tb to ("Operators:" * String(iOperators))
+                        Send LoadWords ltSCLanguage.saOperators
                     End_Procedure
-
-                    On_Key Key_F2           Send Request_SaveAllEntries
-                    On_Key Key_Ctrl+Key_F2  Send Request_SaveAllEntries
-                    On_Key kCancel          Send Close_Panel
-                    On_Key kUpArrow         Send mMoveUp
-                    On_Key kDownArrow       Send mMoveDown
-                    On_Key Key_Tab          Send mMoveDown
                 End_Object
 
                 Object oOperatorsInfo_tb is a TextBox
@@ -1134,7 +955,7 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Integer iC
 
                     Forward Send End_Construct_Object
-                    Move "VDF" to sLanguage
+                    Move CS_EditorLanguage to sLanguage
                     Get FindLanguage of ghoEditorProperties sLanguage to iC
                     If (iC >= 0) Begin
                         Send LoadEntries iC
@@ -1149,10 +970,10 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Integer iC
                     String  sName
 
-                    Move "VDF" to sName
+                    Move CS_EditorLanguage to sName
                     Get FindLanguage                 of ghoEditorProperties sName   to iC
                     If (iC < 0) Begin
-                        Get psLanguages.Count       of ghoEditorProperties         to iC
+                        Get psLanguages.Count        of ghoEditorProperties         to iC
                     End
                     Set psLanguages                  of ghoEditorProperties Item iC to sName
 
@@ -1161,30 +982,36 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set psLanguages.szKeywords       of ghoEditorProperties Item iC to (GetValue(oKeywords(Self), 0))
                     Set psLanguages.szOperators      of ghoEditorProperties Item iC to (GetValue(oOperators(Self), 0))
 
-                    Send RegisterLanguage to ghoEditorProperties iC
+                    // RegisterLanguage was sent here. Its body has been the comment
+                    // "codemax only!" for as long as it has existed - it registered a
+                    // language with the CodeMax control for highlighting, and there is no
+                    // CodeMax control. The Scintilla lexer is configured by SetLexer.
                 End_Procedure
 
                 Procedure LoadEntries Integer iC
                     tSCLanguage SCLanguage
 
-                    Get psLanguages.dwStyle                 of ghoEditorProperties iC to SCLanguage.iProcedural
-                    Get psLanguages.bIsCaseSensitive        of ghoEditorProperties iC to SCLanguage.iCaseSensitive
-                    Get psLanguages.szStringDelims          of ghoEditorProperties iC to SCLanguage.sStringDelimiter
-                    Get psLanguages.chEscape                of ghoEditorProperties iC to SCLanguage.sEscapeChar
-                    Get psLanguages.chTerminator            of ghoEditorProperties iC to SCLanguage.sLineTerminationChar
-                    Get psLanguages.szSingleLineComments    of ghoEditorProperties iC to SCLanguage.sLineComments
-                    Get psLanguages.szMultiLineComments1    of ghoEditorProperties iC to SCLanguage.sMultiLineCommentStart
-                    Get psLanguages.szMultiLineComments2    of ghoEditorProperties iC to SCLanguage.sMultiLineCommentStop
-
-                    Send LoadElementString (psLanguages.szScopeKeywords1(ghoEditorProperties,iC))       "\n" (&SCLanguage.saScopeStart)
-                    Send LoadElementString (psLanguages.szScopeKeywords2(ghoEditorProperties,iC))       "\n" (&SCLanguage.saScopeStop)
-                    Send LoadElementString (psLanguages.szKeywords(ghoEditorProperties,iC))             "\n" (&SCLanguage.saKeywords)
-                    Send LoadElementString (psLanguages.szOperators(ghoEditorProperties,iC))            "\n" (&SCLanguage.saOperators)
-
-                    Send LoadElementString (psLanguages.pszTagElementNames(ghoEditorProperties,iC))     "\n" (&SCLanguage.saTags)
-                    Send LoadElementString (psLanguages.pszTagAttributeNames(ghoEditorProperties,iC))   "\n" (&SCLanguage.saAttributes)
-                    Send LoadElementString (psLanguages.pszTagEntities(ghoEditorProperties,iC))         "\n" (&SCLanguage.saEntities)
+                    /* Eleven more sub-values used to be read into SCLanguage here - dwStyle,
+                       bIsCaseSensitive, the string delimiters, the escape and terminator characters,
+                       the three comment markers and the three HTML/XML tag lists. Every one of them
+                       was WRITE-ONLY: measured across all of AppSrc, nothing ever read those struct
+                       members back. They are Hammer-era leftovers from when this dialog was built
+                       (Nils, 2026-07-28).
                     
+                       Only the four the engine consumes are filled now. _AddAllKeyWords in
+                       cBaseFuncLib reads saScopeStart, saScopeStop, saKeywords and saOperators, and
+                       those are what seed ghoFuncLib's keyword arrays.
+                    
+                       The SETTINGS themselves are untouched - psLanguages still stores all fifteen
+                       sub-values at their original indices, because those indices are the on-disk
+                       format and renumbering them would misread every saved language definition.
+                       This drops the reads, not the data. */
+
+                    Send RefactorAppendSplitLine (psLanguages.szScopeKeywords1(ghoEditorProperties,iC))       "\n" (&SCLanguage.saScopeStart)
+                    Send RefactorAppendSplitLine (psLanguages.szScopeKeywords2(ghoEditorProperties,iC))       "\n" (&SCLanguage.saScopeStop)
+                    Send RefactorAppendSplitLine (psLanguages.szKeywords(ghoEditorProperties,iC))             "\n" (&SCLanguage.saKeywords)
+                    Send RefactorAppendSplitLine (psLanguages.szOperators(ghoEditorProperties,iC))            "\n" (&SCLanguage.saOperators)
+
                     Send DoLoad to oScopes      (&SCLanguage)
                     Send DoLoad to oKeywords    (&SCLanguage)
                     Send DoLoad to oOperators   (&SCLanguage)
@@ -1199,19 +1026,6 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Send Delete_Data    to oOperators
                 End_Procedure
 
-                Procedure LoadElementString String sElement String sSeparator String[] ByRef saElements
-                    Integer iC iItem
-                    Handle hoParser
-
-                    Get Create (RefClass(cLineParser)) to hoParser
-                    Set psSepCharacter of hoParser to sSeparator
-                    Send ParseLine     to hoParser sElement
-                    For iC From 0 to (Item_Count(hoParser) -1)
-                        Move (SizeOfArray(saElements)) to iItem
-                        Get Value of hoParser Item iC to saElements[iItem]
-                    Loop
-                    Send Destroy_Object to hoParser
-                End_Procedure
 
             End_Object
 
@@ -1360,17 +1174,34 @@ Object oScintillaParameters_dg is a cRDCModalPanel
                     Set Location to 90 359
                     Set Label to "Assign"
 //                    Set psImage to "Assign.ico"
+                    /* The engine records a clash rather than announcing it - saying
+                       something is this page's job, because this page is what has the
+                       user's attention. (It used to pop its own Info_Box from inside
+                       AssignShortCutToCmd, which made the engine impossible to test
+                       without a modal dialog appearing.) */
                     Procedure OnClick
-                        Integer iCmd
+                        Integer iCmd iConflict
+                        String  sTaken
                         tShortCut ShortCut
+
                         Get piCurrentCommand to iCmd
                         Get pNewShortCut of oNewKey to ShortCut
-                        If (iCmd<>0 and SizeOfArray(ShortCut.VKcode)>0) Begin
-                            Send AssignShortCutToCmd of oSciCommandHotKeys iCmd ShortCut
-                            Send DisplayCommandDetails
+                        If (iCmd = 0 or SizeOfArray(ShortCut.VKcode) = 0) ;
+                            Procedure_Return
+
+                        Send AssignShortCutToCmd of oSciCommandHotKeys iCmd ShortCut
+                        Get piAssignConflictCmd of oSciCommandHotKeys to iConflict
+                        If (iConflict >= 0) Begin
+                            Get psAssignConflictName of oSciCommandHotKeys to sTaken
+                            Send Stop_Box ("That shortcut is already assigned to " + sTaken ;
+                                           + ". Remove it there first.") "Shortcut in use"
                             Send Activate to oNewKey
-                            Delegate Send NotifyChange
+                            Procedure_Return
                         End
+
+                        Send DisplayCommandDetails
+                        Send Activate to oNewKey
+                        Delegate Send NotifyChange
                     End_Procedure
                 End_Object
 
@@ -1570,6 +1401,7 @@ Object oScintillaParameters_dg is a cRDCModalPanel
 
     Procedure ApplyToEditor
         Handle hClientArea hView
+
         Get Client_Id to hClientArea
         Get Next_Mdi_Dialog of hClientArea True to hView // find first view
         While (hView <> 0)
@@ -1584,13 +1416,36 @@ Object oScintillaParameters_dg is a cRDCModalPanel
     End_Procedure
 
     Procedure LoadEntries
-        String sFontFace
+        String sFontFace sSchemaName
+
+        /* The Colors page's working copy, taken from the LIVE settings rather than
+           re-resolved by name: those are the colours the editor is painting right now,
+           which is what the page has to open showing. Re-resolving would quietly
+           discard an unsaved-then-saved edit that a built-in name still covers.
+           LoadFromSettings sniffs readable-or-packed, so an install that has never
+           opened this dialog opens on its existing scheme and converts it on save. */
+        Get psColorSchema of ghoEditorProperties to sSchemaName
+        If (sSchemaName = "") ;
+            Move CS_ThemeLime to sSchemaName
+        Send LoadFromSettings of oEditingScheme sSchemaName ;
+                                 (psColors(ghoEditorProperties)) ;
+                                 (psFontStyles(ghoEditorProperties))
+        Send RefreshElementControls to oCategory
 
         Get psFontFace of ghoEditorProperties to sFontFace
         If (sFontFace="") Begin
             Move "11pt; 0; Courier New"       to sFontFace
         End
         Set psEditorFont   of oFontFace       to sFontFace
+
+        /* Hand scheme and font to the preview NOW - after the font form is filled,
+           because mGeneratePreview reads it from there, and before Forward Send Popup
+           pages the controls. The preview applies its scheme from the bridge's post-page
+           hook, and if it has not been given one by then it paints its own default
+           (White) and stays that way until something on the page changes. Nothing is
+           repainted here; there is no window yet. It just makes sure there is something
+           to find when there is. */
+        Send mGeneratePreview to oSchemaSelect_grp
 
         Set Value          of oTabSize        to (piTabSize(ghoEditorProperties))
         Set Checked_State  of oLineNumbers    to (piLineNumbering(ghoEditorProperties))

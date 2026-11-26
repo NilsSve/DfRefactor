@@ -1,0 +1,421 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cScintillaSchemeView
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-27
+//
+// Description : PHASE 1 of the SciControlLib modernization (Nils, 2026-07-27): the one place that
+//               knows how to paint a cEditorColourScheme onto a Scintilla control.
+//
+//               This code used to live in cRefactorScintillaEditor.pkg, which was fine while the
+//               editor was the only thing rendering DataFlex source. It was not: the Editor Settings
+//               dialog had a PREVIEW, and because a preview cannot be an editor, the preview was a
+//               RichEdit with a hand-written re-implementation of every style decision made here
+//               (cEditorPreview in THColorer.pkg - ninety lines of "add a keyword, add a space, add a
+//               string" in the dialog, and a second reading of every colour). Two renderers, one
+//               scheme, and no way to keep them in step; the preview showed something adjacent to
+//               what the editor would do rather than the thing itself.
+//
+//               So the rendering moves DOWN, to a class both can be. The editor chain becomes
+//
+//                    cScintillaControl -> cScintillaEditorBridge -> cScintillaSchemeView
+//                                      -> cRefactorEditorCommands -> cRefactorScintillaEditor
+//
+//               and the settings preview (cSchemePreview.pkg) branches off at this class. The
+//               preview is now a real Scintilla control running the real DataFlex lexer with the
+//               real style map, so "what the preview shows" and "what the editor does" are the same
+//               code path and cannot drift.
+//
+//               Two seams make that work, and they are the only things a subclass has to answer:
+//
+//                 LoadCurrentScheme  - fill phoColourScheme. The editor loads the SAVED settings; the
+//                                      preview copies the scheme the dialog is editing, so it shows
+//                                      the pending change rather than what is on disk.
+//                 ActiveSchemeName   - the name to judge "is this a built-in" against, which decides
+//                                      how the selection colours are resolved.
+//
+//               Nothing here reads gtColorer[]. The scheme object is the single source.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+// Which indicator numbers the brace overlays claim. Indicators 0-7 are the lexer's;
+// INDIC_CONTAINER (8) is the first one a container may use, and nothing else in this
+// program uses indicators at all.
+#IFNDEF CI_BraceMatchIndicator
+Define CI_BraceMatchIndicator for 8      // INDIC_CONTAINER
+Define CI_BraceBadIndicator   for 9
+#ENDIF
+
+Use cScintillaEditorBridge.pkg
+Use cEditorColourScheme.pkg
+Use cRefactorEditorSettings.pkg
+Use cRefactorNormalizeCase.pkg      // oNormalizeCase - seeded from the same keyword lists
+
+// The fold-margin +/- and bookmark pixmaps, from Scintilla's image DLL. Used by
+// ApplyFoldingStyle below; the guards let the old chain declare them too while it lasts.
+#IFNDEF SCIMAGE_DLL
+    #IFDEF IS$WIN64
+    Define SCIMAGE_DLL For SCIMAGE64.DLL
+    #ELSE
+    Define SCIMAGE_DLL For SCIMAGE32.DLL
+    #ENDIF
+#ENDIF
+#IFNDEF get_SciEditorIconXpm
+External_Function SciEditorIconXpm "SciEditorIconXpm" SCIMAGE_DLL Integer iIcon Returns Pointer
+#ENDIF
+
+Class cScintillaSchemeView is a cScintillaEditorBridge
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+
+        // The scheme this control paints from, filled by LoadCurrentScheme. One per
+        // control, made once - the appearance code runs on every settings change and on
+        // every paged control, so creating and destroying one per call is waste.
+        Property Handle phoColourScheme 0
+        Set phoColourScheme to (Create(Self, RefClass(cEditorColourScheme)))
+    End_Procedure
+
+    // ==================================================================================
+    // The two seams.
+    // ==================================================================================
+
+    // Fill the scheme from the settings: the live colours, under the current scheme's
+    // name. LoadFromSettings takes the readable form or the old packed pair, whichever
+    // the settings still hold, so an unconverted install renders correctly and converts
+    // itself on the next save.
+    Procedure LoadCurrentScheme
+        Handle hoScheme
+        Get phoColourScheme to hoScheme
+        Send LoadFromSettings of hoScheme (psColorSchema(ghoEditorProperties)) ;
+                                          (psColors(ghoEditorProperties)) ;
+                                          (psFontStyles(ghoEditorProperties))
+    End_Procedure
+
+    // Which named scheme is being painted. Only used to decide whether the selection
+    // colours may be asked of the built-in declaration.
+    Function ActiveSchemeName Returns String
+        Function_Return (psColorSchema(ghoEditorProperties))
+    End_Function
+
+    // ==================================================================================
+    // The language. Split out of the editor's SetLexer so the preview lexes DataFlex the
+    // same way the editor does - the style map below is meaningless without it, and a
+    // preview that lexed differently would be the old two-renderer problem again.
+    // Everything the EDITOR additionally does on SetLexer (its internal commands, its
+    // hotkeys, LoadEntries) stays in the editor; this is the language and nothing else.
+    // ==================================================================================
+    Procedure ApplyLanguage
+        Boolean bInit
+        Integer iLanguage iLexer
+        String  sKeywords sScopeKeywords1 sScopeKeywords2 sOperators sLanguage
+
+        Get psLanguage of ghoEditorProperties to sLanguage
+        Send ApplyEditorLanguage sLanguage
+        Get EditorMessage SCI_GETLEXER 0 0 to iLexer
+        Get FindLanguage of ghoEditorProperties sLanguage to iLanguage
+        If (iLexer <> SCLEX_DATAFLEX) ;
+            Procedure_Return
+
+        Get KeywordListAsWords (psLanguages.szKeywords(ghoEditorProperties, iLanguage))       to sKeywords
+        Get KeywordListAsWords (psLanguages.szScopeKeywords1(ghoEditorProperties, iLanguage)) to sScopeKeywords1
+        Get KeywordListAsWords (psLanguages.szScopeKeywords2(ghoEditorProperties, iLanguage)) to sScopeKeywords2
+        Get KeywordListAsWords (psLanguages.szOperators(ghoEditorProperties, iLanguage))      to sOperators
+        // ^ is a wildcard match in Scintilla's operator list - leaving it in makes
+        // EVERYTHING an operator. It is hardcoded in the lexer anyway.
+        Move (Replaces(CS_U, sOperators, "")) to sOperators
+
+        // Fill the arrays the normalize-case-while-typing feature matches against.
+        Get InitializedLanguage of oNormalizeCase SCLEX_DATAFLEX to bInit
+        If (bInit = False) Begin
+            Send AddKeywords   of oNormalizeCase SCLEX_DATAFLEX sKeywords
+            Send AddScopewords of oNormalizeCase SCLEX_DATAFLEX sScopeKeywords1
+            Send AddScopewords of oNormalizeCase SCLEX_DATAFLEX sScopeKeywords2
+        End
+
+        // The lexer matches lowercase.
+        Move (Lowercase(sKeywords))       to sKeywords
+        Move (Lowercase(sScopeKeywords1)) to sScopeKeywords1
+        Move (Lowercase(sScopeKeywords2)) to sScopeKeywords2
+        Move (Lowercase(sOperators))      to sOperators
+        Send SetKeywordList 0 sKeywords                    // language keywords
+        If (sScopeKeywords1 <> "" and sScopeKeywords2 <> "") Begin
+            Send SetKeywordList 1 sScopeKeywords1          // scope open
+            Send SetKeywordList 2 sScopeKeywords2          // scope close
+            Send SetKeywordList 3 sOperators               // operators
+        End
+    End_Procedure
+
+    // The lexer name Scintilla knows this configured language by. DFRefactor's editor is
+    // for DataFlex source; anything else passes through lowercased, which is the form
+    // Scintilla's own lexer names take.
+    Procedure ApplyEditorLanguage String sLanguage
+        Move (Lowercase(Trim(sLanguage))) to sLanguage
+        // Both names map to Scintilla's lexer: "df" is what the setting says now, "vdf"
+        // is what an unmigrated one still says.
+        If (sLanguage = "df" or sLanguage = "vdf") ;
+            Move "dataflex" to sLanguage
+        Send SetLexerLanguage sLanguage
+    End_Procedure
+
+    // ==================================================================================
+    // Appearance. Everything painted here comes from a cEditorColourScheme, loaded by
+    // LoadCurrentScheme each time the scheme is applied. Applying it is the
+    // APPLICATION's job - the control classes below stay free of any opinion about
+    // colour - and the bridge calls ApplyColourScheme and ApplyFoldingStyle from
+    // ApplyEditorOptions once the control exists.
+    // ==================================================================================
+
+    // One scheme element onto one Scintilla style. A background of CI_NoColour means
+    // "whatever the page colour is".
+    Procedure SetAppearance Integer iStyle Integer eElement
+        Integer iBackColor
+        tEditorStyle Appearance
+
+        Get StyleFor of (phoColourScheme(Self)) eElement to Appearance
+        Send EditorMessage SCI_STYLESETFORE iStyle Appearance.iForeColor
+        Move Appearance.iBackColor to iBackColor
+        If (iBackColor = CI_NoColour) Begin
+            Get piWindowColor to iBackColor
+            If (iBackColor < 0) ;
+                Move clWhite to iBackColor
+        End
+        Send EditorMessage SCI_STYLESETBACK   iStyle iBackColor
+        Send EditorMessage SCI_STYLESETBOLD   iStyle Appearance.bBold
+        Send EditorMessage SCI_STYLESETITALIC iStyle Appearance.bItalic
+        /* Underline was stored, serialized and read back for years without ever being
+           pushed to Scintilla, so the Colors page's Underline checkbox remembered your
+           answer and changed nothing. Scintilla has always supported it; the line was
+           simply missing. */
+        Send EditorMessage SCI_STYLESETUNDERLINE iStyle Appearance.bUnderline
+    End_Procedure
+
+    // Which scheme element each DataFlex token type takes its look from. Only the
+    // DataFlex map is carried over - the old chain branched across a dozen languages
+    // for the Hammer's benefit, and DFRefactor edits DataFlex source.
+    Procedure ApplyDataFlexStyleMap
+        Send SetAppearance SCE_DF_DEFAULT       eEC_Text
+        Send SetAppearance SCE_DF_IDENTIFIER    eEC_Text
+        Send SetAppearance SCE_DF_METATAG       eEC_MetaTags        // { ... } meta-tags
+        Send SetAppearance SCE_DF_IMAGE         eEC_Comments        // report image pages
+        Send SetAppearance SCE_DF_COMMENTLINE   eEC_Comments        // // ...
+        Send SetAppearance SCE_DF_PREPROCESSOR  eEC_PreProcessor    // #COMMAND / #IFDEF
+        Send SetAppearance SCE_DF_PREPROCESSOR2 eEC_PreProcessor
+        Send SetAppearance SCE_DF_NUMBER        eEC_Numbers
+        Send SetAppearance SCE_DF_HEXNUMBER     eEC_Numbers
+        Send SetAppearance SCE_DF_WORD          eEC_Keywords
+        Send SetAppearance SCE_DF_STRING        eEC_Strings
+        Send SetAppearance SCE_DF_STRINGEOL     eEC_StringTyping    // unterminated string
+        Send SetAppearance SCE_DF_SCOPEWORD     eEC_ScopeKeywords
+        Send SetAppearance SCE_DF_OPERATOR      eEC_Operators
+        Send SetAppearance SCE_DF_ICODE         eEC_Numbers
+    End_Procedure
+
+    /* How the selection is drawn. Scintilla changes only the BACKGROUND of selected
+       text, so on a dark scheme a light selection leaves light-blue keywords on a light
+       ground. The theme decides which way out to take - a fixed text colour, which
+       trades the syntax colouring for guaranteed contrast, or translucency, which keeps
+       every token's colour and shifts the ground underneath. See the comment on
+       SetSelectionColours in the bridge.
+
+       The scheme resolves this from its own page colour, so a theme nobody wrote gets a
+       readable selection too. A BUILT-IN is asked directly, because its declarations
+       carry the intent; anything else is judged on the live colours, which is what is
+       actually being painted. */
+    Procedure ApplySelectionAppearance
+        Integer iBackColor iTextColor iAlpha
+        Handle  hoScheme
+        String  sName
+
+        Get phoColourScheme to hoScheme
+        Get ActiveSchemeName to sName
+        If (IsBuiltIn(hoScheme, sName)) ;
+            Send LoadBuiltIn of hoScheme sName
+        Get ResolvedSelectionBackColor of hoScheme to iBackColor
+        Get SelectionTextColor         of hoScheme to iTextColor
+        Get ResolvedSelectionAlpha     of hoScheme to iAlpha
+        // Put the live colours back - the built-in load above overwrote them.
+        If (IsBuiltIn(hoScheme, sName)) ;
+            Send LoadCurrentScheme
+
+        Send SetSelectionColours iBackColor iTextColor
+        Send SetSelectionTranslucency iAlpha
+    End_Procedure
+
+    /* One brace overlay: a rounded translucent box in a single colour.
+
+       SCI_INDICSETUNDER puts it BEHIND the text. That is the whole point - the brace keeps
+       the colour the lexer gave it and gains a tint behind it, instead of being repainted.
+       Drawn over the top, a translucent box dims the glyph it is meant to point at. */
+    Procedure ConfigureBraceIndicator Integer iIndicator Integer iColour Integer iEdgeAlpha
+        Send EditorMessage SCI_INDICSETSTYLE        iIndicator INDIC_ROUNDBOX
+        Send EditorMessage SCI_INDICSETFORE         iIndicator iColour
+        Send EditorMessage SCI_INDICSETALPHA        iIndicator CI_BraceWashFill
+        Send EditorMessage SCI_INDICSETOUTLINEALPHA iIndicator iEdgeAlpha
+        Send EditorMessage SCI_INDICSETUNDER        iIndicator True
+    End_Procedure
+
+    /* Brace matching, drawn the way the Studio draws it.
+
+       Scintilla can mark the matched pair two ways. The default is a STYLE - STYLE_BRACELIGHT
+       replaces the brace's colours outright - and that is what this editor used: on the Lime
+       scheme the brace simply turned red, which reads as "something is wrong here" rather
+       than "here is the partner", and buries the information in whichever colour the scheme
+       happened to name. The other way is an INDICATOR, which draws a translucent box and
+       leaves the character alone. That is the Studio's behaviour and it is strictly more
+       informative: you see the pair AND you still see what the pair is.
+
+       SCI_BRACEHIGHLIGHTINDICATOR only redirects the drawing. The bridge's ShowMatchingBraces
+       still sends plain SCI_BRACEHIGHLIGHT / SCI_BRACEBADLIGHT and needs no change.
+
+       The unmatched box stays red, because there it is the right signal - but translucent,
+       so an unbalanced brace no longer paints a solid block over the code while you are
+       still typing the line. The Studio has no unmatched state at all; this keeps the
+       information and drops the shouting. */
+    Procedure ApplyBraceAppearance
+        Integer iMatchTint iBadTint
+        Handle  hoScheme
+
+        Get phoColourScheme to hoScheme
+        Get HighlightTintColor of hoScheme eEC_BraceHighlight to iMatchTint
+        Get HighlightTintColor of hoScheme eEC_UnmatchedBrace to iBadTint
+
+        Send ConfigureBraceIndicator CI_BraceMatchIndicator iMatchTint CI_BraceWashEdge
+        Send ConfigureBraceIndicator CI_BraceBadIndicator   iBadTint   CI_BraceBadWashEdge
+
+        Send EditorMessage SCI_BRACEHIGHLIGHTINDICATOR True CI_BraceMatchIndicator
+        Send EditorMessage SCI_BRACEBADLIGHTINDICATOR  True CI_BraceBadIndicator
+    End_Procedure
+
+    /* The whole scheme: caret, selection, the token colours, and the two overlays that
+       are not source text (call tips and the autocomplete list). Starts by copying the
+       default style over every style, so a scheme that leaves an entry unset inherits
+       the editor font rather than keeping a stale colour from the previous scheme. */
+    Procedure ApplyColourScheme
+        Integer iLexer iBackColor
+        String  sFont
+        tEditorStyle TextStyle PageStyle
+
+        Send LoadCurrentScheme
+        Get StyleFor of (phoColourScheme(Self)) eEC_Text   to TextStyle
+        Get StyleFor of (phoColourScheme(Self)) eEC_Window to PageStyle
+
+        Send EditorMessage SCI_STYLECLEARALL
+        Set piTextColor   to TextStyle.iForeColor
+        Set piWindowColor to PageStyle.iForeColor      // the window's "fore" IS the page
+
+        Send EditorMessage SCI_SETCARETFORE  TextStyle.iForeColor
+        Send EditorMessage SCI_SETCARETWIDTH 3
+
+        Move PageStyle.iForeColor to iBackColor
+        If (iBackColor < 0) ;
+            Move clWhite to iBackColor
+        Send ApplySelectionAppearance
+
+        Send EditorMessage SCI_STYLESETFORE STYLE_DEFAULT TextStyle.iForeColor
+        Send EditorMessage SCI_STYLESETBACK STYLE_DEFAULT iBackColor
+        Send EditorMessage SCI_STYLESETBACK 0             iBackColor
+
+        Get EditorMessage SCI_GETLEXER to iLexer
+        If (iLexer = SCLEX_DATAFLEX) ;
+            Send ApplyDataFlexStyleMap
+        Else ;
+            Send SetAppearance SCE_TEXT_DEFAULT eEC_Text
+
+        Send ApplyBraceAppearance      // both brace states, drawn as translucent overlays
+        Send SetAppearance STYLE_LINENUMBER eEC_LineNumbers
+        Send EditorMessage SCI_STYLESETSIZE STYLE_LINENUMBER 10
+
+        // Call tips and the autocomplete list are UI, not source - they keep a fixed
+        // readable look rather than following the source colour scheme.
+        Move ("Segoe UI" + Character(0)) to sFont
+        Send EditorMessage SCI_STYLESETFONT STYLE_CALLTIP (AddressOf(sFont))
+        Send EditorMessage SCI_STYLESETSIZE STYLE_CALLTIP 9
+        Send EditorMessage SCI_STYLESETBACK STYLE_CALLTIP (RGB($FF, $FF, $E1))
+        Send EditorMessage SCI_STYLESETFORE STYLE_CALLTIP (RGB($00, $00, $00))
+        Send EditorMessage SCI_CALLTIPSETFOREHLT          (RGB($00, $00, $00))
+        Send EditorMessage SCI_CALLTIPUSESTYLE 10
+        Send EditorMessage SCI_AUTOCUSESTYLE
+        Send EditorMessage SCI_STYLESETFONT STYLE_AUTOCOMPLETE (AddressOf(sFont))
+        Send EditorMessage SCI_STYLESETSIZE STYLE_AUTOCOMPLETE 10
+    End_Procedure
+
+    /* The fold margin's markers. The +/- icons come from the Scintilla image DLL when
+       it has them; the connector markers are deliberately empty, so the margin shows
+       just the two toggles rather than a tree of lines. */
+    Procedure ApplyFoldingStyle
+        Integer iFore iBack
+        Pointer pExpandIcon pCollapseIcon pBookmarkIcon
+        tEditorStyle Appearance
+
+        Move (RGB($00, $00, $00)) to iBack
+        Move (RGB($bb, $bb, $bb)) to iFore
+        Move (SciEditorIconXpm(0)) to pExpandIcon
+        Move (SciEditorIconXpm(1)) to pCollapseIcon
+        Move (SciEditorIconXpm(2)) to pBookmarkIcon
+
+        Get StyleFor of (phoColourScheme(Self)) eEC_LineNumbers to Appearance
+        Send EditorMessage SCI_SETFOLDMARGINCOLOUR True Appearance.iBackColor
+        Get StyleFor of (phoColourScheme(Self)) eEC_LeftMargin to Appearance
+        Send EditorMessage SCI_SETFOLDMARGINHICOLOUR True Appearance.iForeColor
+
+        Send EditorMessage SCI_MARKERSETBACK SC_MARKNUM_FOLDEROPEN iBack
+        Send EditorMessage SCI_MARKERSETFORE SC_MARKNUM_FOLDEROPEN iFore
+        Send EditorMessage SCI_MARKERSETBACK SC_MARKNUM_FOLDER     iBack
+        Send EditorMessage SCI_MARKERSETFORE SC_MARKNUM_FOLDER     iFore
+        Send EditorMessage SCI_MARKERSETBACK SC_MARKNUM_FOLDEREND     iBack
+        Send EditorMessage SCI_MARKERSETFORE SC_MARKNUM_FOLDEREND     iFore
+        Send EditorMessage SCI_MARKERSETBACK SC_MARKNUM_FOLDEROPENMID iBack
+        Send EditorMessage SCI_MARKERSETFORE SC_MARKNUM_FOLDEROPENMID iFore
+        If (pCollapseIcon <> 0) Begin
+            Send EditorMessage SCI_MARKERDEFINEPIXMAP SC_MARKNUM_FOLDEROPEN    pCollapseIcon
+            Send EditorMessage SCI_MARKERDEFINEPIXMAP SC_MARKNUM_FOLDEROPENMID pCollapseIcon
+        End
+        Else ;
+            Send EditorMessage SCI_MARKERDEFINE SC_MARKNUM_FOLDEROPEN SC_MARK_CIRCLEMINUS
+        If (pExpandIcon <> 0) Begin
+            Send EditorMessage SCI_MARKERDEFINEPIXMAP SC_MARKNUM_FOLDER    pExpandIcon
+            Send EditorMessage SCI_MARKERDEFINEPIXMAP SC_MARKNUM_FOLDEREND pExpandIcon
+        End
+        Else ;
+            Send EditorMessage SCI_MARKERDEFINE SC_MARKNUM_FOLDER SC_MARK_CIRCLEPLUS
+        Send EditorMessage SCI_MARKERDEFINE SC_MARKNUM_FOLDERSUB     SC_MARK_EMPTY
+        Send EditorMessage SCI_MARKERDEFINE SC_MARKNUM_FOLDERTAIL    SC_MARK_EMPTY
+        Send EditorMessage SCI_MARKERDEFINE SC_MARKNUM_FOLDERMIDTAIL SC_MARK_EMPTY
+        Send EditorMessage SCI_SETFOLDFLAGS 16 0     // draw a line below a folded scope
+
+        // The highlighted line is a background wash, not a symbol.
+        Send EditorMessage SCI_MARKERDEFINE  SC_MARKNUM_LINEHIGHLIGHT SC_MARK_BACKGROUND
+        Get StyleFor of (phoColourScheme(Self)) eEC_HighlightedLine to Appearance
+        Send EditorMessage SCI_MARKERSETBACK SC_MARKNUM_LINEHIGHLIGHT Appearance.iForeColor
+
+        /* THE BOOKMARK MARKER, and the scheme's Bookmarks entry finally reaching it.
+
+           That entry has been on the Colors page for as long as the page has existed and
+           has never coloured a bookmark. The old chain referenced EC_BOOKMARK in exactly
+           one place - the PASCAL lexer mixin, for assembly blocks - so there is no
+           previous behaviour to restore here, only a setting that never did anything.
+
+           Now: give it a colour and you get a bookmark drawn in it. Leave it unset and
+           you get the shipped pixmap, or the built-in shape in red if the image DLL has
+           none. A pixmap ignores marker colours, which is why the choice has to be one
+           or the other rather than both. */
+        Get StyleFor of (phoColourScheme(Self)) eEC_Bookmark to Appearance
+        If (Appearance.iForeColor <> CI_NoColour or Appearance.iBackColor <> CI_NoColour) Begin
+            Send EditorMessage SCI_MARKERDEFINE SC_MARKNUM_BOOKMARK SC_MARK_BOOKMARK
+            If (Appearance.iBackColor <> CI_NoColour) ;
+                Send EditorMessage SCI_MARKERSETBACK SC_MARKNUM_BOOKMARK Appearance.iBackColor
+            If (Appearance.iForeColor <> CI_NoColour) ;
+                Send EditorMessage SCI_MARKERSETFORE SC_MARKNUM_BOOKMARK Appearance.iForeColor
+        End
+        Else If (pBookmarkIcon <> 0) ;
+            Send EditorMessage SCI_MARKERDEFINEPIXMAP SC_MARKNUM_BOOKMARK pBookmarkIcon
+        Else Begin
+            Send EditorMessage SCI_MARKERDEFINE  SC_MARKNUM_BOOKMARK SC_MARK_BOOKMARK
+            Send EditorMessage SCI_MARKERSETBACK SC_MARKNUM_BOOKMARK (RGB($DE, $00, $00))
+        End
+    End_Procedure
+
+End_Class

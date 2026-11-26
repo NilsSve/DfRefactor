@@ -1,0 +1,559 @@
+﻿//****************************************************************************
+// $Module type: Dialog (dockable tool panel) - FlexTron only
+// $Module name: OutputDockFT
+// $Author     : Nils Svedmyr, RDC Tools International
+//
+// Description : ONE bottom dock that hosts BOTH the Compiler-Output area and the
+//               Modernization-Analyzer area, switched by a bottom "tab" button strip
+//               (Studio-style bottom tabs). Replaces the two former standalone docks
+//               oCompilerOutput_dg (CompilerOutputFT.dg) + oModAnalyzer_dg (ModAnalyzerFT.dg),
+//               which are now Container3d AREAS Use'd inside this panel.
+//
+//               The areas keep their grids + logic verbatim; ghoCompilerOutputDock ->
+//               oCompilerArea and ghoModAnalyzerDock -> oAnalyzerArea, so every existing
+//               "Set psErrorFile / Send Refresh* of ghoXDock" keeps working. The global
+//               entry procedures (ActivateCompileErrorDialog, ActivateModAnalyzer, ...)
+//               keep their names but now Activate THIS panel + select the right tab via
+//               ShowTab. FlexTron only - the non-FT build keeps its two separate docks.
+//****************************************************************************
+Use Windows.pkg
+Use cRichEdit.pkg
+Use cRDCButtonDPI.pkg
+Use cRDCButton.pkg
+Use cRDCModalPanel.pkg
+Use cRDCCJGrid.pkg
+Use seq_chnl.pkg
+Use vwin32fh.pkg
+Use cCJGrid.pkg
+Use cCJGridColumn.pkg
+Use cRefactorCJToolPanel.pkg  // the dock: the RDC Windows library's cRDCCJToolPanel with this program's menu
+Use CompileErrorParser.pkg    // shared .err parser
+Use cModAnalyzer.pkg          // ClassifyMessage + tModAnalyzer + eMod* categories
+Use oRefactorPlanDialogFT.dg  // ShowPlan - preview dialog for "Start Refactoring"
+Use Cursor.pkg                // Cursor_Wait/Ready while the plan loads
+Use cEncodingHelpers.pkg      // rfReadEncodedFileAsStringArray - editor-free source read for the auto-fix guard
+Use FTAllWebControlClasses.pkg   // cWebHtmlBox (the bottom tab strip)
+Use cFTLocalWebControlHost.pkg     // embeds the web tab strip in this native dock
+Use FTMarkupBuilders.pkg         // the HTML vocabulary - OpenHtml, IconLabel, the builders
+Use cFTDockArea.pkg             // the three areas' root class - Used HERE, before the #Include lines
+
+// Forward-declared (defined in TestCompileFT.dg): the live .prn tail's harvested diagnostics - the
+// Analyzer area (#Include'd below) Gets these via phoTestCompileFT for its fast parse path, and the
+// compiler area appends the WARNING subset to its parsed .err (the warnings display).
+Register_Function CachedPrnMessages String sPrnFile Returns tCompileError[]
+Register_Function CachedPrnStampedFile Returns String
+Register_Function CachedPrnWarningMessages Returns tCompileError[]
+Register_Function psPrnTailNote Returns String
+Register_Function LivePrnWarnCount Returns Integer
+// Defined in the analyzer area below; referenced by the grid before its definition.
+Register_Procedure DoFreshGrids
+// The panel's tab switch - referenced by the area procs + the strip buttons.
+Register_Procedure ShowTab Integer eTab
+// Cold-show follow-up (dashboard "View last plan"): re-assert the Analyzer tab + re-push its chip bar once
+// the merged dock's WebView2 strips are warm. Registered so the dashboard can Send it by handle.
+Register_Procedure ReassertAnalyzerView
+// The Manual Changes area's row API - registered so ANY refactoring function can report work it
+// declined, without knowing where the grid lives.
+Register_Procedure AddManualChange String sSource String sFile Integer iLine String sWhat String sWhy
+Register_Procedure ClearManualChanges String sSource
+Register_Procedure RefreshManualGrid
+Register_Function ManualChangeCount Returns Integer
+// The areas' jump-to-source must activate the editor VIEW through its registered activation message
+// (a bare object Activate moves the DataFlex focus tree WITHOUT switching CodeJock's TabWorkspace
+// page - Nils 2026-07-23). Registered here so the sends compile whatever this dock's Use order is
+// relative to EditorViewFT.vw, which defines the real handler.
+Register_Procedure Activate_oEditorView_vw
+// The Test Compile bar docks BEFORE this dock's first dock (TestCompileFT.dg) - see ShowTab.
+Register_Procedure EnsureTestCompileBarDocked
+
+
+// Which tab is showing.
+Enum_List
+    Define eTabCompiler
+    Define eTabAnalyzer
+    Define eTabManual
+End_Enum_List
+
+// --- The two content areas (each fills the panel ABOVE the tab strip; only one visible). ---
+// Each area file defines a Container3d (oCompilerArea / oAnalyzerArea), anchored anAll with a bottom
+// margin = the strip height. They are #Include'd INSIDE oOutputDock_dg (below) so each area OBJECT is a
+// CHILD of the dock - the dock realizes them (creating the grids' ActiveX) before OnUpdate -> Initialize.
+
+Object oOutputDock_dg is a cRefactorCJToolPanel
+    Set Size to 60 400
+    Set piMinSize to 56 211
+    Set Location to 20 14
+    Set Color to (FTViewBg())
+    Set Border_Style to Border_None
+    Set peNeighborhood to nhPublic
+    Set peBarPosition to xtpBarBottom
+    Set psSizeSettingKey to CS_BottomDockHeight   // remember the dragged dock height across runs
+    Move Self to ghoOutputDock
+
+    // Which area is currently shown (eTabCompiler / eTabAnalyzer).
+    Property Integer peActiveTab eTabCompiler
+    // The workspace (.sws) the dock was last shown in - ShowTab records it. A hidden dock shown again keeps its
+    // content only in the SAME workspace; after a switch it holds the old one's results (CompileOutputHeld).
+    Property String psShownWS ""
+    // True once the web host has realized (first OnUpdate). A tab-bar Set psHtml before then can fault 4402.
+    Property Boolean pbTabReady False
+    // Set True by ActivateModAnalyzer just before ShowTab and cleared right after its OWN explicit Send
+    // Initialize. While set, the ShowTab -> Activate -> OnUpdate cascade skips initializing the analyzer grid,
+    // so the single explicit Initialize is the ONLY LoadData - the cascade + explicit were running LoadData
+    // TWICE (each analyze was ~double time - 25908 msgs parsed twice). Left uncleared by OnUpdate so repeated
+    // synchronous Activates during one ShowTab all skip; ShowSavedPlan never sets it, so its cascade still loads.
+    Property Boolean pbSkipAnalyzerInit False
+
+    // The two tab content areas, constructed HERE as children of the dock so the dock realizes them (which
+    // creates each grid's ActiveX BEFORE OnUpdate -> Initialize runs); ghoCompilerOutputDock / ghoModAnalyzerDock
+    // then point at the embedded Container3d. #Include (not Use) makes it explicit that each area OBJECT is
+    // created at exactly this point inside the dock; the areas' own file-scope Uses live at the top of this file.
+    #Include CompilerOutputFT.dg   // -> Object oCompilerArea is a Container3d  (Move Self to ghoCompilerOutputDock)
+    #Include ModAnalyzerFT.dg      // -> Object oAnalyzerArea is a Container3d  (Move Self to ghoModAnalyzerDock)
+    #Include ManualChangesFT.dg   // -> Object oManualArea is a Container3d    (Move Self to ghoManualChangesDock)
+
+    // Builds the bottom tab-bar HTML for the merged dock's cWebHtmlBox (oTabBar_htm). eActive marks the selected
+    // tab. Each tab is a sibling div carrying data-ServerOnClick (so the host fires oTabBar_htm.OnClick with that
+    // id). Self-contained: the flat-dark-tab CSS + the icons (Nils's custom Output glyph + a Tabler list-search
+    // glyph for the Analyzer) are inlined - no application.css / DashIcon dependency (DashIcon lives in
+    // DashboardFT.vw, Used AFTER this file). Active tab = lighter content colour + amber top accent + bold.
+    Function TabBarHtml Integer eActive Returns String
+        String sHtml sComp sAna sMan sTerm sScan sHand
+
+        // Nils's custom "output" glyph (master in AppHtml\FTGlyphs\compileroutput.svg), inlined; var(--dfr-btn-ink, #d8d8d8) -> currentColor so it
+        // themes with the tab state, stroke-width 1 -> 1.75 to match the analyzer glyph's weight at 15px.
+        Move ('<svg width="21" height="21" viewBox="0 0 21 21" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="12.5,7.5 12.5,2.5 1.5,2.5 1.5,18.5 12.5,18.5 12.5,13.5"/><path d="M7.5,10.5h12M15.495,6.539L19.456,10.5M15.495,14.461L19.456,10.5"/></svg>') to sTerm
+        // Tabler "list-search" glyph (a magnifier over list rows) for the Analyzer tab - "inspect the
+        // list of classified messages". Distinct from the Modernization-Plan tile's bolt; was the bolt.
+        Move ('<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 15m-4 0a4 4 0 1 0 8 0a4 4 0 1 0 -8 0"/><path d="M18.5 18.5l2.5 2.5"/><path d="M4 6h16"/><path d="M4 12h4"/><path d="M4 18h4"/></svg>') to sScan
+        Move (If(eActive = eTabCompiler, "outtab outtab-on", "outtab")) to sComp
+        Move (If(eActive = eTabAnalyzer, "outtab outtab-on", "outtab")) to sAna
+        Move (If(eActive = eTabManual, "outtab outtab-on", "outtab")) to sMan
+        // Tabler "pencil" glyph - work still to be done by hand, as opposed to the two read-only views.
+        Move ('<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4"/><path d="M13.5 6.5l4 4"/></svg>') to sHand
+        Move (CS_PaletteCssLink + CssLink("outputdock")) to sHtml
+        Move (sHtml + (DivOpen("outbar"))) to sHtml
+        Move (sHtml + (ClickableHtml("div", (sComp), "compiler", "", (sTerm + 'Output'), ""))) to sHtml
+        Move (sHtml + (ClickableHtml("div", (sAna), "analyzer", "", (sScan + 'Analyzer'), ""))) to sHtml
+        Move (sHtml + (ClickableHtml("div", (sMan), "manual", "", (sHand + 'Manual Changes'), ""))) to sHtml
+        Move (sHtml + CS_DivEnd) to sHtml
+        Function_Return sHtml
+    End_Function
+
+    // --- Bottom tab strip (web) ---
+    // A cLocalWebControlHost holds one cWebHtmlBox that renders both tabs as HTML/CSS (real flat dark tabs:
+    // active = lighter content colour + amber top accent + bold). Each tab div carries data-ServerOnClick, so
+    // the host fires oTabBar_htm.OnClick with "compiler"/"analyzer" -> ShowTab. (Native buttons can't take a
+    // dark background, hence the web route - same approach as the FT dashboard tiles + the TestCompile web bar.)
+    Object oTabHost is a cFTLocalWebControlHost
+        Set Location to 47 0
+        Set Size to 13 400
+        Set peAnchors to anBottomLeftRight
+
+        Object oTabBar_htm is a cFTWebHtmlBox
+            Set piColumnSpan to 1
+            // FIRST render (design-time, before realization - reliable). Runtime updates go via ShowTab/OnUpdate.
+            // DESIGN-TIME PLACEHOLDER for the Studio's Windows Designer, which models the LAST literal
+            // psHtml it can parse. It is the string the runtime seeds (dumped by the cFTWebHtmlBox design
+            // dump, no workspace loaded); the runtime expression sits in End_Construct_Object below.
+            Set psHtml to """
+            <link rel="stylesheet" href="RDCFlexTron/palette.css">
+            <link rel="stylesheet" href="RDCFlexTron/buttons.css">
+            <link rel="stylesheet" href="RDCFlexTron/bars.css">
+            <link rel="stylesheet" href="CssStyle/outputdock.css">
+            <div class="outbar">
+                <div class="outtab outtab-on" data-ServerOnClick="compiler">
+                    <svg width="21" height="21" viewBox="0 0 21 21" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline
+                        points="12.5,7.5 12.5,2.5 1.5,2.5 1.5,18.5 12.5,18.5 12.5,13.5"/>
+                        <path d="M7.5,10.5h12M15.495,6.539L19.456,10.5M15.495,14.461L19.456,10.5"/></svg>Output</div>
+                <div class="outtab" data-ServerOnClick="analyzer">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 15m-4 0a4 4 0 1 0 8 0a4 4 0 1 0 -8 0"/>
+                        <path d="M18.5 18.5l2.5 2.5"/>
+                        <path d="M4 6h16"/>
+                        <path d="M4 12h4"/>
+                        <path d="M4 18h4"/></svg>Analyzer</div>
+                <div class="outtab" data-ServerOnClick="manual">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4"/>
+                        <path d="M13.5 6.5l4 4"/></svg>Manual Changes</div></div>
+            """
+
+            // RUNTIME content - here rather than in the object body, so the Designer keeps the literal above.
+            Procedure End_Construct_Object
+                Forward Send End_Construct_Object
+                Set psHtml to (TabBarHtml(Self, eTabCompiler))
+            End_Procedure
+
+            Procedure OnClick String sId String sParam
+                If (sId = "compiler") ;
+                    Send ShowTab of oOutputDock_dg eTabCompiler
+                If (sId = "analyzer") ;
+                    Send ShowTab of oOutputDock_dg eTabAnalyzer
+                If (sId = "manual") ;
+                    Send ShowTab of oOutputDock_dg eTabManual
+            End_Procedure
+        End_Object
+    End_Object
+
+    // Show the dock and select a tab: one area visible, the other hidden, the tab bar re-rendered with the
+    // active tab marked. Activates the panel (docks it on first call). Replaces the old per-dock Activate/hide.
+    Procedure ShowTab Integer eTab
+        Handle hoBar
+        String sWS
+
+        /* THE TEST COMPILE BAR FIRST, once (Nils 2026-09-20; the rule and the story are on
+           EnsureTestCompileBarDocked). CodeJock stacks bottom bars in first-dock order, so this
+           dock's own first Activate below must never be the session's first bottom dock - or the
+           tabs sit ABOVE the bar for the rest of it. phoCJDialogBar is 0 until this dock docks. */
+        If (phoCJDialogBar(Self) = 0) ;
+            Send EnsureTestCompileBarDocked of (Client_Id(ghoCommandBars))
+        Get psSWSFile of ghoApplication to sWS
+        Set psShownWS to sWS
+        Set peActiveTab to eTab
+        Set Visible_State of (oCompilerArea(Self)) to (eTab = eTabCompiler)
+        Set Visible_State of (oAnalyzerArea(Self)) to (eTab = eTabAnalyzer)
+        Set Visible_State of (oManualArea(Self)) to (eTab = eTabManual)
+        Set pbVisible to True
+        Send Activate
+        /* PAINT THE MANUAL GRID HERE, because this is the first moment it can be painted.
+
+           Its cCJGrid only builds its COM control once the page is realized, so a push arriving
+           while the tab has never been opened is stored but not drawn (RefreshManualGrid returns
+           early rather than faulting - see the guard there). This is the retry: by now the area is
+           visible and activated, so the control exists and the pending rows go in.
+
+           Unconditional rather than flag-driven. The repaint is a handful of rows out of properties
+           already in memory - cheaper than the state needed to decide whether to skip it. */
+        If (eTab = eTabManual) ;
+            Send RefreshManualGrid of (oManualArea(Self))
+        // Re-render the tab bar. Guarded on pbTabReady: the first show is seeded by the design-time psHtml +
+        // synced by OnUpdate (post-realization); switching tabs on an already-shown dock updates here.
+        If (pbTabReady(Self)) Begin
+            Send PushHtml of oTabBar_htm (TabBarHtml(Self, eTab))   // RUNTIME push, flushed now (Set psHtml is design-time only - it won't re-render; on the idle tick the new active tab lags)
+        End
+        // Swap the Test Compile bar's second row per tab: the ANALYZER chip strip on the Analyzer tab; on the
+        // Compiler tab, the COMPILER-totals chip band (warnings/errors) once a compile has produced counts, else
+        // the compile result text (progress / verdict). RefreshCompileSummaryChips (compiler area) does the
+        // compiler-side push + show/hide and self-guards on IsCompilerTabShowing.
+        Get phoTestCompileFT of ghoApplication to hoBar
+        If (hoBar <> 0) Begin
+            If (eTab = eTabAnalyzer) ;
+                Send ShowAnalyzeSummary of hoBar True
+            Else ;
+                Send RefreshCompileSummaryChips of (oCompilerArea(Self))
+        End
+    End_Procedure
+
+    // Re-assert the Analyzer view AFTER a cold show (dashboard "View last plan"): ShowTab re-renders the tab
+    // strip to Analyzer + shows the chip bar, then the grid re-pushes the chip HTML + repaints - both web
+    // pushes now LAND because the WebView2 strips are realized (the first, cold push was dropped by the
+    // SetAnalyzeSummaryHtml / tab-strip UpdateHtml pre-realization guards). Fired one defer tick later by
+    // the dashboard; a harmless no-op-ish repeat on an already-warm dock.
+    // 2026-07-05: repaint-vs-reload now uses the SAME ready/mode predicate as OnUpdate. When the cold show
+    // lost the race so hard that the first Initialize never landed, the cache is EMPTY (DisplayFiltered no
+    // longer claims ready on an empty build) and a blind DisplayFiltered would only repaint the emptiness -
+    // RE-INITIALIZE instead, so "View last plan" always ends with the saved rows actually loaded.
+    Procedure ReassertAnalyzerView
+        Boolean bReady bLoadedSaved bCurSaved
+        String sDataWS sWS
+        Send ShowTab eTabAnalyzer
+        Get pbAnalyzeDataReady of (oModAnalyzer_grd(ghoModAnalyzerDock)) to bReady
+        Get pbLoadedSavedView  of (oModAnalyzer_grd(ghoModAnalyzerDock)) to bLoadedSaved
+        Get pbSavedView        of (oModAnalyzer_grd(ghoModAnalyzerDock)) to bCurSaved
+        Get psAnalyzeDataWS    of (oModAnalyzer_grd(ghoModAnalyzerDock)) to sDataWS
+        Get psSWSFile of ghoApplication to sWS
+        If (bReady and (bLoadedSaved = bCurSaved) and (sDataWS = sWS)) ;
+            Send DisplayFiltered of (oModAnalyzer_grd(ghoModAnalyzerDock))
+        Else ;
+            Send Initialize of (oModAnalyzer_grd(ghoModAnalyzerDock))
+    End_Procedure
+
+    // Is the dock visible AND showing the compiler tab? (the merged equivalent of the old
+    // "ComVisible(ghoCompilerOutputDock)" - used to decide first-show on live errors.)
+    Function IsCompilerTabShowing Returns Boolean
+        Function_Return (ComVisible(Self) and (peActiveTab(Self) = eTabCompiler))
+    End_Function
+
+    Procedure OnCreateToolPanel Handle hoToolPane
+        Set ComContextMenuPresent of hoToolPane to True
+    End_Procedure
+
+    // FT EXPERIMENT, after the forwarded Activate has docked this bar (in cFTCJToolPanel.pkg until 2026-10-08): a
+    // docked CommandBars dialog-bar appears to disable the MDI tab-workspace's drag-to-split view grouping, so
+    // grouping is re-asserted on the workspace to test whether interactive drag-to-split can be revived.
+    // ghoTabWorkspace is captured in oCJCommandBarSystem.OnCreateTabbedWorkspace (DFRefactorFT.src); 0 = a no-op.
+    Procedure Activate Returns Integer
+        Integer iErr
+        Forward Get msg_Activate to iErr
+        If (ghoTabWorkspace <> 0) Begin
+            Send ComEnableGroups of ghoTabWorkspace
+            Send ComRefresh      of ghoTabWorkspace
+        End
+        Procedure_Return iErr
+    End_Procedure
+
+    // Called from Activate (post-realization, first show). Mark the web host ready, sync the tab bar to the
+    // active tab, and initialise that tab's grid.
+    Procedure OnUpdate
+        Boolean bReady bLoadedSaved bCurSaved
+        String sDataWS sWS
+
+        Set pbTabReady to True
+        Send PushHtml of oTabBar_htm (TabBarHtml(Self, peActiveTab(Self)))   // RUNTIME push, flushed NOW (NOT Set psHtml = design-time; else the active-tab look sticks)
+        If (peActiveTab(Self) = eTabCompiler) Begin
+            // Bracket the reload so a plain tab swap back to Output keeps the highlighted row (the
+            // Analyzer branch below gets this for free - DisplayFiltered preserves the highlight
+            // itself). Fresh content (a new compile) finds no identity match and keeps the loader's
+            // own positioning; pure live-stream mode keeps tailing (RestoreHighlight self-guards).
+            Send CaptureHighlight to (oCompileErrors_grd(ghoCompilerOutputDock))
+            Send Initialize       to (oCompileErrors_grd(ghoCompilerOutputDock))
+            Send RestoreHighlight to (oCompileErrors_grd(ghoCompilerOutputDock))
+        End
+        Else If (pbSkipAnalyzerInit(Self) = False) Begin
+            // A plain tab-show (NOT a fresh Analyze - that path sets pbSkipAnalyzerInit and Initializes itself).
+            // If the grid already holds data for the CURRENT mode (analyze vs saved-plan) AND the CURRENT
+            // workspace, just RE-DISPLAY it (cheap) instead of re-parsing the .prn - switching Compiler <->
+            // Analyzer was silently re-running the whole ~24s analyze. Re-load (Initialize -> LoadData /
+            // LoadSavedPlan) when nothing is loaded yet, the mode changed (e.g. ShowSavedPlan flips to saved
+            // view), OR the WORKSPACE changed - the cache would show the previous workspace's rows (Nils
+            // 2026-07-05; the psAnalyzeDataWS stamp). Keep this predicate identical to ReassertAnalyzerView.
+            // (Nils: tab-switch re-ran analyze 2026-07-02.)
+            Get pbAnalyzeDataReady of (oModAnalyzer_grd(ghoModAnalyzerDock)) to bReady
+            Get pbLoadedSavedView of (oModAnalyzer_grd(ghoModAnalyzerDock)) to bLoadedSaved
+            Get pbSavedView       of (oModAnalyzer_grd(ghoModAnalyzerDock)) to bCurSaved
+            Get psAnalyzeDataWS   of (oModAnalyzer_grd(ghoModAnalyzerDock)) to sDataWS
+            Get psSWSFile of ghoApplication to sWS
+            If (bReady and (bLoadedSaved = bCurSaved) and (sDataWS = sWS)) ;
+                Send DisplayFiltered to (oModAnalyzer_grd(ghoModAnalyzerDock))
+            Else ;
+                Send Initialize to (oModAnalyzer_grd(ghoModAnalyzerDock))
+        End
+    End_Procedure
+
+    Procedure Close_Panel
+        Forward Send Close_Panel
+    End_Procedure
+
+    On_Key Key_Alt+Key_C  Send Close_Panel
+    On_Key Key_Escape     Send Close_Panel
+End_Object
+
+// *** Public access methods (names unchanged so callers don't change; retargeted to the merged dock). ***
+
+// --- Compiler Output tab ---
+
+// Show the parsed .err errors on the Compiler Output tab.
+Procedure ActivateCompileErrorDialog String sErrorFile
+    Boolean bExists
+    Get vFilePathExists sErrorFile to bExists
+    If (bExists = False) Begin
+        Send FTInfoBox ("The .err file doesn't exist:\n" * String(sErrorFile))
+        Procedure_Return
+    End
+    Set psRawLogFile  of ghoCompilerOutputDock to ""
+    Set psErrorFile   of ghoCompilerOutputDock to sErrorFile
+    Set psCompiledExe of ghoCompilerOutputDock to ""   // an errors view never carries a success footer
+    Send ShowTab of ghoOutputDock eTabCompiler
+End_Procedure
+
+// Live legacy-compiler errors: refresh the parsed .err grid as the compiler writes it. Shows the
+// Compiler Output tab ONLY on the first error (when it isn't already the shown tab), then refreshes
+// silently - a clean compile never pops the dock, a failing one tails live without stealing focus.
+Procedure RefreshCompileErrorsLive String sErrorFile
+    Boolean bExists bShowing
+
+    Get vFilePathExists sErrorFile to bExists
+    If (bExists = False) ;
+        Procedure_Return
+    Get IsCompilerTabShowing of ghoOutputDock to bShowing
+    Set psRawLogFile of ghoCompilerOutputDock to ""
+    Set psErrorFile  of ghoCompilerOutputDock to sErrorFile
+    If (bShowing = False) ;
+        Send ShowTab of ghoOutputDock eTabCompiler        // first error: show the tab (once)
+    Send RefreshErrorOutput of ghoCompilerOutputDock      // (re)load the parsed errors + scroll to newest
+End_Procedure
+
+// Show the live output (sLogFile) FOLLOWED by the parsed, jumpable errors (sErrFile) - the
+// "output then errors" view. Falls back to errors-only when the log is empty.
+Procedure ActivateCombinedCompileOutput String sLogFile String sErrFile
+    Boolean bExists
+    Get vFilePathExists sErrFile to bExists
+    If (bExists = False) Begin
+        Send FTInfoBox ("The .err file doesn't exist:\n" * String(sErrFile))
+        Procedure_Return
+    End
+    Set psRawLogFile  of ghoCompilerOutputDock to sLogFile
+    Set psErrorFile   of ghoCompilerOutputDock to sErrFile
+    Set psCompiledExe of ghoCompilerOutputDock to ""   // an errors view never carries a success footer
+    Send ShowTab of ghoOutputDock eTabCompiler
+End_Procedure
+
+// A SUCCESSFUL compile that carried WARNINGS. A clean build writes NO .err, but the .prn LISTING holds
+// the warnings, which the dock appends from its stamped .prn cache (AppendCachedPrnWarnings, keyed on
+// the .err and .prn sharing a base name). Show them WITHOUT closing the dock: keep the raw compiler log
+// for the Output text tab, and point psErrorFile at the .prn's SIBLING .err path - it need NOT exist
+// (ReadErrorFileWholeLines returns empty, then the cached warnings append), so the combined view's
+// parsed grid + the warnings chip carry them. Unlike a truly clean build (which CloseCompileErrorDialogs),
+// a warnings-carrying success stays open. No .err-exists guard - the missing .err is NORMAL here. Nils 2026-07-07.
+Procedure ActivateCompileWarningsOutput String sLogFile String sPrnFile String sExePath
+    String sErrSibling
+    // .prn -> sibling .err path (same base name; both extensions are 3 chars). The file need not exist.
+    Move (Left(sPrnFile, (Length(sPrnFile) - 3)) + "err") to sErrSibling
+    Set psRawLogFile  of ghoCompilerOutputDock to sLogFile
+    Set psErrorFile   of ghoCompilerOutputDock to sErrSibling
+    // The compile SUCCEEDED (warnings only), so the summary block ends with the Studio success footer -
+    // sExePath (resolved by FinishCompile) feeds its "----Executable written: ..." line. (Nils 2026-07-08.)
+    Set psCompiledExe of ghoCompilerOutputDock to sExePath
+    Send ShowTab of ghoOutputDock eTabCompiler
+End_Procedure
+
+// Hide the dock. Its content stays - the Compiler Output tab's log and errors, the analysis - so showing it again
+// brings it back as it was (ReshowCompileOutput). Nils 2026-09-30: hiding "should just hide/unhide it - not clear
+// the data. That is what the Clear button is for". ForgetCompileOutput is the clearing.
+Procedure CloseCompileErrorDialog
+    If (Active_State(ghoOutputDock)) Begin
+        Set pbVisible    of ghoOutputDock to False
+        Send Close_Panel of ghoOutputDock
+    End
+End_Procedure
+
+// Forget the Compiler Output tab's content - no log, no .err, zeroed chips: the Clear button's half of the dock,
+// and ShowEmptyCompileOutput's. The grid itself empties on its next Initialize.
+Procedure ForgetCompileOutput
+    Set psRawLogFile          of ghoCompilerOutputDock to ""
+    Set psErrorFile           of ghoCompilerOutputDock to ""
+    Set psCompiledExe         of ghoCompilerOutputDock to ""
+    Set piCompileWarnings     of ghoCompilerOutputDock to 0
+    Set piCompileErrors       of ghoCompilerOutputDock to 0
+    Set piLinkErrors          of ghoCompilerOutputDock to 0
+    Set pbCompileSummaryReady of ghoCompilerOutputDock to False
+End_Procedure
+
+// Does the dock hold anything to show again - a compile's log or errors, or a loaded analysis - from THIS
+// workspace? A dock last shown in another workspace holds that workspace's results (psShownWS).
+Function CompileOutputHeld Returns Boolean
+    String sShownWS sWS sErr sLog sExe sAnalysis
+    If (ghoOutputDock = 0) ;
+        Function_Return False
+    Get psShownWS of ghoOutputDock to sShownWS
+    Get psSWSFile of ghoApplication to sWS
+    If (sShownWS = "" or sShownWS <> sWS) ;
+        Function_Return False
+    Get psErrorFile   of ghoCompilerOutputDock to sErr
+    Get psRawLogFile  of ghoCompilerOutputDock to sLog
+    Get psCompiledExe of ghoCompilerOutputDock to sExe
+    Move "" to sAnalysis
+    If (ghoModAnalyzerDock <> 0) ;
+        Get psErrorFile of ghoModAnalyzerDock to sAnalysis
+    Function_Return (sErr <> "" or sLog <> "" or sExe <> "" or sAnalysis <> "")
+End_Function
+
+// Show the hidden dock again as it was, on the tab it was on. Nothing is re-read or cleared: the tab's OnUpdate
+// re-renders what the dock still holds.
+Procedure ReshowCompileOutput
+    Integer eTab
+    Get peActiveTab of ghoOutputDock to eTab
+    Send ShowTab of ghoOutputDock eTab
+End_Procedure
+
+// Keep the merged dock OPEN on the Compiler Output tab but EMPTY - no .err / log, zeroed compiler chips - so the
+// grids stay on screen with the Test Compile bar (Nils 2026-07-08: replaces the old "close the dock on a clean
+// build"). pbCompileSummaryReady False makes the bar show the "compiled cleanly" verdict text instead of a stale
+// chip band. The grid is re-Initialized explicitly because Send Activate alone does NOT re-fire OnUpdate ->
+// Initialize once the dock is already active (so a clean build right after an errored one still clears the old
+// rows). Safe before realization: ShowTab activates + realizes the dock, and the grid re-Initialize is
+// IsComObjectCreated-guarded.
+Procedure ShowEmptyCompileOutput
+    Send ForgetCompileOutput
+    Send ShowTab of ghoOutputDock eTabCompiler
+    If (IsComObjectCreated(oCompileErrors_grd(ghoCompilerOutputDock))) ;
+        Send Initialize of (oCompileErrors_grd(ghoCompilerOutputDock))
+End_Procedure
+
+// A CLEAN compile finished (Nils 2026-07-08, Studio-style): keep the dock open on the Compiler Output tab
+// showing the compile's streamed log capped by the Studio success footer ("----Compile Finished in N seconds
+// ----" + "----Executable written: <sExePath>") - a positive confirmation instead of an empty grid. sLogFile
+// may be "" (no wrapper log) - the view then shows just the banner + footer. The chips stay hidden
+// (pbCompileSummaryReady False) so the bar shows the green "compiled cleanly" verdict text. The explicit
+// Initialize mirrors ShowEmptyCompileOutput: Activate alone does not re-fire OnUpdate -> Initialize on an
+// already-active dock, and the finished view must replace the live stream.
+Procedure ActivateCompileSuccessOutput String sLogFile String sExePath
+    Set psRawLogFile          of ghoCompilerOutputDock to sLogFile
+    Set psErrorFile           of ghoCompilerOutputDock to ""
+    Set psCompiledExe         of ghoCompilerOutputDock to sExePath
+    Set piCompileWarnings     of ghoCompilerOutputDock to 0
+    Set piCompileErrors       of ghoCompilerOutputDock to 0
+    Set piLinkErrors          of ghoCompilerOutputDock to 0
+    Set pbCompileSummaryReady of ghoCompilerOutputDock to False
+    Send ShowTab of ghoOutputDock eTabCompiler
+    If (IsComObjectCreated(oCompileErrors_grd(ghoCompilerOutputDock))) ;
+        Send Initialize of (oCompileErrors_grd(ghoCompilerOutputDock))
+End_Procedure
+
+// Show the dock streaming a compile's live stdout (sLogFile) on the Compiler Output tab. FinishCompile
+// later swaps to the parsed .err. (A compile is stopped from the Test Compile bar's Compile / Stop Compile.)
+Procedure ShowCompileOutputLive String sLogFile
+    Set psRawLogFile  of ghoCompilerOutputDock to sLogFile
+    Set psErrorFile   of ghoCompilerOutputDock to ""
+    Set psCompiledExe of ghoCompilerOutputDock to ""   // live stream - a stale exe must not route to the success view
+    Send ShowTab of ghoOutputDock eTabCompiler
+End_Procedure
+
+// Reload the live compiler output (called each poll tick while the stdout log grows).
+Procedure RefreshCompileOutputLive
+    Send RefreshLiveOutput of ghoCompilerOutputDock
+End_Procedure
+
+Function IsCompileErrorDialogActive Returns Boolean
+    Function_Return (IsCompilerTabShowing(ghoOutputDock))
+End_Function
+
+// --- Modernization Analyzer tab ---
+
+// Open the analysis on the Analyzer tab for the given .err file (parse + classify + show).
+Procedure ActivateModAnalyzer String sErrorFile
+    Boolean bExists
+
+    Get vFilePathExists sErrorFile to bExists
+    If (bExists = False) Begin
+        Send FTInfoBox ("The .err file doesn't exist:\n" * String(sErrorFile))
+        Procedure_Return
+    End
+    Set psErrorFile of ghoModAnalyzerDock to sErrorFile
+    // Leaving any prior SAVED-PLAN or DEEP-SCAN view: a real Analyze re-parses the .prn, so clear both modes.
+    Set pbSavedView of (oModAnalyzer_grd(ghoModAnalyzerDock)) to False
+    Set pbDeepScanView of (oModAnalyzer_grd(ghoModAnalyzerDock)) to False
+    // The explicit Send Initialize below is the single, reliable re-parse. Suppress the ShowTab -> Activate ->
+    // OnUpdate cascade's analyzer Initialize so LoadData does not also run there - that DOUBLED the analyze.
+    Set pbSkipAnalyzerInit of ghoOutputDock to True
+    Send ShowTab of ghoOutputDock eTabAnalyzer
+    // Force a re-parse of the (now-current) psErrorFile - Send Activate alone does not re-fire
+    // OnUpdate -> Initialize when the dock was already active (e.g. analyzing program B right after A).
+    Send Initialize of (oModAnalyzer_grd(ghoModAnalyzerDock))
+    Set pbSkipAnalyzerInit of ghoOutputDock to False   // re-arm the cascade for non-Analyze shows (e.g. ShowSavedPlan)
+End_Procedure
+
+// Open the analysis on the Analyzer tab for a DEEP SCAN result set: the source-driven scanner's
+// synthetic messages (cDeepScanner.HitsToMessages) replace the compile-output parse. The grid's
+// DEEP-SCAN mode consumes the injected rows and classifies them via the DS recipes - chips,
+// Toggle Explain, Ignore and Auto Select then work exactly as after a compile-driven analyze
+// (the plan reads the grid's paScopedMessages, which LoadData derives from these rows).
+Procedure ActivateModAnalyzerDeepScan tCompileError[] aMessages
+    Set paDeepScanMessages of (oModAnalyzer_grd(ghoModAnalyzerDock)) to aMessages
+    Set pbDeepScanView     of (oModAnalyzer_grd(ghoModAnalyzerDock)) to True
+    Set pbSavedView        of (oModAnalyzer_grd(ghoModAnalyzerDock)) to False
+    Set psErrorFile of ghoModAnalyzerDock to ""
+    // Same suppress-then-Initialize dance as ActivateModAnalyzer (see the notes there).
+    Set pbSkipAnalyzerInit of ghoOutputDock to True
+    Send ShowTab of ghoOutputDock eTabAnalyzer
+    Send Initialize of (oModAnalyzer_grd(ghoModAnalyzerDock))
+    Set pbSkipAnalyzerInit of ghoOutputDock to False
+End_Procedure
+
+// Close the dock.
+Procedure CloseModAnalyzer
+    Set psErrorFile of ghoModAnalyzerDock to ""
+    If (Active_State(ghoOutputDock)) Begin
+        Set pbVisible    of ghoOutputDock to False
+        Send Close_Panel of ghoOutputDock
+    End
+End_Procedure

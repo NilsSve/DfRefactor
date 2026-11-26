@@ -1,0 +1,699 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cScintillaControl
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-27
+//
+// Description : PHASE 1 of the SciControlLib modernization (Nils, 2026-07-27): the clean editor
+//               control class, straight on the Scintilla message API - no CodeMax facade. Built
+//               member-by-member from the CONSUMED surface census (the ~28 CM_ members DFRefactor
+//               actually calls), with the thin one-line wrappers carried over and the fat
+//               CodeMax-emulation members REWRITTEN against the documented contracts
+//               (reference_scintilla_api): positions are BYTES, SCI_GETLINE includes the EOL and
+//               does not NUL-terminate, SCI_FINDCOLUMN is the column->position mapper, the
+//               modified flag is a save-point model.
+//
+//               This batch (v1) is the BUFFER/NAVIGATION/STATE core, proven by a probe program
+//               driving a real control. File I/O (open/save with OEM/UTF-8 detection) and the
+//               notification dispatch are the next batches - they get their own focused passes
+//               because that is where the encoding risk lives.
+//
+//               The class is DELIBERATELY standalone: cRefactorScintillaEditor keeps running on
+//               the old chain until this class covers the full surface, then rebases in one
+//               reviewed step. Old-name mapping is noted per member as "was CM_Xxx".
+//
+//               We ship Scintilla 4.1.6 (SciLexer64.dll, PRE-Lexilla): SCI_SETLEXER-era lexing,
+//               keyword sets 0..3 = keywords / scope-open / scope-close / operators.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use Windows.pkg
+Use cWinControl.pkg         // the modern host for external Windows controls ("replaces the
+                            // obsolete DFControl class" - class reference; Nils 2026-07-27)
+Use ScintillaLexerApi.h.pkg // SCI_* constants, CS_ScintillaWindowClass ("Scintilla"), tSci_TextRange
+Use RefactorDllLoader.pkg   // oDllHandler - LoadLibrary plumbing for SciLexer<bits>.dll
+Use cEncodingHelpers.pkg    // the canonical OEM/UTF-8 byte converters + rfFileSize (pinned by the engine-side tests)
+
+Class cScintillaControl is a cWinControl
+
+    Procedure Construct_Object
+        // The Scintilla DLL lives in the Programs folder; preload it so the window
+        // class exists before the control pages. Same mechanism the old chain uses.
+        Set psDllLoadPath of oDllHandler to (psProgramPath(phoWorkspace(ghoApplication)))
+#IFDEF IS$WIN64
+        Send doLoadLibrary of oDllHandler "SciLexer64.dll"
+#ELSE
+        Send doLoadLibrary of oDllHandler "SciLexer32.dll"
+#ENDIF
+        Forward Send Construct_Object
+        Set External_Class_Name "cScintillaControl" to CS_ScintillaWindowClass
+
+        // Encoding mode mirrors - what the CONTROL was told, so mode-dependent
+        // members (DocumentText, the file I/O batch later) can act accordingly.
+        // Exactly one of these describes the buffer: UTF-8, or single-byte OEM/ANSI.
+        Property Boolean pbUtf8Mode False
+        Property Boolean pbOemMode  True
+        // The opened file carried a UTF-8 BOM - SaveFile re-emits it (the editor
+        // buffer itself never holds the BOM).
+        Property Boolean pbHasUtf8BOM False
+
+        Set Border_Style to Border_ClientEdge
+    End_Procedure
+
+    // The one native funnel: every member below talks to the control through this.
+    // (Carried from the old chain; variadic so 0/1/2 extra args all work.)
+    Function EditorMessage Handle uMsg Longptr wParam Longptr lParam Returns Longptr
+        Handle  hWnd
+        Longptr iRet
+
+        Move 0 to iRet
+        Get Window_Handle to hWnd
+        If (hWnd <> 0) Begin
+            Case Begin
+                Case (Num_Arguments <= 1)
+                    Move (SendMessage(hWnd, uMsg, 0, 0)) to iRet
+                    Case Break
+                Case (Num_Arguments = 2)
+                    Move (SendMessage(hWnd, uMsg, wParam, 0)) to iRet
+                    Case Break
+                Case Else
+                    Move (SendMessage(hWnd, uMsg, wParam, lParam)) to iRet
+            Case End
+        End
+        Function_Return iRet
+    End_Function
+
+    Procedure EditorMessage Handle uMsg Longptr wParam Longptr lParam
+        Longptr iVoid
+        Case Begin
+            Case (Num_Arguments <= 1)
+                Get EditorMessage uMsg to iVoid
+                Case Break
+            Case (Num_Arguments = 2)
+                Get EditorMessage uMsg wParam to iVoid
+                Case Break
+            Case Else
+                Get EditorMessage uMsg wParam lParam to iVoid
+        Case End
+    End_Procedure
+
+    // *** Encoding mode (was: the SCI_SETCODEPAGE / SCI_STYLESETCHARACTERSET pairs scattered
+    // through cRefactorScintillaEditor 1114-1127). ONE place per mode.
+    Procedure UseUtf8Encoding
+        Send EditorMessage SCI_SETCODEPAGE SC_CP_UTF8
+        Send EditorMessage SCI_STYLESETCHARACTERSET STYLE_DEFAULT SC_CHARSET_ANSI
+        Set pbUtf8Mode to True
+        Set pbOemMode  to False
+    End_Procedure
+
+    Procedure UseOemEncoding
+        Send EditorMessage SCI_SETCODEPAGE 0   // single-byte mode
+        Send EditorMessage SCI_STYLESETCHARACTERSET STYLE_DEFAULT SC_CHARSET_OEM
+        Set pbUtf8Mode to False
+        Set pbOemMode  to True
+    End_Procedure
+
+    Procedure UseAnsiEncoding
+        Send EditorMessage SCI_SETCODEPAGE 0   // single-byte mode
+        Send EditorMessage SCI_STYLESETCHARACTERSET STYLE_DEFAULT SC_CHARSET_ANSI
+        Set pbUtf8Mode to False
+        Set pbOemMode  to False
+    End_Procedure
+
+    // *** The mode codecs - the ONLY place buffer bytes and DataFlex (UTF-8) strings meet.
+    // Every text member routes through these two, so encoding correctness lives in one
+    // spot. Single-byte decode/encode uses the engine-side cEncodingHelpers converters
+    // (the same ones the byte-exact unit tests pin). ANSI mode note: the converters run
+    // CP_OEMCP; DFRefactor only ever uses OEM or UTF-8, so a true CP_ACP variant waits
+    // until something needs it - stated here rather than silently wrong.
+    Function BytesToText UChar[] ucaBytes Returns String
+        If (SizeOfArray(ucaBytes) = 0) ;
+            Function_Return ""
+        If (pbUtf8Mode(Self)) ;
+            Function_Return (rfUtf8BytesToString(ucaBytes))
+        Function_Return (rfOemBytesToUtf8(ucaBytes))
+    End_Function
+
+    Function TextToBytes String sText Returns UChar[]
+        If (pbUtf8Mode(Self)) ;
+            Function_Return (rfStringToUtf8Bytes(sText))
+        Function_Return (rfUtf8LineToOemBytes(sText))
+    End_Function
+
+    // *** Whole-document text, mode-aware in both directions.
+    Procedure SetDocumentText String sText
+        Integer iLen
+        UChar[] ucaBytes
+        Get TextToBytes sText to ucaBytes
+        // SCI_SETTEXT wants a NUL-terminated buffer.
+        Move (SizeOfArray(ucaBytes)) to iLen
+        Move 0 to ucaBytes[iLen]
+        Send EditorMessage SCI_SETTEXT 0 (AddressOf(ucaBytes))
+    End_Procedure
+
+    Function DocumentText Returns String
+        Integer iLen
+        Pointer pText
+        Boolean bVoid
+        UChar[] ucaBytes
+        Get ByteLength to iLen
+        If (iLen <= 0) ;
+            Function_Return ""
+        Get EditorMessage SCI_GETCHARACTERPOINTER to pText
+        If (pText = 0) ;
+            Function_Return ""
+        Move (ResizeArray(ucaBytes, iLen)) to ucaBytes
+        Move (memcopy(AddressOf(ucaBytes), pText, iLen)) to bVoid
+        Function_Return (BytesToText(Self, ucaBytes))
+    End_Function
+
+    // Byte length of the document - Scintilla's own unit (positions are BYTES).
+    Function ByteLength Returns Integer
+        Longptr iRet
+        Get EditorMessage SCI_GETLENGTH to iRet
+        Function_Return iRet
+    End_Function
+
+    // WHOLE characters in the document - never derived from positions.
+    // (Contract: SCI_COUNTCHARACTERS accounts for multi-byte UTF-8 sequences.)
+    Function CharacterCount Returns Integer
+        Integer iBytes
+        Get ByteLength to iBytes
+        Longptr iRet
+        Get EditorMessage SCI_COUNTCHARACTERS 0 iBytes to iRet
+        Function_Return iRet
+    End_Function
+
+    // *** Lines. 0-BASED throughout - the same contract the app already pinned for
+    // JumpToSourceLine (callers convert 1-based compiler lines with -1).
+    Function DocumentLineCount Returns Integer
+        Longptr iRet
+        Get EditorMessage SCI_GETLINECOUNT to iRet
+        Function_Return iRet
+    End_Function
+
+    Function CurrentLine Returns Integer
+        Integer iPos
+        Get EditorMessage SCI_GETCURRENTPOS to iPos
+        Longptr iRet
+        Get EditorMessage SCI_LINEFROMPOSITION iPos to iRet
+        Function_Return iRet
+    End_Function
+
+    // The caret's CHARACTER column (SCI_GETCOLUMN counts a tab as a whole tab stop,
+    // which is what "column" means to the person looking at the screen).
+    Function CaretColumn Returns Integer
+        Integer iPos
+        Longptr iRet
+        Get EditorMessage SCI_GETCURRENTPOS to iPos
+        Get EditorMessage SCI_GETCOLUMN iPos to iRet
+        Function_Return iRet
+    End_Function
+
+    // was CM_GotoLine / JumpToSourceLine's core. Removes the selection, scrolls into view.
+    Procedure GotoLineNumber Integer iLine
+        Send EditorMessage SCI_GOTOLINE iLine
+    End_Procedure
+
+    /* was CM_GetLine - REWRITTEN. SCI_GETLINE returns the line INCLUDING its EOL
+       characters and does NOT NUL-terminate (the two traps in its contract), so the
+       old path had to strip and terminate by hand. This never touches SCI_GETLINE:
+       POSITIONFROMLINE .. GETLINEENDPOSITION is the line's text EXCLUDING the EOL by
+       definition, fetched through the one shared range reader. Out-of-range -> "". */
+    Function LineText Integer iLine Returns String
+        Integer iStartPos iEndPos
+        Get EditorMessage SCI_POSITIONFROMLINE iLine to iStartPos
+        If (iStartPos < 0) ;
+            Function_Return ""
+        Get EditorMessage SCI_GETLINEENDPOSITION iLine to iEndPos
+        Function_Return (TextRange(Self, iStartPos, iEndPos))
+    End_Function
+
+    // *** Range/selection reading. ONE buffer-exchange implementation (the proven
+    // tSci_TextRange + ZeroString + CString pattern), everything else goes through it.
+    Function TextRange Integer iStartPos Integer iEndPos Returns String
+        Integer iVoid iLen
+        UChar[] ucaBuf
+        tSci_TextRange TR
+        If (iEndPos <= iStartPos) ;
+            Function_Return ""
+        Move (iEndPos - iStartPos) to iLen
+        Move (ResizeArray(ucaBuf, iLen + 2)) to ucaBuf   // room for the NUL Scintilla adds
+        Move iStartPos to TR.chrg.cpMin
+        Move iEndPos   to TR.chrg.cpMax
+        Move (AddressOf(ucaBuf)) to TR.lpstrText
+        Get EditorMessage SCI_GETTEXTRANGE 0 (AddressOf(TR)) to iVoid
+        Move (ResizeArray(ucaBuf, iLen)) to ucaBuf       // exact bytes, NUL tail dropped
+        Function_Return (BytesToText(Self, ucaBuf))
+    End_Function
+
+    // was CM_GetSel (the text half). "" when nothing is selected.
+    Function SelectedText Returns String
+        Integer iStartPos iEndPos
+        Get EditorMessage SCI_GETSELECTIONSTART to iStartPos
+        Get EditorMessage SCI_GETSELECTIONEND   to iEndPos
+        Function_Return (TextRange(Self, iStartPos, iEndPos))
+    End_Function
+
+    /* was CM_SetSel - REWRITTEN on the documented column mapper. The old signature
+       took line/col pairs; columns are CHARACTER columns while positions are BYTES,
+       and SCI_FINDCOLUMN is the contract-blessed converter ("treats a multi-byte
+       character as a single column", tabs accounted for). SCI_SETSEL scrolls the
+       caret into view itself. */
+    Procedure SelectRange Integer iStartLine Integer iStartCol Integer iEndLine Integer iEndCol
+        Integer iAnchorPos iCaretPos
+        Get EditorMessage SCI_FINDCOLUMN iStartLine iStartCol to iAnchorPos
+        Get EditorMessage SCI_FINDCOLUMN iEndLine iEndCol     to iCaretPos
+        Send EditorMessage SCI_SETSEL iAnchorPos iCaretPos
+    End_Procedure
+
+    // Caret to line/col, no selection, scrolled into view.
+    Procedure SetCaretPosition Integer iLine Integer iCol
+        Integer iPos
+        Get EditorMessage SCI_FINDCOLUMN iLine iCol to iPos
+        Send EditorMessage SCI_GOTOPOS iPos
+    End_Procedure
+
+    // *** Words (the F1-help / refactoring-function path).
+
+    // was CM_GetWord: the word at a line/col, "" when the position is not in a word.
+    Function WordAt Integer iLine Integer iCol Returns String
+        Integer iPos iStartPos iEndPos
+        Get EditorMessage SCI_FINDCOLUMN iLine iCol to iPos
+        Get EditorMessage SCI_WORDSTARTPOSITION iPos True to iStartPos
+        Get EditorMessage SCI_WORDENDPOSITION   iPos True to iEndPos
+        Function_Return (TextRange(Self, iStartPos, iEndPos))
+    End_Function
+
+    // was CM_GetCurrentWord: the word at the caret.
+    Function WordAtCaret Returns String
+        Integer iPos iStartPos iEndPos
+        Get EditorMessage SCI_GETCURRENTPOS to iPos
+        Get EditorMessage SCI_WORDSTARTPOSITION iPos True to iStartPos
+        Get EditorMessage SCI_WORDENDPOSITION   iPos True to iEndPos
+        Function_Return (TextRange(Self, iStartPos, iEndPos))
+    End_Function
+
+    // *** Editing + the save-point model (was CM_AddText / CM_IsModified / the undo family -
+    // all thin in the old chain too; carried over with honest types).
+
+    // Insert at the caret; caret ends after the insertion (SCI_ADDTEXT contract).
+    // Mode-aware: the text is encoded to the BUFFER's encoding before insertion.
+    Procedure AddTextAtCaret String sText
+        UChar[] ucaBytes
+        Get TextToBytes sText to ucaBytes
+        If (SizeOfArray(ucaBytes) = 0) ;
+            Procedure_Return
+        Send EditorMessage SCI_ADDTEXT (SizeOfArray(ucaBytes)) (AddressOf(ucaBytes))
+    End_Procedure
+
+    Function IsModified Returns Boolean
+        Longptr iRet
+        Get EditorMessage SCI_GETMODIFY to iRet
+        Function_Return (iRet <> 0)
+    End_Function
+
+    // Mark the current state as the saved state (fires SCN_SAVEPOINTREACHED).
+    Procedure MarkSaved
+        Send EditorMessage SCI_SETSAVEPOINT
+    End_Procedure
+
+    // Clears undo history AND makes the document unmodified - SILENTLY (contract:
+    // SCI_EMPTYUNDOBUFFER sends no save-point notification).
+    Procedure ClearUndoHistory
+        Send EditorMessage SCI_EMPTYUNDOBUFFER
+    End_Procedure
+
+    Procedure Undo
+        Send EditorMessage SCI_UNDO
+    End_Procedure
+
+    Procedure Redo
+        Send EditorMessage SCI_REDO
+    End_Procedure
+
+    Function CanUndo Returns Boolean
+        Longptr iRet
+        Get EditorMessage SCI_CANUNDO to iRet
+        Function_Return (iRet <> 0)
+    End_Function
+
+    Function CanRedo Returns Boolean
+        Longptr iRet
+        Get EditorMessage SCI_CANREDO to iRet
+        Function_Return (iRet <> 0)
+    End_Function
+
+    // Wrap multi-step edits into ONE undo unit (groups nest; top-level undoes atomically).
+    Procedure BeginUndoGroup
+        Send EditorMessage SCI_BEGINUNDOACTION
+    End_Procedure
+
+    Procedure EndUndoGroup
+        Send EditorMessage SCI_ENDUNDOACTION
+    End_Procedure
+
+    // *** Configuration (was CM_SetTabSize / SCI_SETKEYWORDS sprinkles / SETREADONLY).
+    Procedure SetTabWidth Integer iWidth
+        Send EditorMessage SCI_SETTABWIDTH iWidth
+    End_Procedure
+
+    Function TabWidth Returns Integer
+        Longptr iRet
+        Get EditorMessage SCI_GETTABWIDTH to iRet
+        Function_Return iRet
+    End_Function
+
+    // Keyword set indexes for our DF lexer: 0=keywords, 1=scope-open, 2=scope-close,
+    // 3=operators. sWords is one space/newline-separated list.
+    Procedure SetKeywordList Integer iSet String sWords
+        Send EditorMessage SCI_SETKEYWORDS iSet (AddressOf(sWords))
+    End_Procedure
+
+    /* The settings store keeps one keyword per literal "\n" token (a backslash and an
+       n - DataFlex string literals have no escapes); Scintilla wants them space
+       separated. Was SCKeywords in the language mixin. */
+    Function KeywordListAsWords String sKeywords Returns String
+        Function_Return (Trim(Replaces("\n", sKeywords, " ")))
+    End_Function
+
+    /* Which encoding the control is in, as ONE answer instead of two booleans - what
+       the status bar and the encoding menu ask for. Was TextEncoding. */
+    Function EncodingMode Returns Integer
+        If (pbUtf8Mode(Self)) ;
+            Function_Return eTE_UTF8
+        If (pbOemMode(Self)) ;
+            Function_Return eTE_OEM
+        Function_Return eTE_ANSI
+    End_Function
+
+    /* CRLF or LF line endings for text the buffer hands back and for the EOL the
+       control inserts. Was CM_EnableCRLF, whose name said "enable" for what is really
+       a choice between two modes. */
+    Procedure SetLineEndings Boolean bUseCrLf
+        Send EditorMessage SCI_SETEOLMODE (If(bUseCrLf, SC_EOL_CRLF, SC_EOL_LF))
+    End_Procedure
+
+    Function LineEndingText Returns String
+        Longptr iMode
+        Get EditorMessage SCI_GETEOLMODE to iMode
+        If (iMode = SC_EOL_CRLF) ;
+            Function_Return C_NewLine
+        If (iMode = SC_EOL_CR) ;
+            Function_Return CS_CR
+        Function_Return CS_LF
+    End_Function
+
+    Procedure SetReadOnlyState Boolean bReadOnly
+        Send EditorMessage SCI_SETREADONLY bReadOnly
+    End_Procedure
+
+    Function IsReadOnly Returns Boolean
+        Longptr iRet
+        Get EditorMessage SCI_GETREADONLY to iRet
+        Function_Return (iRet <> 0)
+    End_Function
+
+    /* String-level encoding conversion for callers that hand text in and out as
+       DataFlex strings rather than buffer bytes (the engine does this). The byte-level
+       codecs above are what the control itself uses; these two are the same decision
+       expressed on strings. */
+    Function Utf8ToEditorFormat String sText Returns String
+        If (pbUtf8Mode(Self)) ;
+            Function_Return sText
+        If (pbOemMode(Self)) ;
+            Function_Return (Utf8ToOem(sText))
+        Function_Return (Utf8ToAnsi(sText))
+    End_Function
+
+    Function EditorFormatToUtf8 String sText Returns String
+        If (pbUtf8Mode(Self)) ;
+            Function_Return sText
+        If (pbOemMode(Self)) ;
+            Function_Return (OemToUtf8(sText))
+        Function_Return (AnsiToUtf8(sText))
+    End_Function
+
+    // ==================================================================================
+    // Language + styling (batch 4; was CM_SetLanguage + the SetAppearance layer).
+    // Our SciLexer 4.1.6 carries a NATIVE DataFlex lexer ("dataflex", SCLEX_DATAFLEX),
+    // so highlighting is: pick the lexer, feed the keyword sets (0=keywords,
+    // 1=scope-open, 2=scope-close, 3=operators), give each SCE_DF_* style its colors.
+    // Mapping COLOR SCHEMAS to styles stays a consumer concern - these are the
+    // primitives that consumer needs, nothing more.
+    // ==================================================================================
+
+    // Pick a lexer by its Scintilla name. Names are lowercase; the NUL is required,
+    // Scintilla reads this as a C string.
+    Procedure SetLexerLanguage String sName
+        Move (Lowercase(Trim(sName)) + Character(0)) to sName
+        Send EditorMessage SCI_SETLEXERLANGUAGE 0 (AddressOf(sName))
+    End_Procedure
+
+    Procedure UseDataFlexLexer
+        Send SetLexerLanguage "dataflex"
+    End_Procedure
+
+    Function LexerName Returns String
+        Integer iVoid
+        String sBuffer
+        Move (ZeroString(64)) to sBuffer
+        Get EditorMessage SCI_GETLEXERLANGUAGE 0 (AddressOf(sBuffer)) to iVoid
+        Function_Return (CString(sBuffer))
+    End_Function
+
+    // The base font every style inherits from. Call ResetStylesFromDefault afterwards
+    // to propagate it - deliberately a SEPARATE step (Scintilla's own model:
+    // STYLECLEARALL copies STYLE_DEFAULT over every style, wiping per-style colors).
+    Procedure SetBaseFont String sFaceName Integer iPointSize
+        Move (sFaceName + Character(0)) to sFaceName
+        Send EditorMessage SCI_STYLESETFONT STYLE_DEFAULT (AddressOf(sFaceName))
+        Send EditorMessage SCI_STYLESETSIZE STYLE_DEFAULT iPointSize
+    End_Procedure
+
+    Procedure ResetStylesFromDefault
+        Send EditorMessage SCI_STYLECLEARALL
+    End_Procedure
+
+    Procedure SetStyleAppearance Integer iStyleId Integer iForeColor Integer iBackColor Boolean bBold Boolean bItalic
+        Send EditorMessage SCI_STYLESETFORE   iStyleId iForeColor
+        Send EditorMessage SCI_STYLESETBACK   iStyleId iBackColor
+        Send EditorMessage SCI_STYLESETBOLD   iStyleId bBold
+        Send EditorMessage SCI_STYLESETITALIC iStyleId bItalic
+    End_Procedure
+
+    Function StyleForeColor Integer iStyleId Returns Integer
+        Longptr iRet
+        Get EditorMessage SCI_STYLEGETFORE iStyleId to iRet
+        Function_Return iRet
+    End_Function
+
+    // Force a full style pass now (the lexer normally styles lazily with painting).
+    Procedure Colourise
+        Send EditorMessage SCI_COLOURISE 0 -1
+    End_Procedure
+
+    // Re-style just a byte range - what a member that rewrote one line wants, so the
+    // rest of a large document is not re-lexed for a one-line edit.
+    Procedure ColouriseRange Integer iStartPos Integer iEndPos
+        Send EditorMessage SCI_COLOURISE iStartPos iEndPos
+    End_Procedure
+
+    Function StyleAt Integer iPos Returns Integer
+        Longptr iRet
+        Get EditorMessage SCI_GETSTYLEAT iPos to iRet
+        Function_Return iRet
+    End_Function
+
+    // *** File I/O (was CM_OpenFile / CM_SaveFile - the FAT rewrites where the encoding
+    // risk lives). Contract, matching the GUI-baseline pins on the old chain:
+    //   - UTF-8 BOM     -> UTF-8 mode, BOM remembered but NEVER loaded into the buffer
+    //   - no BOM        -> OEM single-byte mode (the 8a42d5f policy: legacy sources are
+    //                      OEM; the mode RESET matters both directions or it is sticky)
+    //   - EOLs load VERBATIM (byte-fidelity); SCI_SETEOLMODE only steers newly TYPED
+    //     line ends, set from what the file actually uses
+    //   - open leaves the document CLEAN with an empty undo history
+    //   - save is BYTE-EXACT: buffer bytes out, BOM re-emitted when the file had one,
+    //     save point set (document clean)
+
+    Function OpenFile String sFilePath Returns Boolean
+        Boolean bExists bHasBom bVoid
+        Integer iCh iSize iEolMode i
+        Pointer pText
+        UChar[] ucaFile
+
+        Get vFilePathExists sFilePath to bExists
+        If (bExists = False) ;
+            Function_Return False
+        Move (rfFileSize(sFilePath)) to iSize
+        Move (Seq_New_Channel()) to iCh
+        If (iCh < 0) ;
+            Function_Return False
+        Direct_Input Channel iCh ("binary:" + sFilePath)
+        If (iSize > 0) ;
+            Read_Block Channel iCh ucaFile iSize
+        Close_Input Channel iCh
+        Send Seq_Release_Channel iCh
+
+        // UTF-8 BOM decides the mode; the reset applies BOTH ways (sticky-mode fix).
+        Move (iSize >= 3 and ucaFile[0] = C_BOM_UTF8c1 and ucaFile[1] = C_BOM_UTF8c2 and ucaFile[2] = C_BOM_UTF8c3) to bHasBom
+        If (bHasBom = True) ;
+            Send UseUtf8Encoding
+        Else ;
+            Send UseOemEncoding
+        Set pbHasUtf8BOM to bHasBom
+
+        // Typed-newline mode follows the file's own convention (first LF wins the vote);
+        // the LOADED bytes keep their EOLs verbatim regardless.
+        Move SC_EOL_CRLF to iEolMode
+        For i from 0 to (iSize - 1)
+            If (ucaFile[i] = 10) Begin
+                If (i = 0 or ucaFile[i - 1] <> 13) ;
+                    Move SC_EOL_LF to iEolMode
+                Move iSize to i
+            End
+        Loop
+        Send EditorMessage SCI_SETEOLMODE iEolMode
+
+        // NUL-terminate and load; skip the BOM bytes - the buffer never holds the BOM.
+        Move 0 to ucaFile[SizeOfArray(ucaFile)]
+        Move (AddressOf(ucaFile)) to pText
+        If (bHasBom = True) ;
+            Move (pText + 3) to pText
+        Send EditorMessage SCI_SETTEXT 0 pText
+
+        // A freshly opened document is CLEAN with no history to undo into
+        // (SCI_EMPTYUNDOBUFFER clears both, silently - the documented contract).
+        Send ClearUndoHistory
+        Move bVoid to bVoid
+        Function_Return True
+    End_Function
+
+    // ==================================================================================
+    // The SCN_ notification dispatch (batch 3). Scintilla reports everything through
+    // WM_NOTIFY; cWinControl reflects that here as Notify. The lParam is a pointer to
+    // an SCNotification struct - copied out once, dispatched on nmhdr.uCode to named,
+    // OVERRIDABLE hooks (empty here; subclasses augment). The set below is the
+    // consumed core; more events are added when a consumer needs them, not sooner.
+    //
+    // Two contracts worth remembering:
+    //   - SCN_CHARADDED fires only for TYPED input, never for API text insertion
+    //   - SCN_UPDATEUI arrives with idle/paint processing, not inside the API call
+    // ==================================================================================
+
+    Procedure OnSavePointReached
+    End_Procedure
+
+    Procedure OnSavePointLeft
+    End_Procedure
+
+    Procedure OnCharacterAdded Integer iChar
+    End_Procedure
+
+    Procedure OnDocumentModified Integer iModificationType
+    End_Procedure
+
+    Procedure OnEditorUpdateUI Integer iUpdatedFlags
+    End_Procedure
+
+    Procedure OnDoubleClickAt Integer iPosition Integer iLine
+    End_Procedure
+
+    Procedure OnModifyAttemptReadOnly
+    End_Procedure
+
+    // A click in a margin that was marked sensitive. Overridden by the bridge to toggle
+    // folds; the margin numbers are CI_Margin* there.
+    Procedure OnMarginClicked Integer iMargin Integer iLine
+    End_Procedure
+
+    Procedure Notify Longptr wParam Longptr lParam
+        Integer iVoid iCode
+        tSCNotification SCNotify
+
+        Forward Send Notify wParam lParam
+        If (lParam = 0) ;
+            Procedure_Return
+        Move (CopyMemory(AddressOf(SCNotify), lParam, SizeOfType(tSCNotification))) to iVoid
+        Move SCNotify.nmhdr.uCode to iCode
+        Case Begin
+            Case (iCode = SCN_SAVEPOINTREACHED)
+                Send OnSavePointReached
+                Case Break
+            Case (iCode = SCN_SAVEPOINTLEFT)
+                Send OnSavePointLeft
+                Case Break
+            Case (iCode = SCN_CHARADDED)
+                Send OnCharacterAdded SCNotify.ch
+                Case Break
+            Case (iCode = SCN_MODIFIED)
+                Send OnDocumentModified SCNotify.modificationType
+                Case Break
+            Case (iCode = SCN_UPDATEUI)
+                Send OnEditorUpdateUI SCNotify.updated
+                Case Break
+            Case (iCode = SCN_DOUBLECLICK)
+                Send OnDoubleClickAt SCNotify.position SCNotify.line
+                Case Break
+            Case (iCode = SCN_MODIFYATTEMPTRO)
+                Send OnModifyAttemptReadOnly
+                Case Break
+            /* A click in a SENSITIVE margin. Scintilla does not act on it - marking a
+               margin sensitive only makes it REPORT the click, and toggling the fold is
+               the application's job. Missing this dispatch is why clicking the +/- did
+               nothing (found in the hook audit, 2026-07-28). */
+            Case (iCode = SCN_MARGINCLICK)
+                Send OnMarginClicked SCNotify.margin ;
+                     (EditorMessage(Self, SCI_LINEFROMPOSITION, SCNotify.position, 0))
+                Case Break
+        Case End
+    End_Procedure
+
+    Function SaveFile String sFilePath Returns Boolean
+        Boolean bVoid bWriteBom
+        Integer iCh iLen iOffset
+        Pointer pText
+        UChar[] ucaOut
+
+        Get ByteLength to iLen
+        Get EditorMessage SCI_GETCHARACTERPOINTER to pText
+        If (pText = 0 and iLen > 0) ;
+            Function_Return False
+
+        // Re-emit the BOM the file arrived with (the buffer never holds it).
+        Move (pbUtf8Mode(Self) = True and pbHasUtf8BOM(Self) = True) to bWriteBom
+        Move (If(bWriteBom, 3, 0)) to iOffset
+        Move (ResizeArray(ucaOut, iLen + iOffset)) to ucaOut
+        If (bWriteBom = True) Begin
+            Move C_BOM_UTF8c1 to ucaOut[0]
+            Move C_BOM_UTF8c2 to ucaOut[1]
+            Move C_BOM_UTF8c3 to ucaOut[2]
+        End
+        If (iLen > 0) ;
+            Move (MemCopy(AddressOf(ucaOut) + iOffset, pText, iLen)) to bVoid
+
+        Move (Seq_New_Channel()) to iCh
+        If (iCh < 0) ;
+            Function_Return False
+        Direct_Output Channel iCh ("binary:" + sFilePath)
+        // A target that cannot be opened (read-only attribute, locked, folder gone) raises NOTHING here -
+        // Direct_Output only sets SeqEof; the Write below is what raised error 32 with a five-deep call
+        // stack (Nils, 2026-08-18: Ctrl+S on a DfPkg file). Ask here and answer False instead, so the
+        // caller can say what happened in words. See rfIsFileReadOnly's note in RefactorFileIO.pkg.
+        If (SeqEof) Begin
+            Close_Output Channel iCh      // silent on the never-opened channel (probed)
+            Send Seq_Release_Channel iCh
+            Function_Return False
+        End
+        Write Channel iCh ucaOut
+        Close_Output Channel iCh
+        Send Seq_Release_Channel iCh
+
+        // The saved state is the clean state from here on.
+        Send MarkSaved
+        Function_Return True
+    End_Function
+
+End_Class

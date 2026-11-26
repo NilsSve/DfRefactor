@@ -1,0 +1,332 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oScintillaEditor-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-27
+//
+// Description : EDITOR-SIDE characterization for the SciControlLib phase-1 rewrite (the survey's
+//               kickoff rule: pin the consumed facade surface BEFORE reimplementing it). These
+//               tests drive the REAL editor control, so they run only in the GUI runner - under
+//               -c there is no control and phoEditor is 0, the established oEditorReIndent skip.
+//               The first GUI run establishes the baseline on the CM_ facade; after each member
+//               is reimplemented straight on SCI_ messages, the same run proves equivalence.
+//
+//               The consumed surface (census 2026-07-27, all app files): CM_OpenFile,
+//               CM_SaveFile (via WriteFileToDisk), CM_IsModified, CM_SetSel/CM_GetSel,
+//               CM_GetLine, CM_GetCurrentWord(IncludingDot), CM_AddText, CM_Undo/Redo/Can*,
+//               CM_SetLanguage, CM_SetTabSize, CM_SetLineNumbering, CM_SetAutoIndentMode,
+//               CM_ShowScrollBar, the CM_Enable* toggles, and app-level LoadFile /
+//               JumpToSourceLine / WriteDataToEditor / EditorDataAsStringArray. The tests below
+//               cover the state-bearing core; pure setter toggles are exercised implicitly.
+//
+//               Every test SAVES AND RESTORES the shared editor's content and psCodeFile - the
+//               GUI runner's editor may hold real work.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+Object oScintillaEditor is a cTestFixture
+    Set psFunctionName to "ScintillaEditor"
+
+    Function EditorTempPath String sFileName Returns String
+        String sDataPath
+        Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+        Function_Return (vFolderFormat(sDataPath) + sFileName)
+    End_Function
+
+    Function WriteBytesToFile UChar[] ucaBytes String sFilePath Returns Boolean
+        Integer iChannel
+        Move (Seq_New_Channel()) to iChannel
+        If (iChannel < 0) ;
+            Function_Return False
+        Direct_Output Channel iChannel ("binary:" + sFilePath)
+        Write Channel iChannel ucaBytes
+        Close_Output Channel iChannel
+        Send Seq_Release_Channel iChannel
+        Function_Return True
+    End_Function
+
+    Function ReadBytesFromFile String sFilePath Returns UChar[]
+        Integer iChannel iSize
+        UChar[] ucaBytes
+
+        Move (rfFileSize(sFilePath)) to iSize
+        If (iSize <= 0) ;
+            Function_Return ucaBytes
+        Move (Seq_New_Channel()) to iChannel
+        If (iChannel < 0) ;
+            Function_Return ucaBytes
+        Direct_Input Channel iChannel ("binary:" + sFilePath)
+        Read_Block Channel iChannel ucaBytes iSize
+        Close_Input Channel iChannel
+        Send Seq_Release_Channel iChannel
+        Function_Return ucaBytes
+    End_Function
+
+    // Snapshot / restore the shared editor around a test. Restore re-arms the
+    // save point so the user's modified flag is not left dirty by a test.
+    Function EditorSnapshotContent Handle hoEditor Returns String[]
+        String[] asData
+        Get EditorDataAsStringArray of hoEditor to asData
+        Function_Return asData
+    End_Function
+
+    Procedure EditorRestore Handle hoEditor String[] asData String sCodeFile
+        Boolean bVoid
+        Get WriteDataToEditor of hoEditor asData to bVoid
+        Set psCodeFile of hoEditor to sCodeFile
+        Send EditorMessage of hoEditor SCI_SETSAVEPOINT
+    End_Procedure
+
+    /* THE ENCODING PIN, editor side - the other half of the engine-side tests in
+       oEncodingHelpers-Tests. An OEM file with an extended byte must survive
+       CM_OpenFile -> CM_SaveFile BYTE-EXACT: detection is BOM-sniffed
+       (lib 8a42d5f), and WriteBOM is mode-conditional, so no BOM may appear. */
+    {Published = True}
+    Procedure ScintillaEditor_OpenSaveOemByteExact
+        Handle hoEditor
+        Boolean bOK bSame
+        Integer iVoid i iRes
+        String sFileA sFileB sOrigFile
+        String[] asOrig
+        UChar[] ucaIn ucaOut
+
+        Get phoEditor of ghoFuncLib to hoEditor
+        If (hoEditor = 0) Begin
+            /* SKIPPED, not passed. DFUnit has no skipped outcome, so this used to
+               report PASS having asserted nothing - which reads exactly like a broken
+               test. The marker below verifies nothing (there is nothing to verify
+               without the editor); it makes the skip visible in results.xml, so that
+               a ZERO-assertion test now means a bug and nothing else. */
+            Send Assert True "SKIPPED: needs the GUI Scintilla editor, absent under the console runner"
+            Procedure_Return
+        End
+
+        Get EditorSnapshotContent hoEditor to asOrig
+        Get psCodeFile of hoEditor to sOrigFile
+        Get EditorTempPath "_EdTestA.tmp" to sFileA
+        Get EditorTempPath "_EdTestB.tmp" to sFileB
+
+        Move 65  to ucaIn[0]     // A
+        Move 134 to ucaIn[1]     // extended char (a-ring in CP437 AND CP850)
+        Move 98  to ucaIn[2]     // b
+        Move 13  to ucaIn[3]
+        Move 10  to ucaIn[4]
+        Move 120 to ucaIn[5]     // x
+        Get WriteBytesToFile ucaIn sFileA to bOK
+        Send Assert bOK
+
+        Get OpenFile of hoEditor sFileA to iRes
+        Set psCodeFile of hoEditor to sFileB
+        Get WriteFileToDisk of hoEditor to bOK
+        Send Assert bOK
+
+        Get ReadBytesFromFile sFileB to ucaOut
+        Move (SizeOfArray(ucaOut) = SizeOfArray(ucaIn)) to bSame
+        If (bSame = True) Begin
+            For i from 0 to (SizeOfArray(ucaIn) - 1)
+                If (ucaOut[i] <> ucaIn[i]) ;
+                    Move False to bSame
+            Loop
+        End
+        Send Assert bSame
+
+        Send EditorRestore hoEditor asOrig sOrigFile
+        Move (rfDeleteFile(sFileA)) to iVoid
+        Move (rfDeleteFile(sFileB)) to iVoid
+    End_Procedure
+
+    // A UTF-8-with-BOM file keeps its BOM and its content across open -> save,
+    // and the BOM never appears as editor text.
+    {Published = True}
+    Procedure ScintillaEditor_OpenSaveUtf8BomRoundTrip
+        Handle hoEditor
+        Boolean bOK
+        Integer iVoid iRes
+        String sFileA sFileB sOrigFile
+        String[] asOrig asData
+        UChar[] ucaIn
+
+        Get phoEditor of ghoFuncLib to hoEditor
+        If (hoEditor = 0) Begin
+            /* SKIPPED, not passed. DFUnit has no skipped outcome, so this used to
+               report PASS having asserted nothing - which reads exactly like a broken
+               test. The marker below verifies nothing (there is nothing to verify
+               without the editor); it makes the skip visible in results.xml, so that
+               a ZERO-assertion test now means a bug and nothing else. */
+            Send Assert True "SKIPPED: needs the GUI Scintilla editor, absent under the console runner"
+            Procedure_Return
+        End
+
+        Get EditorSnapshotContent hoEditor to asOrig
+        Get psCodeFile of hoEditor to sOrigFile
+        Get EditorTempPath "_EdTestA.tmp" to sFileA
+        Get EditorTempPath "_EdTestB.tmp" to sFileB
+
+        Move 239 to ucaIn[0]    // BOM
+        Move 187 to ucaIn[1]
+        Move 191 to ucaIn[2]
+        Move 65  to ucaIn[3]    // A
+        Move 98  to ucaIn[4]    // b
+        Move 13  to ucaIn[5]
+        Move 10  to ucaIn[6]
+        Move 67  to ucaIn[7]    // C
+        Get WriteBytesToFile ucaIn sFileA to bOK
+        Send Assert bOK
+
+        Get OpenFile of hoEditor sFileA to iRes
+        Get EditorDataAsStringArray of hoEditor to asData
+        Send Assert (SizeOfArray(asData) = 2)
+        Send AssertSAreEqual "Ab" asData[0]
+        Send AssertSAreEqual "C"  asData[1]
+
+        Set psCodeFile of hoEditor to sFileB
+        Get WriteFileToDisk of hoEditor to bOK
+        Send Assert bOK
+        Send Assert (rfFileHasBOM(sFileB))
+        Get EditorDataAsStringArray of hoEditor to asData
+        Send AssertSAreEqual "Ab" asData[0]
+
+        Send EditorRestore hoEditor asOrig sOrigFile
+        Move (rfDeleteFile(sFileA)) to iVoid
+        Move (rfDeleteFile(sFileB)) to iVoid
+    End_Procedure
+
+    // The modified flag's lifecycle: clean after open, set by an edit, cleared by
+    // a save (CM_SaveFile forces the save point - bClearUndo is hardwired True).
+    {Published = True}
+    Procedure ScintillaEditor_ModifiedLifecycle
+        Handle hoEditor
+        Boolean bOK
+        Integer iVoid iRes iMod
+        String sFileA sOrigFile
+        String[] asOrig
+        UChar[] ucaIn
+
+        Get phoEditor of ghoFuncLib to hoEditor
+        If (hoEditor = 0) Begin
+            /* SKIPPED, not passed. DFUnit has no skipped outcome, so this used to
+               report PASS having asserted nothing - which reads exactly like a broken
+               test. The marker below verifies nothing (there is nothing to verify
+               without the editor); it makes the skip visible in results.xml, so that
+               a ZERO-assertion test now means a bug and nothing else. */
+            Send Assert True "SKIPPED: needs the GUI Scintilla editor, absent under the console runner"
+            Procedure_Return
+        End
+
+        Get EditorSnapshotContent hoEditor to asOrig
+        Get psCodeFile of hoEditor to sOrigFile
+        Get EditorTempPath "_EdTestA.tmp" to sFileA
+
+        Move 65 to ucaIn[0]
+        Move 13 to ucaIn[1]
+        Move 10 to ucaIn[2]
+        Move 66 to ucaIn[3]
+        Get WriteBytesToFile ucaIn sFileA to bOK
+        Send Assert bOK
+
+        Get OpenFile of hoEditor sFileA to iRes
+        Get IsModified of hoEditor to iMod
+        Send Assert (iMod = 0)
+
+        Send AddTextAtCaret of hoEditor "x"
+        Get IsModified of hoEditor to iMod
+        Send Assert (iMod <> 0)
+
+        Set psCodeFile of hoEditor to sFileA
+        Get WriteFileToDisk of hoEditor to bOK
+        Send Assert bOK
+        Get IsModified of hoEditor to iMod
+        Send Assert (iMod = 0)
+
+        Send EditorRestore hoEditor asOrig sOrigFile
+        Move (rfDeleteFile(sFileA)) to iVoid
+    End_Procedure
+
+    // Selection, line retrieval and word-at-caret - the navigation core F1 and the
+    // refactoring functions lean on. CM_SetSel takes line/col pairs; CM_GetLine is
+    // 0-based; CM_GetCurrentWord reads the caret word.
+    {Published = True}
+    Procedure ScintillaEditor_SelLineAndCurrentWord
+        Handle hoEditor
+        Boolean bVoid
+        Integer iRes
+        String sVal sOrigFile
+        String[] asOrig asData
+
+        Get phoEditor of ghoFuncLib to hoEditor
+        If (hoEditor = 0) Begin
+            /* SKIPPED, not passed. DFUnit has no skipped outcome, so this used to
+               report PASS having asserted nothing - which reads exactly like a broken
+               test. The marker below verifies nothing (there is nothing to verify
+               without the editor); it makes the skip visible in results.xml, so that
+               a ZERO-assertion test now means a bug and nothing else. */
+            Send Assert True "SKIPPED: needs the GUI Scintilla editor, absent under the console runner"
+            Procedure_Return
+        End
+
+        Get EditorSnapshotContent hoEditor to asOrig
+        Get psCodeFile of hoEditor to sOrigFile
+
+        Move "Move iFoo to iBar"    to asData[0]
+        Move "Procedure TestProc"   to asData[1]
+        Get WriteDataToEditor of hoEditor asData to bVoid
+
+        Get LineText of hoEditor 0 to sVal
+        Send AssertSAreEqual "Move iFoo to iBar" sVal
+        Get LineText of hoEditor 1 to sVal
+        Send AssertSAreEqual "Procedure TestProc" sVal
+
+        // Caret inside "iFoo" (line 0, col 6) -> that is the current word.
+        Send SelectRange of hoEditor 0 6 0 6
+        Get WordAtCaret of hoEditor to sVal
+        Send AssertSAreEqual "iFoo" sVal
+
+        Send EditorRestore hoEditor asOrig sOrigFile
+    End_Procedure
+
+    // JumpToSourceLine lands the caret on the requested line (the findings-list /
+    // analyzer-grid navigation path).
+    {Published = True}
+    Procedure ScintillaEditor_JumpToSourceLine
+        Handle hoEditor
+        Boolean bVoid
+        Integer iPos iLine
+        String sOrigFile
+        String[] asOrig asData
+
+        Get phoEditor of ghoFuncLib to hoEditor
+        If (hoEditor = 0) Begin
+            /* SKIPPED, not passed. DFUnit has no skipped outcome, so this used to
+               report PASS having asserted nothing - which reads exactly like a broken
+               test. The marker below verifies nothing (there is nothing to verify
+               without the editor); it makes the skip visible in results.xml, so that
+               a ZERO-assertion test now means a bug and nothing else. */
+            Send Assert True "SKIPPED: needs the GUI Scintilla editor, absent under the console runner"
+            Procedure_Return
+        End
+
+        Get EditorSnapshotContent hoEditor to asOrig
+        Get psCodeFile of hoEditor to sOrigFile
+
+        Move "Line one"   to asData[0]
+        Move "Line two"   to asData[1]
+        Move "Line three" to asData[2]
+        Move "Line four"  to asData[3]
+        Get WriteDataToEditor of hoEditor asData to bVoid
+
+        // JumpToSourceLine is a 0-BASED API - it hands the number straight to
+        // SCI_GOTOLINE, and every caller converts from 1-based compiler lines with
+        // (iLine - 1). The rewrite must keep that contract (or change EVERY caller).
+        Send JumpToSourceLine of hoEditor 2
+        Get EditorMessage of hoEditor SCI_GETCURRENTPOS to iPos
+        Get EditorMessage of hoEditor SCI_LINEFROMPOSITION iPos to iLine
+        Send Assert (iLine = 2)
+
+        Send EditorRestore hoEditor asOrig sOrigFile
+    End_Procedure
+
+End_Object

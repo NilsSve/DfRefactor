@@ -1,0 +1,239 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cDfLanguageFile
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-01
+//
+// Description : Reader for the DataFlex Studio's own language.db keyword catalogue - the
+//               source the syntax-colouring and keyword checks lean on.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use cJsonObject.pkg
+// Named here rather than relied on from the includer: this class is Used from cBaseFuncLib (which
+// happens to pull these in first) AND from TestBench, near the top of the file where nothing else
+// has. A package that reads and writes files should say so itself.
+Use cEncodingHelpers.pkg         // rfReadEncodedFileAsStringArray
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput
+
+/*  cDfLanguageFile - reads the Studio's own language definition, <install>\Lib\DataFlex.lng.
+
+    ONE READER FOR ONE FILE. The colour scheme already parses this file for its dark palette and the
+    funclib now needs its word lists, so the parsing lives here rather than once in each - the same
+    rule the shared funclib helpers follow. What each caller wants out of it differs; the file does
+    not.
+
+    WHY THIS FILE AT ALL. The funclib's keyword arrays were seeded from the EDITOR's language
+    settings, which are user-editable: turning a word off in the syntax-highlighting dialog quietly
+    changed what the refactoring engine believed the language was. Highlighting is a preference; the
+    grammar is not. This is the grammar, shipped by the vendor, keyed to the version being targeted.
+
+    THE PAIRS ARE THE POINT. "Scope Keywords" is stored as two parallel token groups - <tokens> holds
+    the openers, <tokens2> their partners - so the file states that Begin closes with End, Loop OR
+    Until, and that Class closes only with End_Class. The funclib has only ever had two flat SETS,
+    which cannot express that, and mis-tracked scope on missing or mismatched end keywords as a
+    result.
+
+    Standalone class, no ghoApplication: the parse is testable without an install, and the caller
+    supplies the folder. (The test runner is built on cApplication, so anything hung off
+    cRefactorApplication would be unreachable from a fixture.)
+*/
+Class cDfLanguageFile is a cObject
+
+    // <install root>\Lib\DataFlex.lng, derived from the Pkg folder the app resolves (bin -> root).
+    // Takes the Pkg folder rather than reading it from ghoApplication so this stays testable.
+    Function LanguageFilePathFor String sPkgFolder Returns String
+        String sRoot
+        Integer iPos
+        Move (Trim(sPkgFolder)) to sPkgFolder
+        If (sPkgFolder = "") ;
+            Function_Return ""
+        If (Right(sPkgFolder, 1) = "\") ;
+            Move (Left(sPkgFolder, (Length(sPkgFolder) - 1))) to sPkgFolder
+        Move (RightPos("\", sPkgFolder)) to iPos
+        If (iPos = 0) ;
+            Function_Return ""
+        Move (Left(sPkgFolder, (iPos - 1))) to sRoot
+        Function_Return (vFolderFormat(sRoot) + "Lib\" + CS_InstallLanguageFile)
+    End_Function
+
+    /* The token text of a <token>..</token> line, or "" when the line is not one - or carries
+       regexp="yes", which marks a PATTERN rather than a word (whitespace, numbers, hyperlinks are
+       all regexes in this file). Letting a regex through would put "\s+" in the keyword list. */
+    Function _TokenOnLine String sLine Returns String
+        String sWork
+        Integer iOpen iClose
+
+        Move (Trim(sLine)) to sWork
+        If (Pos("<token", sWork) <> 1) ;
+            Function_Return ""
+        If (Pos('regexp="yes"', sWork) > 0) ;
+            Function_Return ""
+        Move (Pos(">", sWork)) to iOpen
+        If (iOpen = 0) ;
+            Function_Return ""
+        Move (Mid(sWork, (Length(sWork) - iOpen), (iOpen + 1))) to sWork
+        Move (Pos("</", sWork)) to iClose
+        If (iClose < 2) ;
+            Function_Return ""
+        Function_Return (Trim(Left(sWork, (iClose - 1))))
+    End_Function
+
+    /* PURE parse of the whole file into the four things the engine needs.
+
+       A line-state walk, not an XML parse: the file is machine-generated with one token per line, and
+       a real parser would be a dependency and a failure mode bought for nothing. The states are the
+       current tokenset name and which token GROUP is open - <tokens> or <tokens2> - because the scope
+       pairs are exactly the difference between those two groups.
+
+       Only four tokensets are collected. The file has 39, most of them SQL, comment and whitespace
+       states that mean nothing to the funclib; taking everything would put SQL's 268 reserved words
+       into DataFlex's keyword list. */
+    Function ParseLines String[] asLines Returns tDfLanguage
+        tDfLanguage Lang
+        String sLine sSet sTok
+        Integer i iMax iPos iEnd iGroup
+
+        Move (SizeOfArray(asLines) - 1) to iMax
+        Move "" to sSet
+        Move 0 to iGroup
+        For i from 0 to iMax
+            Move (Trim(asLines[i])) to sLine
+            Move (Pos('<tokenset name="', sLine)) to iPos
+            /* THE TAG DISPATCH. One subject - the trimmed line - so a Case says what the chain
+               of Else Ifs was already doing, and the arms keep the order they had.
+
+               THAT ORDER IS LOAD-BEARING, and it is the reason this is worth reading twice:
+               "</tokens" matches "</tokenset>" too, so the two closing arms OVERLAP. The
+               tokenset arm has to come first, because it clears sSet as well as the group -
+               reached the other way round, a closing tokenset would leave sSet naming a set
+               that has ended, and the next stray token would be filed under it. First match
+               wins here exactly as it did before; nothing may be reordered on the grounds that
+               these look independent. */
+            Case Begin
+                Case (iPos > 0)
+                    Move (Mid(sLine, (Length(sLine) - iPos - 14), (iPos + 16))) to sSet
+                    Move (Pos('"', sSet)) to iEnd
+                    If (iEnd > 1) ;
+                        Move (Left(sSet, (iEnd - 1))) to sSet
+                    Else ;
+                        Move "" to sSet
+                    Move 0 to iGroup
+                    Case Break
+                Case (Pos("</tokenset>", sLine) = 1)
+                    Move "" to sSet
+                    Move 0 to iGroup
+                    Case Break
+                Case (Pos("<tokens>", sLine) = 1)
+                    Move 1 to iGroup
+                    Case Break
+                Case (Pos("<tokens2>", sLine) = 1)
+                    Move 2 to iGroup
+                    Case Break
+                Case (Pos("</tokens", sLine) = 1)
+                    Move 0 to iGroup
+                    Case Break
+                Case Else
+                    Get _TokenOnLine sLine to sTok
+                    If (sTok <> "" and sSet <> "" and iGroup > 0) Begin
+                        // WHICH LIST THIS TOKEN JOINS. The key is the PAIR (tokenset, group): "Scope
+                        // Keywords" appears twice, group 1 being the openers and group 2 the closers,
+                        // which is the whole reason the group number is carried down here at all.
+                        // These five are mutually exclusive - unlike the tag dispatch above, no arm
+                        // here can shadow another, so the order is presentation only.
+                        Case Begin
+                            Case (sSet = "Keywords" and iGroup = 1)
+                                Move sTok to Lang.asKeywords[SizeOfArray(Lang.asKeywords)]
+                                Case Break
+                            Case (sSet = "Operators" and iGroup = 1)
+                                Move sTok to Lang.asOperators[SizeOfArray(Lang.asOperators)]
+                                Case Break
+                            Case (sSet = "Meta Data Tags" and iGroup = 1)
+                                Move sTok to Lang.asMetaTags[SizeOfArray(Lang.asMetaTags)]
+                                Case Break
+                            Case (sSet = "Scope Keywords" and iGroup = 1)
+                                Move sTok to Lang.asScopeStart[SizeOfArray(Lang.asScopeStart)]
+                                Case Break
+                            Case (sSet = "Scope Keywords" and iGroup = 2)
+                                Move sTok to Lang.asScopeEnd[SizeOfArray(Lang.asScopeEnd)]
+                                Case Break
+                        Case End
+                    End
+            Case End
+        Loop
+        /* The pair arrays must stay the same length or the correspondence is a lie. They are written
+           in step in the file; a truncated or hand-edited copy is the case this guards - dropping the
+           pairs entirely is recoverable (every caller falls back), a mis-paired list is not. */
+        If ((SizeOfArray(Lang.asScopeStart)) <> (SizeOfArray(Lang.asScopeEnd))) Begin
+            Move (ResizeArray(Lang.asScopeStart, 0)) to Lang.asScopeStart
+            Move (ResizeArray(Lang.asScopeEnd, 0))   to Lang.asScopeEnd
+        End
+        Function_Return Lang
+    End_Function
+
+    // Read + parse in one step. Empty (every array zero-length) when the file is not there, which
+    // every caller reads as "no catalogue - keep what you had".
+    Function LoadFromInstall String sPkgFolder Returns tDfLanguage
+        tDfLanguage Lang
+        String[] asLines
+        String sFile
+        Boolean bExists
+        Get LanguageFilePathFor sPkgFolder to sFile
+        If (sFile = "") ;
+            Function_Return Lang
+        Get vFilePathExists sFile to bExists
+        If (bExists = False) ;
+            Function_Return Lang
+        Move (rfReadEncodedFileAsStringArray(sFile)) to asLines
+        Get ParseLines asLines to Lang
+        Function_Return Lang
+    End_Function
+
+    /* Write a parsed catalogue to JSON at sFile. Pretty, and NO BOM - ParseUtf8 chokes on one.
+
+       FOR READING, NOT FOR LOADING. The engine parses DataFlex.lng straight from the install, which
+       is always present when a target exists (psTargetDfVersion has one setter, and it derives from
+       the selected compiler's own path). This exists so a catalogue can be kept in git and DIFFED:
+       what DF 27 adds, retires or re-pairs against DF 25 is a question about the release, and a text
+       file under version control answers it in one command. Nothing reads these back. */
+    Function WriteCatalogueJson tDfLanguage Lang String sStamp String sFile Returns Boolean
+        Handle hoJson
+        tDfLanguageCacheFile CacheFile
+        UChar[] ucJson
+        Integer iCh
+
+        Move CI_DfLanguageCacheVersion to CacheFile.iVersion
+        Move sStamp to CacheFile.sSourceStamp
+        Move Lang   to CacheFile.Language
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson CacheFile
+        Set peWhiteSpace of hoJson to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoJson to ucJson
+        Send Destroy of hoJson
+        Get rfOpenOutput sFile to iCh
+        If (iCh < 0) ;
+            Function_Return False
+        Write channel iCh ucJson
+        Send rfCloseOutput iCh
+        Function_Return True
+    End_Function
+
+    /* Does sEnd close sStart, per the file's own pairing? An opener with SEVERAL partners (Begin ends
+       with End, Loop or Until) is why this is a scan rather than an index lookup - and why the answer
+       has to be "is this pair present", not "what is this opener's partner". */
+    Function ScopeEndMatches tDfLanguage ByRef Lang String sStart String sEnd Returns Boolean
+        Integer i iMax
+        Move (Lowercase(Trim(sStart))) to sStart
+        Move (Lowercase(Trim(sEnd)))   to sEnd
+        Move (SizeOfArray(Lang.asScopeStart) - 1) to iMax
+        For i from 0 to iMax
+            If (Lowercase(Lang.asScopeStart[i]) = sStart and Lowercase(Lang.asScopeEnd[i]) = sEnd) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+End_Class

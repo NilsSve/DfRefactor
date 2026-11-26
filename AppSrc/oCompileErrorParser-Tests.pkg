@@ -1,0 +1,254 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oCompileErrorParser-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-16
+//
+// Description : Unit tests for CompileErrorParser.pkg - the ONE .err/.prn line parser that both the compiler-output
+//               dock and the Modernization Analyzer read through. oPrnTail-Tests covers the live-tail byte filter
+//               and two ExtractData shapes; this fixture pins the rest of the surface (Nils 2026-08-16, "a series
+//               of new unit tests ... for the compile analyzer/processor"):
+//               - the LINK ERROR shape (no number, no line, file before the comma);
+//               - a diagnostic WITHOUT "ON LINE:" (the guard that keeps a path token out of the Integer);
+//               - the display text the output grid's icon picker keys off ("Warning <n>:" / "Error <n>:");
+//               - MassageErrorFile over a mixed array, in order;
+//               - ReadErrorFile's blank-line skip and its answer for a missing file;
+//               - ReadErrorFileWholeLines' drop of a mid-write, unterminated tail.
+//               Temp files go under the Data folder and are removed again.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use CompileErrorParser.pkg       // the .err parser
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+    Object oCompileErrorParser_Tests is a cTestFixture
+        Set psFunctionName to "CompileErrorParser"
+
+        Function _TempPath String sLeaf Returns String
+            String sDataPath
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Function_Return (sDataPath + sLeaf)
+        End_Function
+
+        // LINK ERROR: <file>, <text> - an error, file before the comma, text after; the display text leads
+        // with "Link Error:" and carries neither a number nor a "(ln n)".
+        {Published = True}
+        Procedure CEP_ExtractData_LinkErrorShape
+            tCompileError E
+            Get ExtractData "LINK ERROR: C:\WS\AppSrc\Order.vw, Unresolved external ORDER_TOTAL" to E
+            Send Assert (E.bError = True)
+            Send AssertSAreEqual "C:\WS\AppSrc\Order.vw" E.sFileName
+            Send Assert ((Pos("Unresolved external ORDER_TOTAL", E.sErrorTxt)) > 0)
+            Send AssertIAreEqual 0 E.iErrorNo
+            Send AssertIAreEqual 0 E.iLine
+            Send AssertSAreEqual "Link Error:" (Left(E.sText, 11))
+            Send Assert ((Pos("(ln ", E.sText)) = 0)
+        End_Procedure
+
+        /* LINK ERROR WITH NO COMMA - and no file, which is the shape a missing bitmap or icon
+           actually produces:
+
+               LINK ERROR: UNABLE TO OPEN FILE DacAbout.bmp
+               LINK ERROR: UNABLE TO ADD THE BITMAPS
+               LINK ERROR: UNABLE TO CREATE EXECUTABLE
+
+           The shape above it has a comma and a file; this one has neither, so the filename branch
+           is skipped entirely and everything after the prefix stays as the text. What matters here
+           is that it is still flagged an ERROR and still leads with "Link Error:", because that
+           prefix is the whole of how CountLinkErrors (CompilerOutputFT.dg) recognises a link error
+           and keeps it out of the compile-errors chip. Break the prefix and the chip silently
+           reports link failures as source errors again - which is what it did until 2026-09-10,
+           and what no test then caught, because only the comma-bearing shape was covered. */
+        {Published = True}
+        Procedure CEP_ExtractData_LinkErrorWithoutFile
+            tCompileError E
+            Get ExtractData "LINK ERROR: UNABLE TO OPEN FILE DacAbout.bmp" to E
+            Send Assert (E.bError = True)
+            Send AssertSAreEqual "Link Error:" (Left(E.sText, 11))
+            // No comma means no file to name - and an invented one would send a source jump nowhere.
+            Send AssertSAreEqual "" E.sFileName
+            Send AssertIAreEqual 0 E.iErrorNo
+            Send AssertIAreEqual 0 E.iLine
+            Send Assert ((Pos("DacAbout.bmp", E.sErrorTxt)) > 0)
+            // The other two lines of that same failure carry no filename either.
+            Get ExtractData "LINK ERROR: UNABLE TO CREATE EXECUTABLE" to E
+            Send Assert (E.bError = True)
+            Send AssertSAreEqual "Link Error:" (Left(E.sText, 11))
+        End_Procedure
+
+        // A diagnostic with no "ON LINE:" - the file still parses, the line stays 0, and the path's
+        // "\Users\" never becomes the line number (the DF26 Integer-move fault this guard exists for).
+        {Published = True}
+        Procedure CEP_ExtractData_NoOnLineKeepsZeroLine
+            tCompileError E
+            Get ExtractData "ERROR: 4313 Can't open include file: Foo.fd OF FILE: C:\WS\AppSrc\Users\x.pkg" to E
+            Send Assert (E.bError = True)
+            Send AssertIAreEqual 4313 E.iErrorNo
+            Send AssertIAreEqual 0 E.iLine
+            Send AssertSAreEqual "C:\WS\AppSrc\Users\x.pkg" E.sFileName
+            Send AssertSAreEqual "Can't open include file: Foo.fd" E.sErrorTxt
+        End_Procedure
+
+        // The display text: kind + number, the file, "(ln n)", then the message - and the "(offset)" the
+        // compiler writes after the line number is dropped from the message text.
+        {Published = True}
+        Procedure CEP_ExtractData_DisplayTextShape
+            tCompileError W E
+
+            Get ExtractData "WARNING: 4531 Obsolete function ON LINE: 40 (900) OF FILE: C:\a.pkg" to W
+            Get ExtractData "ERROR: 4544 Ambiguous function in expression ON LINE: 20 (120) OF FILE: C:\b.pkg" to E
+            Send Assert (W.bError = False)
+            Send AssertIAreEqual 4531 W.iErrorNo
+            Send AssertIAreEqual 40 W.iLine
+            Send AssertSAreEqual "Obsolete function" W.sErrorTxt
+            Send AssertSAreEqual "Warning 4531:" (Left(W.sText, 13))
+            Send Assert ((Pos("(ln 40)", W.sText)) > 0)
+            Send Assert ((Pos("C:\a.pkg", W.sText)) > 0)
+            Send Assert ((Pos("(900)", W.sText)) = 0)
+            Send Assert (E.bError = True)
+            Send AssertSAreEqual "Error 4544:" (Left(E.sText, 11))
+            Send Assert ((Pos("(ln 20)", E.sText)) > 0)
+        End_Procedure
+
+        // MassageErrorFile parses every line, in order, one struct per line - and an empty array in is an
+        // empty array out.
+        {Published = True}
+        Procedure CEP_MassageErrorFile_ParsesEveryLineInOrder
+            String[] asLines asNone
+            tCompileError[] aOut aEmpty
+
+            Move "WARNING: 4531 Obsolete function ON LINE: 40 (900) OF FILE: C:\a.pkg"                to asLines[0]
+            Move "ERROR: 4544 Ambiguous function in expression ON LINE: 20 (120) OF FILE: C:\b.pkg" to asLines[1]
+            Move "LINK ERROR: C:\c.src, Unresolved external X"                                        to asLines[2]
+            Get MassageErrorFile asLines to aOut
+            Send AssertIAreEqual 3 (SizeOfArray(aOut))
+            Send Assert (aOut[0].bError = False)
+            Send AssertIAreEqual 4531 aOut[0].iErrorNo
+            Send Assert (aOut[1].bError = True)
+            Send AssertIAreEqual 4544 aOut[1].iErrorNo
+            Send AssertSAreEqual "C:\b.pkg" aOut[1].sFileName
+            Send Assert (aOut[2].bError = True)
+            Send AssertSAreEqual "C:\c.src" aOut[2].sFileName
+            Get MassageErrorFile asNone to aEmpty
+            Send AssertIAreEqual 0 (SizeOfArray(aEmpty))
+        End_Procedure
+
+        // ReadErrorFile skips blank and whitespace-only lines, and answers an empty array for a file that
+        // does not exist (never a fault).
+        {Published = True}
+        Procedure CEP_ReadErrorFile_SkipsBlanksAndMissingIsEmpty
+            Boolean bOk
+            Integer iVoid
+            String sFile
+            String[] asWrite asRead asMissing
+
+            Get _TempPath "_CepRead.tmp" to sFile
+            Move "ERROR: 1 first ON LINE: 1 (1) OF FILE: C:\a.pkg"  to asWrite[0]
+            Move ""                                                to asWrite[1]
+            Move "   "                                             to asWrite[2]
+            Move "ERROR: 2 second ON LINE: 2 (2) OF FILE: C:\a.pkg" to asWrite[3]
+            Get rfWriteEncodedFileFromStringArray (&asWrite) sFile C_NewLine False to bOk
+            Send Assert bOk
+            Get ReadErrorFile sFile to asRead
+            Move (rfDeleteFile(sFile)) to iVoid
+            Send AssertIAreEqual 2 (SizeOfArray(asRead))
+            Send Assert ((Pos("first", asRead[0])) > 0)
+            Send Assert ((Pos("second", asRead[1])) > 0)
+            Get ReadErrorFile (sFile + ".nowhere") to asMissing
+            Send AssertIAreEqual 0 (SizeOfArray(asMissing))
+        End_Procedure
+
+        // ReadErrorFileWholeLines: a file that does NOT end in a line break is mid-write (or was cut by a
+        // process kill) - its last line is incomplete and is dropped; a properly terminated file keeps
+        // every line.
+        {Published = True}
+        Procedure CEP_ReadErrorFileWholeLines_DropsUnterminatedTail
+            Integer iVoid iCh
+            String sFile sCRLF
+            String[] asCut asWhole
+
+            Move (Character(13) + Character(10)) to sCRLF
+            Get _TempPath "_CepTail.tmp" to sFile
+            // 1) unterminated: "A", "B", then a half-written "C"
+            Get rfOpenOutput sFile to iCh
+            Send Assert (iCh >= 0)
+            Write channel iCh ("ERROR: 1 a ON LINE: 1 (1) OF FILE: C:\a.pkg" + sCRLF)
+            Write channel iCh ("ERROR: 2 b ON LINE: 2 (2) OF FILE: C:\a.pkg" + sCRLF)
+            Write channel iCh "ERROR: 3 c ON LINE: 3 (3) OF FILE: C:\Regserve"
+            Send rfCloseOutput iCh
+            Get ReadErrorFileWholeLines sFile to asCut
+            Send AssertIAreEqual 2 (SizeOfArray(asCut))
+            Send Assert ((Pos("OF FILE: C:\a.pkg", asCut[1])) > 0)
+            // 2) terminated: all three stay
+            Get rfOpenOutput sFile to iCh
+            Send Assert (iCh >= 0)
+            Write channel iCh ("ERROR: 1 a ON LINE: 1 (1) OF FILE: C:\a.pkg" + sCRLF)
+            Write channel iCh ("ERROR: 2 b ON LINE: 2 (2) OF FILE: C:\a.pkg" + sCRLF)
+            Write channel iCh ("ERROR: 3 c ON LINE: 3 (3) OF FILE: C:\c.pkg" + sCRLF)
+            Send rfCloseOutput iCh
+            Get ReadErrorFileWholeLines sFile to asWhole
+            Move (rfDeleteFile(sFile)) to iVoid
+            Send AssertIAreEqual 3 (SizeOfArray(asWhole))
+        End_Procedure
+
+        /* A COMPILER THAT DIED, NOT EXITED (2026-10-05): its exit code is the Windows exception code. The
+           words for the ones seen or likely, the bare code for any other in the range, and "" for every
+           ordinary exit - 0, the small codes a compile with errors returns, and -1, this program's own
+           "unknown". */
+        {Published = True}
+        Procedure CEP_CompilerCrashWords_NamesACrashAndNothingElse
+            Send AssertSAreEqual "" (CompilerCrashWords(0))
+            Send AssertSAreEqual "" (CompilerCrashWords(1))
+            Send AssertSAreEqual "" (CompilerCrashWords(-1))
+            Send AssertSAreEqual "stack overflow, exit code 0xC00000FD" (CompilerCrashWords(-1073741571))
+            Send AssertSAreEqual "heap corruption, exit code 0xC0000374" (CompilerCrashWords(-1073740940))
+            Send AssertSAreEqual "access violation, exit code 0xC0000005" (CompilerCrashWords(-1073741819))
+            Send AssertSAreEqual "exit code -1073741000" (CompilerCrashWords(-1073741000))
+            Send AssertSAreEqual "" (CompilerCrashWords(-805306368))     // one above the range
+        End_Procedure
+
+        /* A FOLDER IS NOT THE FILE OF A MESSAGE (2026-10-05). The last line of a crashed compile's listing
+           read "... OF FILE: E:\Lib\AppSrc\" and parsed into a row whose file was that folder. */
+        {Published = True}
+        Procedure CEP_IsCompilerMessageFile_AFolderOrNothingIsNot
+            tCompileError Cut
+            Send Assert (IsCompilerMessageFile("E:\Lib\AppSrc\cTemplateEngine.pkg"))
+            Send Assert (IsCompilerMessageFile("E:\Lib\AppSrc\") = False)
+            Send Assert (IsCompilerMessageFile("E:/Lib/AppSrc/") = False)
+            Send Assert (IsCompilerMessageFile("") = False)
+            Send Assert (IsCompilerMessageFile("   ") = False)
+            // the line as the listing held it, through the parser
+            Get ExtractData "ERROR: 52 Bad format of expression (operator) [ ON LINE: 91 (132120) OF FILE: E:\Lib\AppSrc\" to Cut
+            Send AssertSAreEqual "E:\Lib\AppSrc\" (Cut.sFileName)
+            Send Assert (IsCompilerMessageFile(Cut.sFileName) = False)
+        End_Procedure
+
+        // rfPrnIncludedFiles: the "Including file:" lines, full path out of the trailing parentheses,
+        // distinct, in listing order; echo lines and diagnostics never count (2026-08-16).
+        {Published = True}
+        Procedure CEP_PrnIncludedFiles_ReadsTheCompiledSet
+            Boolean bOk
+            Integer iVoid
+            String sFile
+            String[] asWrite asOut
+
+            Get _TempPath "_CepInc.tmp" to sFile
+            Move "DataFlex 26.0 (64-bit) Command Line Compiler"                                             to asWrite[0]
+            Move "Including file: KeyFieldValidation.pkg    (E:\WebAppSrc\AppSrc\KeyFieldValidation.pkg)" to asWrite[1]
+            Move "     1>>>Use Windows.pkg"                                                                 to asWrite[2]
+            Move "Including file: ChilKat.pkg    (E:\WebAppSrc\AppSrc\ChilKat.pkg)"                       to asWrite[3]
+            Move "WARNING: 4534 Not Unicode safe ON LINE: 12 (99) OF FILE: E:\a.pkg"                       to asWrite[4]
+            Move "Including file: ChilKat.pkg    (E:\WebAppSrc\AppSrc\ChilKat.pkg)"                       to asWrite[5]   // again - once
+            Move "     3>>>// Including file: not really (x)"                                              to asWrite[6]   // an echo, not a header
+            Get rfWriteEncodedFileFromStringArray (&asWrite) sFile C_NewLine False to bOk
+            Send Assert bOk
+            Get rfPrnIncludedFiles sFile to asOut
+            Move (rfDeleteFile(sFile)) to iVoid
+            Send AssertIAreEqual 2 (SizeOfArray(asOut))
+            Send AssertSAreEqual "E:\WebAppSrc\AppSrc\KeyFieldValidation.pkg" asOut[0]
+            Send AssertSAreEqual "E:\WebAppSrc\AppSrc\ChilKat.pkg"            asOut[1]
+        End_Procedure
+
+    End_Object

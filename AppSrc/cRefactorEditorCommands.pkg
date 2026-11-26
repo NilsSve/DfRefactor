@@ -1,0 +1,813 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cRefactorEditorCommands
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-27
+//
+// Description : PHASE 1 of the SciControlLib modernization (Nils, 2026-07-27): the three
+//               interactive editor commands - Normalize Case, Re-indent and Drop Self - brought
+//               HOME.
+//
+//               Original work:
+//               Copyright (c)  2017 The Kurant project
+//               $ProjectName : TheHammer3
+//               $Authors     : Wil van Antwerpen
+//               $Created     : 07.06.2017  13:30
+//
+//               They were living in the library as cSciLexerRefactor.pkg, a subclass of the 5,500
+//               line CodeMax facade. That was always the wrong address: they are DFRefactor's own
+//               features (the file is literally named after this product), they are what
+//               cRefactorScintillaEditor's context menu and hotkeys invoke, and their presence in
+//               the library was the last thing tying the editor to cSciLexer.pkg. Moving them here
+//               lets the editor rebase onto cScintillaEditorBridge and drop the old chain entirely.
+//
+//               The port is faithful to the BEHAVIOUR and modern in the mechanics. Three changes
+//               worth knowing about, each noted again at its site:
+//                 * Forcing the lexer to style the whole document was done by scrolling to the last
+//                   line, pumping the message queue and scrolling back. It is now one Colourise -
+//                   deterministic instead of dependent on painting having happened.
+//                 * Re-indent rebuilt the document by appending raw bytes and hand-converting the
+//                   encoding. It now builds a string and hands it to SetDocumentText, which owns the
+//                   encoding choice in one place.
+//                 * Reading a line no longer goes through SCI_GETLINE (which includes the EOL and
+//                   does not NUL-terminate - the old buffer read walked off the end of its
+//                   ZeroString); LineText gives the text and LineEndingText the separator.
+//
+//               The _T() translation wrapper is deliberately NOT carried over: it lives in
+//               cSciLexerSupport.pkg, whose closure self-instantiates the settings object, and it
+//               exists for the Hammer's multi-language UI. DFRefactor's own UI text is English.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use cScintillaSchemeView.pkg    // the bridge + the colour-scheme rendering, shared with
+                                // the Editor Settings preview
+Use cRefactorNormalizeCase.pkg  // oNormalizeCase - the keyword-casing dictionary (a PEER
+                                // object, not a base class; no Use lines of its own)
+// The Drop Self confirmation - local, and the reason Tools\MessageBox2.dg is no longer in the
+// build. A program with a Drop Self confirmation of its own Uses it before this package, and
+// that file defines C_OwnDropSelfConfirm - then this one stays out.
+#IFNDEF C_OwnDropSelfConfirm
+Use DropSelfConfirm.dg
+#ENDIF
+// The Find / Replace / Goto dialogs, now local to DFRefactor. They are plain
+// ModalPanels whose only dependencies are DataFlex's own packages, so nothing of the
+// old editor chain comes with them. What HAS changed is what they drive - the entry
+// points below run the bridge's search engine.
+// A program with a Find dialog of its own Uses it before this package, and that file defines
+// C_OwnFindDialog - then this one stays out.
+#IFNDEF C_OwnFindDialog
+Use ScintillaFind.dg
+#ENDIF
+// A program with a Replace dialog of its own Uses it before this package, and that file defines
+// C_OwnReplaceDialog - then this one stays out.
+#IFNDEF C_OwnReplaceDialog
+Use ScintillaReplace.dg
+#ENDIF
+// A program with a Go To Line dialog of its own Uses it before this package, and that file
+// defines C_OwnGotoDialog - then this one stays out.
+#IFNDEF C_OwnGotoDialog
+Use ScintillaGoto.dg
+#ENDIF
+
+// What Drop Self remembers per object, so "yes to all for oFoo" is asked once.
+Struct tDropSelfResponse
+    String  sObject
+    Integer eResponse
+    Boolean bPadded
+End_Struct
+
+// Where a line sits relative to a Case block - re-indent needs this because Case
+// bodies are indented one level in from their Case Begin.
+#IFNDEF CI_CaseNone
+Enum_List
+    Define CI_CaseNone For 0
+    Define CI_CaseBegin
+    Define CI_CaseCondition
+    Define CI_CaseBreak
+    Define CI_CaseEnd
+End_Enum_List
+#ENDIF
+
+Class cRefactorEditorCommands is a cScintillaSchemeView
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // Drop Self pads a shortened object reference with spaces so surrounding code
+        // stays aligned; the user's last answer carries to the next occurrence.
+        Property Boolean pbDropSelfPadReplacement True
+        Property Boolean pbIndentCaseBreak        True   // False = Case Break sits with the condition
+        Property Boolean pbReindentStudioCommentOut False // True = leave column-0 // alone (Studio's Ctrl+/)
+        Property tDropSelfResponse[] pDropSelfResponses
+        // How far to nudge the view after a Goto so the line is not flush against an edge.
+        Property Integer piLinesToScrollAfterGoto 4
+    End_Procedure
+
+    // *** Find / Replace / Goto - the dialogs and the verbs they and the menus drive.
+    // The dialogs speak in a tFindReplaceOptions struct; the engine underneath speaks in
+    // plain booleans. This is the one place the two meet.
+
+    // The dialogs call this back with the struct (Replace.dg does it on the invoking
+    // object), so the name and shape have to stay as they are.
+    Function SetSearchOptions tFindReplaceOptions Options Returns Integer
+        Function_Return (ApplySearchOptions(Self, Options.bWordMatch, Options.bMatchCase, ;
+                         Options.bRegExp, Options.bDocumentStart))
+    End_Function
+
+    Function CurrentSearchOptions String sSearchText Returns tFindReplaceOptions
+        tFindReplaceOptions Options
+        Move sSearchText to Options.sSearchText
+        Get SearchMatchesWholeWord to Options.bWordMatch
+        Get SearchMatchesCase      to Options.bMatchCase
+        Get SearchUsesRegExp       to Options.bRegExp
+        Get pbFindDocumentStart    to Options.bDocumentStart
+        Function_Return Options
+    End_Function
+
+    // The three verbs the menu items and the Replace dialog send. They work off the
+    // remembered search text, which is what "next" means.
+    Procedure FindFirst
+        Boolean bVoid
+        Get FindFirstOccurrence (psSearchText(Self)) to bVoid
+    End_Procedure
+
+    Procedure FindNext
+        Boolean bVoid
+        Get FindNextOccurrence (psSearchText(Self)) to bVoid
+    End_Procedure
+
+    Procedure FindPrevious
+        Boolean bVoid
+        Get FindPreviousOccurrence (psSearchText(Self)) to bVoid
+    End_Procedure
+
+    Procedure Find
+        Boolean bVoid
+        Integer iVoid
+        tFindReplaceOptions Options
+
+        Get WordAtCaret to Options.sSearchText     // seed with the word under the caret
+        Get CurrentSearchOptions Options.sSearchText to Options
+        Move FindDown to Options.eFindOptions
+        Send RequestDetails of oFindDialog (&Options)
+        If (Options.bStartFind = False) ;
+            Procedure_Return
+        Get SetSearchOptions Options to iVoid
+        Set psSearchText to Options.sSearchText
+        If (Options.bMarkAll) ;
+            Get MarkAllOccurrences Options.sSearchText to iVoid
+        Else If (Options.bDocumentStart) ;
+            Get FindFirstOccurrence Options.sSearchText to bVoid
+        Else ;
+            Get FindNextOccurrence Options.sSearchText to bVoid
+    End_Procedure
+
+    Procedure Replace
+        Boolean bVoid
+        Integer iVoid
+        tFindReplaceOptions Options
+
+        Get WordAtCaret to Options.sSearchText
+        Get CurrentSearchOptions Options.sSearchText to Options
+        // The dialog drives single replacements itself, through the handle it is given;
+        // it comes back with bReplaceAll set only when the user asked for all of them.
+        Send RequestDetails of oReplaceDialog (&Options) (Object_Id(Self))
+        If (Options.bReplaceAll = False) ;
+            Procedure_Return
+        Get SetSearchOptions Options to iVoid
+        Set psSearchText to Options.sSearchText
+        Get ReplaceAllOccurrences Options.sSearchText Options.sReplaceText to iVoid
+    End_Procedure
+
+    // Replace.dg sends this for its single-replacement button.
+    Procedure ReplaceText String sReplacement
+        Boolean bVoid
+        Get ReplaceSelectionWith sReplacement to bVoid
+    End_Procedure
+
+    /* With a line number, jump to it; without one, ask. After the jump, nudge the view
+       so the line does not sit against the very top or bottom edge - context above and
+       below is most of the point of jumping there. */
+    Procedure GotoLine Integer iLineEx
+        Integer iLine iScreenLines iFirstLine iScroll
+
+        If (Num_Arguments > 0) ;
+            Move iLineEx to iLine
+        Else Begin
+            Send RequestDetails of oGotoDialog (&iLine)
+            If (iLine < 0) ;
+                Procedure_Return
+        End
+        Send GotoLineNumber iLine
+        Get EditorMessage SCI_LINESONSCREEN to iScreenLines
+        Get EditorMessage SCI_GETFIRSTVISIBLELINE to iFirstLine
+        Get piLinesToScrollAfterGoto to iScroll
+        If (iScreenLines > iScroll) Begin
+            If (iLine = iFirstLine) ;
+                Send EditorMessage SCI_LINESCROLL 0 (-iScroll)
+            Else If (iLine = (iFirstLine + iScreenLines - 1)) ;
+                Send EditorMessage SCI_LINESCROLL 0 iScroll
+        End
+    End_Procedure
+
+    // *** Normalize Case - make every keyword and scope word match the casing configured in
+    // the language settings.
+
+    /* One line, using the LEXER's own word boundaries: walk the styled positions, and
+       every time a run of keyword or scope-word style ends, look that word up in the
+       casing dictionary and overstrike it. Overstrike keeps the line the same length,
+       so nothing downstream has to re-measure. Returns True when the line changed. */
+    Function LineNormalizeCase Integer iLine Returns Boolean
+        Integer iPosStart iPosChar iPos iLineLength iWordStart
+        Integer eStyle eLastStyle
+        String  sLine sCasedLine sWord sCasedWord
+
+        Get LineText iLine to sLine
+        If (sLine = "") ;
+            Function_Return False
+        Get EditorMessage SCI_FINDCOLUMN iLine to iPosStart
+        Get EditorMessage SCI_LINELENGTH iLine to iLineLength
+        Move sLine to sCasedLine
+        Move 0 to eLastStyle
+        For iPosChar from iPosStart to (iPosStart + iLineLength)
+            Get StyleAt iPosChar to eStyle
+            Move (iPosChar - iPosStart + 1) to iPos
+            If (eStyle = SCE_DF_WORD and eLastStyle <> SCE_DF_WORD) Begin
+                Move SCE_DF_WORD to eLastStyle
+                Move iPos to iWordStart
+            End
+            Else If (eStyle = SCE_DF_SCOPEWORD and eLastStyle <> SCE_DF_SCOPEWORD) Begin
+                Move SCE_DF_SCOPEWORD to eLastStyle
+                Move iPos to iWordStart
+            End
+            If (eLastStyle = SCE_DF_WORD and eStyle <> SCE_DF_WORD) Begin
+                Move (Mid(sLine, iPos - iWordStart, iWordStart)) to sWord
+                Get FindKeyWord of oNormalizeCase SCLEX_DATAFLEX sWord to sCasedWord
+                Move (Overstrike(sCasedWord, sCasedLine, iWordStart)) to sCasedLine
+                Move 0 to eLastStyle
+            End
+            Else If (eLastStyle = SCE_DF_SCOPEWORD and eStyle <> SCE_DF_SCOPEWORD) Begin
+                Move (Mid(sLine, iPos - iWordStart, iWordStart)) to sWord
+                Get FindScopeWord of oNormalizeCase SCLEX_DATAFLEX sWord to sCasedWord
+                Move (Overstrike(sCasedWord, sCasedLine, iWordStart)) to sCasedLine
+                Move 0 to eLastStyle
+            End
+        Loop
+        If (sLine = sCasedLine) ;
+            Function_Return False
+        Send SetLineText iLine sCasedLine
+        Send ColouriseRange iPosStart (iPosStart + iLineLength)  // the styles just moved
+        Function_Return True
+    End_Function
+
+    /* Normalize the line the caret is on, putting the selection back afterwards -
+       rewriting a line moves it. This is what "Adjust case while typing" does, and it
+       fires as you leave a line by pressing Enter. */
+    Procedure NormalizeCaseCurrentLine
+        Boolean bChanged bVoid
+        Integer iStartLine iStartCol iEndLine iEndCol
+
+        Get RefreshSelectionState to bVoid
+        Get piSelStartLine to iStartLine
+        Get piSelStartCol  to iStartCol
+        Get piSelEndLine   to iEndLine
+        Get piSelEndCol    to iEndCol
+        Get LineNormalizeCase iStartLine to bChanged
+        If (bChanged) ;
+            Send SelectRange iStartLine iStartCol iEndLine iEndCol
+    End_Procedure
+
+    // Enter: fix the casing of the line being left, then let the base do the newline
+    // and its indentation. The old chain did the same, in the same order.
+    Procedure HandleReturnKey
+        If (pbNormalizeCase(Self)) ;
+            Send NormalizeCaseCurrentLine
+        Forward Send HandleReturnKey
+    End_Procedure
+
+    Procedure NormalizeCaseWholeFile
+        Boolean bVoid
+        Integer iCurrentLine iLine iLineCount
+
+        Get CurrentLine to iCurrentLine
+        Get DocumentLineCount to iLineCount
+        // The whole document must be styled before we can read word styles off it. The
+        // old chain achieved that by scrolling to the end, pumping the queue and
+        // scrolling back; one Colourise says the same thing and cannot half-happen.
+        Send Colourise
+        Send BeginUndoGroup
+        For iLine from 0 to (iLineCount - 1)
+            Get LineNormalizeCase iLine to bVoid
+        Loop
+        Send EndUndoGroup
+        Send GotoLineNumber iCurrentLine
+    End_Procedure
+
+    // *** Re-indent - rebuild every line's leading whitespace from the lexer's fold levels.
+
+    // Where this line sits in a Case block.
+    Function LineCaseStatus String sLine Returns Integer
+        Integer iFirstChar
+
+        Move (Length(sLine) - Length(LTrim(sLine))) to iFirstChar
+        If (Lowercase(Mid(sLine, 4, iFirstChar + 1)) <> "case") ;
+            Function_Return CI_CaseNone
+        Move (LTrim(Lowercase(sLine))) to sLine
+        Move (LTrim(Right(sLine, Length(sLine) - 4))) to sLine
+        If (Left(sLine, 5) = "begin") ;
+            Function_Return CI_CaseBegin
+        If (Left(sLine, 5) = "break") ;
+            Function_Return CI_CaseBreak
+        If (Left(sLine, 3) = "end") ;
+            Function_Return CI_CaseEnd
+        Function_Return CI_CaseCondition
+    End_Function
+
+    /* A one-line If/Else whose statement is continued on the next line with a trailing
+       semicolon - the continuation gets an extra indent. bIndentActive carries the rule
+       forward, because a continuation can itself end in a semicolon. */
+    Function LineIsContinuedIfElse Integer iLine String sLine Boolean bIndentActive Returns Boolean
+        Integer iFirstChar
+        Move (Length(sLine) - Length(LTrim(sLine))) to iFirstChar
+        Move (RTrim(Lowercase(sLine))) to sLine
+        If (Mid(sLine, 3, iFirstChar + 1) <> "if " and Mid(sLine, 5, iFirstChar + 1) <> "else " ;
+            and Mid(sLine, 5, iFirstChar + 1) <> "else;" and bIndentActive = False) ;
+            Function_Return False
+        Get LineWithoutStringsAndComments iLine to sLine   // a trailing ; inside a comment is not one
+        Function_Return (Right(sLine, 1) = ";")
+    End_Function
+
+    // Inside a #COMMAND .. #ENDCOMMAND macro body, indentation is the author's - the
+    // macro's own layout is part of what it expands to.
+    Function LineOpensOrContinuesCommandMacro Integer iLine String sLine Boolean bMacroOpen Returns Boolean
+        If (LineOpensScope(Self, iLine) = False and bMacroOpen = False) ;
+            Function_Return bMacroOpen
+        Move (Uppercase(LTrim(sLine))) to sLine
+        If (Left(sLine, 1) <> "#") ;
+            Function_Return bMacroOpen
+        If (Left(sLine, 9) = "#COMMAND ") ;
+            Function_Return True
+        If (Left(sLine, 11) = "#ENDCOMMAND") ;
+            Function_Return False
+        Function_Return bMacroOpen
+    End_Function
+
+    /* The indentation one line WANTS, in characters, from the lexer's fold levels. A
+       line that closes a scope takes the shallower of its own level and the next one.
+       Comments inherit the previous line's level, multi-line string bodies and macro
+       lines keep what they have, and Use lines and goto labels always sit at column 0. */
+    Function ReIndentTextForLine Integer iLine Integer iLineCount Integer ByRef iPrevLevel Returns String
+        Boolean bIsComment bIsMultiLineString bIsLabel
+        Integer iFoldLevel iNextLevel iLevel iFirstChar iTabWidth
+        String  sLine sIndent
+
+        Get LineFoldLevel iLine to iFoldLevel
+        Move 0 to iNextLevel
+        If (iLine < (iLineCount - 1)) ;
+            Get LineFoldLevel (iLine + 1) to iNextLevel
+        Move iFoldLevel to iLevel
+        If (iNextLevel < iFoldLevel) ;
+            Move iNextLevel to iLevel
+
+        Get LineText iLine to sLine
+        Get LineIsComment iLine to bIsComment
+        If (bIsComment) Begin
+            // A block comment is also a fold point; follow the line above instead.
+            Move False to bIsComment
+            If (iLine > 0) ;
+                Get LineIsComment (iLine - 1) to bIsComment
+            If (bIsComment) ;
+                Move iPrevLevel to iLevel
+            If (Left(sLine, 2) = "//" and pbReindentStudioCommentOut(Self)) Begin
+                Move 0 to iLevel        // Studio's comment-out marker stays at column 0
+                Move False to bIsComment
+            End
+        End
+        Get LineIsMultiLineString iLine to bIsMultiLineString
+        If (bIsMultiLineString) ;
+            Move iPrevLevel to iLevel
+
+        Get TabWidth to iTabWidth
+        Get IndentationText (iLevel * iTabWidth) to sIndent
+        Move (Length(sLine) - Length(LTrim(sLine)) + 1) to iFirstChar
+        // Compiler directives and string bodies keep the indentation they came with.
+        If (Mid(sLine, 1, iFirstChar) = "#" or bIsMultiLineString) ;
+            Move (Left(sLine, iFirstChar - 1)) to sIndent
+        Move (LTrim(sLine)) to sLine
+        If (Lowercase(Left(sLine, 4)) = "use ") ;
+            Move "" to sIndent
+        If (bIsMultiLineString = False) Begin
+            Get LineIsGotoLabel iLine to bIsLabel
+            If (bIsLabel) ;
+                Move "" to sIndent
+        End
+        Move iLevel to iPrevLevel
+        Function_Return sIndent
+    End_Function
+
+    Procedure ReIndentWholeFile
+        Boolean bUseTabs bIsReportImage bIsContinued bIndentActive bMacroOpen
+        Integer eCaseStatus iCurrentLine iLine iLineCount iTabWidth iCaseLevel iPrevLevel
+        String  sTab sIndent sLine sOriginalLine sEol sDocument
+
+        Get CurrentLine to iCurrentLine
+        Get TabWidth to iTabWidth
+        Get EditorMessage SCI_GETUSETABS to bUseTabs
+        If (bUseTabs) ;
+            Move (Character(9)) to sTab
+        Else ;
+            Move (Repeat(" ", iTabWidth)) to sTab
+        Get LineEndingText to sEol
+        Get DocumentLineCount to iLineCount
+        Send Colourise                     // fold levels must exist before we read them
+
+        For iLine from 0 to (iLineCount - 1)
+            Get LineText iLine to sLine
+            If (RTrim(sLine) <> "") Begin
+                Get LineIsReportImage iLine to bIsReportImage
+                If (bIsReportImage = False) Begin
+                    Get LineCaseStatus sLine to eCaseStatus
+                    If (eCaseStatus = CI_CaseBegin) ;
+                        Increment iCaseLevel
+                    Else If (eCaseStatus = CI_CaseEnd) ;
+                        Decrement iCaseLevel
+                    Get LineIsContinuedIfElse iLine sLine bIndentActive to bIsContinued
+                    Get LineOpensOrContinuesCommandMacro iLine sLine bMacroOpen to bMacroOpen
+                    Move sLine to sOriginalLine
+                    Move (LTrim(sLine)) to sLine
+                    If (bIndentActive) Begin
+                        // A Begin after a continued If/Else is the block's own indent,
+                        // not an extra one (Starzen, issue 127).
+                        If (Left(Lowercase(sLine), 6) = "begin ") ;
+                            Move False to bIndentActive
+                    End
+                    // Always computed, even inside a macro body: it advances iPrevLevel,
+                    // which the lines after the macro depend on.
+                    Get ReIndentTextForLine iLine iLineCount (&iPrevLevel) to sIndent
+                    If (iCaseLevel > 0) Begin
+                        If (eCaseStatus = CI_CaseNone or eCaseStatus = CI_CaseEnd ;
+                            or (eCaseStatus = CI_CaseBreak and pbIndentCaseBreak(Self))) ;
+                            Move (sIndent + Repeat(sTab, iCaseLevel)) to sIndent
+                        Else ;
+                            Move (sIndent + Repeat(sTab, iCaseLevel - 1)) to sIndent
+                    End
+                    If (bIndentActive) ;
+                        Move (sIndent + sTab) to sIndent
+                    Move (sIndent + sLine) to sLine
+                    // Inside #COMMAND .. #ENDCOMMAND the author's layout is part of what
+                    // the macro expands to - hand back the line untouched.
+                    If (bMacroOpen) ;
+                        Move sOriginalLine to sLine
+                    Move bIsContinued to bIndentActive
+                End
+            End
+            If (iLine = 0) ;
+                Move sLine to sDocument
+            Else ;
+                Move (sDocument + sEol + sLine) to sDocument
+        Loop
+
+        Send BeginUndoGroup
+        Send SetDocumentText sDocument     // SetDocumentText owns the encoding choice
+        Send EndUndoGroup
+        Send GotoLineNumber iCurrentLine
+    End_Procedure
+
+    // *** Drop Self - offer to shorten "Send Foo of (oBar(Self))" to "Send Foo of oBar".
+
+    Function DropSelfConfirmation Integer iLine String sFind String sReplace Boolean bPadded Boolean bRemember Returns Integer
+        Integer eResponse
+        String  sAnnotation
+
+        Move ("Do you want to replace '" + sFind + "' with '" + sReplace + "' ?") to sAnnotation
+        Send GotoLineNumber iLine
+        // Show the question against the line itself, so the user can see the context
+        // the dialog is talking about.
+        Send EditorMessage SCI_ANNOTATIONSETSTYLE iLine STYLE_CALLTIP
+        Send EditorMessage SCI_ANNOTATIONSETTEXT  iLine (AddressOf(sAnnotation))
+        Send EditorMessage SCI_ANNOTATIONSETVISIBLE ANNOTATION_BOXED
+
+        Get Ask of oDropSelfConfirm_dg sAnnotation bPadded bRemember to eResponse
+
+        Move "" to sAnnotation
+        Send EditorMessage SCI_ANNOTATIONSETTEXT iLine (AddressOf(sAnnotation))
+        Send EditorMessage SCI_ANNOTATIONSETVISIBLE ANNOTATION_HIDDEN
+        Function_Return eResponse
+    End_Function
+
+    // Some targets are never worth suggesting: dropping Self off Parent changes meaning.
+    Function IsDropSelfTargetValid String sReplace Returns Boolean
+        Function_Return (Lowercase(sReplace) <> "parent")
+    End_Function
+
+    Procedure LocateDropSelfObject String sLine Integer iSelfPos Integer iLength Integer ByRef iPosStart Integer ByRef iPosEnd Integer ByRef iLevel
+        Boolean bIsParam
+        Integer iObjStart iNext
+        String  sChar
+
+        Move False to bIsParam
+        Move (iPosStart + 4) to iObjStart
+        Move (Replaces(Character(9), sLine, " ")) to sLine
+        Move (Pos("(", sLine, iObjStart)) to iPosStart   // the ( after " to " / " of "
+        Move (Pos(")", sLine, iPosStart)) to iPosEnd
+        If (iPosStart > iObjStart) Begin
+            // Anything non-blank between the keyword and the ( means this (Self) is a
+            // passed parameter, not an object reference.
+            For iNext from iObjStart to iPosStart
+                Move (Mid(sLine, 1, iNext)) to sChar
+                If (sChar <> " ") Begin
+                    Move True to bIsParam
+                    Move iPosStart to iNext   // stop
+                End
+            Loop
+        End
+        If (iSelfPos >= iPosStart and iSelfPos < iPosEnd and bIsParam = False) Begin
+            Move 0 to iLevel
+            Move iPosEnd to iNext
+            Move (Mid(sLine, 1, iNext)) to sChar
+            While (iNext <= iLength and (sChar = " " or sChar = ")"))
+                If (sChar = ")") Begin
+                    Move iNext to iPosEnd
+                    Increment iLevel
+                End
+                Increment iNext
+                Move (Mid(sLine, 1, iNext)) to sChar
+            Loop
+        End
+    End_Procedure
+
+    // The answer already given for this object, or 0 for "not asked yet".
+    Function DropSelfAutoResponse String sObject Returns Integer
+        Integer iItem iCount eResponse
+        tDropSelfResponse[] Responses
+
+        Move 0 to eResponse
+        Move (Lowercase(sObject)) to sObject
+        Get pDropSelfResponses to Responses
+        Move (SizeOfArray(Responses)) to iCount
+        For iItem from 0 to (iCount - 1)
+            If (Responses[iItem].sObject = sObject) Begin
+                Move Responses[iItem].eResponse to eResponse
+                If (Responses[iItem].bPadded) ;
+                    Move (eResponse ior CI_DropSelfPadded) to eResponse
+                Move iCount to iItem   // stop
+            End
+        Loop
+        Function_Return eResponse
+    End_Function
+
+    Procedure RememberDropSelfResponse String sObject Integer eResponse Boolean bPadded
+        Integer iCount
+        tDropSelfResponse[] Responses
+        Get pDropSelfResponses to Responses
+        Move (SizeOfArray(Responses)) to iCount
+        Move (Lowercase(sObject)) to Responses[iCount].sObject
+        Move eResponse            to Responses[iCount].eResponse
+        Move bPadded              to Responses[iCount].bPadded
+        Set pDropSelfResponses to Responses
+    End_Procedure
+
+    Procedure ForgetDropSelfResponses
+        tDropSelfResponse[] Responses
+        Move (ResizeArray(Responses, 0)) to Responses
+        Set pDropSelfResponses to Responses
+    End_Procedure
+
+    Procedure BlankUntilPosition Integer iPos String ByRef sLine
+        Integer iChar
+        If (iPos > 0) Begin
+            For iChar from 1 to (iPos - 1)
+                Move (Overstrike(" ", sLine, iChar)) to sLine
+            Loop
+        End
+    End_Procedure
+
+    /* A line starting with If / Else / On_Key still calls a method, but then Send is
+       not the first word and the scan below would miss it. Blank the compound part so
+       the method call reads as if it started the line. */
+    Procedure BlankCompoundBeforeMethod String ByRef sLine
+        Integer iPos
+        String  sTrimmed
+        Move (Lowercase(LTrim(sLine))) to sTrimmed
+        If (Left(sTrimmed, 3) = "if " or Left(sTrimmed, 5) = "else " or Left(sTrimmed, 7) = "on_key ") Begin
+            Move (Pos("send ", Lowercase(sLine))) to iPos
+            If (iPos = 0) ;
+                Move (Pos("get ", Lowercase(sLine))) to iPos
+            If (iPos = 0) ;
+                Move (Pos("set ", Lowercase(sLine))) to iPos
+            Send BlankUntilPosition iPos (&sLine)
+        End
+    End_Procedure
+
+    Procedure DropSelfFromHere
+        Boolean bAutoResponse bSuggestReplace bPadded bRemember bCanceled
+        Integer iPos iPosStart iPosEnd iLevel iStartLine iLine iLineCount iLength eResponse
+        String  sLine sFind sReplace sPad
+
+        Move False to bCanceled
+        Send ForgetDropSelfResponses
+        Get pbDropSelfPadReplacement to bPadded
+        Get CurrentLine to iStartLine
+        Get DocumentLineCount to iLineCount
+        For iLine from iStartLine to (iLineCount - 1)
+            Move False to bSuggestReplace
+            Get LineWithoutStringsAndComments iLine to sLine
+            Move (Lowercase(sLine)) to sLine
+            Move (Pos("(self)", sLine)) to iPos
+            If (iPos > 0) Begin
+                Send BlankCompoundBeforeMethod (&sLine)
+                Move (Pos("(self)", sLine)) to iPos
+            End
+            If (iPos > 0) Begin
+                If (Left(LTrim(sLine), 5) = "send ") Begin
+                    Move (Pos(" to ", sLine)) to iPosStart
+                    If (iPosStart = 0) ;
+                        Move (Pos(" of ", sLine)) to iPosStart
+                    If (iPosStart <> 0) Begin
+                        Move (Length(sLine)) to iLength
+                        Send LocateDropSelfObject sLine iPos iLength (&iPosStart) (&iPosEnd) (&iLevel)
+                        Get LineText iLine to sLine          // the real text, not the blanked one
+                        Move (Mid(sLine, iPosEnd - iPosStart + 1, iPosStart)) to sFind
+                        Move sFind to sReplace
+                        If (iLevel = 2) Begin                // one level of nesting only
+                            Move (Left(sReplace, RightPos("(", sReplace) - 1)) to sReplace
+                            Move (Replace("(", sReplace, "")) to sReplace
+                            Get IsDropSelfTargetValid sReplace to bSuggestReplace
+                        End
+                    End
+                End
+                If (Left(LTrim(sLine), 4) = "get " or Left(LTrim(sLine), 4) = "set ") Begin
+                    Move (Pos(" of ", sLine)) to iPosStart
+                    If (iPosStart <> 0) Begin
+                        Move (Pos(" to ", sLine)) to iLength   // never scan past the " to "
+                        If (iPos < iLength) Begin
+                            Send LocateDropSelfObject sLine iPos iLength (&iPosStart) (&iPosEnd) (&iLevel)
+                            Get LineText iLine to sLine
+                            Move (Mid(sLine, iPosEnd - iPosStart + 1, iPosStart)) to sFind
+                            Move sFind to sReplace
+                            If (iLevel = 2) Begin
+                                Move (Left(sReplace, RightPos("(", sReplace) - 1)) to sReplace
+                                Move (Replace("(", sReplace, "")) to sReplace
+                                Get IsDropSelfTargetValid sReplace to bSuggestReplace
+                            End
+                        End
+                    End
+                End
+                If (bSuggestReplace) Begin
+                    Move False to bAutoResponse
+                    Get DropSelfAutoResponse sFind to eResponse
+                    If (eResponse = 0) ;
+                        Get DropSelfConfirmation iLine sFind sReplace bPadded bRemember to eResponse
+                    Else ;
+                        Move True to bAutoResponse
+                    If ((eResponse iAnd CI_DropSelfPadded) <> 0) Begin
+                        Move True to bPadded
+                        Move (eResponse - CI_DropSelfPadded) to eResponse
+                    End
+                    Else ;
+                        Move False to bPadded
+                    If ((eResponse iAnd CI_DropSelfRemember) <> 0) Begin
+                        Move (eResponse - CI_DropSelfRemember) to eResponse
+                        Send RememberDropSelfResponse sFind eResponse bPadded
+                        Move True to bRemember
+                    End
+                    Else If (bAutoResponse = False) ;
+                        Move False to bRemember
+
+                    If (eResponse = MBR_Cancel) Begin
+                        Move True to bCanceled
+                        Move iLineCount to iLine   // stop
+                    End
+                    Else If (eResponse = MBR_Yes) Begin
+                        Set pbDropSelfPadReplacement to bPadded
+                        // The 8 spaces keep the following code aligned, so the user does
+                        // not have to re-indent by hand after every replacement.
+                        If (bPadded) ;
+                            Move "        " to sPad
+                        Else ;
+                            Move ""         to sPad
+                        Move (Replace(sFind, sLine, sReplace + sPad)) to sLine
+                        Send BeginUndoGroup
+                        Send SetLineText iLine sLine
+                        Send EndUndoGroup
+                    End
+                End
+            End
+        Loop
+        If (bSuggestReplace = False and bCanceled = False) Begin
+            Set Status_Help to "Drop Self: No more occurrences found."
+            Send Request_Status_Help True
+        End
+    End_Procedure
+
+    // *** The refactoring-function entry points. The engine calls these with the source
+    // file array; these three work on the LIVE editor buffer, so the array is ignored -
+    // it is there because the engine's calling convention requires it.
+
+    // Procedure forms for the context menu and the hotkeys, which invoke these as
+    // actions rather than as refactoring functions.
+    Procedure RefactorNormalizeCase
+        Send NormalizeCaseWholeFile
+    End_Procedure
+
+    Procedure RefactorReIndent
+        Send ReIndentWholeFile
+    End_Procedure
+
+    Procedure RefactorDropSelf
+        Send DropSelfFromHere
+    End_Procedure
+
+    /* Convert the SELECTED C prototype into a DataFlex External_Function declaration.
+       Paste a prototype from a header or the MSDN Syntax block, select it, run this.
+
+       Not a refactoring function (Nils 2026-08-03: "not quite a refactoring function, but
+       still could be of use") - it consumes C, which no refactoring function ever sees, so
+       it lives with the other editor verbs rather than in oRefactorFuncLib. The conversion
+       itself is CDeclarationToDataFlex on the funclib class, which is pure and unit-tested;
+       everything here is selection handling.
+
+       Refuses rather than guesses: an empty selection or text the parser does not recognise
+       leaves the buffer untouched and says so on the status bar. Replacing a selection with
+       nonsense would be worse than doing nothing, and this is a destructive edit. */
+    Procedure ConvertCDeclaration
+        String   sSel sOut
+        String[] asNotes
+        Integer  i iMax iStart iEnd
+        UChar[]  ucaBytes
+
+        Get SelectedText to sSel
+        If (Trim(sSel) = "") Begin
+            Set Status_Help to "Convert C declaration: select a C function prototype first."
+            Send Request_Status_Help True
+            Procedure_Return
+        End
+        Get CDeclarationToDataFlex of ghoFuncLib sSel (&asNotes) to sOut
+        If (sOut = "") Begin
+            // The converter says WHICH thing was wrong when it can tell - "an argument is
+            // a string literal, so this is a call" beats "not a prototype", because the
+            // fix (paste the prototype instead of the call) follows from it.
+            If (SizeOfArray(asNotes) > 0) ;
+                Set Status_Help to ("Convert C declaration: " + asNotes[0] + " - paste the function's prototype instead.")
+            Else ;
+                Set Status_Help to "Convert C declaration: that does not read as a C function prototype."
+            Send Request_Status_Help True
+            Procedure_Return
+        End
+        // The notes ride under the declaration as comments - the assumptions a prototype
+        // cannot answer (which DLL, and whether a non-const pointer is in or out).
+        Move (SizeOfArray(asNotes) - 1) to iMax
+        For i from 0 to iMax
+            Move (sOut + (Character(13)) + (Character(10)) + "// " + asNotes[i]) to sOut
+        Loop
+        // Replace the selection through the target range, which is how every other write
+        // in this class reaches the buffer (TextToBytes keeps the encoding honest).
+        Get EditorMessage SCI_GETSELECTIONSTART to iStart
+        Get EditorMessage SCI_GETSELECTIONEND   to iEnd
+        Get TextToBytes sOut to ucaBytes
+        Send BeginUndoGroup
+        Send EditorMessage SCI_SETTARGETRANGE iStart iEnd
+        Send EditorMessage SCI_REPLACETARGET (SizeOfArray(ucaBytes)) (AddressOf(ucaBytes))
+        Send EndUndoGroup
+        Set Status_Help to "Convert C declaration: done - set the DLL name."
+        Send Request_Status_Help True
+    End_Procedure
+
+    Function RefactorNormalizeCase String[] ByRef asSourceFile Returns Integer
+        Boolean bErr
+        Integer iRetval
+        Move Err to bErr             // save the caller's error state
+        Move 0 to iRetval
+        Send NormalizeCaseWholeFile
+        If (Err = False) ;
+            Move 1 to iRetval
+        Move bErr to Err             // restore it, AFTER reading our own result
+        Function_Return iRetval
+    End_Function
+
+    Function RefactorReIndent String[] ByRef asSourceFile Returns Integer
+        Boolean bErr
+        Integer iRetval
+        Move Err to bErr
+        Move 0 to iRetval
+        Send ReIndentWholeFile
+        If (Err = False) ;
+            Move 1 to iRetval
+        Move bErr to Err
+        Function_Return iRetval
+    End_Function
+
+    Function RefactorDropSelf String[] ByRef asSourceFile Returns Integer
+        Boolean bErr
+        Integer iRetval
+        Move Err to bErr
+        Move 0 to iRetval
+        Send DropSelfFromHere
+        If (Err = False) ;
+            Move 1 to iRetval
+        Move bErr to Err
+        Function_Return iRetval
+    End_Function
+
+End_Class

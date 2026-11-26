@@ -1,0 +1,417 @@
+﻿Use DFAllEnt.pkg
+Use DFUnit.pkg
+Use cRDCCJCommandBarSystem.pkg
+// cFTModalPanel (pulled in below) asks for its status-bar theme through FTCJTheme. This build
+// never seeds giFTThemeMode, so every accessor hands back the original dark constant - no change.
+// Must follow the CodeJock package above, which is where the xtp* theme constants come from.
+Use FTThemeColors.pkg
+// The progress-count rules, for the fixtures that pin them. A leaf package - constants in,
+// strings and structs out - so the core application and both FT surfaces share one answer and a
+// test can reach it without pulling any of them in.
+Use ModProgressCounts.pkg
+Use cRefactorApplication.pkg
+Use RefactorStatusPanel.pkg
+
+// Embed the unit-test source into the .exe so the failure source-line lookup works from the binary
+// alone - no oUnit_Tests.pkg on disk needed at run time (e.g. the distributed/alpha package). DFUnit
+// reads it back as "resource: res_UnitTestSource" (psUnitTestResource, set in oUnit_Tests.pkg).
+// Include_Resource is a COMPILE-TIME directive; DF_RESOURCE_TYPE_LINE embeds it as line-delimited text.
+Include_Resource oUnit_Tests.pkg as res_UnitTestSource type DF_RESOURCE_TYPE_LINE
+
+// We do not use cRefactorApplication for this app, because it makes the compiler
+// to be triggered for every start, which we don't want.
+Object oApplication is a cApplication 
+    Set psCompany to "RDC Tools International"
+    Set psProduct to "DF-Unit Tester"  
+    Set pbPreserveEnvironment to True  
+    
+    Property tSCLanguage pSCLanguage
+    /* Blank, and that is the whole contract: cBaseFuncLib._AddAllKeyWords runs from
+       End_Construct_Object and asks for the target install's Pkg folder to read the language
+       definition. Without a stub here that Get faults - "Invalid message GET_PSTARGETPKGFOLDER",
+       error 98, before a single test runs (Nils 2026-08-01). Blank means "no install to read", so
+       the funclib keeps its editor-settings fallback, which is the right answer for a runner that
+       targets nothing. Same reasoning as pSCLanguage above. */
+    Property String psTargetPkgFolder ""
+    Property Handle phoRefactorView
+    Property Handle phoUnitTestEditor 0
+    Property String psHomeTarget
+    Property Boolean pbBatchMode False
+    Property String psSWSFile 
+
+    // The icons follow the theme, as in DFRefactorFT.src's OnCreate: this workspace's own dark icons, then the ones
+    // RDCFlexTron installs (Bitmaps\RDCFlexTron\Dk), then the light Bitmaps.
+    Procedure OnCreate
+        Integer iMode
+        Get ReadInteger CS_FTThemeSection CS_FTTheme CI_FTThemeDark to iMode
+        If (iMode = CI_FTThemeLight) ;
+            Set psBitmapPath of (phoWorkspace(Self)) to "Bitmaps"
+        Else ;
+            Set psBitmapPath of (phoWorkspace(Self)) to "Bitmaps\DK;Bitmaps\RDCFlexTron\Dk;Bitmaps"
+    End_Procedure
+
+    Function AllSourceFiles String[] asFolders String sFileFilter Returns tRefactorFiles
+        tRefactorFiles FileData
+        tRFSearchResult[] asSourceFiles
+        String sFolderName sFileMask sFileName sExtension
+        Integer iFolder iFolders iCount iSize iFile iSearchIndex
+        String[] asFileFilter
+
+        Move (SizeOfArray(asFolders)) to iFolders
+        If (iFolders = 0) Begin
+            Function_Return FileData
+        End
+
+        If (sFileFilter contains ",") Begin
+            Move (Replaces(",", sFileFilter, ";")) to sFileFilter
+        End
+        Move (Trim(Lowercase(sFileFilter)))       to sFileFilter
+        Move (Replaces("*", sFileFilter, ""))     to sFileFilter
+        Move (StrSplitToArray(sFileFilter, ";"))  to asFileFilter
+
+        Decrement iFolders
+        Move 0 to iFile
+
+        For iFolder from 0 to iFolders
+            Move asFolders[iFolder] to sFolderName
+            If (Right(sFolderName, 1) <> "\") Begin
+                Move (sFolderName + "\") to sFolderName
+            End
+            Move (sFolderName + "*.*") to sFileMask
+            Move (rfFileSearch(sFileMask, DIRMODE_FILES_ONLY, False)) to asSourceFiles
+            Move (SizeOfArray(asSourceFiles)) to iSize
+            Decrement iSize
+            For iCount from 0 to iSize
+                Move asSourceFiles[iCount].sFilename to sFileName
+                Get ParseFileExtension sFileName to sExtension
+                If (Left(sExtension, 1) <> ".") Begin
+                    Move ("." + String(sExtension)) to sExtension
+                End
+                Move (Lowercase(sExtension)) to sExtension
+                Move (SearchArray(sExtension, asFileFilter)) to iSearchIndex
+                If (iSearchIndex <> -1) Begin
+                    Move (sFolderName + String(sFileName)) to FileData.asFullFileNames[iFile]
+                    Increment iFile
+                End
+            Loop
+        Loop
+        Move asFolders to FileData.asFolders
+
+        Function_Return FileData
+    End_Function
+
+    /* The SciControlLib editor talks to ghoApplication, and this runner deliberately
+       uses plain cApplication (see feedback_test_runner_app_class) - so the members the
+       editor's code paths expect must exist HERE. Missing ones die with Error 98 at
+       runtime: CM_OpenFile's very first act is Get StartPerfCounter of ghoApplication,
+       which killed the context menu's "Refresh File" (Nils 2026-07-27). The
+       cRefactorApplication originals are no-ops anyway - mirror them. */
+    Function StartPerfCounter Integer eOperation String sComment Returns Integer
+        Function_Return 0
+    End_Function
+
+    Procedure StopPerfCounter Integer iCounter
+    End_Procedure
+
+    Procedure DisplayPerfCounters
+    End_Procedure
+
+    // The census of everything the editor stack asks ghoApplication for (grep
+    // "of ghoApplication" across cRefactorScintillaEditor + the SciControlLib chain):
+    // StartPerfCounter, StopPerfCounter, DisplayPerfCounters, phoEditor,
+    // pbWorkspaceMode, psSWSFile, SelectSourceFile, OnFileNameUpdate,
+    // ResolveSourceFileInTree, pSCLanguage, phoMainPanel, phoWorkspace. All covered
+    // here or by cApplication; pTHWorkspace is deliberately absent - only
+    // FindFiles.dg reads it, and this program never loads that dialog.
+
+    // Stays 0 on purpose: UpdateMainPanelCaption bows out when the loading editor is
+    // not THE application editor, which keeps this runner's caption untouched.
+    Property Handle phoEditor 0
+
+    Property Boolean pbWorkspaceMode False
+
+    Procedure OnFileNameUpdate String sFileName
+    End_Procedure
+
+    // "" = not found; the Open-File-Under-Cursor caller Info_Boxes that honestly.
+    Function ResolveSourceFileInTree String sFile Returns String
+        Function_Return ""
+    End_Function
+
+    Object oRunnerOpenFileDialog is a OpenDialog
+        Set Dialog_Caption to "Select Source File"
+        Set Filter_String to "DataFlex Sources|*.src;*.pkg;*.vw;*.dg;*.sl;*.dd;*.rv|All Files (*.*)|*.*"
+    End_Object
+
+    // Was an empty stub, which with the never-set psSWSFile left the editor context
+    // menu's "Select Source File" permanently disabled in this program. Real now:
+    // pick a source file, load it into the unit-test editor.
+    Procedure SelectSourceFile
+        Boolean bOpen
+        String sFileName sFolder
+        Handle hoEditor
+
+        Get phoUnitTestEditor to hoEditor
+        If (hoEditor = 0) ;
+            Procedure_Return
+        Get Initial_Folder of oRunnerOpenFileDialog to sFolder
+        If (sFolder = "") Begin
+            Get psAppSrcPath of (phoWorkspace(Self)) to sFolder
+            Set Initial_Folder of oRunnerOpenFileDialog to sFolder
+        End
+        Get Show_Dialog of oRunnerOpenFileDialog to bOpen
+        If (bOpen = True) Begin
+            Get File_Name of oRunnerOpenFileDialog to sFileName
+            If (sFileName <> "") ;
+                Send LoadFile of hoEditor sFileName
+        End
+    End_Procedure
+
+    /* Put the DEFAULT file (psCodeFile - LegacyCode.pkg) back into the unit-test
+       editor. The editor fixtures write their own snippets while running, so after a
+       run the editor showed "the test procedure code of four lines" (Nils 2026-07-27)
+       - reload the real file instead. Guarded on the WINDOW handle, not the object:
+       in console mode (-c) the editor OBJECT exists but its control is never paged,
+       and CM_OpenFile against window 0 has nothing to load into. */
+    Procedure ReloadDefaultCodeFile
+        Boolean bExists
+        String sFile
+        Handle hoEditor
+
+        Get phoUnitTestEditor to hoEditor
+        If (hoEditor = 0) ;
+            Procedure_Return
+        If (Window_Handle(hoEditor) = 0) ;
+            Procedure_Return
+        Get psCodeFile of hoEditor to sFile
+        Get vFilePathExists sFile to bExists
+        If (bExists = True) ;
+            Send LoadFile of hoEditor sFile
+    End_Procedure
+
+End_Object
+
+// *** Note that we don't need the Refactor Engine here. ***
+
+Use cRDCTooltipController.pkg
+Object oToolTipController is a cRDCTooltipController
+End_Object
+
+Object oMain is a Panel
+    Set Label to "DF-Unit TestRunner"
+    Set Size to 499 378
+    Set Location to 94 200
+    Set piMinSize to 300 250 
+    Set Border_Style to Border_Thick 
+    Set peAnchors to anAll
+    Set phoMainPanel of ghoApplication to Self
+    Set Icon to "UnitTesting.ico"
+    
+    { Visibility=Private }
+    Property Handle phoOutputBox
+
+    Object oCJCommandBarSystem is a cRDCCJCommandBarSystem
+
+        Procedure OnCreateCommandBars
+            Set pbTabbedWorkspaces to False
+            Send DoChangeToolTipFormat
+        End_Procedure
+
+        Object oCJStatusBar is a cCJStatusBar
+            Set Statusbar_Id to Self
+
+            Object oStatusPane1 is a cCJStatusBarPane
+                Set piID to sbpIDIdlePane
+                Set pbStyleStretch to True
+            End_Object
+
+            Object oStatusPane2 is a cCJStatusBarPane
+                Set phoViewPane to Self
+                Set pbStyleStretch to True
+            End_Object
+
+            Object oUTF8_OEM_Text is a cCJStatusBarPane
+                Set psText to "OEM"
+            End_Object
+
+            Object oNumberOfLines_StatusbarPane is a cCJStatusBarPane
+            End_Object
+
+            Object oNumberOfCharacters_StatusbarPane is a cCJStatusBarPane
+            End_Object
+
+            Procedure Set NumberOfEditorLines String sText
+            End_Procedure
+
+            Procedure Set NumberOfEditorCharacters String sText
+            End_Procedure
+            
+            Procedure Set StatusText String sText
+                Set psText of oStatusPane1 to sText
+            End_Procedure                          
+            
+            Procedure Set ActionText String sText
+                Handle hoViewPane
+                Get phoViewPane to hoViewPane
+                Set psText of hoViewPane to sText
+            End_Procedure
+
+            Procedure Set UTF8Text String sText
+                Set psText of (oUTF8_OEM_Text(Self)) to sText
+            End_Procedure
+            
+        End_Object 
+        
+    End_Object
+    
+    Object oClientArea is a ClientArea
+        /* In oMainRefactorObjects, the two main refactoring objects are created;
+            Object oRefactorEngine is a cRefactorEngine
+                Set pbBatchMode to (pbBatchMode(ghoApplication))
+                #Include oRefactorFuncLib.pkg
+            End_Object
+
+           cRefactorFuncLib -> ghoFuncLib and,
+           cRefactorEngine  -> ghoEngine.
+            
+           Always use at top of ClientArea.
+        */
+        Use oMainRefactorObjects.pkg
+
+        // PROMOTED above the test fixtures (2026-07-26): this dialog is the runner's first
+        // entry into SciControlLib's CYCLIC editor Use-graph (its line ~10 Uses
+        // oEditorProperties.pkg), and whichever package enters that graph first fixes the
+        // compile order of everything inside it. The fixtures (oEditorSettings-Tests) need
+        // cEditorProperties/ghoEditorProperties defined, so the entry must precede them -
+        // and it must be THIS entry: entering the graph anywhere else reorders the cycle
+        // (e.g. via cRefactorScintillaEditor: its hotkey mixin then compiles before the
+        // global CommandHotKeyText it binds to, and every editor object dies with
+        // Error 98 at Construct). Same relative order as before - the dialog always
+        // compiled before DFUnitTestRunner.vw - only earlier.
+        Use ScintillaParameters.dg
+        // JSON-backed settings: repoints ghoEditorProperties. AFTER the dg (the graph entry),
+        // BEFORE the fixtures - so the tests see the same object production programs run with.
+        Use cRefactorEditorSettings.pkg
+
+        Object oTestApplication is a cDFUnitTestApplication
+
+            // After every run - the startup auto-run and the "Run again" button both
+            // route through here - put LegacyCode.pkg back in the editor: the editor
+            // fixtures leave their last test snippet behind otherwise.
+            Procedure ManualRunTests
+                Forward Send ManualRunTests
+                Send ReloadDefaultCodeFile of ghoApplication
+            End_Procedure
+
+            // *** UNIT TESTS GOES HERE ***
+            Use oUnit_Tests.pkg
+
+            
+            { Published=True }
+            Procedure ExpectingAnError
+                Send ExpectError DFERR_PROGRAM
+                Error DFERR_PROGRAM "An expected error."
+                Send UnExpectError DFERR_PROGRAM
+            End_Procedure 
+            
+            Procedure End_Construct_Object
+                Forward Send End_Construct_Object
+            End_Procedure
+
+        End_Object 
+        
+        // *** Other program files: ***
+        // (ScintillaParameters.dg is Used ABOVE oTestApplication - see the note there.)
+        Use DeleteWorkspaceHistory.dg
+        Use DFUnitTestRunner.vw
+
+        Procedure End_Construct_Object
+            Forward Send End_Construct_Object
+        End_Procedure
+
+        On_Key Key_Ctrl+Key_F4 Send None
+        On_Key Key_Escape      Send None
+    End_Object
+    
+End_Object
+
+Procedure Startup
+    Boolean bUseUI bUseUIIfInDebugger bAutoRunTests
+    Handle hoOutputBox hoUnitTestEditor
+    Integer iIsFirstTime
+    String sHomePath
+    tRFSearchResult[] aSwsFiles
+
+    // The DFUnit framework's AutoRun owns command-line arbitration:
+    //   -c / --console  -> run unattended: write the results to the console
+    //                      and exit the process with 0 (all passed) or
+    //                      -1 (failures). AutoRun never returns in this case.
+    //   no / other args -> UI mode. AutoRun's UI branch is empty here because
+    //                      this app supplies its own custom view, so control
+    //                      returns to us and we activate that view below.
+    Send AutoRun of ghoTestApplication
+
+    // We only reach this point in UI mode (console mode exited inside AutoRun).
+    Get pbUseUI of ghoTestApplication to bUseUI
+    Get pbUseUIIfInDebugger of ghoTestApplication to bUseUIIfInDebugger
+    If (bUseUI = True or (IsDebuggerPresent() and bUseUIIfInDebugger = True)) Begin
+        Send Activate_DFUnitTestRunner_vw of (Client_id(ghoCommandBars))
+        Get ReadInteger of ghoApplication CS_Settings "IsFirstTime" 0 to iIsFirstTime
+        If (iIsFirstTime = 0) Begin
+            // Can only set to zoom the first time the program is started, before the
+            // the sizing is saved to the registry, else the whole program is zoomed when started.
+            // Need to set the view_mode after the view has been activated.
+            Set View_Mode of (DFUnitTestRunner_vw(Client_Id(ghoCommandBars))) to Viewmode_Zoom
+            Send WriteInteger of ghoApplication CS_Settings "IsFirstTime" 1
+        End
+        // The output view is deferred-activated, so its reporter can only be
+        // registered now that the view exists - not in End_Construct_Object.
+        Get phoOutputBox of (phoMainPanel(ghoApplication)) to hoOutputBox
+        If (hoOutputBox <> 0) Begin
+            Send AddReporter of ghoTestApplication hoOutputBox
+        End
+        // The deferred view's editor (oTestCode_edt) carried its handle on
+        // ghoApplication because ghoFuncLib did not exist when the view
+        // constructed. Bind it onto the now-final ghoFuncLib so the editor
+        // fixtures run for real and populate the Scintilla editor.
+        Get phoUnitTestEditor of ghoApplication to hoUnitTestEditor
+        If (hoUnitTestEditor <> 0) Begin
+            Set phoEditor of ghoFuncLib to hoUnitTestEditor
+        End
+        // The editor's context menu enables "Select Source File" on psSWSFile - the
+        // "a workspace is open" signal cRefactorApplication maintains. This runner's
+        // plain cApplication declares the property but nothing ever SET it, so the
+        // item was permanently disabled (Nils 2026-07-27). The workspace is open by
+        // now - record its .sws.
+        Get psHome of (phoWorkspace(ghoApplication)) to sHomePath
+        Move (rfFileSearch(vFolderFormat(sHomePath) + "*.sws", DIRMODE_FILES_ONLY, False)) to aSwsFiles
+        If (SizeOfArray(aSwsFiles) > 0) ;
+            Set psSWSFile of ghoApplication to (vFolderFormat(sHomePath) + aSwsFiles[0].sFilename)
+        // Honor the DFUnit -n / --no-autorun flag.
+        Get pbAutoRunTests of ghoTestApplication to bAutoRunTests
+        If (bAutoRunTests = True) Begin
+            // The window paints whole first; then the run, with "Run again" greyed while it runs (RunTests of the
+            // view). The ManualRunTests override reloads the default file after the run.
+            Send PumpMsgQueue of Desktop
+            Send RunTests of (DFUnitTestRunner_vw(Client_Id(ghoCommandBars)))
+        End
+        Else Begin
+            // No auto-run: still show LegacyCode.pkg instead of an empty editor.
+            Send ReloadDefaultCodeFile of ghoApplication
+        End
+    End
+End_Procedure
+Send Startup
+
+//  - If you get a compile error: "Can't include resource ..\HELP\ABOUT.RTF",
+//    you need to create a "About.rtf" file in the Help folder.
+//    Note that it can be empty, but it needs to exist for the About dialog.
+//    Or you can remark line 1302 in DfAbout.pkg = "Define ShouldEmbeddAboutHelpFile for 0"
+//
+// -  If you get a compile Error 4295: "xxx Can't include resource FILELISTBACKUPFILE.CFG",
+//    you will need to manually make a copy of the Filelist.cfg in the Data folder -> "FilelistBackupFile.cfg"
+//
+If (pbUseUI(ghoTestApplication) = True or (IsDebuggerPresent() and pbUseUIIfInDebugger(ghoTestApplication) = True)) Begin
+    Set Icon of (phoMainPanel(ghoApplication)) to "UnitTesting.ico"
+    Start_UI
+End

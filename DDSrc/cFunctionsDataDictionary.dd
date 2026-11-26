@@ -1,6 +1,8 @@
 ﻿Use DataDict.pkg
 Use cRDCAutoCreateNewID.pkg
 Use RefactorConstants.h.pkg
+Use cCmdLineIniFile.pkg       // DecodeFunctionName - the ONE tested rule for "Name,Parameter" specs
+
 
 // We need to create an instance of this class in the cRefactorEngine class.
 // That class is instantiated by the cRefactorApplication class - in the End_Construct_Object.
@@ -11,6 +13,7 @@ Use RefactorConstants.h.pkg
 Declare_Datafile SysFile
 Declare_Datafile Functions
 Declare_Datafile FunctionsA
+Declare_Datafile DFLastID
 
 Object oFunctionTypes is a DescriptionValidationTable
     Set Table_Title to "Function Type"
@@ -34,6 +37,7 @@ Object oFunctionGroups is a DescriptionValidationTable
         Send Add_Table_Value eFnGroupOther         CS_FnGroupOther
         Send Add_Table_Value eFnGroupModernization CS_FnGroupModernization
         Send Add_Table_Value eFnGroupCleanup       CS_FnGroupCleanup
+        Send Add_Table_Value eFnGroupUnicode64     CS_FnGroupUnicode64
     End_Procedure
 End_Object
 
@@ -57,6 +61,7 @@ Class cFunctionsDataDictionary is a DataDictionary
 
         Set Main_File to Functions.File_Number
         Set Add_System_File to SysFile.File_Number DD_Lock_On_All
+        Set Add_System_File to DFLastID.File_Number DD_Lock_On_All
 
         Set Foreign_Field_Option DD_KEYFIELD DD_NOPUT to True
         Set Foreign_Field_Option DD_KEYFIELD DD_FINDREQ to True
@@ -66,6 +71,7 @@ Class cFunctionsDataDictionary is a DataDictionary
         Set Key_Field_State Field Functions.ID to True
         Set Field_Prompt_Object Field Functions.ID to oFunctions_sl
         Set Status_Help Field Functions.ID to "Automatically generated ID number"
+        Set Field_Auto_Increment Field Functions.ID to File_Field DFLastID.FunctionsID
 
         Set Field_Prompt_Object Field Functions.Function_Name to oFunctions_sl
         Set Status_Help Field Functions.Function_Name to "the name entered must be exactly the same as the function name itself. Then the code must be added to the cRefactorDbView class (cRefactorDbView.pkg). See class code for standard function parameters."
@@ -83,7 +89,7 @@ Class cFunctionsDataDictionary is a DataDictionary
         Set Field_Class_Name Field Functions.Type to "Combo"
 
         Set Field_Value_Table Field Functions.FnGroup to oFunctionGroups
-        Set Status_Help Field Functions.FnGroup to "The functional group: Modernization (brings legacy code up to current DataFlex), Cleanup (tidies or removes), or Other. Set via the function's { FnGroup } meta-tag."
+        Set Status_Help Field Functions.FnGroup to "The functional group: Modernization (brings legacy code up to current DataFlex), x64 + Unicode (64-bit/Unicode migration readiness), Cleanup (tidies or removes), or Other. Set via the function's { FnGroup } meta-tag."
         Set Field_Class_Name Field Functions.FnGroup to "Combo"
 
         Set Field_Class_Name Field Functions.bHasParameter to "Checkbox"
@@ -110,7 +116,7 @@ Class cFunctionsDataDictionary is a DataDictionary
     Procedure Creating
         Integer iID
         Forward Send Creating
-        Get AutoCreateNewID File_Field Functions.ID True to iID
+//        Get AutoCreateNewID File_Field Functions.ID True to iID
     End_Procedure
 
     Procedure Update
@@ -342,6 +348,44 @@ Class cFunctionsDataDictionary is a DataDictionary
         Function_Return iItems
     End_Function
 
+    // The NAMES of the selected published functions WITHIN one FnGroup - the group-scoped RUN's
+    // function set (Nils 2026-07-16): a Run from a group-filtered view executes ONLY that group's
+    // ticks (transient narrow/restore in SelectFunctionsFT's run click, the plan-run pattern).
+    Function SelectedPublishedFunctionNamesPerGroup Integer eGroup Returns String[]
+        String[] asNames
+
+        Constraint_Set (Self +14) Clear
+        Constrained_Clear eq FunctionsA by Index.3
+        Constrain FunctionsA.Selected eq 1
+        Constrain FunctionsA.bPublished eq 1
+        Constrain FunctionsA.FnGroup eq eGroup
+        Constrained_Find First FunctionsA by Index.3
+        While (Found)
+            Move (Trim(FunctionsA.Function_Name)) to asNames[SizeOfArray(asNames)]
+            Constrained_Find Next
+        Loop
+        Function_Return asNames
+    End_Function
+
+    // Selected + published count WITHIN one FnGroup - the group-filtered Select Functions view's
+    // Run-button count (Nils 2026-07-16): that button describes what the CONSTRAINED grid shows,
+    // while the dashboard's "Functions selected" pill keeps the cross-group total (TotalNoSelected).
+    Function TotalNoSelectedPerGroup Integer eGroup Returns Integer
+        Integer iItems
+
+        Constraint_Set (Self +13) Clear
+        Constrained_Clear eq FunctionsA by Index.3
+        Constrain FunctionsA.Selected eq 1
+        Constrain FunctionsA.bPublished eq 1
+        Constrain FunctionsA.FnGroup eq eGroup
+        Constrained_Find First FunctionsA by Index.3
+        While (Found)
+            Increment iItems
+            Constrained_Find Next
+        Loop
+        Function_Return iItems
+    End_Function
+
     Procedure ResetSysFile
         Reread SysFile
             Move 0 to SysFile.iCountNumberOfFiles
@@ -371,6 +415,33 @@ Class cFunctionsDataDictionary is a DataDictionary
             Move iCount to SysFile.SelectedeOtherFunction
             Get TotalNoSelectedPerType eOtherFunctionAll to iCount
             Move iCount to SysFile.SelectedeOtherAllFunction
+        Unlock
+    End_Procedure
+
+    /* The selection counters - the total and each type's - counted again from the ticks, and SAVED (2026-11-20),
+       for RestoreCmdLineSelections after a /bm run has put the user's own ticks back. Not ResetSysFile: it also
+       zeroes the run's statistics, which the batch result is still written from. Not ResetAllSysFileSelectionCounters
+       alone: it counts the per-type counters only, and leaves them in the buffer - the live test left the total
+       at the INI's 1 over the user's 31 ticks. */
+    Procedure RecountSelectionCounters
+        Integer iCount
+        Reread SysFile
+            Get TotalNoSelected to SysFile.SelectedFunctionTotal
+            Get TotalNoSelectedPerType eStandardFunction to iCount
+            Move iCount to SysFile.SelectedeStandardFunction
+            Get TotalNoSelectedPerType eRemoveFunction to iCount
+            Move iCount to SysFile.SelectedeRemoveFunction
+            Get TotalNoSelectedPerType eEditorFunction to iCount
+            Move iCount to SysFile.SelectedeEditorFunction
+            Get TotalNoSelectedPerType eReportFunction to iCount
+            Move iCount to SysFile.SelectedeReportFunction
+            Get TotalNoSelectedPerType eReportFunctionAll to iCount
+            Move iCount to SysFile.SelectedeReportAllFunction
+            Get TotalNoSelectedPerType eOtherFunction to iCount
+            Move iCount to SysFile.SelectedeOtherFunction
+            Get TotalNoSelectedPerType eOtherFunctionAll to iCount
+            Move iCount to SysFile.SelectedeOtherAllFunction
+            SaveRecord SysFile
         Unlock
     End_Procedure
 
@@ -423,35 +494,234 @@ Class cFunctionsDataDictionary is a DataDictionary
     End_Procedure
 
     // Sets all Functions records as unselected. (FunctionsA.Selected = 0)
+    // The names of the functions ticked now (2026-11-20) - what a /bm run saves before it ticks the INI's
+    // (ApplyCmdLineSelections), so RestoreCmdLineSelections can put them back.
+    Function SelectedFunctionNames Returns String[]
+        String[] asNames
+        Constraint_Set (Self + 16) Clear
+        Constrained_Clear eq FunctionsA by Index.3
+        Constrain FunctionsA.Selected eq 1
+        Constrained_Find First FunctionsA by Index.3
+        While (Found)
+            Move (Trim(FunctionsA.Function_Name)) to asNames[SizeOfArray(asNames)]
+            Constrained_Find Next
+        Loop
+        Function_Return asNames
+    End_Function
+
+    // The file filter in SysFile, read and written (2026-11-20) - for ApplyCmdLineSelections and
+    // RestoreCmdLineSelections, which put a /bm INI's filter in and the user's own back, and cannot name SysFile
+    // themselves (the application class compiles first in the test runner).
+    Function FileExtensionFilter Returns String
+        String sFilter
+        Reread SysFile
+            Move SysFile.FileExtensionFilter to sFilter
+        Unlock
+        Function_Return sFilter
+    End_Function
+
+    Procedure SetFileExtensionFilter String sFilter
+        Reread SysFile
+            Move sFilter to SysFile.FileExtensionFilter
+            SaveRecord SysFile
+        Unlock
+    End_Procedure
+
     Procedure UnSelectAllRecords
         Constraint_Set (Self  + 11) Clear
         Constrained_Clear eq FunctionsA by Index.1
         Constrained_Find First FunctionsA by Index.1
         While (Found)
-            Reread FunctionsA
-                Move 0 to FunctionsA.Selected
-                SaveRecord FunctionsA
-            Unlock
+            If (FunctionsA.Selected <> 0) Begin
+                Reread FunctionsA
+                    Move 0 to FunctionsA.Selected
+                    SaveRecord FunctionsA
+                Unlock
+            End
             Constrained_Find Next
         Loop
     End_Procedure
 
+    // Dumb selector: set Functions.Selected = 1 for each named function. NO companion logic - the callers
+    // decide companions in the right layer (the Modernization plan in cModAnalyzer.AddNeededIndicatorCompanions;
+    // the manual-grid / batch run-time net in EnsureCompanionsSelected + the DefineSelectMacro param helpers
+    // below). Nils, 2026-07-06: the old unconditional companion pull here made the plan tick DeclareRefactoredIndicators /
+    // DefineSelectMacro even for a built-in-only Found/Err workspace on the default eLeaveSelect - looked like a bug.
+    /* The NAME half of a "Name" / "Name,Parameter" INI spec, delegated to cCmdLineIniFile so
+       there is ONE rule and it is the unit-tested one - the encode side and both decode sides
+       have to agree, and a second copy here is exactly how they would stop agreeing.
+
+       It also TRIMS, which the old inline split did not: a hand-edited INI reading
+       "Name , Parameter" looked up a name with a trailing space and found nothing, silently. */
+    Function SpecFunctionName String sSpec Returns String
+        Handle hoSpec
+        String sName
+        Get Create (RefClass(cCmdLineIniFile)) to hoSpec
+        Get DecodeFunctionName of hoSpec sSpec to sName
+        Send Destroy of hoSpec
+        Function_Return sName
+    End_Function
+
     Procedure SelectRecordsFromStringArray String[] asFunctions
         Integer iCount iSize
-
+        String sFunctionName
         Move (SizeOfArray(asFunctions)) to iSize
         Decrement iSize
         For iCount from 0 to iSize
             Clear FunctionsA
-            Move asFunctions[iCount] to FunctionsA.Function_Name
+            Get SpecFunctionName asFunctions[iCount] to sFunctionName
+            Move sFunctionName to FunctionsA.Function_Name
             Find eq FunctionsA by Index.2
-            If (Found = True) Begin
+            If (Found = True and (FunctionsA.Selected <> 1)) Begin
                 Reread FunctionsA
                     Move 1 to FunctionsA.Selected
                     SaveRecord FunctionsA
                 Unlock
             End
         Loop
+    End_Procedure
+
+    // The mirror: Functions.Selected = 0 for each named function (a function put on the never-pick list
+    // loses its tick, 2026-10-06). A name the table does not have is ignored, as above.
+    Procedure UnSelectRecordsFromStringArray String[] asFunctions
+        Integer iCount iSize
+        String sFunctionName
+        Move (SizeOfArray(asFunctions)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            Clear FunctionsA
+            Get SpecFunctionName asFunctions[iCount] to sFunctionName
+            Move sFunctionName to FunctionsA.Function_Name
+            Find eq FunctionsA by Index.2
+            If (Found = True and (FunctionsA.Selected <> 0)) Begin
+                Reread FunctionsA
+                    Move 0 to FunctionsA.Selected
+                    SaveRecord FunctionsA
+                Unlock
+            End
+        Loop
+    End_Procedure
+
+    /* Which of these INI specs name a function this build does not have.
+
+       SelectRecordsFromStringArray finds-or-ignores, which is right for selection but means a
+       typo, or a function renamed or dropped in a later DFRefactor, just VANISHES from the run:
+       the summary only lists functions that ARE selected, so nothing marks the absence. A batch
+       INI is maintained by hand over months, and its whole point is running unattended. Returned
+       rather than reported here so the caller decides where it belongs. */
+    Function UnknownFunctionNames String[] asFunctions Returns String[]
+        Integer iCount iSize
+        String sFunctionName
+        String[] asUnknown
+
+        Move (SizeOfArray(asFunctions)) to iSize
+        Decrement iSize
+        For iCount from 0 to iSize
+            Get SpecFunctionName asFunctions[iCount] to sFunctionName
+            If (sFunctionName <> "") Begin
+                Clear FunctionsA
+                Move sFunctionName to FunctionsA.Function_Name
+                Find eq FunctionsA by Index.2
+                If (Found = False) ;
+                    Move sFunctionName to asUnknown[SizeOfArray(asUnknown)]
+            End
+        Loop
+        Function_Return asUnknown
+    End_Function
+
+    // Run-time safety net for the MANUAL grid / batch paths ONLY - the engine SKIPS this for a Modernization-plan
+    // run (eRunPlan), which already decided its companions precisely in cModAnalyzer. When any selected function
+    // is an indicator converter, make sure DeclareRefactoredIndicators is also selected: it re-declares the named
+    // indicators the converters would otherwise leave undefined. Unconditional here (the DD cannot source-scan -
+    // it compiles before the funclib), but harmless when there is nothing to declare - the refactor's own GATE 1/2
+    // return 0. DefineSelectMacro is handled separately + parameter-gated (HasModernizeSelectConverterSelected).
+    Procedure EnsureCompanionsSelected
+        Boolean bHasConverter
+        String[] asSelected
+        Integer i iSize
+        String sLC
+        Get SelectedPublishedFunctionNames to asSelected
+        Move (SizeOfArray(asSelected) - 1) to iSize
+        Move False to bHasConverter
+        For i from 0 to iSize
+            Move (Lowercase(Trim(asSelected[i]))) to sLC
+            If (sLC = "changelegacyindicators" or sLC = "changesquarebracketsindicators" or sLC = "changeindicatortoboolean") ;
+                Move True to bHasConverter
+        Loop
+        If (bHasConverter = True) Begin
+            Move "DeclareRefactoredIndicators" to asSelected[SizeOfArray(asSelected)]
+            Send SelectRecordsFromStringArray asSelected
+        End
+        Send ResetSysFile
+    End_Procedure
+
+    // True when a currently-selected indicator converter runs under eModernizeSelect - the only mode that
+    // leaves a bare SELECT macro to define (the default eLeaveSelect never does). A cheap Functions.Parameter
+    // read (no funclib, no source scan). The engine checks THIS first and only then pays for the whole-file
+    // SELECT source scan - so an eLeaveSelect run (the common case) never reads the run file set for it.
+    Function HasModernizeSelectConverterSelected Returns Boolean
+        String[] asSelected
+        Integer i iSize
+        String sLC
+        Get SelectedPublishedFunctionNames to asSelected
+        Move (SizeOfArray(asSelected) - 1) to iSize
+        For i from 0 to iSize
+            Move (Lowercase(Trim(asSelected[i]))) to sLC
+            If (sLC = "changelegacyindicators" or sLC = "changesquarebracketsindicators" or sLC = "changeindicatortoboolean") Begin
+                Clear FunctionsA
+                Move asSelected[i] to FunctionsA.Function_Name
+                Find eq FunctionsA by Index.2
+                If (Found = True and (Lowercase(Trim(FunctionsA.Parameter)) = "emodernizeselect")) ;
+                    Function_Return True
+            End
+        Loop
+        Function_Return False
+    End_Function
+
+    // Same question asked of a NAMED list instead of the current selection: does this PLAN contain an
+    // indicator converter that will run under eModernizeSelect? A plan is built before anything is
+    // selected, so the selection-based test above cannot answer for it (Nils 2026-07-26 - the plan said
+    // 37 functions and the engine then said 38, because the SELECT companion was pulled in at run time,
+    // after the plan dialog had already been shown). Same cheap Parameter read, same three converters.
+    Function HasModernizeSelectConverterInList String[] asFunctions Returns Boolean
+        Integer i iSize
+        String sLC
+        Move (SizeOfArray(asFunctions) - 1) to iSize
+        For i from 0 to iSize
+            Move (Lowercase(Trim(asFunctions[i]))) to sLC
+            If (sLC = "changelegacyindicators" or sLC = "changesquarebracketsindicators" or sLC = "changeindicatortoboolean") Begin
+                Clear FunctionsA
+                Move asFunctions[i] to FunctionsA.Function_Name
+                Find eq FunctionsA by Index.2
+                If (Found = True and (Lowercase(Trim(FunctionsA.Parameter)) = "emodernizeselect")) ;
+                    Function_Return True
+            End
+        Loop
+        Function_Return False
+    End_Function
+
+    /* True when <sName> is a REPORT-only refactoring function (eReportFunction /
+       eReportFunctionAll). Such a function writes a worksheet and changes nothing, so it has no
+       business inside a plan RUN - see the filter in TestCompileFT.dg's StartAutoSelect for why
+       it is a correctness problem and not just a cost one. Find by Index.2 (Function_Name), the
+       same lookup HasModernizeSelectConverterInList above uses. An unknown name answers False:
+       a function we cannot classify is left in the plan rather than silently dropped. */
+    Function IsReportOnlyFunction String sName Returns Boolean
+        Clear FunctionsA
+        Move sName to FunctionsA.Function_Name
+        Find eq FunctionsA by Index.2
+        If (Found = False) ;
+            Function_Return False
+        Function_Return (FunctionsA.Type = eReportFunction or FunctionsA.Type = eReportFunctionAll)
+    End_Function
+
+    // Select the DefineSelectMacro companion. The engine calls this only after confirming BOTH eModernizeSelect
+    // (HasModernizeSelectConverterSelected) and a real [Select]/Indicate Select in scope - so it is never a no-op.
+    Procedure SelectDefineSelectMacro
+        String[] asComp
+        Move "DefineSelectMacro" to asComp[0]
+        Send SelectRecordsFromStringArray asComp
+        Send ResetSysFile
     End_Procedure
 
     // Returns a CRLF-prefixed list of the PARAMETERIZED functions among asFunctions, each as
@@ -489,6 +759,27 @@ Class cFunctionsDataDictionary is a DataDictionary
             Constrained_Find Next
         Loop
     End_Procedure
+
+    // Sets ONE function's stored Parameter and returns its PREVIOUS value, so a caller can restore it.
+    // The engine takes a refactor function's parameter from the TABLE (BuildDispatchList reads
+    // FunctionsA.Parameter), not from whoever starts the run - so a caller driving a parameterised refactor
+    // for one transient run has to write it here, and must put the user's own value back afterwards. Same
+    // rule as the Selected flags: a transient run must leave the standing configuration as it found it.
+    Function SetFunctionParameter String sFunctionName String sParameter Returns String
+        String sPrev
+        Move "" to sPrev
+        Clear FunctionsA
+        Move sFunctionName to FunctionsA.Function_Name
+        Find eq FunctionsA.Function_Name
+        If (Found = True) Begin
+            Move (Trim(FunctionsA.Parameter)) to sPrev
+            Reread FunctionsA
+                Move sParameter to FunctionsA.Parameter
+                SaveRecord FunctionsA
+            Unlock
+        End
+        Function_Return sPrev
+    End_Function
 
     Function CreateNewRecordFromMetaTag tFuncLib FuncLib Returns Boolean
         Integer iID

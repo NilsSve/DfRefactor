@@ -1,0 +1,402 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oWorkspaceFile-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-05
+//
+// Description : Unit tests for the .sws format boundary (cWorkspaceFile).
+//
+//               Format is decided ONCE, from the file's CONTENT - not its name, extension or DataFlex version.
+//               The DF26 Studio converts a WORKSPACE .sws to JSON while leaving LIBRARY .sws files as INI, so
+//               both shapes are live at once and a version-based guess would be wrong half the time.
+//
+//               bParsed carries as much weight as the contents: "read and genuinely empty" versus "never read"
+//               has already been confused twice in this codebase, each time producing a confident statement
+//               that was the opposite of the truth.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+    Object oWorkspaceFile_Tests is a cTestFixture
+        Set psFunctionName to "ReadWorkspaceFile"
+
+        Function _WsTestRoot Returns String
+            String sDataPath
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Function_Return (vFolderFormat(sDataPath) + "ZSwsFormatTest\")
+        End_Function
+
+        Procedure _WriteLines String[] asLines String sPath
+            Boolean bOk
+            Get rfWriteEncodedFileFromStringArray (&asLines) sPath C_NewLine False to bOk
+            Send Assert bOk ("could not write fixture " + sPath)
+        End_Procedure
+
+        Procedure _RemoveFixture
+            String sRoot
+            Boolean bOk
+            Get _WsTestRoot to sRoot
+            Move (rfRemoveFolderTree(sRoot)) to bOk
+        End_Procedure
+
+        // INI is recognised from its section header, and its version read.
+        { Published = True }
+        Procedure SwsFormat_IniIsReadCompletely
+            Handle ho
+            String sRoot sPath
+            String[] asLines
+            tSwsFile Sws
+            Boolean bOk
+
+            Get _WsTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "Plain.sws") to sPath
+            Move "[Properties]" to asLines[0]
+            Move "Version=19.1" to asLines[1]
+            Send _WriteLines asLines sPath
+
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get ReadWorkspaceFile of ho sPath to Sws
+            Send AssertIAreEqual eSwsIni Sws.eSwsFormat
+            Send Assert Sws.bParsed "an INI .sws must come back parsed"
+            Send AssertSAreEqual "19.1" Sws.sDfVersion
+            Send AssertSAreEqual "Plain" Sws.sWorkspaceName
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* JSON is recognised from its first non-blank character, NOT from the extension - which is
+           ".sws" for both shapes. Contents are not read here yet, and bParsed says so rather than
+           letting an empty struct pass as an answer. */
+        { Published = True }
+        Procedure SwsFormat_JsonIsRecognisedAndNotClaimedAsRead
+            Handle ho
+            String sRoot sPath
+            String[] asLines
+            tSwsFile Sws
+            Boolean bOk
+
+            Get _WsTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move (sRoot + "Modern.sws") to sPath
+            Move ""                to asLines[0]
+            Move "{"               to asLines[1]
+            Move '  "df": "26.0",' to asLines[2]
+            Move '  "dependencies": [ "Libraries/Alpha/Alpha.sws" ]' to asLines[3]
+            Move "}"               to asLines[4]
+            Send _WriteLines asLines sPath
+
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get ReadWorkspaceFile of ho sPath to Sws
+            Send AssertIAreEqual eSwsJson Sws.eSwsFormat
+            Send Assert (Sws.bParsed = False) "a JSON .sws must not claim to have been read yet"
+            Send AssertSAreEqual "Modern" Sws.sWorkspaceName
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        /* MULTI-PATH, which is the reason this struct replaces tWorkspacePaths.
+
+           A .ws path key may name several folders separated by ";". tWorkspacePaths kept one String
+           per key and was filled with the FIRST entry only (cRefactorApplication ~605 for INI, and
+           asAppSrc[0] for JSON - the array was read and then discarded), so every caller that
+           scanned "the" AppSrc folder scanned one of however many were declared. */
+        { Published = True }
+        Procedure SwsFormat_IniPathsKeepEveryDeclaredFolder
+            Handle ho
+            String sRoot sPath
+            String[] asLines
+            tSwsFile Sws
+            Boolean bOk
+
+            Get _WsTestRoot to sRoot
+            Move (rfDirectoryCreateEx((sRoot + "Programs\"), False)) to bOk
+
+            Move (sRoot + "Multi.sws") to sPath
+            Move "[Properties]"                  to asLines[0]
+            Move "Version=19.1"                  to asLines[1]
+            Move "[WorkspacePaths]"              to asLines[2]
+            Move "ConfigFile=.\Programs\Cfg.ws"  to asLines[3]
+            Send _WriteLines asLines sPath
+
+            Move "[Workspace]"                              to asLines[0]
+            Move "Home=..\"                                 to asLines[1]
+            Move "AppSrcPath=.\AppSrc;.\AppSrc2;.\Shared"   to asLines[2]
+            Move "DdSrcPath=.\DdSrc"                        to asLines[3]
+            Move "DataPath=.\Data"                          to asLines[4]
+            Move (ResizeArray(asLines, 5)) to asLines
+            Send _WriteLines asLines (sRoot + "Programs\Cfg.ws")
+
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get ReadWorkspaceFile of ho sPath to Sws
+            Send Assert Sws.bParsed "the INI workspace was not parsed"
+            // ALL THREE, not just the first.
+            Send AssertIAreEqual 3 (SizeOfArray(Sws.Paths.asAppSrc))
+            Send Assert (Sws.Paths.asAppSrc[0] contains "AppSrc")  "first AppSrc folder missing"
+            Send Assert (Sws.Paths.asAppSrc[1] contains "AppSrc2") "SECOND AppSrc folder was dropped"
+            Send Assert (Sws.Paths.asAppSrc[2] contains "Shared")  "THIRD AppSrc folder was dropped"
+            // ...resolved to absolute, anchored on HOME (not on the .ws's own Programs folder).
+            Send Assert (Sws.Paths.asAppSrc[0] contains "Programs" = False) "AppSrc was anchored to the .ws folder instead of Home"
+            Send AssertIAreEqual 1 (SizeOfArray(Sws.Paths.asDdSrc))
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // A missing file is neither format-guessed nor claimed as read.
+        { Published = True }
+        Procedure SwsFormat_MissingFileIsNotClaimedAsRead
+            Handle ho
+            String sRoot
+            tSwsFile Sws
+            Get _WsTestRoot to sRoot
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get ReadWorkspaceFile of ho (sRoot + "NoSuchFile.sws") to Sws
+            Send Assert (Sws.bParsed = False) "a missing .sws must not come back parsed"
+            Send Destroy of ho
+        End_Procedure
+
+        /* ---- OwnSwsCandidateInFolder: the own-.sws picker (2026-08-28) ----
+           The repo holds DFRefactor25.0.sws (INI, DF25 Studio) beside DFRefactorFlexTron.sws
+           (JSON, DF26); "first DFRefactor* found" picked the DF25 file on the DF26 build by
+           alphabetical accident, and TestBench's Test Compile ran against the wrong workspace -
+           reporting "No errors" for code that did not compile. The picker prefers the format the
+           caller asks for; an other-format candidate is a fallback, never discarded. */
+
+        Procedure _WriteOwnSwsPair String sRoot
+            String[] asIni asJson
+            Boolean bOk
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move "[Properties]"  to asIni[0]
+            Move "Version=25.0"  to asIni[1]
+            Send _WriteLines asIni (sRoot + "DFRefactor25.0.sws")
+            Move '{'             to asJson[0]
+            Move '  "df": 26.0'  to asJson[1]
+            Move '}'             to asJson[2]
+            Send _WriteLines asJson (sRoot + "DFRefactorZ.sws")
+        End_Procedure
+
+        // A DF26-style caller (wants JSON) must get the JSON one - even though the INI file
+        // sorts FIRST alphabetically, which is the exact accident this picker ends.
+        { Published = True }
+        Procedure OwnSws_PrefersTheWantedFormatOverFileOrder
+            Handle ho
+            String sRoot sPick
+            Get _WsTestRoot to sRoot
+            Send _WriteOwnSwsPair sRoot
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get OwnSwsCandidateInFolder of ho sRoot eSwsJson to sPick
+            Send AssertSAreEqual (sRoot + "DFRefactorZ.sws") sPick
+            // ...and the DF25-style caller gets the INI one from the same folder.
+            Get OwnSwsCandidateInFolder of ho sRoot eSwsIni to sPick
+            Send AssertSAreEqual (sRoot + "DFRefactor25.0.sws") sPick
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // Only an other-format candidate present: it is still returned (preference, not filter) -
+        // the caller's own parse guards decide what to do with it.
+        { Published = True }
+        Procedure OwnSws_OtherFormatIsAFallbackNotDiscarded
+            Handle ho
+            String sRoot sPick
+            String[] asIni
+            Boolean bOk
+            Get _WsTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move "[Properties]" to asIni[0]
+            Move "Version=25.0" to asIni[1]
+            Send _WriteLines asIni (sRoot + "DFRefactor25.0.sws")
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get OwnSwsCandidateInFolder of ho sRoot eSwsJson to sPick
+            Send AssertSAreEqual (sRoot + "DFRefactor25.0.sws") sPick
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+        // Exactly ONE .sws in the folder: returned whatever its name or format, as before.
+        { Published = True }
+        Procedure OwnSws_SingleFileWinsWhateverItsName
+            Handle ho
+            String sRoot sPick
+            String[] asIni
+            Boolean bOk
+            Get _WsTestRoot to sRoot
+            Move (rfDirectoryCreateEx(sRoot, False)) to bOk
+            Move "[Properties]" to asIni[0]
+            Move "Version=19.1" to asIni[1]
+            Send _WriteLines asIni (sRoot + "SomethingElse.sws")
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get OwnSwsCandidateInFolder of ho sRoot eSwsJson to sPick
+            Send AssertSAreEqual (sRoot + "SomethingElse.sws") sPick
+            Send Destroy of ho
+            Send _RemoveFixture
+        End_Procedure
+
+    End_Object
+
+    /* Tests for rfStripUtf8Bom (RefactorFileIO.pkg) - the armor between raw
+       Read_Block and ParseUtf8. ParseUtf8 refuses a whole JSON document over a
+       leading UTF-8 BOM; DFRefactorFlexTron.sws picked one up mid-2026-08-28
+       and pOwnSws silently came back empty (TestBench's Test Compile then chose
+       the wrong df-cli dialect). The last test proves the ParseUtf8 premise
+       itself, so the day the runtime learns to accept a BOM this fixture says
+       the armor can retire. */
+    Object oStripUtf8Bom_Tests is a cTestFixture
+        Set psFunctionName to "rfStripUtf8Bom"
+
+        { Published = True }
+        Procedure Strip_RemovesLeadingBomOnly
+            UChar[] ucIn ucOut
+
+            Move 239 to ucIn[0]
+            Move 187 to ucIn[1]
+            Move 191 to ucIn[2]
+            Move 123 to ucIn[3]     // {
+            Move 125 to ucIn[4]     // }
+            Move (rfStripUtf8Bom(ucIn)) to ucOut
+            Send Assert (SizeOfArray(ucOut) = 2) "the three BOM bytes and nothing else must go"
+            Send Assert (ucOut[0] = 123 and ucOut[1] = 125) "the payload behind the BOM must survive byte-for-byte"
+        End_Procedure
+
+        // Positive control: data without a BOM passes through untouched.
+        { Published = True }
+        Procedure Strip_LeavesCleanDataUntouched
+            UChar[] ucIn ucOut
+            Integer iCount
+
+            Move 123 to ucIn[0]     // {
+            Move 239 to ucIn[1]     // a BOM byte INSIDE the data is data
+            Move 187 to ucIn[2]
+            Move 191 to ucIn[3]
+            Move (rfStripUtf8Bom(ucIn)) to ucOut
+            Send Assert (SizeOfArray(ucOut) = 4) "clean data must keep its size"
+            For iCount from 0 to 3
+                Send Assert (ucOut[iCount] = ucIn[iCount]) ("clean data changed at index " + String(iCount))
+            Loop
+        End_Procedure
+
+        // Arrays too short to hold a BOM, a bare BOM, and a partial BOM.
+        { Published = True }
+        Procedure Strip_EdgeSizes
+            UChar[] ucIn ucOut ucEmpty
+
+            Move (rfStripUtf8Bom(ucEmpty)) to ucOut
+            Send Assert (SizeOfArray(ucOut) = 0) "empty in, empty out"
+            Move 239 to ucIn[0]
+            Move 187 to ucIn[1]
+            Move (rfStripUtf8Bom(ucIn)) to ucOut
+            Send Assert (SizeOfArray(ucOut) = 2) "a two-byte partial BOM is data, not a BOM"
+            Move 191 to ucIn[2]
+            Move (rfStripUtf8Bom(ucIn)) to ucOut
+            Send Assert (SizeOfArray(ucOut) = 0) "a document that IS only a BOM strips to empty"
+        End_Procedure
+
+        /* The premise and the fix, end to end: ParseUtf8 refuses BOM-prefixed
+           JSON (this is WHY the armor exists), and the same bytes parse once
+           rfStripUtf8Bom has run. If the refusal assert ever fails, the
+           runtime has learned to tolerate the BOM and the armor can retire. */
+        { Published = True }
+        Procedure Strip_MakesBomJsonParseable
+            Handle hoJson
+            Boolean bOK
+            UChar[] ucIn
+            String sJson
+            Integer iCount iLen
+
+            Move 239 to ucIn[0]
+            Move 187 to ucIn[1]
+            Move 191 to ucIn[2]
+            Move '{"df":26.0}' to sJson
+            Move (Length(sJson)) to iLen
+            For iCount from 1 to iLen
+                Move (Ascii(Mid(sJson, 1, iCount))) to ucIn[iCount + 2]
+            Loop
+            Get Create (RefClass(cJsonObject)) to hoJson
+            Get ParseUtf8 of hoJson ucIn to bOK
+            Send Assert (bOK = False) "premise: ParseUtf8 accepts a BOM now - the armor can retire"
+            Move (rfStripUtf8Bom(ucIn)) to ucIn
+            Get ParseUtf8 of hoJson ucIn to bOK
+            Send Assert bOK "the stripped document must parse"
+            Send Destroy of hoJson
+        End_Procedure
+
+    End_Object
+
+    /* Tests for OwnSwsGuardText (cWorkspaceFile.pkg) - the "pOwnSws may never
+       be empty" rule (Nils 2026-08-29). An unparsed, pathless or project-less
+       own-workspace is ALWAYS a regression and must produce a message for
+       RefreshOwnSws to raise; a healthy struct must pass in silence. */
+    Object oOwnSwsGuard_Tests is a cTestFixture
+        Set psFunctionName to "OwnSwsGuardText"
+
+        Function _HealthySws Returns tSwsFile
+            tSwsFile Sws
+            Move True to Sws.bParsed
+            Move "C:\Somewhere\DFRefactorFlexTron.sws" to Sws.RuntimePaths.sSwsPath
+            Move "TestBench.src" to Sws.aProjects[0].sName
+            Function_Return Sws
+        End_Function
+
+        // Positive control: a healthy own-workspace raises nothing.
+        { Published = True }
+        Procedure Guard_HealthyStructPassesSilently
+            Handle ho
+            String sText
+            tSwsFile Sws
+
+            Get _HealthySws to Sws
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get OwnSwsGuardText of ho Sws to sText
+            Send Destroy of ho
+            Send AssertSAreEqual "" sText
+        End_Procedure
+
+        { Published = True }
+        Procedure Guard_UnparsedIsARegression
+            Handle ho
+            String sText
+            tSwsFile Sws
+
+            Get _HealthySws to Sws
+            Move False to Sws.bParsed
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get OwnSwsGuardText of ho Sws to sText
+            Send Destroy of ho
+            Send Assert (sText contains "REGRESSION") "an unparsed pOwnSws must be named a regression"
+            Send Assert (sText contains "DFRefactorFlexTron.sws") "the message must name the file involved"
+        End_Procedure
+
+        { Published = True }
+        Procedure Guard_ParsedButProjectlessIsARegression
+            Handle ho
+            String sText
+            tSwsFile Sws
+            tSwsProject[] aNone
+
+            Get _HealthySws to Sws
+            Move aNone to Sws.aProjects
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get OwnSwsGuardText of ho Sws to sText
+            Send Destroy of ho
+            Send Assert (sText contains "no projects") "a project-less parse is lost data and must say so"
+        End_Procedure
+
+        { Published = True }
+        Procedure Guard_PathlessSaysNoFileWasLocated
+            Handle ho
+            String sText
+            tSwsFile Sws
+
+            Get _HealthySws to Sws
+            Move "" to Sws.RuntimePaths.sSwsPath
+            Get Create (RefClass(cWorkspaceFile)) to ho
+            Get OwnSwsGuardText of ho Sws to sText
+            Send Destroy of ho
+            Send Assert (sText contains "REGRESSION") "a pathless pOwnSws must be named a regression"
+            Send Assert (sText contains "no .sws file was located") "the message must say no file was found"
+        End_Procedure
+
+    End_Object

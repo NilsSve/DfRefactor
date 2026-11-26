@@ -1,0 +1,608 @@
+﻿//****************************************************************************
+// $Module type: Package (global functions + the tCompileError struct)
+// $Module name: CompileErrorParser
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : The canonical DataFlex compiler ".err" parser. Lifted out of
+//               CompilerOutput.dg so BOTH the compiler-output dock AND the .err
+//               analysis panel (cModAnalyzer / ModAnalyzer.dg) share ONE parser.
+//
+//               The .err format is regular:
+//                 ERROR: <num> <desc> ON LINE: <ln> (<off>) OF FILE: <path>
+//               (plus LINK ERROR lines). ReadErrorFile reads the file into a line
+//               array; ExtractData parses one line into a tCompileError; and
+//               MassageErrorFile runs the whole array through ExtractData.
+//
+//               These are GLOBAL functions (Get-callable from anywhere, like the
+//               RF* file functions), so the dock's existing "Get ReadErrorFile" /
+//               "Get MassageErrorFile" call sites keep working unchanged after the
+//               lift - we only remove the old inline copies + the struct there and
+//               add "Use CompileErrorParser.pkg".
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS for a PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//****************************************************************************
+Use RefactorFileIO.pkg   // rfOpenInput / rfCloseInput (+ seq_chnl: Readln channel, SeqEof)
+Use cEncodingHelpers.pkg // rfOemBytesRangeToString / rfUtf8BytesRangeToString (the .prn tail parser)
+
+Struct tCompileError
+    Boolean bError    // If false, it is a warning.
+    Integer iErrorNo
+    Integer iLine
+    String sFileName
+    String sErrorTxt
+    String sText
+    Boolean bDeepScan // True = a SYNTHETIC row from the source-driven Deep Scan (cDeepScanner) -
+                      // iErrorNo is then the rule's stable DS pseudo number (9001+), shown as
+                      // "DS <n>" in the analyzer grid instead of "W/E <n>". Never set by the
+                      // .err/.prn parsers (defaults False), so compiler rows are unaffected.
+    /* THE SCAN'S OWN VERDICT on a Deep Scan hit (2026-09-11) - its category, function and hint as
+       the scan decided them for THIS line, which can differ from its rule's: an object of a learned
+       subclass that no converter acts on loses the function, and so does a hit inside a #COMMAND
+       body (the engine never changes macro code). Filled by cDeepScanner.HitsToMessages and applied by cModAnalyzer.
+       VerifyScanVerdict, because the recipe table knows only the rule. 0 / "" on every other
+       message, which means "no verdict". */
+    Integer eScanCategory
+    String  sScanFn
+    String  sScanHint
+End_Struct
+
+// HISTORY, kept so the filter is never reinvented: the DF 26 BETA compilers appended 2
+// NON-DETERMINISTIC bytes after each extended (>=128) character echoed into a .err/.prn diagnostic
+// (an uninitialized conversion buffer - the trailing bytes tracked process memory layout, constant
+// within a run, different between runs; reported to Data Access with byte evidence). A Swedish-named
+// file then parsed to a DIFFERENT sFileName each compile and the analyzer showed phantom new/gone
+// rows, so StripCompilerExtCharNoise dropped 2 bytes after every extended character, BY POSITION.
+//
+// The DF 26 RELEASE CANDIDATE fixed the compiler (verified 2026-07-23 by the original experiment:
+// same CP850 source with Swedish-named symbols compiled repeatedly, .prn diagnostic lines
+// byte-identical across runs, names emitted as proper UTF-8 - "A-ring" arrives as c3 85, no trailing
+// bytes). DF 25 also emits clean UTF-8. Against EITHER supported compiler the positional strip
+// CORRUPTED valid output - on UTF-8 it kept a lead byte, ate its continuation byte and the next
+// character's lead - so the filter was removed outright. No supported compiler needs it: pre-RC
+// DF 26 builds are not in use anywhere (Nils, 2026-07-22).
+
+
+// Read a .err (or any text/log) file into a line array, skipping blank lines.
+// (Lifted from CompilerOutput.dg; the original rfFileSize pre-size was a perf
+// micro-opt only - the array auto-grows, so the result is identical.)
+Function ReadErrorFile Global String sFileName Returns String[]
+    Integer iCh iCount
+    String[] asFile
+    String sLine
+
+    Move 0 to iCount
+    Get rfOpenInput ("binary:" + sFileName) to iCh
+    If (iCh < 0) Begin
+        Function_Return asFile
+    End
+
+    While (SeqEof = False)
+        Readln channel iCh sLine
+        If (Trim(sLine) <> "") Begin
+            Move sLine to asFile[iCount]
+            Increment iCount
+        End
+    Loop
+    Send rfCloseInput iCh
+
+    Function_Return asFile
+End_Function
+
+// Like ReadErrorFile, but for a .err that may be MID-WRITE - the live error tail during a compile,
+// or one left truncated by Stop Compile's process kill: when the file does NOT end in a line break,
+// its final line is INCOMPLETE - drop it. A half-written "OF FILE: ...\Regserve" (the ".inc" cut
+// off by the kill) otherwise parses into a grid row whose source-jump path points nowhere - the
+// Scintilla open validation then complains "cannot drop a folder" (Nils 2026-07-04). Nothing is
+// ever lost: a live tail re-reads the completed line on its next refresh, and a FINISHED compile's
+// .err always ends in a line break.
+Function ReadErrorFileWholeLines Global String sFileName Returns String[]
+    String[] asLines
+    UChar[]  ucaTail
+    Integer  iSize
+
+    Get ReadErrorFile sFileName to asLines
+    If (SizeOfArray(asLines) = 0) ;
+        Function_Return asLines
+    Move (rfFileSizeLive(sFileName)) to iSize
+    If (iSize > 0) Begin
+        Move (rfReadFileSliceBytes(sFileName, (iSize - 1), 1)) to ucaTail
+        If (SizeOfArray(ucaTail) = 1 and ucaTail[0] <> 10) Begin
+            Move (ResizeArray(asLines, (SizeOfArray(asLines) - 1))) to asLines
+        End
+    End
+    Function_Return asLines
+End_Function
+
+// Does a parsed diagnostic name a FILE? "" does not (a link or manifest error), and neither does a path that
+// ends in a separator: that is a folder, and it is what a listing cut off in the middle of a line leaves behind.
+// On 2026-10-05 the DataFlex 26 compiler crashed three times on one workspace (stack overflow in DfComp.dll, by
+// the Windows event log). Each listing stopped at a buffer boundary, the last one inside
+// "... OF FILE: E:\Lib\AppSrc\" - and that folder went on as the file of an error row, into a plan and into the
+// engine's file list, where the editor's file-time check raised error 4358 on it.
+Function IsCompilerMessageFile Global String sFileName Returns Boolean
+    Move (Trim(sFileName)) to sFileName
+    If (sFileName = "") ;
+        Function_Return False
+    Function_Return (Right(sFileName, 1) <> "\" and Right(sFileName, 1) <> "/")
+End_Function
+
+// What happened to a compiler that did not exit but DIED - or "" for an ordinary exit code (0, or the small code
+// a compile with errors returns). A crashed process hands Windows its exception code as its exit code: 0xC00000FD
+// and its kin, the error range 0xC0000000..0xCFFFFFFF, which is negative in a 32-bit Integer.
+Function CompilerCrashWords Global Integer iExitCode Returns String
+    If (iExitCode < -1073741824 or iExitCode > -805306369) ;
+        Function_Return ""
+    If (iExitCode = -1073741571) ;
+        Function_Return "stack overflow, exit code 0xC00000FD"
+    If (iExitCode = -1073740940) ;
+        Function_Return "heap corruption, exit code 0xC0000374"
+    If (iExitCode = -1073741819) ;
+        Function_Return "access violation, exit code 0xC0000005"
+    If (iExitCode = -1073740791) ;
+        Function_Return "stack buffer overrun, exit code 0xC0000409"
+    Function_Return ("exit code " + String(iExitCode))
+End_Function
+
+// Parse one .err line into a tCompileError (error/warning, number, file, line, text).
+Function ExtractData Global String sValue Returns tCompileError
+    String sTmp
+    Integer iPos
+    Boolean bLinkError
+    tCompileError CompileError
+
+    // Link Error?
+    Move (Pos("LINK ERROR:", sValue)) to bLinkError
+    If (bLinkError) Begin
+        Move True to CompileError.bError
+        Move (Length("LINK ERROR: ")) to iPos
+
+        // Remove read part
+        Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
+
+        // File name:
+        Move (Pos(",", sValue)) to iPos
+        If (iPos <> 0) Begin
+            Move (Trim(Left(sValue, iPos - 1))) to sTmp
+            Move sTmp to CompileError.sFileName
+            // Remove read part
+            Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
+        End
+    End
+
+    // Error or Warning?
+    Else Begin
+        Move (Pos(" ", sValue)) to iPos
+        If (Left(sValue, iPos) contains "ERROR") Begin
+            Move True to CompileError.bError
+        End
+        // Remove read part
+        Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
+
+        If (bLinkError = False) Begin
+            Move (Pos(" ", sValue)) to iPos
+            // Error number:
+            Move (Trim(Left(sValue, iPos))) to sTmp
+            Move sTmp to CompileError.iErrorNo
+        End
+        // Remove read part
+        Move (Trim(Mid(sValue, Length(sValue), iPos))) to sValue
+
+        // File name:
+        Move (Pos("OF FILE:", sValue)) to iPos
+        Move (Trim(Mid(sValue, Length(sValue), iPos + 8))) to sTmp
+        Move sTmp to CompileError.sFileName
+        // Remove read part
+        Move (Trim(Left(sValue, iPos-1))) to sValue
+
+        // Line number - ONLY when the line actually carries "ON LINE:". Without the
+        // guard, a line lacking it makes the Mid/Left below extract a non-numeric token
+        // (e.g. "US" out of a path like ...\Users\...), and Move-ing that to an Integer
+        // FAULTS in DF26 ("Invalid symbol in expression 'US'") - Move is NOT lenient.
+        // With "ON LINE:" present the token is the numeric line. See
+        // feedback_dataflex_integer_cast_faults.md.
+        Move (Pos("ON LINE:", sValue)) to iPos
+        If (iPos > 0) Begin
+            Move (Trim(Mid(sValue, Length(sValue), iPos + 8))) to sTmp
+            Move (Pos(" ", sTmp)) to iPos
+            Move (Trim(Left(sTmp, iPos))) to sTmp
+            Move sTmp to CompileError.iLine
+            Move (Pos("ON LINE:", sValue)) to iPos
+            Move (Trim(Left(sValue, iPos -1))) to sValue
+        End
+    End
+
+    Move sValue to CompileError.sErrorTxt
+
+    // Finally, construct the text to display. The non-link prefix must follow bError: the .err
+    // rows are all errors, but the cached .prn WARNING lines now flow through this same parser
+    // (AppendCachedPrnWarnings / ReadCompilerMessages) - a hardcoded "Error" mislabeled every
+    // warning row, and the output grid's icon picker keys off this "Warning <n>"/"Error <n>"
+    // text form (CompilerOutputFT.dg OnSetDisplayMetrics), so the glyph was wrong too.
+    If (bLinkError) Begin
+        Move "Link Error:" to sValue
+    End
+    Else If (CompileError.bError = True) Begin
+        Move "Error" to sValue
+    End
+    Else Begin
+        Move "Warning" to sValue
+    End
+    If (bLinkError = False) Begin
+        Append sValue " " CompileError.iErrorNo ":"
+    End
+    Append sValue "   " CompileError.sFileName
+    If (bLinkError = False) Begin
+        Append sValue "   " "(ln " CompileError.iLine ")"
+    End
+    Append sValue " " CompileError.sErrorTxt
+    Move sValue to CompileError.sText
+
+    Function_Return CompileError
+End_Function
+
+// Parse a whole .err line array into tCompileError[] (calls ExtractData per line).
+Function MassageErrorFile Global String[] asFile Returns tCompileError[]
+    String sValue
+    Integer iSize iCount
+    tCompileError[] asCompileError
+
+    Move (SizeOfArray(asFile)) to iSize
+    Decrement iSize
+    For iCount from 0 to iSize
+        Move asFile[iCount] to sValue
+        Get ExtractData asFile[iCount] to asCompileError[iCount]
+    Loop
+
+    Function_Return asCompileError
+End_Function
+
+/* THE FILES THE COMPILER READ (2026-08-16) - the .prn lists every one it opened, in order:
+       Including file: KeyFieldValidation.pkg    (E:\WebAppSrc\AppSrc\KeyFieldValidation.pkg)
+   That set is the honest scope for anything driven by a compiler message - the declaration report,
+   the rename and align offers - and it is NOT the user's folder selection: on WinServ the report ran
+   over the ticked folders (E:\WebAppSrc root, not its AppSrc), saw one of pbSilent's three
+   declarations, called it "rename yours" when it is the align case, and its 151 errors stayed.
+   Returns the DISTINCT full paths as spelled (the caller drops the DataFlex install and anything
+   gone from disk - RunScopedFunction's file-precise branch does exactly that). Reads the listing
+   through ReadErrorFile, whose speed on a 60 MB listing is measured above. */
+Function rfPrnIncludedFiles Global String sPrnFile Returns String[]
+    String[] asAll asOut
+    String sLine sPath
+    Integer i iMax iOpen iClose
+
+    Get ReadErrorFile sPrnFile to asAll
+    Move (SizeOfArray(asAll) - 1) to iMax
+    For i from 0 to iMax
+        Move asAll[i] to sLine
+        If (Left(sLine, 16) = "Including file: ") Begin
+            Move (RightPos("(", sLine)) to iOpen
+            Move (RightPos(")", sLine)) to iClose
+            If (iOpen > 0 and iClose > iOpen) Begin
+                Move (Trim(Mid(sLine, (iClose - iOpen - 1), (iOpen + 1)))) to sPath
+                If (sPath <> "" and SearchArray(sPath, asOut, Desktop, RefFunc(DFSTRICMP)) = -1) ;
+                    Move sPath to asOut[SizeOfArray(asOut)]
+            End
+        End
+    Loop
+    Function_Return asOut
+End_Function
+
+// -------- Incremental .prn tail parsing (the live-compile diagnostics harvest) --------
+// The Test Compile dock reads the GROWING .prn in slices WHILE the compiler runs (any compiler) and
+// filters it down to the diagnostic lines on the fly, so by FinishCompile the messages are already in
+// memory: the dock's warning counts and the Analyzer's parse skip their full multi-MB .prn reads.
+// These are PURE functions (unit-tested in oPrnTail-Tests.pkg).
+
+// Classifies ONE trimmed listing line: 1 = warning, 2 = error (incl. link), 0 = not a diagnostic.
+// EXACTLY the same prefix tests as ReadCompilerMessages' filter (case-insensitive, like all DataFlex
+// string compares), so the tail-harvested set is identical to a full-read one.
+Function rfPrnDiagnosticKind Global String sTrimmedLine Returns Integer
+    If (Left(sTrimmedLine, 8) = "WARNING:") ;
+        Function_Return 1
+    If (Left(sTrimmedLine, 6) = "ERROR:") ;
+        Function_Return 2
+    If (Left(sTrimmedLine, 11) = "LINK ERROR:") ;
+        Function_Return 2
+    Function_Return 0
+End_Function
+
+/* A DIAGNOSTIC LINE AS THE COMPILER WROTE IT (2026-10-03). A listing with no BOM is decoded as OEM
+   below, because its source echo is in the sources' own code page - but the DataFlex 25 and 26
+   compilers write their own diagnostics in UTF-8 whatever the listing: the Swedish text of error
+   4306 arrives with its a-ring as the two bytes C3 A5 in the classic compiler's listing, which has
+   no BOM. Decoded as OEM those two bytes became two box characters, and the Check's findings showed
+   them (Nils 2026-10-03). The full read, ReadCompilerMessages, never had this: it keeps the bytes as
+   they are.
+
+   So a kept line with any character above ASCII goes back to its own bytes - the OEM decode maps
+   one byte to one character, and rfUtf8LineToOemBytes undoes it exactly - and is read again as
+   UTF-8 when those bytes are valid UTF-8. An older compiler's OEM line is not (an extended letter
+   there is one byte, which UTF-8 never accepts on its own), so it keeps the decode it had. Pure
+   ASCII, nearly every line, costs one compare: SizeOfString counts bytes and Length characters,
+   and the two differ only past ASCII. */
+Function rfPrnDiagnosticAsWritten Global String sLine Returns String
+    UChar[] ucaBytes
+
+    If (SizeOfString(sLine) = Length(sLine)) ;
+        Function_Return sLine
+    Move (rfUtf8LineToOemBytes(sLine)) to ucaBytes
+    If (_rfBytesAreUtf8(&ucaBytes, 0, SizeOfArray(ucaBytes)) = False) ;
+        Function_Return sLine
+    Function_Return (rfUtf8BytesToString(ucaBytes))
+End_Function
+
+// Consumes one raw-bytes chunk of the growing .prn. ucaCarry holds the unterminated trailing line
+// between calls (BYTES, so a multi-byte character split across two chunks reassembles losslessly -
+// decode only ever runs on COMPLETE lines). The whole-lines region of the chunk is decoded in ONE
+// native call (rfOemBytesRangeToString / rfUtf8BytesRangeToString - per bUtf8, the listing's BOM) and
+// split natively; only lines passing rfPrnDiagnosticKind are kept (trimmed, like ReadCompilerMessages)
+// in asMsgs with iWarn/iErr tallies - the ~250k source-echo lines of a big listing cost one scan and
+// no string each. Returns the number of diagnostic lines appended by this call.
+// NOTE ucaChunk is ByRef purely to AVOID THE COPY: a by-value UChar[] parameter deep-copies the whole
+// 1 MB chunk on EVERY call (and again into the range decoders below) - runtime element-copying that
+// capped the pipeline at ~10 MB/s (the "drain timeout" series, Nils 2026-07-03). It is never modified.
+Function rfPrnTailConsume Global UChar[] ByRef ucaChunk UChar[] ByRef ucaCarry Boolean bUtf8 String[] ByRef asMsgs Integer ByRef iWarn Integer ByRef iErr Returns Integer
+    Integer iChunkLen iCarryLen iFirstLF iLastLF iIdx iAdded iKind iLineLen iStart
+    Integer iRegLen iFrom iWpos iEpos iLpos iNext iLF
+    String  sRegion sTrim sLF sNW sNE sNL
+    UChar[] ucaLine
+
+    Move (SizeOfArray(ucaChunk)) to iChunkLen
+    If (iChunkLen = 0) ;
+        Function_Return 0
+    Move 0 to iAdded
+    Move (SizeOfArray(ucaCarry)) to iCarryLen
+    Move 0 to iStart
+
+    // 1) Complete the carried line with the chunk's head (up to the FIRST LF).
+    If (iCarryLen > 0) Begin
+        Move -1 to iFirstLF
+        Move 0 to iIdx
+        While (iIdx < iChunkLen and iFirstLF = -1)
+            If (ucaChunk[iIdx] = 10) ;
+                Move iIdx to iFirstLF
+            Increment iIdx
+        Loop
+        If (iFirstLF = -1) Begin
+            // No line end anywhere in this chunk (a listing line longer than the read chunk - rare):
+            // append the whole chunk to the carry and wait for more.
+            Move (ResizeArray(ucaCarry, (iCarryLen + iChunkLen))) to ucaCarry
+            For iIdx from 0 to (iChunkLen - 1)
+                Move ucaChunk[iIdx] to ucaCarry[iCarryLen + iIdx]
+            Loop
+            Function_Return 0
+        End
+        // carry + chunk[0..iFirstLF-1] = one complete line; strip a trailing CR after assembly.
+        Move ucaCarry to ucaLine
+        If (iFirstLF > 0) Begin
+            Move (ResizeArray(ucaLine, (iCarryLen + iFirstLF))) to ucaLine
+            For iIdx from 0 to (iFirstLF - 1)
+                Move ucaChunk[iIdx] to ucaLine[iCarryLen + iIdx]
+            Loop
+        End
+        Move (SizeOfArray(ucaLine)) to iLineLen
+        If (iLineLen > 0) Begin
+            If (ucaLine[iLineLen - 1] = 13) ;
+                Move (ResizeArray(ucaLine, (iLineLen - 1))) to ucaLine
+        End
+        If (bUtf8 = True) ;
+            Move (Trim(rfUtf8BytesToString(ucaLine))) to sTrim
+        Else ;
+            Move (Trim(rfOemBytesToUtf8(ucaLine))) to sTrim
+        Move (rfPrnDiagnosticKind(sTrim)) to iKind
+        If (iKind > 0) Begin
+            If (bUtf8 = False) ;
+                Move (rfPrnDiagnosticAsWritten(sTrim)) to sTrim
+            Move sTrim to asMsgs[SizeOfArray(asMsgs)]
+            If (iKind = 1) ;
+                Increment iWarn
+            Else ;
+                Increment iErr
+            Increment iAdded
+        End
+        Move (ResizeArray(ucaCarry, 0)) to ucaCarry
+        Move (iFirstLF + 1) to iStart
+    End
+
+    // 2) Find the LAST LF at/after iStart (backward scan - normally just a few bytes from the end).
+    Move -1 to iLastLF
+    Move (iChunkLen - 1) to iIdx
+    While (iIdx >= iStart and iLastLF = -1)
+        If (ucaChunk[iIdx] = 10) ;
+            Move iIdx to iLastLF
+        Decrement iIdx
+    Loop
+
+    // 3) Decode the whole-lines region [iStart .. iLastLF-1] in ONE native call, then hop between
+    //    diagnostics with LF-PREFIXED needles ("\n" + "WARNING:" etc, native 3-arg Pos): a hit IS a
+    //    line start BY CONSTRUCTION, so the thousands of "ERROR"/"WARNING" occurrences INSIDE echoed
+    //    source lines never match at all - the loop runs once per ACTUAL diagnostic (a few thousand
+    //    per compile), not once per keyword occurrence. (The previous bare-keyword scan paid an
+    //    interpreted iteration + rescan for every mid-line occurrence, which kept the pipeline at a
+    //    quarter of its native speed - the "drain timeout" series, Nils 2026-07-03.) The "ERROR:"
+    //    inside a "LINK ERROR:" line is mid-line by the same construction. The region's FIRST line
+    //    (regions always begin at a line boundary) has no LF prefix - tested directly once.
+    If (iLastLF > iStart) Begin
+        If (bUtf8 = True) ;
+            Get rfUtf8BytesRangeToString (&ucaChunk) iStart (iLastLF - iStart) to sRegion
+        Else ;
+            Get rfOemBytesRangeToString (&ucaChunk) iStart (iLastLF - iStart) to sRegion
+        Move (Length(sRegion)) to iRegLen
+        Move (Character(10)) to sLF
+        // The region's first line, tested directly (kind on the raw prefix works: diagnostics start
+        // at column 0 and rfPrnDiagnosticKind tests Left() prefixes).
+        Move (rfPrnDiagnosticKind(sRegion)) to iKind
+        If (iKind > 0) Begin
+            Move (Pos(sLF, sRegion, 1)) to iLF
+            If (iLF = 0) ;
+                Move (iRegLen + 1) to iLF
+            Move (Left(sRegion, (iLF - 1))) to sTrim
+            If (Right(sTrim, 1) = Character(13)) ;
+                Move (Left(sTrim, (Length(sTrim) - 1))) to sTrim
+            Move (Trim(sTrim)) to sTrim
+            If (bUtf8 = False) ;
+                Move (rfPrnDiagnosticAsWritten(sTrim)) to sTrim
+            Move sTrim to asMsgs[SizeOfArray(asMsgs)]
+            If (iKind = 1) ;
+                Increment iWarn
+            Else ;
+                Increment iErr
+            Increment iAdded
+        End
+        // All remaining diagnostics via the LF-prefixed needles.
+        Move (sLF + "WARNING:")     to sNW
+        Move (sLF + "ERROR:")       to sNE
+        Move (sLF + "LINK ERROR:")  to sNL
+        Move 1 to iFrom
+        Move 0 to iWpos     // cached next-hit positions (the LF of the hit): 0 = rescan, -1 = exhausted
+        Move 0 to iEpos
+        Move 0 to iLpos
+        While (iFrom <= iRegLen)
+            // Refresh a cached hit the cursor has passed (each needle rescans only when consumed).
+            If (iWpos >= 0 and iWpos < iFrom) Begin
+                Move (Pos(sNW, sRegion, iFrom)) to iWpos
+                If (iWpos = 0) ;
+                    Move -1 to iWpos
+            End
+            If (iEpos >= 0 and iEpos < iFrom) Begin
+                Move (Pos(sNE, sRegion, iFrom)) to iEpos
+                If (iEpos = 0) ;
+                    Move -1 to iEpos
+            End
+            If (iLpos >= 0 and iLpos < iFrom) Begin
+                Move (Pos(sNL, sRegion, iFrom)) to iLpos
+                If (iLpos = 0) ;
+                    Move -1 to iLpos
+            End
+            // The earliest live hit is the next diagnostic; none left = done.
+            Move 0 to iNext
+            If (iWpos > 0) ;
+                Move iWpos to iNext
+            If (iEpos > 0 and (iNext = 0 or iEpos < iNext)) ;
+                Move iEpos to iNext
+            If (iLpos > 0 and (iNext = 0 or iLpos < iNext)) ;
+                Move iLpos to iNext
+            If (iNext = 0) ;
+                Move (iRegLen + 1) to iFrom
+            Else Begin
+                // iNext = the LF BEFORE the diagnostic; the line runs (iNext+1) .. next LF.
+                Move (Pos(sLF, sRegion, (iNext + 1))) to iLF
+                If (iLF = 0) ;
+                    Move (iRegLen + 1) to iLF
+                Move (Mid(sRegion, (iLF - iNext - 1), (iNext + 1))) to sTrim
+                If (Right(sTrim, 1) = Character(13)) ;
+                    Move (Left(sTrim, (Length(sTrim) - 1))) to sTrim
+                Move (Trim(sTrim)) to sTrim
+                Move (rfPrnDiagnosticKind(sTrim)) to iKind
+                If (iKind > 0) Begin
+                    If (bUtf8 = False) ;
+                        Move (rfPrnDiagnosticAsWritten(sTrim)) to sTrim
+                    Move sTrim to asMsgs[SizeOfArray(asMsgs)]
+                    If (iKind = 1) ;
+                        Increment iWarn
+                    Else ;
+                        Increment iErr
+                    Increment iAdded
+                End
+                // Continue from the CONSUMED line's ending LF - it may itself prefix the next
+                // diagnostic (back-to-back diagnostic lines).
+                Move iLF to iFrom
+            End
+        Loop
+    End
+
+    // 4) The remainder becomes the new carry (bytes - see the seam note above): everything after the
+    //    last LF, or - when NO LF exists at/after iStart - everything from iStart (the head before
+    //    iStart was already consumed into the carried line in step 1).
+    If (iLastLF = -1) ;
+        Move iStart to iIdx
+    Else ;
+        Move (iLastLF + 1) to iIdx
+    Move (ResizeArray(ucaCarry, 0)) to ucaCarry
+    Move (iChunkLen - iIdx) to iLineLen
+    If (iLineLen > 0) Begin
+        Move (ResizeArray(ucaCarry, iLineLen)) to ucaCarry
+        Move 0 to iStart                     // reuse as the carry write index base
+        While (iStart < iLineLen)
+            Move ucaChunk[iIdx + iStart] to ucaCarry[iStart]
+            Increment iStart
+        Loop
+    End
+    Function_Return iAdded
+End_Function
+
+// End-of-compile: the listing may not end with an LF - process the leftover carry as the final line.
+Function rfPrnTailFlushCarry Global UChar[] ByRef ucaCarry Boolean bUtf8 String[] ByRef asMsgs Integer ByRef iWarn Integer ByRef iErr Returns Integer
+    Integer iKind iLen
+    String  sTrim
+
+    Move (SizeOfArray(ucaCarry)) to iLen
+    If (iLen = 0) ;
+        Function_Return 0
+    If (ucaCarry[iLen - 1] = 13) ;
+        Move (ResizeArray(ucaCarry, (iLen - 1))) to ucaCarry
+    If (bUtf8 = True) ;
+        Move (Trim(rfUtf8BytesToString(ucaCarry))) to sTrim
+    Else ;
+        Move (Trim(rfOemBytesToUtf8(ucaCarry))) to sTrim
+    Move (ResizeArray(ucaCarry, 0)) to ucaCarry
+    Move (rfPrnDiagnosticKind(sTrim)) to iKind
+    If (iKind = 0) ;
+        Function_Return 0
+    If (bUtf8 = False) ;
+        Move (rfPrnDiagnosticAsWritten(sTrim)) to sTrim
+    Move sTrim to asMsgs[SizeOfArray(asMsgs)]
+    If (iKind = 1) ;
+        Increment iWarn
+    Else ;
+        Increment iErr
+    Function_Return 1
+End_Function
+
+// Read a .prn listing (or a .err) and return ONLY the parsed compiler messages - the
+// WARNING: / ERROR: / LINK ERROR: lines. A .prn interleaves the FULL source listing
+// with the diagnostics, so we must filter to the diagnostic lines before parsing
+// (ExtractData would mis-parse a random listing line). For a .err every line already
+// is a diagnostic, so the filter is a harmless pass-through there. This is how the
+// modernization analyzer gets WARNINGS - the .err carries errors only.
+//
+// MEASURED, do not "optimise" this again (2026-07-22). On LegacyApp's 59 MB / 1.2-million-line
+// listing, on the real file:
+//     ReadErrorFile (this line-array read)    813 ms   1,214,059 lines
+//     the prefix filter below                 921 ms   40,093 kept
+//     MassageErrorFile                      1,641 ms   40,093 parsed
+//     ------------------------------------------------------------
+//     whole function                        ~3.4 s
+// It was rewritten to drive the live tail's byte-chunk filter (rfPrnTailConsume) on the theory that
+// materialising 1.2 million array elements was the cost of a 67-second Analyze. It was not: that
+// rewrite measured 58,297 ms - SEVENTEEN TIMES SLOWER - and the 67 seconds were never in here at all.
+// rfPrnTailConsume is the right tool for its own job, keeping up with a compiler writing 2.5 MB/s in
+// 120 ms slices; it is much slower per byte than the native line reader when handed a whole file.
+//
+// The number worth carrying away is 40,093: a listing this size holds forty thousand diagnostics, and
+// whatever the Analyze spends its time on, it spends it PER MESSAGE downstream of here.
+Function ReadCompilerMessages Global String sFileName Returns tCompileError[]
+    String[] asAll asMsg
+    Integer iSize iCount iMsg
+    String sTrim
+    tCompileError[] asResult
+
+    Get ReadErrorFile sFileName to asAll
+    Move (SizeOfArray(asAll)) to iSize
+    Move 0 to iMsg
+    Decrement iSize
+    For iCount from 0 to iSize
+        Move (Trim(asAll[iCount])) to sTrim
+        If (rfPrnDiagnosticKind(sTrim) <> 0) Begin
+            Move sTrim to asMsg[iMsg]
+            Increment iMsg
+        End
+    Loop
+    Get MassageErrorFile asMsg to asResult
+    Function_Return asResult
+End_Function

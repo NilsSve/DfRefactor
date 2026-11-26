@@ -1,0 +1,450 @@
+﻿Use cFTModalPanel.pkg         // FT: the dark modal, same base as MaintainLibrariesFT.dg
+Use cTimer.pkg                   // oCwPollTimer - the poll that makes this genuinely asynchronous
+Use RefactorConstants.h.pkg
+Use FTPageIsUp.pkg               // FT: FTHostPageIsUp - can the host's page take a live push now?
+Use cFTGridHost.pkg              // FT: the dialog's one host - a grid of 8 px columns, the page over its Close button (RDCFlexTron)
+Use FTAllWebControlClasses.pkg   // FT: cFTWebButton - Close
+Use cFTHtmlPage.pkg              // FT: the run's page - its title (psLabel) and the glyph beside it
+Use cLibraryInventory.pkg        // SwsFormatOf - the verdict comes from the FILE
+Use cWorkspaceCopyPlan.pkg       // UnresolvableLibraryRefs - the chain walk that names what df-cli tripped on
+Use cRDCAsyncProcess.pkg            // the process itself; started, then polled
+Use FTMarkupBuilders.pkg         // the HTML vocabulary - OpenHtml, IconLabel, the builders
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+Use cDfCliPackages.pkg           // DfCliPath / DfCliCapture - the df-cli that does the conversion
+
+/*  CONVERTING A WORKSPACE .sws FROM INI TO DATAFLEX 26 JSON - with the wait on screen.
+
+    WHY A DIALOG AND NOT A STATUS PANEL (Nils 2026-08-14). df-cli's convert can take a while, and
+    every earlier attempt at showing that went wrong in the same way: the work blocked the message
+    pump, so whatever was on screen froze, and a frozen thing is indistinguishable from a hung one.
+    This is the version that does not block.
+
+    GENUINELY ASYNCHRONOUS, which the earlier ones were not. RDCRunProgramBounded STARTS the child
+    asynchronously and then sits in a polling loop - so the process is async and the application is
+    not. Here the poll lives on a cTimer instead, which is exactly the use cRDCAsyncProcess's own header
+    describes. Between ticks the UI is live: the CSS bar animates by itself, the output area fills,
+    and the panel repaints because nothing is holding the pump.
+
+    THE OUTPUT IS THE POINT. df-cli explains itself perfectly well - "Failed to load workspace. Would
+    you like to attempt a repair? (y/n):", or the list of projects it could not find - and the
+    program has been paraphrasing that at second hand. Captured through the cmd.exe redirect
+    DfCliCapture already uses, then tailed on every tick, it is simply shown.
+
+    AND THE PROMPT CANNOT HANG US. StartProcess passes CREATE_NO_WINDOW, so the child has no console:
+    a read from stdin FAILS instead of waiting for a human. The question still lands in the log,
+    where it becomes the explanation rather than a deadlock. That is the whole lesson of 2026-08-14
+    turned into a feature.
+
+    A MARQUEE, NOT A MEASUREMENT. df-cli reports no progress, so the bar is a pure CSS animation that
+    says "still working" and claims no percentage. It moves on its own; no DataFlex tick drives it.
+
+    THE VERDICT COMES FROM THE FILE, never the exit code: the only question is whether the .sws is
+    JSON now, and the file is the one witness that cannot be wrong.
+
+    A PAGE OVER ITS CLOSE BUTTON (2026-09-30), built the way the library's message box is: one grid
+    host, which cFTModalPanel fits to the panel (phoClientHost); the run in a cFTHtmlPage, whose title
+    names the target version; and Close as a framework button (cFTWebButton) under it, shut until there
+    is a verdict. Until then Close was a chip in the page's HTML footer. df-cli's output keeps its own
+    scroll box inside the page, so the verdict under it stays in view however long the output grows.  */
+
+Object oConvertWorkspace_dg is a cFTModalPanel
+    Set Label to "Convert workspace to the DataFlex 26 format"
+    Set Size to 230 620
+    Set Location to 2 6
+    Set piMinSize to 170 500
+    Set Icon to "DFRefactor.ico"
+
+    // The .sws to convert. Never assumed to be the loaded workspace - the migration flow points this
+    // at a copy that is not open yet.
+    Property String  psSwsFile ""
+    // The version written into the converted file. The caller floors this at 26.0; nothing here does.
+    Property String  psTargetVersion "26.0"
+    // Where cmd.exe is told to put df-cli's stdout+stderr, and what the tail re-reads each tick.
+    Property String  psLogFile ""
+    // Everything read from that log so far, already escaped for HTML.
+    Property String  psOutput ""
+    // The async child, and how long it has been going.
+    Property Handle  phProc 0
+    Property Integer piElapsedMs 0
+    // False while it runs; True once there is a verdict. Drives the bar, the Close button and OnTimer.
+    Property Boolean pbFinished False
+    // The answer the caller gets: is the file JSON now?
+    Property Boolean pbConverted False
+    // Why it failed, when it did. Shown under the output rather than in a second dialog - a modal on
+    // top of a modal is how the confirm dialog's web host got broken in the first place.
+    Property String  psVerdict ""
+    // The programs the INI file listed before df-cli ran, for the check that every one arrived.
+    Property String[] pasListedProjects
+    // True when the converted file lacks one of them: the verdict names it, in the failure style.
+    Property Boolean pbProgramsLost False
+
+    Object oWebHost is a cFTGridHost
+        Set Location to 4 4
+        Set Size to 206 612
+        Set peAnchors to anNone         // placed by cFTModalPanel (phoClientHost)
+        // Row 0, the page, takes the extra height, and row 1 is 8 px of air above Close in row 2. Column 0 takes
+        // the extra width, so Close keeps to the right edge; the page spans every column.
+        Set piColumnCount to 12         // column 0, then Close's 11
+        Set psColumnWidths to "0/1fr"   // column 0 takes the extra width
+        Set psRowHeights to "0/1fr 1/8px"
+
+        // A path, and df-cli's own words, are DATA here - not markup. "R&D" is an ordinary folder
+        // name and an unescaped & silently truncates what follows it.
+        Function Esc String sText Returns String
+            Function_Return (rfHtmlEscape(sText))
+        End_Function
+
+        // The page's body: the file, the bar while df-cli works, its output and the verdict. The heading is the
+        // page's own title (ShowTitle), and Close is a framework button under the page.
+        Function BodyHtml Returns String
+            String sHtml sSws sOut sVerdict
+            Boolean bDone bOk bLost
+
+            Get psSwsFile       of (oConvertWorkspace_dg(Self)) to sSws
+            Get psOutput        of (oConvertWorkspace_dg(Self)) to sOut
+            Get pbFinished      of (oConvertWorkspace_dg(Self)) to bDone
+            Get pbConverted     of (oConvertWorkspace_dg(Self)) to bOk
+            Get psVerdict       of (oConvertWorkspace_dg(Self)) to sVerdict
+            Get pbProgramsLost  of (oConvertWorkspace_dg(Self)) to bLost
+
+            // The stylesheet, every rule in it scoped to the body's .cw; the palette's tokens come with the host.
+            Move (CssLink("convertworkspace")) to sHtml
+
+            Move (sHtml + (DivOpen("cw")) + (DivOpen("cw-p")) + (Esc(Self, sSws)) + CS_DivEnd) to sHtml
+            If (bDone = False) ;
+                Move (sHtml + (((DivOpen("cw-bar")) + '<i></i>') + CS_DivEnd)) to sHtml
+
+            Move (sHtml + (DivOpen("cw-out"))) to sHtml
+            If (Trim(sOut) = "") ;
+                Move (sHtml + ((SpanOpen("cw-wait")) + 'df-cli is running. Its output appears here as it arrives') + CS_Ellipsis + CS_SpanEnd) to sHtml
+            Else ;
+                Move (sHtml + sOut) to sHtml
+            Move (sHtml + CS_DivEnd) to sHtml
+
+            If (bDone = True) Begin
+                // A conversion that lost a program is not shown as a success (2026-09-11).
+                If (bOk = True and bLost = False) ;
+                    Move (sHtml + (DivOpen("cw-v cw-ok")) + (Esc(Self, sVerdict)) + CS_DivEnd) to sHtml
+                Else ;
+                    Move (sHtml + (DivOpen("cw-v cw-bad")) + (Esc(Self, sVerdict)) + CS_DivEnd) to sHtml
+            End
+
+            Move (sHtml + CS_DivEnd) to sHtml
+            Function_Return sHtml
+        End_Function
+
+        /* Row 0: the run. The title names the target version, so ShowTitle sets it on each open; the literal is the
+           Designer's. */
+        Object oCwPage is a cFTHtmlPage
+            Set piRowIndex to 0
+            Set piColumnSpan to 12
+            Set pbFillHeight to True        // the body fills the page; df-cli's output scrolls in its own box
+            Set psLabel to "Converting to the DataFlex 26.0 JSON workspace format"
+            Set psCSSClass to "ftpage ftg-export"
+            /* A SAMPLE FOR THE STUDIO'S DESIGNER, which draws a literal psHtml: BodyHtml's markup for a run that has
+               just started, with a made-up path. The program never shows it - Activating renders the real run
+               before the page loads (RefreshBody). */
+            Set psHtml to """
+            <link rel="stylesheet" href="CssStyle/convertworkspace.css">
+            <div class="cw">
+                <div class="cw-p">C:\Projects\Order Entry\Order Entry.sws</div>
+                <div class="cw-bar"><i></i></div>
+                <div class="cw-out"><span class="cw-wait">df-cli is running. Its output appears here as it arrives&hellip;</span></div></div>
+            """
+        End_Object
+
+        /* Row 2: CLOSE, a framework button (cFTWebButton, RDCFlexTron) at the bottom right. It is shut until df-cli
+           has finished and there is a verdict (RefreshBody); its OnButtonClick runs after the web click has returned
+           (the library's click relay), where the panel can close. 11 columns (78 px) fit the caption (Close ~72 px,
+           measured 2026-09-30). */
+        Object oCwCloseBtn is a cFTWebButton
+            Set piRowIndex to 2
+            Set piColumnIndex to 1
+            Set piColumnSpan to 11
+            Set psCaption to "Close"
+            Set psCSSClass to "ftbtn ftg-close"
+            Set pbEnabled to False
+            Set psToolTip to "Wait for df-cli to finish."
+
+            Procedure OnButtonClick
+                Send CloseNow of (oConvertWorkspace_dg(Self))
+            End_Procedure
+        End_Object
+    End_Object
+
+    // cFTModalPanel fits the host to the panel, when it is shown and on every resize.
+    Set phoClientHost to (oWebHost(Self))
+
+    /* THE PAGE AND CLOSE from the dialog's state - on each open and on every tick of the poll. UpdateHtml keeps
+       the page for a mount still to come and pushes it to a page that is up; the button's setter WebSets the same
+       way. Close opens when there is a verdict - pushed when that changes, not on every tick. */
+    Procedure RefreshBody
+        Handle hoHost hoPage hoClose
+        String sHtml
+        Boolean bDone
+        Move (oWebHost(Self)) to hoHost
+        Move (oCwPage(hoHost)) to hoPage
+        Move (oCwCloseBtn(hoHost)) to hoClose
+        Get BodyHtml of hoHost to sHtml
+        Send UpdateHtml of hoPage sHtml
+        Get pbFinished to bDone
+        Send UpdateEnabled of hoClose bDone
+        Send UpdateToolTip of hoClose (If(bDone, "", "Wait for df-cli to finish."))
+        Send CheckUpdateWebUI of hoHost
+    End_Procedure
+
+    /* THE TAIL. Re-reads the whole log each tick rather than tracking an offset: it is a handful of
+       lines, and a length-based tail would be trusting a size Windows can report STALE while the
+       writer still holds the handle (see the note in feedback about open-handle file sizes).
+
+       A read that fails is not an error - cmd.exe may hold the file at the moment we look - so the
+       previous text simply stands until the next tick.
+
+       EACH LINE AS ITS BYTES ARE (Nils 2026-09-30: a workspace named "... with åäö" showed here as
+       "... with Õõ÷"). df-cli writes its own messages in the Windows code page, and this read them as
+       OEM - the BOM rule's answer for a file without one. rfReadToolOutputLines reads a line as UTF-8
+       when its bytes are UTF-8, in the Windows code page otherwise - as cDfCliPackages reads df-cli. */
+    Procedure PullOutput
+        String[] asLines
+        String sLog sOut
+        Integer i iMax
+
+        Get psLogFile to sLog
+        If (sLog = "" or vFilePathExists(sLog) = 0) ;
+            Procedure_Return
+        Move (rfReadToolOutputLines(sLog)) to asLines
+        Move (SizeOfArray(asLines) - 1) to iMax
+        If (iMax < 0) ;
+            Procedure_Return
+        Move "" to sOut
+        For i from 0 to iMax
+            Move (sOut + (Esc(oWebHost(Self), asLines[i])) + Character(10)) to sOut
+        Loop
+        Set psOutput to sOut
+    End_Procedure
+
+    /* THE POLL. 250ms - fast enough that output feels live, slow enough that re-reading a short log
+       costs nothing. Everything that decides the outcome happens here; Popup just waits for Close. */
+    Object oCwPollTimer is a cTimer
+        Set piTimeout to 250
+        Set pbEnabled to False
+
+        Procedure OnTimer
+            Handle  hoProc hoPlan
+            Boolean bRunning bDone
+            Integer iElapsed iFormat i
+            String  sSws sVerdict sTarget
+            String[] asListed asNow asLost asBad
+            Handle  hoInv
+
+            Get pbFinished of (oConvertWorkspace_dg(Self)) to bDone
+            If (bDone = True) Begin
+                Set pbEnabled to False
+                Procedure_Return
+            End
+
+            Get phProc of (oConvertWorkspace_dg(Self)) to hoProc
+            If (hoProc = 0) Begin
+                Set pbEnabled to False
+                Procedure_Return
+            End
+
+            Send PullOutput of (oConvertWorkspace_dg(Self))
+            Get IsProcessRunning of hoProc to bRunning
+            Get piElapsedMs of (oConvertWorkspace_dg(Self)) to iElapsed
+            Move (iElapsed + 250) to iElapsed
+            Set piElapsedMs of (oConvertWorkspace_dg(Self)) to iElapsed
+
+            // Still going, and inside the deadline: repaint and come back.
+            If (bRunning = True and iElapsed < (CI_DfCliConvertTimeoutSecs * 1000)) Begin
+                Send RefreshBody of (oConvertWorkspace_dg(Self))
+                Procedure_Return
+            End
+
+            Move "" to sVerdict
+            If (bRunning = True) Begin
+                Send KillProcess of hoProc 1
+                Move ("df-cli did not finish within" * String(CI_DfCliConvertTimeoutSecs) * "seconds and was stopped.") to sVerdict
+            End
+            Send CleanUp of hoProc
+            Send Destroy of hoProc
+            Set phProc of (oConvertWorkspace_dg(Self)) to 0
+            Set pbEnabled to False
+
+            // One last read - the final lines usually land as the process exits.
+            Send PullOutput of (oConvertWorkspace_dg(Self))
+
+            /* ASKED OF THE FILE. Whatever df-cli said and whatever it returned, the question is
+               whether the .sws is JSON now. */
+            Get psSwsFile of (oConvertWorkspace_dg(Self)) to sSws
+            Get Create (RefClass(cLibraryInventory)) to hoInv
+            Get SwsFormatOf of hoInv sSws to iFormat
+            Send Destroy of hoInv
+            Set pbConverted of (oConvertWorkspace_dg(Self)) to (iFormat = eSwsJson)
+
+            If (iFormat = eSwsJson) Begin
+                Move "Converted. The workspace file is now in the DataFlex 26 JSON format, and packages can be added to it." to sVerdict
+                /* EVERY PROGRAM MUST ARRIVE (Nils 2026-09-11). What the INI file listed is checked
+                   against what the JSON file lists now, read the way the Compile program list
+                   reads it. The section was renumbered before df-cli ran, so this should find
+                   nothing - it is here so that a program df-cli drops for any other reason is
+                   named, not found missing later. */
+                Get pasListedProjects of (oConvertWorkspace_dg(Self)) to asListed
+                Get GetWorkspaceProjects of ghoApplication sSws to asNow
+                Move (SwsProgramsMissing(asListed, asNow)) to asLost
+                If (SizeOfArray(asLost) > 0) Begin
+                    Move (sVerdict * SwsProgramsMissingNote(asLost)) to sVerdict
+                    Set pbProgramsLost of (oConvertWorkspace_dg(Self)) to True
+                End
+            End
+            Else If (sVerdict = "") Begin
+                Move "NOT converted - the file is still in the older INI format. df-cli's own output is above; a library reference that does not resolve is the usual cause, because df-cli reads the whole chain before it converts anything." to sVerdict
+                /* NAME THE ENTRY (2026-09-14). On a real workspace df-cli's account above was a dump
+                   of a library file's own text and "Failed to load/install library X"; the chain walk
+                   knows which entry that is, and whether the file is missing or is there carrying
+                   git conflict markers. The same walk the copy step reports with. */
+                Get psTargetVersion of (oConvertWorkspace_dg(Self)) to sTarget
+                Get Create (RefClass(cWorkspaceCopyPlan)) to hoPlan
+                Get UnresolvableLibraryRefs of hoPlan sSws sTarget to asBad
+                Send Destroy of hoPlan
+                If (SizeOfArray(asBad) > 0) Begin
+                    Move (sVerdict + " These references do not resolve:") to sVerdict
+                    For i from 0 to (SizeOfArray(asBad) - 1)
+                        Move (sVerdict + " [" + asBad[i] + "]") to sVerdict
+                    Loop
+                End
+            End
+            Set psVerdict   of (oConvertWorkspace_dg(Self)) to sVerdict
+            Set pbFinished  of (oConvertWorkspace_dg(Self)) to True
+            Send RefreshBody of (oConvertWorkspace_dg(Self))
+        End_Procedure
+    End_Object
+
+    // Close, from its button's OnButtonClick - after the web click, where the modal can end. The button is shut
+    // until there is a verdict, so this needs no guard of its own.
+    Procedure CloseNow
+        Send Close_Panel
+    End_Procedure
+
+    // The page's title names the version the file is converted to - stored for a page that loads, and pushed to a
+    // page that is up.
+    Procedure ShowTitle String sTarget
+        Handle hoHost hoPage
+        String sTitle
+        Move (oWebHost(Self)) to hoHost
+        Move (oCwPage(hoHost)) to hoPage
+        Move ("Converting to the DataFlex " + sTarget + " JSON workspace format") to sTitle
+        Set psLabel of hoPage to sTitle
+        // A push only for a page that is up (RDCFlexTron's FTHostPageIsUp: the host active, its page called
+        // home). This runs as the dialog opens, when its page is still to be built - and on a second opening
+        // the framework's own flag alone still said "ready", for the page of the first.
+        If (FTHostPageIsUp(hoHost)) ;
+            WebSet psLabel of hoPage to sTitle
+    End_Procedure
+
+    /* Start the child, then hand over to the timer. Called from Activating rather than before Popup
+       because the web host has to be alive for the first paint to reach it. */
+    Procedure Activating
+        String sDfCli sSws sTarget sLog sHome sArgs
+        String[] asNone
+        Handle hoProc
+        Boolean bOk
+        Integer iPos
+
+        Forward Send Activating
+
+        Set psOutput    to ""
+        Set psVerdict   to ""
+        Set pbFinished  to False
+        Set pbConverted to False
+        Set piElapsedMs to 0
+        Set pasListedProjects to asNone
+        Set pbProgramsLost to False
+
+        Get psSwsFile to sSws
+        Get psTargetVersion to sTarget
+        Send ShowTitle sTarget
+        Get DfCliPath to sDfCli
+        If (sDfCli = "" or sSws = "") Begin
+            Set psVerdict  to "df-cli.exe was not found beside the selected compiler, so nothing could be converted."
+            Set pbFinished to True
+            Send RefreshBody
+            Procedure_Return
+        End
+
+        // The workspace's own folder: where the log goes, and where the child runs.
+        Move (RightPos("\", sSws)) to iPos
+        If (iPos > 0) ;
+            Move (Left(sSws, iPos)) to sHome
+        Else ;
+            Move ".\" to sHome
+        Move (sHome + "dfrefactor_convert.log") to sLog
+        If (vFilePathExists(sLog)) ;
+            Move (rfDeleteFile(sLog)) to bOk
+        Set psLogFile to sLog
+
+        /* THE PROGRAM LIST GOES IN WHOLE (Nils 2026-09-11). df-cli's convert keeps only the LAST of
+           two [Projects] lines that share a key, and says nothing about the one it drops - a real
+           workspace lost its main program that way. So the section is renumbered Project0..N
+           first, every program kept; a healthy file is not touched, and a JSON one has no
+           [Projects] to touch. What the file listed is kept as well, so the verdict can check that
+           every program arrived. */
+        Set pasListedProjects to (SwsIniProjectsFromLines(rfReadEncodedFileAsStringArray(sSws)))
+        If (SwsIniRenumberProjectsInFile(sSws) = False) Begin
+            Set psVerdict  to "NOT converted. The [Projects] list in this file had to be renumbered first - df-cli drops a program when two share a number - and the file could not be written. It may be read-only, or open in the Studio."
+            Set pbFinished to True
+            Send RefreshBody
+            Procedure_Return
+        End
+
+        /* THE cmd.exe WRAPPER, exactly as DfCliCapture builds it - cmd strips the first and last
+           quote of the /c argument, so the real command is wrapped in a second pair. It is what
+           makes stdout+stderr capturable at all.
+
+           Started through cRDCAsyncProcess so the poll can live on the timer, and with bShowWindow
+           False so CREATE_NO_WINDOW applies: no console means df-cli's repair prompt fails fast
+           instead of waiting for an answer nobody can give. The question still reaches the log. */
+        Move ('/c " "' + sDfCli + '" convert --df ' + sTarget + ' "' + sSws + '" > "' + sLog + '" 2>&1 "') to sArgs
+        Get Create (RefClass(cRDCAsyncProcess)) to hoProc
+        Get StartProcess of hoProc "cmd.exe" sArgs sHome False to bOk
+        If (bOk = False) Begin
+            Send CleanUp of hoProc
+            Send Destroy of hoProc
+            Set psVerdict  to "df-cli could not be started."
+            Set pbFinished to True
+            Send RefreshBody
+            Procedure_Return
+        End
+        Set phProc to hoProc
+        Send RefreshBody
+        Set pbEnabled of (oCwPollTimer(Self)) to True
+    End_Procedure
+End_Object
+
+/*  Convert sSwsFile to the DataFlex 26 JSON workspace format, showing the run.
+
+    Returns True when the file is JSON afterwards - which is asked of the FILE, not of df-cli's exit
+    code. sTargetVersion is written into the converted workspace; the CALLER floors it at 26.0,
+    because a target below that has no packages to record and no reason to convert.
+
+        Get ConvertWorkspaceToJson sSws sTarget to bOk
+
+    Global, so both the Libraries dialog and the migration copy can reach it.  */
+Function ConvertWorkspaceToJson Global String sSwsFile String sTargetVersion Returns Boolean
+    Handle ho
+    Boolean bOk
+
+    Move (Trim(sSwsFile)) to sSwsFile
+    If (sSwsFile = "") ;
+        Function_Return False
+    If (Trim(sTargetVersion) = "") ;
+        Move "26.0" to sTargetVersion
+
+    Move (oConvertWorkspace_dg(Self)) to ho
+    Set psSwsFile       of ho to sSwsFile
+    Set psTargetVersion of ho to sTargetVersion
+    Send Popup of ho
+    Get pbConverted of ho to bOk
+    Function_Return bOk
+End_Function

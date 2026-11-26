@@ -1,0 +1,489 @@
+//****************************************************************************
+// $Module type: Class Package
+// $Module name: cClassPackageIndex
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-31
+//
+// Description : Class-name -> defining-package index built over the DataFlex install and the
+//               workspace's libraries; the resolver behind MakeFileAutonomous's missing-Use
+//               suggestions.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use RefactorFileIO.pkg
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+
+/*  cClassPackageIndex - which package DEFINES a given class, and the file-autonomy transform
+    built on it.
+
+    WHY AN INDEX IS NOT AN OPTIMISATION HERE. The obvious rule, "a class named cFoo comes from
+    cFoo.pkg", is wrong far more often than it is right: of the 1,208 class definitions in the
+    DataFlex 25 Pkg folder only 286 - 24% - live in a file named after the class. Without a
+    content-built map there is nothing to emit but bad guesses, so the map IS the feature.
+
+    A STANDALONE CLASS so the suite can create it directly (UnitTests declares
+    "Object oApplication is a cApplication", so anything hung off cRefactorApplication is
+    unreachable from tests - see cLibraryInventory for the same reasoning).
+
+    The index is a SORTED array of "CLASSNAME|packagefile" keys, searched by a manual lower-bound
+    binary search. A class with two definitions therefore appears twice and is detectable as
+    ambiguous, which matters: a workspace using both VDFQuery and vwin32fh has vWin32fh's classes
+    defined in two places, and guessing between them would be worse than leaving the file alone.
+*/
+Class cClassPackageIndex is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // "CLASSNAME|packagefile.pkg", UPPERCASE class, sorted.
+        Property String[] pasClassKeys
+        Property Boolean  pbIndexLoaded False
+    End_Procedure
+
+    /* The class names DEFINED by these lines - "Class <Name> is a <Base>" at statement start.
+       Comment lines are skipped; a "Class" appearing later in a line is not a definition. */
+    Function ClassNamesFromLines String[] ByRef asLines Returns String[]
+        String[] asOut
+        String sLine sWord
+        Integer i iMax
+
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move (Replaces(Character(9), asLines[i], " ")) to sLine
+            Move (Trim(sLine)) to sLine
+            If (Left(sLine, 2) <> "//") Begin
+                Move (Lowercase(sLine)) to sWord
+                If (Left(sWord, 6) = "class ") Begin
+                    Get _NthWordOf sLine 2 to sWord
+                    // "Class X is a Y" - word 3 must be "is", or this is not a definition.
+                    If (sWord <> "") Begin
+                        Get _NthWordOf sLine 3 to sLine
+                        If (Lowercase(sLine) = "is") ;
+                            Move sWord to asOut[SizeOfArray(asOut)]
+                    End
+                End
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // Nth (1-based) whitespace-delimited word, "" when there are fewer. Local copy so this class
+    // stays free of the funclib (which the test runner cannot reach through ghoFuncLib either).
+    { Visibility=Private }
+    Function _NthWordOf String sText Integer iN Returns String
+        String sWord sCh
+        Integer iLen i iWord
+        Boolean bIn
+
+        Move (Trim(Replaces(Character(9), sText, " "))) to sText
+        Move (Length(sText)) to iLen
+        Move 0 to iWord
+        Move False to bIn
+        Move "" to sWord
+        For i from 1 to iLen
+            Move (Mid(sText, 1, i)) to sCh
+            If (sCh = " ") Begin
+                If (bIn = True and iWord = iN) ;
+                    Function_Return sWord
+                Move False to bIn
+            End
+            Else Begin
+                If (bIn = False) Begin
+                    Increment iWord
+                    Move True to bIn
+                End
+                If (iWord = iN) ;
+                    Move (sWord + sCh) to sWord
+            End
+        Loop
+        If (iWord >= iN) ;
+            Function_Return sWord
+        Function_Return ""
+    End_Function
+
+    // Adds every "<CLASS>|<file.pkg>" definition found under sFolder (recursive) to asKeys.
+    { Visibility=Private }
+    Procedure _IndexPkgFolder String sFolder String[] ByRef asKeys
+        tRFSearchResult[] aFiles
+        String[] asLines asNames asMasks
+        String sMask sBase
+        Integer i iMax j jMax iPos m mMax
+
+        If (sFolder = "") ;
+            Procedure_Return
+        If (rfDirectoryExists(sFolder) = False) ;
+            Procedure_Return
+        /* .dd AS WELL AS .pkg (Nils 2026-08-03). A DataDictionary CLASS lives in a .dd file -
+           "Class OrderDtl_DataDictionary Is A DataDictionary" in DDSrc\OrderDtl.dd - and it is
+           made available to other files by "Use OrderDtl.dd", exactly as a package is. Indexing
+           only *.pkg meant MakeFileAutonomous could NEVER resolve a DD class, so every file
+           instantiating one reported "no package found for <X>_DATADICTIONARY - left alone."
+           That was not a lookup to investigate: the class was simply never in the index.
+
+           Nothing downstream needs special-casing, because sBase below keeps the FULL file name
+           WITH its extension - the key becomes "ORDERDTL_DATADICTIONARY|OrderDtl.dd" and the
+           emitted line "Use OrderDtl.dd". Only CLASS declarations are indexed
+           (ClassNamesFromLines), so a .dd's own "Object X is a Y" instances are never mistaken
+           for definitions. */
+        Move "*.pkg" to asMasks[0]
+        Move "*.dd"  to asMasks[1]
+        Move (SizeOfArray(asMasks) - 1) to mMax
+        For m from 0 to mMax
+            Move (vFolderFormat(sFolder) + asMasks[m]) to sMask
+            Get rfFileSearchRecursive sMask DIRMODE_FILES_ONLY False to aFiles
+            Move (SizeOfArray(aFiles) - 1) to iMax
+            For i from 0 to iMax
+                Move (rfReadEncodedFileAsStringArray(aFiles[i].sFilename)) to asLines
+                Get ClassNamesFromLines (&asLines) to asNames
+                Move (SizeOfArray(asNames) - 1) to jMax
+                If (jMax >= 0) Begin
+                    Move (RightPos("\", aFiles[i].sFilename)) to iPos
+                    If (iPos > 0) ;
+                        Move (Mid(aFiles[i].sFilename, (Length(aFiles[i].sFilename) - iPos), (iPos + 1))) to sBase
+                    Else ;
+                        Move aFiles[i].sFilename to sBase
+                    For j from 0 to jMax
+                        Move (Uppercase(asNames[j]) + "|" + sBase) to asKeys[SizeOfArray(asKeys)]
+                    Loop
+                End
+            Loop
+        Loop
+    End_Procedure
+
+    /* Builds the index from the DataFlex install's Pkg folder plus any extra folders (the
+       workspace's own source and its libraries). Returns the number of definitions indexed.
+
+       Each package is read ONCE into the key set - never re-read per class being resolved. That
+       inversion is the pinned-indicator lesson: the per-candidate re-scan there cost 24s of a 55s
+       Analyze. */
+    Function BuildIndex String sInstallPkgFolder String[] ByRef asExtraFolders Returns Integer
+        String[] asKeys
+        Integer i iMax
+
+        Send _IndexPkgFolder sInstallPkgFolder (&asKeys)
+        Move (SizeOfArray(asExtraFolders) - 1) to iMax
+        For i from 0 to iMax
+            Send _IndexPkgFolder asExtraFolders[i] (&asKeys)
+        Loop
+        Move (SortArray(asKeys)) to asKeys
+        Set pasClassKeys to asKeys
+        Set pbIndexLoaded to True
+        Function_Return (SizeOfArray(asKeys))
+    End_Function
+
+    // Index of the first key >= sPrefix, or SizeOfArray when none - a manual lower bound, because
+    // BinarySearchArray only finds exact matches and a class may have several entries.
+    { Visibility=Private }
+    Function _LowerBound String[] ByRef asSorted String sPrefix Returns Integer
+        Integer iLo iHi iMid
+        Move 0 to iLo
+        Move (SizeOfArray(asSorted)) to iHi
+        While (iLo < iHi)
+            Move ((iLo + iHi) / 2) to iMid
+            If (asSorted[iMid] < sPrefix) ;
+                Move (iMid + 1) to iLo
+            Else ;
+                Move iMid to iHi
+        Loop
+        Function_Return iLo
+    End_Function
+
+    /* Every package that defines sClass - empty when unknown, more than one when ambiguous.
+       Duplicated definitions of the same class in the SAME package collapse to one entry. */
+    Function PackagesForClass String sClass Returns String[]
+        String[] asKeys asOut asSeen
+        String sPrefix sKey sPkg
+        Integer i iMax iLen
+
+        Move (Uppercase(Trim(sClass)) + "|") to sPrefix
+        If (sPrefix = "|") ;
+            Function_Return asOut
+        Get pasClassKeys to asKeys
+        Move (Length(sPrefix)) to iLen
+        Move (SizeOfArray(asKeys)) to iMax
+        Move (_LowerBound(Self, &asKeys, sPrefix)) to i
+        While (i < iMax)
+            Move asKeys[i] to sKey
+            If (Left(sKey, iLen) <> sPrefix) ;
+                Move iMax to i
+            Else Begin
+                // Returned in the package file's OWN case - an emitted "Use ccjgridclasses.pkg"
+                // compiles (DataFlex does not care) but does not match the file on disk, and a
+                // refactoring that mangles the case of every filename it writes is a poor citizen.
+                // Deduped case-INSENSITIVELY through asSeen.
+                Move (Mid(sKey, (Length(sKey) - iLen), (iLen + 1))) to sPkg
+                If (SearchArray(Lowercase(sPkg), asSeen) = -1) Begin
+                    Move (Lowercase(sPkg)) to asSeen[SizeOfArray(asSeen)]
+                    Move sPkg to asOut[SizeOfArray(asOut)]
+                End
+                Increment i
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* The reverse lookup: every class one package file defines (the keys are "CLASS|leaf"), matched on
+       the leaf name case-insensitively - UPPERCASE names, as stored; empty when the package is not
+       indexed. For a converter deciding whether a "Use <that package>" still earns its place after it
+       converted the class the package is named after (cGridToCJGridBase.RetireConvertedSubclassUses,
+       2026-09-05): a package may define more than that one class, and only the file's text can tell. */
+    Function ClassesInPackage String sPkgLeaf Returns String[]
+        String[] asKeys asOut
+        String sSuffix sKey
+        Integer i iMax iLen iBar
+
+        Move ("|" + Lowercase(Trim(sPkgLeaf))) to sSuffix
+        If (sSuffix = "|") ;
+            Function_Return asOut
+        Get pasClassKeys to asKeys
+        Move (Length(sSuffix)) to iLen
+        Move (SizeOfArray(asKeys) - 1) to iMax
+        For i from 0 to iMax
+            Move asKeys[i] to sKey
+            If (Lowercase(Right(sKey, iLen)) = sSuffix) Begin
+                Move (Pos("|", sKey)) to iBar
+                If (iBar > 1) ;
+                    Move (Left(sKey, (iBar - 1))) to asOut[SizeOfArray(asOut)]
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* The classes this file INSTANTIATES: "Object <n> is a <C>" declarations and RefClass(<C>)
+       references (Get Create (RefClass(cFoo)) instantiates just as surely as an Object block).
+       Comment lines are skipped.
+       And the classes it BUILDS ON (2026-11-01): the base of "Class <X> is a <C>", and the class of a method
+       added to it - "Procedure <M> for <C>", "Procedure Set <M> for <C>", "Function <M> for <C> Returns <T>".
+       Both compile only once <C> is defined, as an object does: one workspace's dbList subclass package had no
+       Use for the package dbList lives in, and every program that used it failed on its class line.
+       aiFirst comes back with the line each class is first used on, parallel to the result (2026-11-01). */
+    Function ClassesUsedFirstLines String[] ByRef asLines Integer[] ByRef aiFirst Returns String[]
+        String[] asOut
+        String sLine sLow sW1 sW3 sW4 sCls sRest
+        Integer i iMax iPos iEnd
+
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move (Trim(Replaces(Character(9), asLines[i], " "))) to sLine
+            If (Left(sLine, 2) <> "//" and sLine <> "") Begin
+                Move (Lowercase(sLine)) to sLow
+                Get _NthWordOf sLow 1 to sW1
+                If (sW1 = "object") Begin
+                    Get _NthWordOf sLow 3 to sW3
+                    Get _NthWordOf sLow 4 to sW4
+                    // "is a" and "is an" are both legal DataFlex.
+                    If (sW3 = "is" and (sW4 = "a" or sW4 = "an")) Begin
+                        Get _NthWordOf sLine 5 to sCls
+                        If (sCls <> "" and SearchArray(Uppercase(sCls), asOut) = -1) Begin
+                            Move (Uppercase(sCls)) to asOut[SizeOfArray(asOut)]
+                            Move i to aiFirst[SizeOfArray(aiFirst)]
+                        End
+                    End
+                End
+                // "Class <X> is a <C>" - the base class.
+                If (sW1 = "class") Begin
+                    Get _NthWordOf sLow 3 to sW3
+                    Get _NthWordOf sLow 4 to sW4
+                    If (sW3 = "is" and (sW4 = "a" or sW4 = "an")) Begin
+                        Get _NthWordOf sLine 5 to sCls
+                        If (sCls <> "" and SearchArray(Uppercase(sCls), asOut) = -1) Begin
+                            Move (Uppercase(sCls)) to asOut[SizeOfArray(asOut)]
+                            Move i to aiFirst[SizeOfArray(aiFirst)]
+                        End
+                    End
+                End
+                // "Procedure <M> for <C>", "Procedure Set <M> for <C>", "Function <M> for <C> ..." - a method added to <C>.
+                If (sW1 = "procedure" or sW1 = "function") Begin
+                    Get _NthWordOf sLow 3 to sW3
+                    Get _NthWordOf sLow 4 to sW4
+                    Move "" to sCls
+                    If (sW3 = "for") ;
+                        Get _NthWordOf sLine 4 to sCls
+                    Else If (sW4 = "for" and _NthWordOf(Self, sLow, 2) = "set") ;
+                        Get _NthWordOf sLine 5 to sCls
+                    If (sCls <> "" and SearchArray(Uppercase(sCls), asOut) = -1) Begin
+                        Move (Uppercase(sCls)) to asOut[SizeOfArray(asOut)]
+                        Move i to aiFirst[SizeOfArray(aiFirst)]
+                    End
+                End
+                // RefClass(<C>) anywhere on the line.
+                Move (Pos("refclass(", sLow)) to iPos
+                While (iPos > 0)
+                    Move (Mid(sLine, (Length(sLine) - (iPos + 8)), (iPos + 9))) to sRest
+                    Move (Pos(")", sRest)) to iEnd
+                    If (iEnd > 1) Begin
+                        Move (Trim(Left(sRest, (iEnd - 1)))) to sCls
+                        If (sCls <> "" and SearchArray(Uppercase(sCls), asOut) = -1) Begin
+                            Move (Uppercase(sCls)) to asOut[SizeOfArray(asOut)]
+                            Move i to aiFirst[SizeOfArray(aiFirst)]
+                        End
+                    End
+                    Move (Mid(sLow, (Length(sLow) - (iPos + 8)), (iPos + 9))) to sLow
+                    Move (Mid(sLine, (Length(sLine) - (iPos + 8)), (iPos + 9))) to sLine
+                    Move (Pos("refclass(", sLow)) to iPos
+                Loop
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // ClassesUsedFirstLines without the lines.
+    Function ClassesUsedInLines String[] ByRef asLines Returns String[]
+        String[] asOut
+        Integer[] aiFirst
+        Get ClassesUsedFirstLines (&asLines) (&aiFirst) to asOut
+        Function_Return asOut
+    End_Function
+
+    // The package files this file already Uses, lowercased, extension included.
+    Function UsedPackagesInLines String[] ByRef asLines Returns String[]
+        String[] asOut
+        String sLine sName
+        Integer i iMax
+
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move (Trim(Replaces(Character(9), asLines[i], " "))) to sLine
+            If (Lowercase(Left(sLine, 4)) = "use " and Left(sLine, 2) <> "//") Begin
+                Get _NthWordOf sLine 2 to sName
+                Move (Lowercase(Trim(sName))) to sName
+                If (sName <> "" and SearchArray(sName, asOut) = -1) ;
+                    Move sName to asOut[SizeOfArray(asOut)]
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // The index of the last "Use" line above iBefore that compiles in every case, or -1 (rfUseAnchorStep). A new Use
+    // goes after it - as late as the class allows, so the file's existing include ORDER is disturbed as little as
+    // possible: a Use inserted at the top can change which file first pulls a package in, and that has produced a
+    // runtime error 98 in this codebase after a perfectly clean compile.
+    { Visibility=Private }
+    Function _LastUseLineBefore String[] ByRef asLines Integer iBefore Returns Integer
+        Integer i iAt iDepth
+        Boolean bUseInBlock
+        Move -1 to iAt
+        Move 0 to iDepth
+        Move False to bUseInBlock
+        For i from 0 to (iBefore - 1)
+            Send rfUseAnchorStep asLines[i] i (&iDepth) (&bUseInBlock) (&iAt)
+        Loop
+        Function_Return iAt
+    End_Function
+
+    /* THE TRANSFORM: give the file a "Use <package>" for every class it instantiates but does not
+       already include. Returns the number of Use lines added; asAmbiguous / asUnknown come back
+       with the classes deliberately left alone.
+
+       Deliberately conservative - it SKIPS rather than guesses whenever it is not certain:
+         - a class defined in THIS file needs no Use;
+         - a class the index does not know is left alone (it may be declared in a .src, or come
+           from a package this scan never saw);
+         - a class with MORE THAN ONE defining package is left alone. That is not hypothetical: a
+           workspace using both VDFQuery and vwin32fh has vWin32fh's classes defined twice, and
+           picking the wrong one produces a file that compiles into the wrong implementation.
+
+       Plain "Use <file>.pkg" at column zero - no #IFDEF wrapper, and the same level as every other
+       Use in these files (Nils 2026-07-31).
+
+       BEFORE THE FIRST LINE THAT NEEDS IT (2026-11-01). Each new Use goes after the last Use above the first line
+       that uses one of its classes - which is the file's last Use whenever that line comes after all of them, as
+       before. One workspace's shared package adds methods to dbGrid at line 349 and has Uses down to line 626:
+       'Use Dftable.pkg' after the last of them came too late, and every program still failed on the class. */
+    Function AddMissingUses String[] ByRef asCode String[] ByRef asAmbiguous String[] ByRef asUnknown Returns Integer
+        String[] asUsed asHave asLocal asLocalUp asPkgs asAdd asAddLow asIns
+        Integer[] aiFirst aiAddFirst
+        String sCls sPkg sRow
+        Integer i iMax j iAt iCount iFirstCode iBar
+
+        Get ClassesUsedFirstLines (&asCode) (&aiFirst) to asUsed
+        Get UsedPackagesInLines (&asCode) to asHave
+        Get ClassNamesFromLines (&asCode) to asLocal
+        Get _UpperAll (&asLocal) to asLocalUp
+        Move (SizeOfArray(asUsed) - 1) to iMax
+        For i from 0 to iMax
+            Move asUsed[i] to sCls
+            // Defined right here - nothing to include.
+            If (SearchArray(sCls, asLocalUp) = -1) Begin
+                Get PackagesForClass sCls to asPkgs
+                If (SizeOfArray(asPkgs) = 0) Begin
+                    Move sCls to asUnknown[SizeOfArray(asUnknown)]
+                End
+                Else If (SizeOfArray(asPkgs) > 1) Begin
+                    Move sCls to asAmbiguous[SizeOfArray(asAmbiguous)]
+                End
+                Else Begin
+                    // asHave / asAddLow are lowercase; asAdd keeps the file's own case for output.
+                    Move asPkgs[0] to sPkg
+                    If (SearchArray(Lowercase(sPkg), asHave) = -1) Begin
+                        Move (SearchArray(Lowercase(sPkg), asAddLow)) to j
+                        If (j = -1) Begin
+                            Move (Lowercase(sPkg)) to asAddLow[SizeOfArray(asAddLow)]
+                            Move sPkg to asAdd[SizeOfArray(asAdd)]
+                            Move aiFirst[i] to aiAddFirst[SizeOfArray(aiAddFirst)]
+                        End
+                        // Another class of the same package used earlier: the Use goes before that one.
+                        Else If (aiFirst[i] < aiAddFirst[j]) ;
+                            Move aiFirst[i] to aiAddFirst[j]
+                    End
+                End
+            End
+        Loop
+
+        Move (SizeOfArray(asAdd)) to iCount
+        If (iCount = 0) ;
+            Function_Return 0
+        // Where each goes: after the last Use above its first use. No Use above it: above the first real
+        // statement, NOT at line 0 - these files open with a comment header and the block belongs on top of the
+        // code, not on top of the header. As "<line, 6 digits>|<package>" rows, sorted, and inserted from the
+        // bottom up so the lines above keep their numbers; packages at one place keep their alphabetical order.
+        Get _FirstCodeLine (&asCode) to iFirstCode
+        For j from 0 to (iCount - 1)
+            Get _LastUseLineBefore (&asCode) aiAddFirst[j] to iAt
+            If (iAt = -1) ;
+                Move (iFirstCode - 1) to iAt
+            Move (Right("000000" + String(iAt + 1), 6) + "|" + asAdd[j]) to asIns[SizeOfArray(asIns)]
+        Loop
+        Move (SortArray(asIns)) to asIns
+        Move (iCount - 1) to j
+        While (j >= 0)
+            Move asIns[j] to sRow
+            Move (Pos("|", sRow)) to iBar
+            Move (Integer(Left(sRow, (iBar - 1)))) to iAt
+            Move (InsertInArray(asCode, iAt, ("Use " + Right(sRow, (Length(sRow) - iBar))))) to asCode
+            Decrement j
+        Loop
+        Function_Return iCount
+    End_Function
+
+    // The first line that is neither blank nor a // comment - where a Use block belongs in a file
+    // that has none, so it lands under the header rather than above it. 0 when the file is all
+    // comment or empty.
+    { Visibility=Private }
+    Function _FirstCodeLine String[] ByRef asLines Returns Integer
+        String sLine
+        Integer i iMax
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move (Trim(Replaces(Character(9), asLines[i], " "))) to sLine
+            If (sLine <> "" and Left(sLine, 2) <> "//") ;
+                Function_Return i
+        Loop
+        Function_Return 0
+    End_Function
+
+    // Uppercased copy of an array - for a case-insensitive SearchArray against class names.
+    { Visibility=Private }
+    Function _UpperAll String[] ByRef asIn Returns String[]
+        String[] asOut
+        Integer i iMax
+        Move (SizeOfArray(asIn) - 1) to iMax
+        For i from 0 to iMax
+            Move (Uppercase(asIn[i])) to asOut[i]
+        Loop
+        Function_Return asOut
+    End_Function
+
+End_Class

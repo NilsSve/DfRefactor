@@ -1,0 +1,2467 @@
+//****************************************************************************
+// $Module type: Package
+// $Module name: cShadowedPackageFiles.pkg
+//
+// $Author     : Nils Svedmyr, RDC Tools International.
+// Copyright (c) 2026 RDC Tools International
+// E-mail      : support@rdctools.com
+// Web-site    : http://www.rdctools.com
+//
+// Created     : 2026-08-30 (Military date format - Year-Month-Day)
+//
+// Description : Finds package files that exist in more than one place under the workspace, and
+//               says which copy the compiler actually used.
+//
+//               A stale copy compiles perfectly, which is the whole problem: fix the library and
+//               the workspace keeps building the old file. One real case drove this - a workspace
+//               carried nine copies of the same wrapper package; the modernised one was a declared
+//               git dependency and checked out, yet a vendored copy inside ANOTHER package won the
+//               search path, so seven obsolete-function warnings survived every attempt to fix
+//               them at the source. Nothing in the compiler output says "you have another copy".
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use GlobalFunctionsProcedures.pkg
+Use RefactorConstants.h.pkg
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput / rfFileSearchRecursive
+
+// The file that picks the language DataFlex's own texts compile in (see IsLanguageSettingLeaf).
+Define CS_LanguageSettingFile for "Language_Current.inc"
+
+/* ---- WHICH COPY THE BUILD COMPILED - the note on a dashboard finding row (Nils 2026-09-11) ----
+
+   Nils, of a row about a file that exists twice under the workspace: "It is the '2 copies of this
+   file exist here...' that is very confusing". The note these replace counted FILE NAMES under the
+   home and printed "N copies of this file exist here; the build uses THIS one" on every row whose
+   name was counted twice. The other copy sat in a language-variant folder no build searches,
+   nothing said where it was, and "THIS one" was never checked - a row about that other copy would
+   have printed the same sentence, falsely.
+
+   The build's own listing records which file it compiled ("Including file:"), so the note is
+   decided from that: a row about the copy the build compiled needs no note; a row about a
+   DIFFERENT file of a compiled name gets the compiled copy named - the one case where the reader
+   is about to edit something the compiler never reads; anything else, no note.
+
+   Pure and global. The dashboard asks once per finding row, where creating an object costs and
+   copying an array per row once cost a 131-second render (see CompiledScopeStamp). The index is
+   built ONCE per listing; a row then pays one BinarySearchArray and a string compare. Defined in
+   calling order - a function used in an expression must already be known to the compiler. */
+
+// The file part of a path, lowercased - the one spelling the index and every lookup share.
+Function FileLeafLower Global String sPath Returns String
+    Integer iAt
+
+    Move (Replaces("/", Trim(sPath), "\")) to sPath
+    Move (RightPos("\", sPath)) to iAt
+    If (iAt > 0) ;
+        Move (Right(sPath, (Length(sPath) - iAt))) to sPath
+    Function_Return (Lowercase(sPath))
+End_Function
+
+/* THE PACKAGE CHECKOUT A FILE SITS IN (2026-11-12): the folder that holds it, with its trailing "\" -
+   "E:\Ws\DfPkg\NilsSve_VDFQuery20-904dc8c\" - for a file in either of df-cli's two pools,
+   <workspace>\DfPkg\<checkout>\ and ...\DataFlex\Packages\Cache\<entry>\; "" for any other file, and for
+   one directly in the pool root, which is in no package. FailingPackageCopies counts errors per package
+   with it. The same two shapes as PoolPackageDisplayNameOf below. */
+Function PoolPackageRootOf Global String sFile Returns String
+    String sLow sSeg
+    Integer iPos iEnd
+
+    Move (Replaces("/", Trim(sFile), "\")) to sFile
+    Move (Lowercase(sFile)) to sLow
+    Move (Pos("\dfpkg\", sLow)) to iPos
+    If (iPos > 0) ;
+        Move (iPos + 7) to iPos
+    Else Begin
+        Move (Pos("\dataflex\packages\cache\", sLow)) to iPos
+        If (iPos = 0) ;
+            Function_Return ""
+        Move (iPos + 25) to iPos
+    End
+    Move (Mid(sFile, (Length(sFile)), iPos)) to sSeg
+    Move (Pos("\", sSeg)) to iEnd
+    If (iEnd = 0) ;
+        Function_Return ""
+    Function_Return (Left(sFile, (iPos + iEnd - 1)))
+End_Function
+
+/* THE PACKAGE A POOL FILE BELONGS TO, as the name a reader knows it by - "VDFQuery20". Moved here from
+   cModAnalyzer.PoolPackageDisplayName on 2026-11-12 (that method now returns this), so the "In packages"
+   band and the overriding-copies rows can never name one package two ways. See that method's comment
+   for the two pool shapes and the tail rule. PURE. */
+Function PoolPackageDisplayNameOf Global String sFile Returns String
+    String sLow sSeg sTail sCh
+    Integer iPos iEnd i iLen
+    Boolean bHexOrVer
+
+    Move (Lowercase(sFile)) to sLow
+    Move (Pos("\dfpkg\", sLow)) to iPos
+    If (iPos > 0) ;
+        Move (iPos + 7) to iPos
+    Else Begin
+        Move (Pos("\dataflex\packages\cache\", sLow)) to iPos
+        If (iPos = 0) ;
+            Function_Return ""
+        Move (iPos + 25) to iPos
+    End
+    Move (Mid(sFile, (Length(sFile)), iPos)) to sSeg
+    Move (Pos("\", sSeg)) to iEnd
+    If (iEnd = 0) ;
+        Function_Return ""              // a file directly in the pool root is not a package
+    Move (Left(sSeg, (iEnd - 1))) to sSeg
+    // <Owner>_<Name>: the first underscore is df-cli's separator.
+    Move (Pos("_", sSeg)) to iPos
+    If (iPos > 0 and iPos < Length(sSeg)) ;
+        Move (Mid(sSeg, Length(sSeg), (iPos + 1))) to sSeg
+    // -<commit> / -<version> tail: strip only when it really looks like one.
+    Move (RightPos("-", sSeg)) to iPos
+    If (iPos > 1 and iPos < Length(sSeg)) Begin
+        Move (Mid(sSeg, Length(sSeg), (iPos + 1))) to sTail
+        Move (Length(sTail)) to iLen
+        Move True to bHexOrVer
+        For i from 1 to iLen
+            Move (Lowercase(Mid(sTail, 1, i))) to sCh
+            If (not("0123456789abcdef" contains sCh)) ;
+                Move False to bHexOrVer
+        Loop
+        If (bHexOrVer = True and iLen < 7) ;
+            Move False to bHexOrVer     // too short for a commit - "Utils-2" style names keep their tail... unless it is a version
+        If (bHexOrVer = False) Begin
+            // A dotted version tail ("1.2.0")?
+            Move True to bHexOrVer
+            For i from 1 to iLen
+                Move (Mid(sTail, 1, i)) to sCh
+                If (not("0123456789." contains sCh)) ;
+                    Move False to bHexOrVer
+            Loop
+            If (not(sTail contains ".")) ;
+                Move False to bHexOrVer
+        End
+        If (bHexOrVer = True) ;
+            Move (Left(sSeg, (iPos - 1))) to sSeg
+    End
+    Function_Return sSeg
+End_Function
+
+/* The listing's compiled files as a lookup. Returns the distinct file names, lowercased and SORTED
+   for BinarySearchArray, and fills asBuilt at the same indexes with the path compiled under each -
+   Character(9)-separated in the rare case the build compiled two files of one name, which a Use
+   naming a relative path can do. */
+Function CompiledLeafIndex Global String[] asCompiled String[] ByRef asBuilt Returns String[]
+    String[] asAll asLeaf
+    String sPath sLow
+    Integer i iMax iAt
+
+    Move (SizeOfArray(asCompiled) - 1) to iMax
+    For i from 0 to iMax
+        If (Trim(asCompiled[i]) <> "") ;
+            Move (FileLeafLower(asCompiled[i])) to asAll[SizeOfArray(asAll)]
+    Loop
+    Move (SortArray(asAll)) to asAll
+    // Adjacent duplicates out. i = 0 is its own branch: DataFlex does not short-circuit, so
+    // "i = 0 or asAll[i] <> asAll[i - 1]" would still read asAll[-1].
+    Move (SizeOfArray(asAll) - 1) to iMax
+    For i from 0 to iMax
+        If (i = 0) ;
+            Move asAll[i] to asLeaf[SizeOfArray(asLeaf)]
+        Else If (asAll[i] <> asAll[i - 1]) ;
+            Move asAll[i] to asLeaf[SizeOfArray(asLeaf)]
+    Loop
+    Move (ResizeArray(asBuilt, SizeOfArray(asLeaf))) to asBuilt
+    Move (SizeOfArray(asCompiled) - 1) to iMax
+    For i from 0 to iMax
+        Move (Trim(asCompiled[i])) to sPath
+        If (sPath <> "") Begin
+            Move (BinarySearchArray(FileLeafLower(sPath), asLeaf)) to iAt
+            If (iAt <> -1) Begin
+                Move (Lowercase(sPath)) to sLow
+                If (asBuilt[iAt] = "") ;
+                    Move sPath to asBuilt[iAt]
+                Else If (Pos((Character(9) + sLow + Character(9)), (Character(9) + Lowercase(asBuilt[iAt]) + Character(9))) = 0) ;
+                    Move (asBuilt[iAt] + Character(9) + sPath) to asBuilt[iAt]
+            End
+        End
+    Loop
+    Function_Return asLeaf
+End_Function
+
+/* The compiled copy to name on a row about sFile, given sBuilt - the path(s) the build compiled
+   under sFile's name, as CompiledLeafIndex stores them. "" when sFile IS one of them - the row is
+   about the copy the build read, and there is nothing to warn about - or when there is none. */
+Function CompiledCopyFor Global String sFile String sBuilt Returns String
+    String sLow
+    Integer iTab
+
+    Move (Lowercase(Trim(sFile))) to sLow
+    If (sLow = "" or Trim(sBuilt) = "") ;
+        Function_Return ""
+    If (Pos((Character(9) + sLow + Character(9)), (Character(9) + Lowercase(sBuilt) + Character(9))) > 0) ;
+        Function_Return ""
+    Move (Pos(Character(9), sBuilt)) to iTab
+    If (iTab > 0) ;
+        Function_Return (Left(sBuilt, (iTab - 1)))
+    Function_Return sBuilt
+End_Function
+
+// The program a listing is for: "<name>.x64.prn" or "<name>.prn" -> "<name>.src"; "" otherwise.
+Function ProgramOfListing Global String sPrn Returns String
+    String sLeaf
+    Integer iAt
+
+    Move (Trim(sPrn)) to sLeaf
+    Move (RightPos("\", sLeaf)) to iAt
+    If (iAt > 0) ;
+        Move (Right(sLeaf, (Length(sLeaf) - iAt))) to sLeaf
+    If (Lowercase(Right(sLeaf, 4)) <> ".prn") ;
+        Function_Return ""
+    Move (Left(sLeaf, (Length(sLeaf) - 4))) to sLeaf
+    If (Lowercase(Right(sLeaf, 4)) = ".x64" or Lowercase(Right(sLeaf, 4)) = ".x86") ;
+        Move (Left(sLeaf, (Length(sLeaf) - 4))) to sLeaf
+    If (sLeaf = "") ;
+        Function_Return ""
+    Function_Return (sLeaf + ".src")
+End_Function
+
+/* The note's words: "<program> compiles <copy>, not this copy. " - the compiled copy relative to the
+   workspace home when it lies inside it, so it fits the cell the note leads. A folder that merely
+   STARTS like the home is not inside it. Plain text: it goes through a tooltip builder that
+   escapes. */
+Function CompiledElsewhereNote Global String sProgram String sBuilt String sHome Returns String
+    String sShow sHomeSep
+
+    Move (Trim(sBuilt)) to sShow
+    If (sShow = "") ;
+        Function_Return ""
+    Move (Trim(sHome)) to sHomeSep
+    If (sHomeSep <> "" and Right(sHomeSep, 1) <> "\") ;
+        Move (sHomeSep + "\") to sHomeSep
+    If (sHomeSep <> "" and Lowercase(Left(sShow, Length(sHomeSep))) = Lowercase(sHomeSep)) ;
+        Move (Right(sShow, (Length(sShow) - Length(sHomeSep)))) to sShow
+    If (Trim(sProgram) = "") ;
+        Function_Return ("The last build compiled " + sShow + ", not this copy. ")
+    Function_Return (Trim(sProgram) + " compiles " + sShow + ", not this copy. ")
+End_Function
+
+Class cShadowedPackageFiles is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // The report this run wrote, for the caller's "Other Log Files" list.
+        Property String psLogFile ""
+        // Test-only override for KeptShadowsJsonPath - see the note there. "" in production.
+        Property String psKeptShadowsFile ""
+        // The listing the resolution evidence came from - named in the report so the reader can
+        // tell WHICH compile is being described.
+        Property String psListingUsed ""
+    End_Procedure
+
+    /* PURE. One listing record, of the shape the compiler writes into a .prn:
+
+           Including file: vWin32fh.pkg    (E:\Ws\DfPkg\SomePackage-<sha>\AppSrc\vWin32fh.pkg)
+
+       Returns the LOWERCASE leaf name and fills sPath with the full path exactly as written; ""
+       when the line is not an include record.
+
+       The first "(" is the wrapper's, never one inside the path: a path may well contain
+       "Program Files (x86)", but that sits AFTER the opening one, and the close is taken from the
+       RIGHT. A file NAME containing a parenthesis would break this, and no package has one. */
+    Function IncludedFileFromPrnLine String sLine String ByRef sPath Returns String
+        String  sTrim sRest sName
+        Integer iOpen iClose
+
+        Move "" to sPath
+        Move (Trim(sLine)) to sTrim
+        If (Lowercase(Left(sTrim, 15)) <> "including file:") ;
+            Function_Return ""
+        Move (Trim(Right(sTrim, (Length(sTrim) - 15)))) to sRest
+        Move (Pos("(", sRest))      to iOpen
+        Move (RightPos(")", sRest)) to iClose
+        If (iOpen = 0 or iClose <= iOpen) ;
+            Function_Return ""
+        Move (Trim(Mid(sRest, (iClose - iOpen - 1), (iOpen + 1)))) to sPath
+        Move (Trim(Left(sRest, (iOpen - 1)))) to sName
+        If (sName = "" or sPath = "") ;
+            Function_Return ""
+        Function_Return (Lowercase(sName))
+    End_Function
+
+    // PURE. Every candidate that shares sLeaf with sWinner but is not sWinner itself - the copies
+    // the compile did NOT use. Case-insensitive on the leaf and on the whole path, because Windows
+    // hides filename case and the two records reach us from different sources.
+    Function ShadowCopiesOf String sLeaf String sWinner String[] asCandidates Returns String[]
+        String[] asOut
+        String   sWinLC sLeafLC sCand
+        Integer  i iLast
+
+        Move (Lowercase(Trim(sWinner))) to sWinLC
+        Move (Lowercase(Trim(sLeaf)))   to sLeafLC
+        Move (SizeOfArray(asCandidates) - 1) to iLast
+        For i from 0 to iLast
+            Move (Trim(asCandidates[i])) to sCand
+            If (sCand <> "") Begin
+                If (Lowercase(ExtractFileName(sCand)) = sLeafLC) Begin
+                    If (Lowercase(sCand) <> sWinLC) ;
+                        Move sCand to asOut[SizeOfArray(asOut)]
+                End
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* The compiler listing to read the resolution out of - the NEWEST .prn under the workspace.
+
+       Newest rather than "the main program's", because the resolution recorded in a listing is
+       only true of the build that wrote it: an older listing describes a path layout that may
+       since have changed. "" when the workspace has never been compiled, which the caller reports
+       rather than guessing a winner from path order. */
+    Function NewestListingFile String sHome Returns String
+        tRFSearchResult[] aFound
+        String   sBest
+        DateTime dtBest dtThis
+        Integer  i iLast
+
+        Move "" to sBest
+        Move (rfFileSearchRecursive((vFolderFormat(sHome) + "*.prn"), DIRMODE_FILES_ONLY, False)) to aFound
+        Move (SizeOfArray(aFound) - 1) to iLast
+        For i from 0 to iLast
+            Move aFound[i].dtLastWriteDateTime to dtThis
+            If (sBest = "" or dtThis > dtBest) Begin
+                Move aFound[i].sFilename to sBest
+                Move dtThis to dtBest
+            End
+        Loop
+        Function_Return sBest
+    End_Function
+
+    /* PURE. The extensions a Use or an #INCLUDE resolves by NAME through the search path - the
+       files the sweeps and both reference sets are built from.
+
+       WIDENED 2026-09-15 from .pkg / .inc / .h, and the earlier reasoning is worth keeping because
+       it was half right: a workspace's OWN .vw / .dd / .sl is reached by its own path, so a
+       same-named one in a variant folder is a different screen, not a shadow. What that missed is
+       the other half of the population. The install ships .dg / .vw / .mac (MonthCalendarPrompt.dg
+       among them), and libraries ship .utl / .nui / .vw - one migration copy carried the app's own
+       DATES.UTL and MACROS.UTL in front of VDFQuery's, invisible to a three-extension sweep. Which
+       copy is a shadow is decided by the LISTING, not by the extension; the sweep's only job is to
+       find every file a Use could reach. .src stays out: a program is never Used, and a library's
+       sample program beside the app's own of the same name is not a copy of anything. */
+    Function SourceLeafExtensions Returns String[]
+        String[] asOut
+        Move ".pkg" to asOut[0]
+        Move ".inc" to asOut[1]
+        Move ".h"   to asOut[2]
+        Move ".utl" to asOut[3]
+        Move ".nui" to asOut[4]
+        Move ".dg"  to asOut[5]
+        Move ".vw"  to asOut[6]
+        Move ".sl"  to asOut[7]
+        Move ".dd"  to asOut[8]
+        Move ".rv"  to asOut[9]
+        Move ".bp"  to asOut[10]
+        Move ".wo"  to asOut[11]
+        Move ".cls" to asOut[12]
+        Move ".mac" to asOut[13]
+        Function_Return asOut
+    End_Function
+
+    // Every source file under the workspace (SourceLeafExtensions), full paths.
+    Function WorkspaceSourceFiles String sHome Returns String[]
+        tRFSearchResult[] aFound
+        String[] asExt asOut
+        String   sPath sSkip
+        Integer  iMask iMaskLast iFile iLast
+
+        // OUR OWN BACKUP TREE IS NOT A SHADOW. DFRefactor mirrors the files it changes into
+        // DFRefactor_Backup\<drive>\<path>, so every backed-up file matched its own original and
+        // came back as a finding - 17 of the first live run's 53, every one of them noise, and
+        // noise of the worst kind: the tool reporting itself (Nils 2026-08-30).
+        Move (Lowercase(CS_DirSeparator + CS_BackupFolder + CS_DirSeparator)) to sSkip
+        Get SourceLeafExtensions to asExt
+        Move (SizeOfArray(asExt) - 1) to iMaskLast
+        For iMask from 0 to iMaskLast
+            Move (rfFileSearchRecursive((vFolderFormat(sHome) + "*" + asExt[iMask]), DIRMODE_FILES_ONLY, False)) to aFound
+            Move (SizeOfArray(aFound) - 1) to iLast
+            For iFile from 0 to iLast
+                Move (Trim(aFound[iFile].sFilename)) to sPath
+                If (sPath <> "") Begin
+                    If (not(Lowercase(sPath) contains sSkip)) ;
+                        Move sPath to asOut[SizeOfArray(asOut)]
+                End
+            Loop
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // PURE. A folder name reduced to letters and digits, lowercased - so "Data Folder Selector"
+    // and "NilsSve_DataFolderSelector_Library_DF26-40f317da" can be recognised as the same library
+    // under two naming conventions.
+    Function NormalisedFolderName String sName Returns String
+        String  sOut sCh
+        Integer i iLen
+
+        Move (Lowercase(Trim(sName))) to sOut
+        Move (Length(sOut)) to iLen
+        Move "" to sName
+        For i from 1 to iLen
+            Move (Mid(sOut, 1, i)) to sCh
+            If ((sCh >= "a" and sCh <= "z") or (sCh >= "0" and sCh <= "9")) ;
+                Move (sName + sCh) to sName
+        Loop
+        Function_Return sName
+    End_Function
+
+    /* The DfPkg package checkout that corresponds to a Libraries\ folder, or "".
+
+       Matched on the normalised name being CONTAINED in the package's: a checkout is named
+       <owner>_<library>-<sha>, so the library's own name is a fragment of it. Deliberately not the
+       reverse - "duf" must find "NilsSve_DUFLibrary26.0-25ae4a4d", but "NilsSve_DUFLibrary26.0"
+       must never be claimed by a folder called "lib". */
+    Function PackageFolderFor String sHome String sLibFolder Returns String
+        tRFSearchResult[] aDirs
+        String  sKey sCand
+        Integer i iLast
+
+        Move (NormalisedFolderName(Self, sLibFolder)) to sKey
+        If (sKey = "") ;
+            Function_Return ""
+        Move (rfFileSearch((vFolderFormat(sHome) + "DfPkg" + CS_DirSeparator + "*.*"), DIRMODE_DIRECTORIES_ONLY, False)) to aDirs
+        Move (SizeOfArray(aDirs) - 1) to iLast
+        For i from 0 to iLast
+            Move (Trim(aDirs[i].sFilename)) to sCand
+            If (sCand <> "" and sCand <> "." and sCand <> "..") Begin
+                If ((NormalisedFolderName(Self, sCand)) contains sKey) ;
+                    Function_Return (vFolderFormat(sHome) + "DfPkg" + CS_DirSeparator + sCand)
+            End
+        Loop
+        Function_Return ""
+    End_Function
+
+    /* PURE. True for the extensions WorkspaceSourceFiles sweeps - see SourceLeafExtensions.
+       Declared ABOVE its caller deliberately: it is read from an EXPRESSION, and DataFlex resolves
+       those at the point of use, not at the end of the class. */
+    Function IsSourceLeaf String sLeaf Returns Boolean
+        String[] asExt
+        Integer i iLast
+
+        Move (Lowercase(Trim(sLeaf))) to sLeaf
+        Get SourceLeafExtensions to asExt
+        Move (SizeOfArray(asExt) - 1) to iLast
+        For i from 0 to iLast
+            If (Right(sLeaf, Length(asExt[i])) = asExt[i]) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    /* How a stale library folder compares with the package that replaced it. Fills the three counts
+       the reader actually needs to judge a cleanup:
+         iOnlyHere - source files present in the folder and in NO form in the package. THE decisive
+                     number: it is what would be lost, and on one real workspace it was 86 of 154
+                     (an old DUF tree carrying its own sub-libraries, which are separate packages now).
+         iDiffer   - same file name, different SIZE. Compared by size, not content: enough to say
+                     "these are not the same file", cheap enough to run over a whole tree.
+         iSame     - same name, same size.
+       Counting SOURCE files only (the WorkspaceSourceFiles extensions), because a stray .bak or an
+       image says nothing about whether code would be lost. */
+    Procedure FolderVersusPackage String sLibDir String sPkgDir Integer ByRef iSame Integer ByRef iDiffer Integer ByRef iOnlyHere
+        tRFSearchResult[] aLib aPkg
+        String[] asPkgLeaf
+        Integer[] aiPkgSize
+        String  sLeaf
+        Integer i iLast iAt
+
+        Move 0 to iSame
+        Move 0 to iDiffer
+        Move 0 to iOnlyHere
+        Move (rfFileSearchRecursive((vFolderFormat(sPkgDir) + "*.*"), DIRMODE_FILES_ONLY, False)) to aPkg
+        Move (SizeOfArray(aPkg) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(ExtractFileName(aPkg[i].sFilename))) to sLeaf
+            Move sLeaf to asPkgLeaf[SizeOfArray(asPkgLeaf)]
+            Move (rfFileSize(aPkg[i].sFilename)) to aiPkgSize[SizeOfArray(aiPkgSize)]
+        Loop
+        Move (rfFileSearchRecursive((vFolderFormat(sLibDir) + "*.*"), DIRMODE_FILES_ONLY, False)) to aLib
+        Move (SizeOfArray(aLib) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(ExtractFileName(aLib[i].sFilename))) to sLeaf
+            If (IsSourceLeaf(Self, sLeaf) = True) Begin
+                Move (SearchArray(sLeaf, asPkgLeaf)) to iAt
+                If (iAt = -1) ;
+                    Increment iOnlyHere
+                Else If (aiPkgSize[iAt] = (rfFileSize(aLib[i].sFilename))) ;
+                    Increment iSame
+                Else ;
+                    Increment iDiffer
+            End
+        Loop
+    End_Procedure
+
+    /* PURE. The library FOLDER a removed .sws entry belongs to, or "" when there is nothing this
+       tool may touch. Given the workspace home and an entry as the .sws records it - relative or
+       absolute - it answers the DIRECT CHILD of <home>\Libraries that contains it.
+
+       Walking up to that child rather than taking the .sws file's own parent, because a library
+       routinely keeps its .sws in a subfolder: vWin32fh's lives in StudioLibrary\, so the parent is
+       Libraries\vwin32fh\StudioLibrary and retiring THAT would leave the library half-present and
+       still findable.
+
+       Answers "" for an entry that does not live under <home>\Libraries at all. A library declared
+       by absolute path into another project is shared with whatever else declares it, and a folder
+       outside the workspace is not this workspace's to rename - the one case where doing nothing is
+       obviously right. */
+    Function RetirableLibraryFolder String sHome String sEntry Returns String
+        String sPath sRoot sLow sRootLow sRest sName
+        Integer iAt
+
+        Move (Trim(sEntry)) to sPath
+        If (sPath = "" or Trim(sHome) = "") ;
+            Function_Return ""
+        Move (Replaces("/", sPath, CS_DirSeparator)) to sPath
+        // Relative entries are written relative to the workspace home (RelativeLibraryEntry).
+        If (not(sPath contains ":")) ;
+            Move (vFolderFormat(sHome) + sPath) to sPath
+        Move (vFolderFormat(sHome) + "Libraries" + CS_DirSeparator) to sRoot
+        Move (Lowercase(sPath)) to sLow
+        Move (Lowercase(sRoot)) to sRootLow
+        If (Left(sLow, Length(sRootLow)) <> sRootLow) ;
+            Function_Return ""
+        Move (Right(sPath, (Length(sPath) - Length(sRoot)))) to sRest
+        Move (Pos(CS_DirSeparator, sRest)) to iAt
+        If (iAt < 2) ;
+            Function_Return ""
+        Move (Left(sRest, (iAt - 1))) to sName
+        Function_Return (sRoot + sName)
+    End_Function
+
+    /* PURE. The direct children of <home>\Libraries that asBefore's entries point into and asNow's
+       do not - what a change to the library list stopped using - each once, in asBefore's order.
+
+       FOLDER AGAINST FOLDER, never entry against entry (2026-09-11). One folder can hold more than
+       one .sws - a library ships one per release, which is how these are versioned - so dropping one
+       entry does not orphan a folder a sibling entry still names. And the SAME entry is written
+       differently once df-cli has converted the file - "Libraries\X\X.sws" in [Libraries],
+       "Libraries/X/X.sws" in a JSON dependency - which an entry compare would read as a removal. A
+       git dependency names no folder at all, so the library it replaced drops out, which is the
+       point. Whether the folder is still ON DISK, and whether something further down the chain
+       still declares it, are the caller's questions (vFolderExists, IsOrphanedLibraryFolder). */
+    Function LibraryFoldersNoLongerListed String sHome String[] asBefore String[] asNow Returns String[]
+        String[] asNowLow asSeenLow asOut
+        String sFolder sLow
+        Integer i iMax
+
+        Move (SizeOfArray(asNow) - 1) to iMax
+        For i from 0 to iMax
+            Get RetirableLibraryFolder sHome asNow[i] to sFolder
+            If (sFolder <> "") ;
+                Move (Lowercase(sFolder)) to asNowLow[SizeOfArray(asNowLow)]
+        Loop
+        Move (SizeOfArray(asBefore) - 1) to iMax
+        For i from 0 to iMax
+            Get RetirableLibraryFolder sHome asBefore[i] to sFolder
+            Move (Lowercase(sFolder)) to sLow
+            If (sFolder <> "" and SearchArray(sLow, asNowLow) = -1 and SearchArray(sLow, asSeenLow) = -1) Begin
+                Move sLow    to asSeenLow[SizeOfArray(asSeenLow)]
+                Move sFolder to asOut[SizeOfArray(asOut)]
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* ---- THE LIBRARY FOLDER A PACKAGE REPLACED -------------------------------------------
+
+       Nils 2026-09-10: "If libraries were also ticked when a workspace was copied to a new
+       location, and then they were removed from the Libraries dialog + packages added in their
+       place ... the analyzer searches both the libraries and packages, aka there are duplicates."
+
+       IT IS NOT DUPLICATES, and that is worse. A DfPkg checkout is excluded from the refactoring
+       scope (CS_NoFolderList, since 2026-08-18) and a folder under <home>\Libraries is not - it is
+       an ordinary folder under the home, found by the ordinary home scan. So the two are never
+       BOTH scanned: the one the compiler builds is out of scope, and the one it abandoned is in.
+       The user then fixes a warning in a file that takes no part in the build, rebuilds, and the
+       warning is still there - the failure this whole class exists to name.
+
+       AND NOTHING ALREADY HERE DROPS IT. RemoveLibraryFolders (the "Include library folders"
+       untick) deletes only rows that are under a declared library root AND NOT under the home, so
+       a library inside <home>\Libraries fails the second test; and once the .sws stops declaring
+       it, it is not a library root any more either. RemoveSystemFolders takes only CS_NoFolderList
+       names. MaintainLibrariesFT asks when its dialog closes after a showing that stopped using a
+       folder (OfferRetireAfterClose, 2026-09-11 - an offer at OK before that) - event-driven, so a
+       workspace copied while already in this state, or one where the question was declined, is
+       not asked again. This is the standing detector for that state. */
+
+    /* PURE. Is this direct child of <home>\Libraries one that nothing declares any more?
+
+       THE DECLARATION TEST IS BY PATH, NOT BY NAME. A "does any .sws mention it" test - which
+       SwsDeclarationText below answers, for a different question - reads FALSE here: a git
+       dependency names the library in its URL precisely BECAUSE it is now a package
+       ("https://github.com/Someone/Library-DUF.git" contains "duf"), so the folder it replaced
+       would look declared for ever. asDeclaredLibPaths is the caller's list of library SOURCE
+       folders actually declared by the workspace - GetWorkspaceLibrarySourceFolders, which follows
+       local dependencies and skips git ones - and a folder is declared when any of them is AT or
+       UNDER it.
+
+       A folder an earlier round already retired is not offered again: <name>.OLD, and .OLD2 upward
+       when the first name was taken. Only the last segment is judged, so a workspace living under
+       a path with ".old" in it is unaffected. */
+    Function IsOrphanedLibraryFolder String sLibFolder String[] asDeclaredLibPaths Returns Boolean
+        String  sLow sName sDecl
+        Integer i iMax iAt
+
+        Move (Lowercase(Trim(sLibFolder))) to sLow
+        If (sLow = "") ;
+            Function_Return False
+        If (Right(sLow, 1) = CS_DirSeparator) ;
+            Move (Left(sLow, (Length(sLow) - 1))) to sLow
+        Move (RightPos(CS_DirSeparator, sLow)) to iAt
+        If (iAt > 0) ;
+            Move (Right(sLow, (Length(sLow) - iAt))) to sName
+        Else ;
+            Move sLow to sName
+        If (sName contains ".old") ;
+            Function_Return False
+        Move (SizeOfArray(asDeclaredLibPaths) - 1) to iMax
+        For i from 0 to iMax
+            Move (Lowercase(Trim(asDeclaredLibPaths[i]))) to sDecl
+            If (Right(sDecl, 1) = CS_DirSeparator) ;
+                Move (Left(sDecl, (Length(sDecl) - 1))) to sDecl
+            If (sDecl <> "") Begin
+                If (sDecl = sLow) ;
+                    Function_Return False
+                If (Left(sDecl, (Length(sLow) + 1)) = (sLow + CS_DirSeparator)) ;
+                    Function_Return False
+            End
+        Loop
+        Function_Return True
+    End_Function
+
+    /* PURE. The name a retire should give sFolder, given the sibling names already TAKEN
+       (lowercased, full paths): <name>.OLD, or the first free <name>.OLD2, .OLD3 ... and "" when
+       even .OLD99 is taken - which the caller reports rather than guessing further.
+
+       Pure so the numbering is testable: it is the one part of a retire that can quietly destroy
+       the copy a previous retire left behind, and rfRenameFile REFUSES to overwrite, so a wrong
+       name here shows up as a failure rather than a loss - but only if the numbering is right. */
+    Function RetireTargetName String sFolder String[] asTakenLower Returns String
+        String  sBase sTry
+        Integer iN
+
+        Move (Trim(sFolder)) to sBase
+        If (sBase = "") ;
+            Function_Return ""
+        If (Right(sBase, 1) = CS_DirSeparator) ;
+            Move (Left(sBase, (Length(sBase) - 1))) to sBase
+        Move (sBase + ".OLD") to sTry
+        Move 2 to iN
+        While (SearchArray(Lowercase(sTry), asTakenLower) <> -1 and iN < 100)
+            Move (sBase + ".OLD" + String(iN)) to sTry
+            Increment iN
+        Loop
+        If (SearchArray(Lowercase(sTry), asTakenLower) <> -1) ;
+            Function_Return ""
+        Function_Return sTry
+    End_Function
+
+    /* PURE - the FILE twin of RetireTargetName (Nils 2026-09-14). The name a retire gives a shadowing
+       COPY, given the sibling names already taken (lowercased, full paths): <file>.shadowed, or the
+       first free <file>.shadowed2, .shadowed3 ... and "" when even .shadowed99 is taken.
+
+       Why a number is needed at all: a first [Rename them] leaves <file>.shadowed, a Revert moves the
+       backup back as the live file, "Offer them again" forgets the retire, and the next [Rename them]
+       asked rfRenameFile to move the file onto its own twin - refused, as it must be (that twin is a
+       copy only a hand can restore from), and reported as "a file of that name already exists" three
+       times over on a real copy, while the row kept offering the same press. A taken twin is not a
+       failure; it is a number. Nothing is deleted either way. */
+    Function ShadowTargetName String sFile String[] asTakenLower Returns String
+        String  sBase sTry
+        Integer iN
+
+        Move (Trim(sFile)) to sBase
+        If (sBase = "") ;
+            Function_Return ""
+        Move (sBase + ".shadowed") to sTry
+        Move 2 to iN
+        While (SearchArray(Lowercase(sTry), asTakenLower) <> -1 and iN < 100)
+            Move (sBase + ".shadowed" + String(iN)) to sTry
+            Increment iN
+        Loop
+        If (SearchArray(Lowercase(sTry), asTakenLower) <> -1) ;
+            Function_Return ""
+        Function_Return sTry
+    End_Function
+
+    // The <file>.shadowed* siblings already on disk beside sFile, lowercased full paths - what
+    // ShadowTargetName must step past.
+    Function _ShadowNamesTaken String sFile Returns String[]
+        tRFSearchResult[] aFound
+        String[] asOut
+        String  sFolder sLeaf
+        Integer i iPos
+
+        Move (RightPos(CS_DirSeparator, sFile)) to iPos
+        If (iPos = 0) ;
+            Function_Return asOut
+        Move (Left(sFile, iPos)) to sFolder
+        Move (Right(sFile, (Length(sFile) - iPos))) to sLeaf
+        Move (rfFileSearch((sFolder + sLeaf + ".shadowed*"), DIRMODE_FILES_ONLY, False)) to aFound
+        For i from 0 to (SizeOfArray(aFound) - 1)
+            Move (Lowercase(sFolder + aFound[i].sFilename)) to asOut[SizeOfArray(asOut)]
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // Are two files the same content? Size first, then the lines - a source file, read whole.
+    Function _SameFileContent String sA String sB Returns Boolean
+        String[] asA asB
+
+        If (rfFileSizeLive(sA) <> rfFileSizeLive(sB)) ;
+            Function_Return False
+        Move (rfReadEncodedFileAsStringArray(sA)) to asA
+        Move (rfReadEncodedFileAsStringArray(sB)) to asB
+        Function_Return (IsSameArray(asA, asB))
+    End_Function
+
+    /* Renames one library folder out of the compiler's reach, filling sNewName and returning ""
+       on success or the reason it failed. RENAMED, NEVER DELETED, for the reason
+       MaintainLibrariesFT._RetireLibraryFolders gives: these trees are not copies of the package
+       that replaced them - one real Libraries\DUF held 86 source files present in no form in its
+       package - and the undo for a rename is renaming back. */
+    Function RetireLibraryFolder String sFolder String ByRef sNewName Returns String
+        tRFSearchResult[] aDirs
+        String[] asTaken
+        String  sParent sTarget sCand
+        Integer i iLast iAt
+
+        Move "" to sNewName
+        Move (Trim(sFolder)) to sFolder
+        If (sFolder = "") ;
+            Function_Return "no folder given"
+        If (Right(sFolder, 1) = CS_DirSeparator) ;
+            Move (Left(sFolder, (Length(sFolder) - 1))) to sFolder
+        If (rfDirectoryExists(sFolder) = False) ;
+            Function_Return ("the folder is no longer there: " + sFolder)
+        Move (RightPos(CS_DirSeparator, sFolder)) to iAt
+        If (iAt < 2) ;
+            Function_Return ("not a folder this may rename: " + sFolder)
+        Move (Left(sFolder, (iAt - 1))) to sParent
+        // Every sibling, so the numbering below steps over a name an earlier retire already owns.
+        Move (rfFileSearch((vFolderFormat(sParent) + "*.*"), DIRMODE_DIRECTORIES_ONLY, False)) to aDirs
+        Move (SizeOfArray(aDirs) - 1) to iLast
+        For i from 0 to iLast
+            Move (Trim(aDirs[i].sFilename)) to sCand
+            If (sCand <> "" and sCand <> "." and sCand <> "..") ;
+                Move (Lowercase(vFolderFormat(sParent) + sCand)) to asTaken[SizeOfArray(asTaken)]
+        Loop
+        Get RetireTargetName sFolder asTaken to sTarget
+        If (sTarget = "") ;
+            Function_Return ("every .OLD name up to 99 is already taken beside: " + sFolder)
+        Move sTarget to sNewName
+        Function_Return (rfRenameFile(sFolder, sTarget))
+    End_Function
+
+    /* Every direct child of <home>\Libraries that a PACKAGE has replaced and nothing declares:
+       fills the folder, its package, and the three counts FolderVersusPackage takes, and returns
+       how many. The counts are what makes the offer judgeable rather than a bare warning -
+       ONLY-HERE above all, because that is what a rename would put out of reach.
+
+       A folder holding no source at all is skipped: an empty shell left by a copy cannot shadow
+       anything, and offering to rename it is noise. The package match is PackageFolderFor's, which
+       is by normalised name - the same test the report has used since 2026-08-30. */
+    Function OrphanedLibraryFolders String sHome String[] asDeclaredLibPaths ;
+            String[] ByRef asFolder String[] ByRef asPkg Integer[] ByRef aiSame ;
+            Integer[] ByRef aiDiffer Integer[] ByRef aiOnlyHere Returns Integer
+        tRFSearchResult[] aDirs
+        String  sLibRoot sChild sLib sPkg
+        Integer i iLast iSame iDiffer iOnlyHere
+
+        Move (Trim(sHome)) to sHome
+        If (sHome = "") ;
+            Function_Return 0
+        Move (vFolderFormat(sHome) + "Libraries") to sLibRoot
+        If (rfDirectoryExists(sLibRoot) = False) ;
+            Function_Return 0
+        Move (rfFileSearch((vFolderFormat(sLibRoot) + "*.*"), DIRMODE_DIRECTORIES_ONLY, False)) to aDirs
+        Move (SizeOfArray(aDirs) - 1) to iLast
+        For i from 0 to iLast
+            Move (Trim(aDirs[i].sFilename)) to sChild
+            If (sChild <> "" and sChild <> "." and sChild <> "..") Begin
+                Move (vFolderFormat(sLibRoot) + sChild) to sLib
+                If (IsOrphanedLibraryFolder(Self, sLib, asDeclaredLibPaths) = True) Begin
+                    Get PackageFolderFor sHome sChild to sPkg
+                    If (sPkg <> "") Begin
+                        Send FolderVersusPackage sLib sPkg (&iSame) (&iDiffer) (&iOnlyHere)
+                        If ((iSame + iDiffer + iOnlyHere) > 0) Begin
+                            Move sLib      to asFolder[SizeOfArray(asFolder)]
+                            Move sPkg      to asPkg[SizeOfArray(asPkg)]
+                            Move iSame     to aiSame[SizeOfArray(aiSame)]
+                            Move iDiffer   to aiDiffer[SizeOfArray(aiDiffer)]
+                            Move iOnlyHere to aiOnlyHere[SizeOfArray(aiOnlyHere)]
+                        End
+                    End
+                End
+            End
+        Loop
+        Function_Return (SizeOfArray(asFolder))
+    End_Function
+
+    /* Every .sws in the workspace home, as ONE lowercased blob - the cheapest honest test of "is
+       this folder still declared". A folder is only reported when the listing shows nothing of it
+       was compiled AND no .sws so much as mentions its name, so a library used by a DIFFERENT
+       project in the same workspace is never called stale on one program's evidence. */
+    Function SwsDeclarationText String sHome Returns String
+        tRFSearchResult[] aFound
+        String[] asLines
+        String  sBlob
+        Integer i iLast j jLast
+
+        Move (rfFileSearch((vFolderFormat(sHome) + "*.sws"), DIRMODE_FILES_ONLY, False)) to aFound
+        Move (SizeOfArray(aFound) - 1) to iLast
+        For i from 0 to iLast
+            Move (rfReadEncodedFileAsStringArray(vFolderFormat(sHome) + aFound[i].sFilename)) to asLines
+            Move (SizeOfArray(asLines) - 1) to jLast
+            For j from 0 to jLast
+                Move (sBlob + " " + Lowercase(asLines[j])) to sBlob
+            Loop
+        Loop
+        Function_Return sBlob
+    End_Function
+
+    /* PURE. Is this path the WORKSPACE OWN source, rather than a package pool or a library folder?
+
+       This is the whole discriminator for PART 3, and it was measured before it was written. Every
+       workspace shares some file names with the DataFlex install - 10 on one legacy workspace, 28 on
+       another - so "you have a file called like an install file" is noise. Splitting them by WHERE
+       the winning copy lives separates the two populations exactly:
+
+         DfPkg\ or Libraries\  a package or library that legitimately carries that name. Nils own
+                               DfAbout.pkg, StdAbout.pkg, cSelectFolderDialog.pkg and MSSqldrv.pkg
+                               all shadow install files ON PURPOSE - four of them on one workspace,
+                               and not one is a defect.
+         anywhere else         the applications OWN copy of a vendor file, which is the dangerous
+                               kind: it is usually decades old, and it wins.
+
+       Judged on the path only. Reading the file could not answer it - a deliberate fork and a stale
+       leftover look identical inside. */
+    Function IsWorkspaceOwnSource String sPath String sHome Returns Boolean
+        String sLow sHomeLow
+
+        Move (Lowercase(Trim(sPath))) to sLow
+        Move (Lowercase(vFolderFormat(Trim(sHome)))) to sHomeLow
+        If (sLow = "" or sHomeLow = "") ;
+            Function_Return False
+        If (Left(sLow, Length(sHomeLow)) <> sHomeLow) ;
+            Function_Return False
+        If (Pos((CS_DirSeparator + "dfpkg" + CS_DirSeparator), sLow) > 0) ;
+            Function_Return False
+        If (Pos((CS_DirSeparator + "libraries" + CS_DirSeparator), sLow) > 0) ;
+            Function_Return False
+        Function_Return True
+    End_Function
+
+    /* PURE. A file a library ships as a TEMPLATE for the application to generate and keep - a
+       same-named copy that is right by design, and it must never be offered a rename.
+       LoginEncryptionKey.inc is the Studio's per-application encryption key (Nils 2026-09-15:
+       "always leave LoginEncryptionKey.inc, it is a Studio auto-generated encryption file"); DUF,
+       VDFQuery and the Filesystem library each ship one, so it turned up in four of the five
+       workspaces measured, DIFFERENT from the pool's every time. Excluded here, in the one place
+       every reference set passes through (CopiesAgainstReference). */
+    Function IsPerAppGeneratedFile String sLeaf Returns Boolean
+        Function_Return (Lowercase(Trim(sLeaf)) = "loginencryptionkey.inc")
+    End_Function
+
+    /* PURE, and the exact MIRROR of IsPerAppGeneratedFile above: a named file that must always be
+       SUGGESTED for rename, even though its bytes differ from the shipped one (Nils 2026-09-16:
+       "errornum.inc should always have a suggestion to be renamed").
+
+       The tick means "renaming this loses nothing". bSame is one way to know that; this list is the
+       other. errornum.inc earns its place because it does not merely differ - it STARVES the file it
+       stands in front of. The 1992 copy measured on a real workspace holds 300 #REPLACEs whose values
+       are all identical to the install's, ZERO constants of its own, and is MISSING 93; its
+       "#IFDEF ERRORNUM_INCLUDED" guard then takes the install copy's include guard, so the real file
+       never loads and every one of those 93 comes back undefined - the 573-error cascade that read
+       like an application bug for days. There is nothing in it to preserve, so the general
+       "DIFFERENT => let a human look" default is wrong here in the same way it was wrong for
+       LoginEncryptionKey.inc in the other direction.
+
+       Suggested, never forced: the row is only TICKED, and the user can untick it like any other. */
+    Function IsAlwaysRetireFile String sLeaf Returns Boolean
+        Function_Return (Lowercase(Trim(sLeaf)) = "errornum.inc")
+    End_Function
+
+    /* THE ONE SYSTEM FILE A WORKSPACE HOLDS ON PURPOSE: ITS LANGUAGE (Nils 2026-11-05).
+
+       Language_Current.inc names the language DataFlex's own texts compile in, and includes that
+       language's texts. The docs (Selecting Your Language) place it in DataFlex\Pkg, where the
+       installer sets it; Usr\Language\<language>\Pkg ships one per language. They never mention a
+       copy in a workspace, but one does the same job for that one workspace, because its folder is
+       searched first. So it is a setting, not an outdated copy, and renaming it has nothing to gain.
+
+       MEASURED on scratch compiles with a Swedish workspace's own files:
+
+         the file and its text files          0 errors, the exe says Avbryt, never Cancel
+         renamed away                         0 errors, the exe says Cancel, never Avbryt
+         the file, its text files not found   238 errors, no exe
+         only the Define, no #Include         237 errors, no exe
+
+       The second row is what [Rename them] did to a real workspace, behind a dialog that only said
+       DIFFERENT. So a file that names its language AND includes its texts gets no row at all
+       (_SetsALanguage, in the one place the rows are made, because the answer needs the file's
+       lines). The fourth row is the exception: LanguageText.pkg used to include the texts itself,
+       and a copy from then now leaves every C_$ text undefined. That one is broken, and stays listed.
+
+       THE TEXT FILES KEEP THE GENERAL RULE. Language_<language>.inc and its DD, WebApp and WinPrint
+       files get a row only when the install ships the same name, so a rename still finds the shipped
+       text and the language stays. */
+    Function IsLanguageSettingLeaf String sLeaf Returns Boolean
+        Function_Return (Lowercase(Trim(sLeaf)) = Lowercase(CS_LanguageSettingFile))
+    End_Function
+
+    /* PURE. The language these lines of a Language_Current.inc pick ("Svenska"), with the file they
+       include, or "" when they do not both name a language and include its texts. Only what stands
+       before a // counts. */
+    Function LanguageSettingOf String[] ByRef asLines String ByRef sInclude Returns String
+        String sLine sLow sLanguage sName
+        Integer i iLast iAt
+
+        Move "" to sLanguage
+        Move "" to sInclude
+        Move (SizeOfArray(asLines) - 1) to iLast
+        For i from 0 to iLast
+            Move (Replaces(Character(9), asLines[i], " ")) to sLine
+            Move (Pos("//", sLine)) to iAt
+            If (iAt > 0) ;
+                Move (Left(sLine, (iAt - 1))) to sLine
+            Move (Trim(sLine)) to sLine
+            Move (Lowercase(sLine)) to sLow
+            If (Pos("#include ", sLow) = 1) ;
+                Move (Trim(Right(sLine, (Length(sLine) - 9)))) to sInclude
+            If (Pos("define ", sLow) = 1 and Pos(" language$current ", sLow) > 0) Begin
+                Move (Pos(" for ", sLow)) to iAt
+                If (iAt > 0) Begin
+                    Move (Trim(Right(sLine, (Length(sLine) - iAt - 4)))) to sName
+                    If (Pos("language$", Lowercase(sName)) = 1) ;
+                        Move (Right(sName, (Length(sName) - 9))) to sLanguage
+                End
+            End
+        Loop
+        If (sInclude = "") ;
+            Function_Return ""
+        Function_Return sLanguage
+    End_Function
+
+    // Does this copy set a language? Reads the file only for the one name that can.
+    Function _SetsALanguage String sLeaf String sPath Returns Boolean
+        String[] asLines
+        String sInclude sLanguage
+
+        If (IsLanguageSettingLeaf(Self, sLeaf) = False) ;
+            Function_Return False
+        Move (rfReadEncodedFileAsStringArray(sPath)) to asLines
+        Get LanguageSettingOf (&asLines) (&sInclude) to sLanguage
+        Function_Return (sLanguage <> "")
+    End_Function
+
+    /* PURE. Every copy in the workspace's OWN source of a file a reference set ships, classified by
+       whether THIS build read it. A classifier against ANY reference set: the install's shipped
+       names (InstallCopiesClassified) are the only one asked since 2026-10-05; from 2026-09-15 until
+       then the names the workspace's libraries ship were a second. Two classes, one list:
+
+         class 0 - the listing names the workspace copy as the compiled one: it OVERRIDES the
+                   shipped file. The 2026-08-30 finding, unchanged.
+         class 1 - the workspace carries the file under a shipped name and the build did NOT
+                   read it: its folder is off the search path, or nothing Uses it. It compiles
+                   nothing today and wins the day the compiler reaches it. A 1997 copy of a
+                   treeview package sat in a side folder of a workspace for years exactly so -
+                   nine views Use the name, the installed copy compiled, and nothing said the
+                   old one was there, one path edit away from winning (Nils 2026-09-13: "I would
+                   like to also have system file copies that are not reached by the compiler
+                   offered a rename"). Renaming one changes nothing THIS build compiled -
+                   a program the listing does not cover may still reach it on its own build,
+                   which is why the dialog says so rather than calling the rename free.
+
+       asLeaf / asWinner are the listing's compiled names (lowercased) and paths; asAll is the
+       sweep of every source file under the home; asRefLower / asRefPath the reference names,
+       lowercased, and the path shipping each (parallel). No file system access - the caller
+       supplies all of it, which is what makes this testable. Fills four parallel arrays and
+       returns the count; the compiled copy is never listed a second time from the sweep, and a
+       per-application generated file (IsPerAppGeneratedFile) is never listed at all. */
+    Function CopiesAgainstReference String[] ByRef asLeaf String[] ByRef asWinner String[] ByRef asAll ;
+            String[] ByRef asRefLower String[] ByRef asRefPath String sHome ;
+            String[] ByRef asOutLeaf String[] ByRef asOutPath String[] ByRef asOutShipped Integer[] ByRef aiClass Returns Integer
+        String[] asWinLower
+        String sLow sLeafLow sLeaf
+        Integer i iLast iCount iRef
+        Boolean bOwn
+
+        Move (ResizeArray(asOutLeaf, 0))    to asOutLeaf
+        Move (ResizeArray(asOutPath, 0))    to asOutPath
+        Move (ResizeArray(asOutShipped, 0)) to asOutShipped
+        Move (ResizeArray(aiClass, 0))      to aiClass
+        Move 0 to iCount
+        // class 0 - the compiled copy is the workspace's own
+        Move (SizeOfArray(asLeaf) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(Trim(asWinner[i]))) to sLow
+            Move sLow to asWinLower[SizeOfArray(asWinLower)]
+            Get IsWorkspaceOwnSource asWinner[i] sHome to bOwn
+            If (bOwn = True) Begin
+                Move (Lowercase(Trim(asLeaf[i]))) to sLeafLow
+                Move (SearchArray(sLeafLow, asRefLower)) to iRef
+                If (iRef <> -1 and IsPerAppGeneratedFile(Self, sLeafLow) = False) Begin
+                    Move asLeaf[i]      to asOutLeaf[iCount]
+                    Move asWinner[i]    to asOutPath[iCount]
+                    Move asRefPath[iRef] to asOutShipped[iCount]
+                    Move 0 to aiClass[iCount]
+                    Increment iCount
+                End
+            End
+        Loop
+        // class 1 - carried under a shipped name, and not what this build compiled
+        Move (SizeOfArray(asAll) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(Trim(asAll[i]))) to sLow
+            If (sLow <> "") Begin
+                If (SearchArray(sLow, asWinLower) = -1) Begin
+                    Move (FileLeafLower(sLow)) to sLeafLow
+                    Move (SearchArray(sLeafLow, asRefLower)) to iRef
+                    If (iRef <> -1 and IsPerAppGeneratedFile(Self, sLeafLow) = False) Begin
+                        Get IsWorkspaceOwnSource asAll[i] sHome to bOwn
+                        If (bOwn = True) Begin
+                            Move (ExtractFileName(Trim(asAll[i]))) to sLeaf
+                            Move sLeaf            to asOutLeaf[iCount]
+                            Move (Trim(asAll[i])) to asOutPath[iCount]
+                            Move asRefPath[iRef]  to asOutShipped[iCount]
+                            Move 1 to aiClass[iCount]
+                            Increment iCount
+                        End
+                    End
+                End
+            End
+        Loop
+        Function_Return iCount
+    End_Function
+
+    /* PURE. The file an ERROR line of a listing names - "ERROR: 52 ... ON LINE: 67 (67) OF FILE:
+       E:\Ws\DfPkg\...\dates.nui" - or "" for any other line, a warning included. */
+    Function ErrorFileFromPrnLine String sLine Returns String
+        String sTrim
+        Integer iAt
+
+        Move (Trim(sLine)) to sTrim
+        If (Uppercase(Left(sTrim, 6)) <> "ERROR:") ;
+            Function_Return ""
+        Move (Pos("OF FILE:", Uppercase(sTrim))) to iAt
+        If (iAt = 0) ;
+            Function_Return ""
+        Function_Return (Trim(Right(sTrim, (Length(sTrim) - iAt - 7))))
+    End_Function
+
+    /* PURE. THE SECOND KIND OF ROW (2026-11-12): a copy in the workspace's OWN source that this build
+       compiled in place of a file a package checkout ships, where that package has ERRORS in the same
+       build.
+
+       Nils's rule of 2026-10-05 stands - a file name a library also uses is no finding - and this is
+       its one exception, proposed on 2026-11-05 and taken up on 2026-11-12. Measured on a real
+       workspace: its AppSrc held a LANGUAGE.PKG from before the library was a package, the search
+       path reached it first, and VDFQuery20's dates.nui compiled against it - 76 errors, every one in
+       a package file nobody can edit, the board saying "fix it where the package is maintained", and
+       nothing naming the copy. With the library's own language.pkg in its place: the 76 gone, 0 new.
+
+       THE TRIGGER IS NARROW. Only a copy the listing names as COMPILED (a copy the build did not read
+       cannot cause this build's errors), only in front of a file in DfPkg or the package cache, and
+       only when that package's files carry errors in the same listing. That is a correlation, not a
+       proof - the package may fail for reasons of its own - so the row is ticked only when the two
+       files are identical, as every other row, and the board says "may".
+
+       asLeaf / asWinner are the listing's compiled names and paths, asAll the sweep of the home and
+       asErrFiles the files the listing's ERROR lines name (ErrorFileFromPrnLine), one per error.
+       Fills four parallel arrays - the copy's leaf and path, the package's file of that name, and the
+       package's error count - and returns the count. */
+    Function FailingPackageCopies String[] ByRef asLeaf String[] ByRef asWinner String[] ByRef asAll ;
+            String[] ByRef asErrFiles String sHome ;
+            String[] ByRef asOutLeaf String[] ByRef asOutPath String[] ByRef asOutShipped Integer[] ByRef aiErrors Returns Integer
+        String[] asRoot asPoolLeaf asPoolPath
+        Integer[] aiRootErr aiPoolErr
+        String sRoot sLeafLow
+        Integer i iLast iAt iCount
+        Boolean bOwn
+
+        Move (ResizeArray(asOutLeaf, 0))    to asOutLeaf
+        Move (ResizeArray(asOutPath, 0))    to asOutPath
+        Move (ResizeArray(asOutShipped, 0)) to asOutShipped
+        Move (ResizeArray(aiErrors, 0))     to aiErrors
+        // the packages with errors in this build, and how many each has
+        Move (SizeOfArray(asErrFiles) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(PoolPackageRootOf(asErrFiles[i]))) to sRoot
+            If (sRoot <> "") Begin
+                Move (SearchArray(sRoot, asRoot)) to iAt
+                If (iAt = -1) Begin
+                    Move (SizeOfArray(asRoot)) to iAt
+                    Move sRoot to asRoot[iAt]
+                    Move 0     to aiRootErr[iAt]
+                End
+                Move (aiRootErr[iAt] + 1) to aiRootErr[iAt]
+            End
+        Loop
+        If (SizeOfArray(asRoot) = 0) ;
+            Function_Return 0
+        // every file those packages ship, by name - one pass over the sweep
+        Move (SizeOfArray(asAll) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(PoolPackageRootOf(asAll[i]))) to sRoot
+            If (sRoot <> "") Begin
+                Move (SearchArray(sRoot, asRoot)) to iAt
+                If (iAt <> -1) Begin
+                    Move (FileLeafLower(asAll[i])) to asPoolLeaf[SizeOfArray(asPoolLeaf)]
+                    Move (Trim(asAll[i]))          to asPoolPath[SizeOfArray(asPoolPath)]
+                    Move aiRootErr[iAt]            to aiPoolErr[SizeOfArray(aiPoolErr)]
+                End
+            End
+        Loop
+        // the workspace's own copies this build compiled under one of those names
+        Move 0 to iCount
+        Move (SizeOfArray(asLeaf) - 1) to iLast
+        For i from 0 to iLast
+            Get IsWorkspaceOwnSource asWinner[i] sHome to bOwn
+            If (bOwn = True) Begin
+                Move (Lowercase(Trim(asLeaf[i]))) to sLeafLow
+                Move (SearchArray(sLeafLow, asPoolLeaf)) to iAt
+                If (iAt <> -1 and IsPerAppGeneratedFile(Self, sLeafLow) = False) Begin
+                    Move (ExtractFileName(Trim(asWinner[i]))) to asOutLeaf[iCount]
+                    Move (Trim(asWinner[i])) to asOutPath[iCount]
+                    Move asPoolPath[iAt]     to asOutShipped[iCount]
+                    Move aiPoolErr[iAt]      to aiErrors[iCount]
+                    Increment iCount
+                End
+            End
+        Loop
+        Function_Return iCount
+    End_Function
+
+    /* PURE. One row from one classified copy. bSame / bTicked are left False: they need the two
+       files' bytes, which the caller with file access fills in (_AppendShadowRows). */
+    Function ShadowRowFrom String sLeaf String sPath String sShipped Integer eKind Integer iClass Returns tShadowCopy
+        tShadowCopy Row
+
+        Move (Trim(sLeaf))    to Row.sLeaf
+        Move (Trim(sPath))    to Row.sPath
+        Move (Trim(sShipped)) to Row.sShipped
+        Move eKind  to Row.eKind
+        Move iClass to Row.iClass
+        Move "DataFlex" to Row.sSource
+        Move False to Row.bSame
+        Move False to Row.bTicked
+        Function_Return Row
+    End_Function
+
+    // The install's shipped file names (SourceLeafExtensions), lowercased - the reference set a
+    // workspace copy of a system file is judged against. rfFileSearch answers bare names, which is
+    // exactly the spelling the compare wants.
+    Function InstallShippedNames String sInstall Returns String[]
+        tRFSearchResult[] aFound
+        String[] asExt asOut
+        Integer iMask iMaskLast iFile iLast
+
+        If (Trim(sInstall) = "") ;
+            Function_Return asOut
+        Get SourceLeafExtensions to asExt
+        Move (SizeOfArray(asExt) - 1) to iMaskLast
+        For iMask from 0 to iMaskLast
+            Move (rfFileSearch((vFolderFormat(sInstall) + "*" + asExt[iMask]), DIRMODE_FILES_ONLY, False)) to aFound
+            Move (SizeOfArray(aFound) - 1) to iLast
+            For iFile from 0 to iLast
+                If (Trim(aFound[iFile].sFilename) <> "") ;
+                    Move (Lowercase(Trim(aFound[iFile].sFilename))) to asOut[SizeOfArray(asOut)]
+            Loop
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* PURE. Every copy of a DataFlex system file in the workspace's OWN source, classified by
+       whether THIS build read it - CopiesAgainstReference over the install's shipped names, each
+       standing for <install>\<name>. The shipped path is spelled with the copy's own leaf, as the
+       install folder spells it on disk. Kept as the install kind's entry (and its tests' seam)
+       when the pool kind arrived on 2026-09-15. */
+    Function InstallCopiesClassified String[] ByRef asLeaf String[] ByRef asWinner String[] ByRef asAll ;
+            String[] ByRef asShippedLower String sHome String sInstall ;
+            String[] ByRef asOutLeaf String[] ByRef asOutPath String[] ByRef asOutInst Integer[] ByRef aiClass Returns Integer
+        String[] asRefPath
+        Integer i iLast iCount
+
+        Move (SizeOfArray(asShippedLower) - 1) to iLast
+        For i from 0 to iLast
+            Move (vFolderFormat(sInstall) + asShippedLower[i]) to asRefPath[i]
+        Loop
+        Get CopiesAgainstReference (&asLeaf) (&asWinner) (&asAll) (&asShippedLower) (&asRefPath) sHome ;
+            (&asOutLeaf) (&asOutPath) (&asOutInst) (&aiClass) to iCount
+        Move (iCount - 1) to iLast
+        For i from 0 to iLast
+            Move (vFolderFormat(sInstall) + asOutLeaf[i]) to asOutInst[i]
+        Loop
+        Function_Return iCount
+    End_Function
+
+
+    /* PART 3 - the workspace overriding a file of DataFlex OWN, which is the most serious shape this
+       report can find and the one it was blind to until 2026-08-30 - and PART 4, its commoner
+       cousin since 2026-09-15: the workspace's own copy of a file one of its LIBRARIES ships.
+
+       WHAT PART 3 COSTS, from the workspace that prompted it: a legacy application carried its own
+       errornum.inc - the file that defines every DFERR_* constant - dated 1992 and holding 299 of the
+       392 the installed DataFlex defines. Its folder is on the appSrc path, so it WON; and because it
+       opens with #IFDEF ERRORNUM_INCLUDED it also claimed the include guard, so the real one could
+       never load afterwards. DataFlex own packages then failed to compile against DataFlex own
+       constants: 573 errors, every one of them pointing at an innocent install file, and the last of
+       them a 4391 that read like a broken Object in the users source. Nothing in the workspace looked
+       wrong, and the file had not been touched in decades.
+
+       WHAT PART 4 COSTS (Nils 2026-09-15, on a migration copy: "one or several files from an
+       external library were copied to the workspace AppSrc folder. This can of course create lots
+       of problems and worse, those problems can be hard to track down"). Measured across five
+       workspaces: one to five such copies each, and EVERY one differed from the library's file -
+       old versions of the library's own packages, compiled in its place. So the same rename is
+       offered, file by file, with the content compared: an identical copy loses nothing, a
+       different one is a fork until someone looks.
+
+       WHY THE EXISTING PARTS COULD NOT SEE EITHER: parts 1 and 2 compare workspace copies with EACH
+       OTHER. A system-file copy exists exactly once under the home, so it is not a duplicate by any
+       measure they take; a library-file copy IS a duplicate, but so are a language variant's, and
+       nothing in part 1 says which duplicate is a library's file standing behind the app's.
+
+       Both callers - the report and the dashboard line - come through ShadowCopiesFrom, so the two
+       can never disagree about what counts as one. It answers rows of tShadowCopy, one per copy.
+
+       PART 4 AND ITS KIND LEFT ON 2026-10-05. Nils, looking at the Rename dialog: "It is actually
+       perfectly OK with duplicate filenames, as long as they are not a DataFlex system package. Thus
+       all other 'duplicates' should be removed from the dialog" - and, asked about the report: "Yes!"
+       So ShadowCopiesFrom answers the copies of DataFlex system packages and nothing else, and the
+       board's line, its dialog and this report list those only. What is said above about the
+       library-file copies is why they were listed for three weeks, not what the code does now -
+       apart from ONE shape since 2026-11-12, a copy compiled in place of the file of a package that
+       has errors in the same build (FailingPackageCopies).
+
+       THE LISTING IS HISTORY; THE DISK IS NOW (Nils 2026-08-31). Every class-0 row was read out of
+       a .prn, so it says which copy a PAST build compiled. After [Rename them] has moved a copy to
+       <name>.shadowed the listing still names it - and this used to keep reporting it, so the
+       dashboard line survived the very fix that cleared it and the button had nothing left to do.
+       So a winner that is NO LONGER ON DISK is not a live override: it cannot win the next build and
+       there is nothing to rename. It is counted out through iRetiredGone instead, because it is not
+       nothing either - it means THIS listing predates the fix, which is exactly what the board has
+       to say.
+
+       AND THE COPIES THE BUILD NEVER READ (Nils 2026-09-13). The trigger above was "the compiler
+       included YOUR copy", read from the listing - and a copy in a folder the compiler never
+       searches passes it untouched, for ever. Those are class 1 in the same rows, judged by
+       CopiesAgainstReference against the sweep of the home, offered the same rename - which for
+       them changes nothing this build compiled. iClass says which is which; the board, the dialog
+       and the report read it to word each one honestly.
+
+       AND ONE EXCEPTION TO THE RULE OF 2026-10-05 (2026-11-12): a copy compiled in place of the file
+       of a package that has errors in this build - FailingPackageCopies, the rows of kind
+       eShadowFailingPackage. asErrFiles, the files the listing's ERROR lines name, is what it needs. */
+    Function ShadowCopiesFrom String[] ByRef asLeaf String[] ByRef asWinner String sHome String[] ByRef asAll ;
+            String[] ByRef asErrFiles tShadowCopy[] ByRef aRows Integer ByRef iRetiredGone Returns Integer
+        String[] asShipped asOutLeaf asOutPath asOutShipped
+        Integer[] aiClass aiErrors aiNone
+        String sInstall
+        Integer iCount i
+
+        Move (ResizeArray(aRows, 0)) to aRows
+        Move 0 to iRetiredGone
+        // the install kind, when a target install is known
+        Get psTargetPkgFolder of ghoApplication to sInstall
+        If (Trim(sInstall) <> "") Begin
+            Get InstallShippedNames sInstall to asShipped
+            Get InstallCopiesClassified (&asLeaf) (&asWinner) (&asAll) (&asShipped) sHome sInstall ;
+                (&asOutLeaf) (&asOutPath) (&asOutShipped) (&aiClass) to iCount
+            Send _AppendShadowRows (&aRows) (&asOutLeaf) (&asOutPath) (&asOutShipped) (&aiClass) eShadowInstall (&iRetiredGone) (&aiNone)
+        End
+        // A copy of a file one of the workspace's libraries ships is no row since 2026-10-05 (see the
+        // note above) - unless this build compiled it and that package fails in the same build.
+        Get FailingPackageCopies (&asLeaf) (&asWinner) (&asAll) (&asErrFiles) sHome ;
+            (&asOutLeaf) (&asOutPath) (&asOutShipped) (&aiErrors) to iCount
+        If (iCount > 0) Begin
+            Move (ResizeArray(aiClass, 0)) to aiClass
+            For i from 0 to (iCount - 1)
+                Move 0 to aiClass[i]
+            Loop
+            Send _AppendShadowRows (&aRows) (&asOutLeaf) (&asOutPath) (&asOutShipped) (&aiClass) eShadowFailingPackage (&iRetiredGone) (&aiErrors)
+        End
+        Function_Return (SizeOfArray(aRows))
+    End_Function
+
+    /* One classified set into the rows, with the two facts only the disk can answer: a class-0
+       copy the listing named may have been moved away since (counted out through iRetiredGone),
+       and whether the copy and the shipped file hold the same bytes - which is also the tick's
+       default, because an identical copy is the one case a rename loses nothing. A path already
+       in the rows (a file both the install and a package ship) is not added a second time.
+       aiErrors, parallel to the rest, is the package's error count for eShadowFailingPackage; the
+       install kind passes none. */
+    Procedure _AppendShadowRows tShadowCopy[] ByRef aRows String[] ByRef asLeaf String[] ByRef asPath ;
+            String[] ByRef asShipped Integer[] ByRef aiClass Integer eKind Integer ByRef iRetiredGone Integer[] ByRef aiErrors
+        tShadowCopy Row
+        tKeptShadow[] aKept
+        Integer i iLast j jLast
+        Boolean bStillThere bShippedThere bDup bSetting
+
+        Get ReadKeptShadows to aKept
+        Move (SizeOfArray(asLeaf) - 1) to iLast
+        For i from 0 to iLast
+            // A class-0 winner the listing named: still there, or moved away since? A class-1 copy
+            // came off the live sweep, so it is there by construction.
+            Move True to bStillThere
+            If (aiClass[i] = 0) ;
+                File_Exist asPath[i] bStillThere
+            If (bStillThere = False) Begin
+                Increment iRetiredGone
+            End
+            Else Begin
+                Move False to bDup
+                Move (SizeOfArray(aRows) - 1) to jLast
+                For j from 0 to jLast
+                    If (Lowercase(Trim(aRows[j].sPath)) = Lowercase(Trim(asPath[i]))) ;
+                        Move True to bDup
+                Loop
+                // A language setting is no outdated copy - see IsLanguageSettingLeaf.
+                Get _SetsALanguage asLeaf[i] asPath[i] to bSetting
+                If (bDup = False and bSetting = False) Begin
+                    Get ShadowRowFrom asLeaf[i] asPath[i] asShipped[i] eKind aiClass[i] to Row
+                    If (eKind = eShadowFailingPackage) Begin
+                        Move (PoolPackageDisplayNameOf(Row.sShipped)) to Row.sSource
+                        If (i < SizeOfArray(aiErrors)) ;
+                            Move aiErrors[i] to Row.iPackageErrors
+                    End
+                    File_Exist Row.sShipped bShippedThere
+                    If (bShippedThere = True) ;
+                        Get _SameFileContent Row.sPath Row.sShipped to Row.bSame
+                    Get IsAlwaysRetireFile Row.sLeaf to Row.bAlways
+                    Move (Row.bSame or Row.bAlways) to Row.bTicked
+                    // A copy the user decided to keep stays a row - the report and [Which files?]
+                    // still name it - but it is off the line and out of the dialog until un-kept.
+                    // A Get, not an expression: IsKeptPath is declared further down the class, and
+                    // DataFlex resolves an expression call at the point of use.
+                    Get IsKeptPath Row.sPath (&aKept) to Row.bKept
+                    If (Row.bKept = True) ;
+                        Move False to Row.bTicked
+                    Move Row to aRows[SizeOfArray(aRows)]
+                End
+            End
+        Loop
+    End_Procedure
+
+    /* The same answer, for a caller that has not read the listing itself - the dashboard. Returns 0
+       when there is no listing, which is the honest answer rather than a guess: which copy wins is a
+       fact about a BUILD. */
+    Function ShadowCopiesNow tShadowCopy[] ByRef aRows Integer ByRef iRetiredGone Returns Integer
+        String[] asListing asLeaf asWinner asAll asErrFiles
+        String sHome sListing sPath sLeaf
+        Integer i iLast iIdx
+
+        Get psHomeTarget of ghoApplication to sHome
+        Get NewestListingFile sHome to sListing
+        Move (ResizeArray(aRows, 0)) to aRows
+        Move 0 to iRetiredGone     // defined on EVERY exit, including the no-listing one
+        If (sListing = "") ;
+            Function_Return 0
+        Move (rfReadEncodedFileAsStringArray(sListing)) to asListing
+        Move (SizeOfArray(asListing) - 1) to iLast
+        For i from 0 to iLast
+            Get IncludedFileFromPrnLine asListing[i] (&sPath) to sLeaf
+            If (sLeaf <> "") Begin
+                Move (SearchArray(sLeaf, asLeaf)) to iIdx
+                If (iIdx = -1) Begin
+                    Move sLeaf to asLeaf[SizeOfArray(asLeaf)]
+                    Move sPath to asWinner[SizeOfArray(asWinner)]
+                End
+            End
+            Else Begin
+                // the files this build's errors are in - which packages fail (FailingPackageCopies)
+                Get ErrorFileFromPrnLine asListing[i] to sPath
+                If (sPath <> "") ;
+                    Move sPath to asErrFiles[SizeOfArray(asErrFiles)]
+            End
+        Loop
+        // The sweep is what finds a copy the listing never mentions - once per memo, like the report.
+        Get WorkspaceSourceFiles sHome to asAll
+        Function_Return (ShadowCopiesFrom(Self, (&asLeaf), (&asWinner), sHome, (&asAll), (&asErrFiles), (&aRows), (&iRetiredGone)))
+    End_Function
+
+
+
+    /* WHERE THE KEPT LIST LIVES: Data\KeptShadows-<wskey>.json, in DFRefactor's own Data folder -
+       never in the target workspace. Same fold and same folder as the analyzer's ignore list, whose
+       path build this borrows: take the saved-plan path (the one source of truth on
+       ghoApplication) and swap the file base. Both bases come from their CS_*Json Defines, so a
+       rename of either constant stays consistent here. */
+    Function KeptShadowsJsonPath Returns String
+        String sPath sSavedBase sKeptBase
+
+        /* A TESTABLE SEAM, and it is not optional here. Under UnitTests ghoApplication is a
+           plain cApplication, so SavedPlanJsonPath COMPILES and returns "" - the silent-empty trap
+           that turns a fixture green while it exercises nothing. psKeptShadowsFile lets a test
+           point the round-trip at a scratch file and actually assert on it; production never sets
+           it. See [[feedback_test_runner_app_class]]. */
+        Get psKeptShadowsFile to sPath
+        If (sPath <> "") ;
+            Function_Return sPath
+        Get SavedPlanJsonPath of ghoApplication to sPath
+        If (sPath = "") ;
+            Function_Return ""
+        Move (Left(CS_SavedPlanJson,   (Length(CS_SavedPlanJson)   - 5))) to sSavedBase   // "LastPlan"
+        Move (Left(CS_KeptShadowsJson, (Length(CS_KeptShadowsJson) - 5))) to sKeptBase    // "KeptShadows"
+        Function_Return (Replaces(sSavedBase, sPath, sKeptBase))
+    End_Function
+
+    // The copies this workspace's user decided to keep. Empty when absent / unparseable / written
+    // by an older layout (iVersion <> CI_KeptShadowsVersion). Mirrors cModAnalyzer.ReadIgnored.
+    Function ReadKeptShadows Returns tKeptShadow[]
+        Handle hoJson
+        tKeptShadowFile TheFile
+        tKeptShadow[] aEmpty
+        String sFile
+
+        Get KeptShadowsJsonPath to sFile
+        If (sFile = "") ;
+            Function_Return aEmpty
+        Get rfParseJsonFile sFile to hoJson
+        If (hoJson = 0) ;
+            Function_Return aEmpty
+        Get JsonToDataType of hoJson to TheFile
+        Send Destroy of hoJson
+        If (TheFile.iVersion <> CI_KeptShadowsVersion) ;
+            Function_Return aEmpty
+        Function_Return TheFile.aRows
+    End_Function
+
+    // Persist it (pretty, NO BOM - a BOM breaks ParseUtf8 on the way back in).
+    Procedure WriteKeptShadows tKeptShadow[] aRows
+        Handle hoJson
+        UChar[] ucJson
+        Integer iCh
+        String sFile
+        tKeptShadowFile TheFile
+
+        Get KeptShadowsJsonPath to sFile
+        If (sFile = "") ;
+            Procedure_Return
+        Move CI_KeptShadowsVersion to TheFile.iVersion
+        Move aRows to TheFile.aRows
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson TheFile
+        Set peWhiteSpace of hoJson to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoJson to ucJson
+        Send Destroy of hoJson
+        Get rfOpenOutput sFile to iCh
+        If (iCh < 0) ;
+            Procedure_Return
+        Write channel iCh ucJson
+        Send rfCloseOutput iCh
+    End_Procedure
+
+    /* PURE. Is this path one the user decided to keep, given the record? Case-insensitive, because
+       DataFlex string compare is - which is right here, since Windows hides filename case anyway. */
+    Function IsKeptPath String sPath tKeptShadow[] ByRef aKept Returns Boolean
+        Integer i iLast
+
+        Move (SizeOfArray(aKept) - 1) to iLast
+        For i from 0 to iLast
+            If (Trim(aKept[i].sPath) = Trim(sPath)) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    // Has the user decided to keep this exact path? The record, read fresh.
+    Function IsKeptShadow String sPath Returns Boolean
+        tKeptShadow[] aKept
+
+        Get ReadKeptShadows to aKept
+        Function_Return (IsKeptPath(Self, sPath, (&aKept)))
+    End_Function
+
+    // Record a keep (idempotent - a second call for the same path changes nothing). Written ONLY
+    // by a press: the dialog's "keep the rest" - the one deliberate act; see the note in
+    // RefactorConstants - or the board's "Stay in <language>" for a retired language setting.
+    Procedure RememberKept String sPath String sLeaf
+        tKeptShadow[] aKept
+        tKeptShadow Row
+
+        Get ReadKeptShadows to aKept
+        If (IsKeptPath(Self, sPath, (&aKept)) = True) ;
+            Procedure_Return
+        Move sPath to Row.sPath
+        Move sLeaf to Row.sLeaf
+        Move Row to aKept[SizeOfArray(aKept)]
+        Send WriteKeptShadows aKept
+    End_Procedure
+
+    // Forget one, so the line may offer it again. The "N kept" chip's way back.
+    Procedure ForgetKept String sPath
+        tKeptShadow[] aKept aOut
+        Integer i iLast
+
+        Get ReadKeptShadows to aKept
+        Move (SizeOfArray(aKept) - 1) to iLast
+        For i from 0 to iLast
+            If (Trim(aKept[i].sPath) <> Trim(sPath)) ;
+                Move aKept[i] to aOut[SizeOfArray(aOut)]
+        Loop
+        Send WriteKeptShadows aOut
+    End_Procedure
+
+    /* PURE. The folders of a search path that are the workspace's own source, in search order. The
+       path also carries the libraries, DFRefactor's own folders and DataFlex's. */
+    Function OwnFoldersOnSearchPath String sSearchPath String sHome Returns String[]
+        String[] asAll asOut
+        String sFolder
+        Integer i iLast
+
+        Move (StrSplitToArray(sSearchPath, ";")) to asAll
+        Move (SizeOfArray(asAll) - 1) to iLast
+        For i from 0 to iLast
+            Move (Trim(asAll[i])) to sFolder
+            If (sFolder <> "") Begin
+                If (IsWorkspaceOwnSource(Self, (vFolderFormat(sFolder)), sHome) = True) ;
+                    Move sFolder to asOut[SizeOfArray(asOut)]
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // The retired language setting in one folder, as the disk spells it: <file>.shadowed, or the
+    // lowest number when only numbered ones are left. "" when there is none.
+    Function _RetiredLanguageFileIn String sFolder Returns String
+        tRFSearchResult[] aFound
+        String[] asNames
+        Integer i iLast
+
+        Move (rfFileSearch((vFolderFormat(sFolder) + CS_LanguageSettingFile + ".shadowed*"), DIRMODE_FILES_ONLY, False)) to aFound
+        Move (SizeOfArray(aFound) - 1) to iLast
+        For i from 0 to iLast
+            If (Trim(aFound[i].sFilename) <> "") ;
+                Move (Trim(aFound[i].sFilename)) to asNames[SizeOfArray(asNames)]
+        Loop
+        If (SizeOfArray(asNames) = 0) ;
+            Function_Return ""
+        Move (SortArray(asNames)) to asNames
+        Function_Return (vFolderFormat(sFolder) + asNames[0])
+    End_Function
+
+    // Is a file of this name in any of these folders?
+    Function _IsFileInFolders String sLeaf String[] asFolders Returns Boolean
+        String sPath
+        Integer i iLast
+        Boolean bThere
+
+        Move (SizeOfArray(asFolders) - 1) to iLast
+        For i from 0 to iLast
+            Move (vFolderFormat(asFolders[i]) + sLeaf) to sPath
+            File_Exist sPath bThere
+            If (bThere = True) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    /* A LANGUAGE SETTING [Rename them] ALREADY TOOK AWAY (Nils 2026-11-05, asked whether the board
+       should offer it back: yes). From 2026-09-13 until the rule at IsLanguageSettingLeaf the dialog
+       could rename a workspace's Language_Current.inc, and the programs went on compiling without
+       an error, in another language, with the file out of sight as <name>.shadowed.
+
+       Offered only when renaming it back would do what the offer says, which is why each test is here:
+
+         - no live Language_Current.inc in the folders given: that one is the answer now
+         - its folder is on the search path: the compiler never read one anywhere else, so the rename
+           took nothing away (the caller passes the workspace's own folders on the path)
+         - it names a language and includes its texts: the Define-only form is the broken one
+         - that is not the install's language: then the rename changed nothing
+         - the file it includes can be found: measured, 238 errors if not
+         - nobody chose to stay with the install's language (RememberKept, the board's other answer)
+
+       At most one answer, the first in search order, because that is the one that would win. Fills
+       sLanguage and returns the file's path, or returns "". */
+    Function RetiredLanguageSettingIn String[] asFolders String sInstallFolder String sInstallLanguage String ByRef sLanguage Returns String
+        tKeptShadow[] aKept
+        String[] asLines asLook
+        String sRetired sPicked sInclude
+        Integer i iLast
+        Boolean bReach bKept
+
+        Move "" to sLanguage
+        If (_IsFileInFolders(Self, CS_LanguageSettingFile, asFolders) = True) ;
+            Function_Return ""
+        Move asFolders to asLook
+        Move sInstallFolder to asLook[SizeOfArray(asLook)]
+        Get ReadKeptShadows to aKept
+        Move (SizeOfArray(asFolders) - 1) to iLast
+        For i from 0 to iLast
+            Get _RetiredLanguageFileIn asFolders[i] to sRetired
+            If (sRetired <> "") Begin
+                Move (rfReadEncodedFileAsStringArray(sRetired)) to asLines
+                Get LanguageSettingOf (&asLines) (&sInclude) to sPicked
+                Get IsKeptPath sRetired (&aKept) to bKept
+                Get _IsFileInFolders sInclude asLook to bReach
+                If (sPicked <> "" and Lowercase(sPicked) <> Lowercase(sInstallLanguage) and bKept = False and bReach = True) Begin
+                    Move sPicked to sLanguage
+                    Function_Return sRetired
+                End
+            End
+        Loop
+        Function_Return ""
+    End_Function
+
+    /* The same answer for the board: sSearchPath is the target workspace's composite path, and the
+       language it is compared with is the one the install's own Language_Current.inc picks. No
+       install known, or one that sets no language: no offer, since the sentence could not be true. */
+    Function RetiredLanguageSettingNow String sSearchPath String ByRef sLanguage String ByRef sInstallLanguage Returns String
+        String[] asFolders asLines
+        String sHome sInstall sInclude
+
+        Move "" to sLanguage
+        Move "" to sInstallLanguage
+        Get psHomeTarget of ghoApplication to sHome
+        Get psTargetPkgFolder of ghoApplication to sInstall
+        If (Trim(sHome) = "" or Trim(sInstall) = "") ;
+            Function_Return ""
+        Move (rfReadEncodedFileAsStringArray(vFolderFormat(sInstall) + CS_LanguageSettingFile)) to asLines
+        Get LanguageSettingOf (&asLines) (&sInclude) to sInstallLanguage
+        If (sInstallLanguage = "") ;
+            Function_Return ""
+        Get OwnFoldersOnSearchPath sSearchPath sHome to asFolders
+        Function_Return (RetiredLanguageSettingIn(Self, asFolders, sInstall, sInstallLanguage, (&sLanguage)))
+    End_Function
+
+    // PURE. The live name a retired language setting goes back to, in its own folder.
+    Function LiveLanguageSettingPath String sRetired Returns String
+        Integer iAt
+
+        Move (RightPos(CS_DirSeparator, sRetired)) to iAt
+        If (iAt = 0) ;
+            Function_Return ""
+        Function_Return (Left(sRetired, iAt) + CS_LanguageSettingFile)
+    End_Function
+
+    // Renames it back. "" when done, else the reason. rfRenameFile refuses to overwrite, so a live
+    // setting that turned up since the board was drawn is left as it is.
+    Function RestoreLanguageSetting String sRetired Returns String
+        String sLive
+
+        Get LiveLanguageSettingPath sRetired to sLive
+        If (sLive = "") ;
+            Function_Return ("not a path this may rename: " + sRetired)
+        Function_Return (rfRenameFile(sRetired, sLive))
+    End_Function
+
+    /* RETIRE the workspace copies the user ticked - the [Rename them] the board offers (Nils
+       2026-08-30: "a concise line explaining it and a button with a [Fix it] type of thing, that
+       renames those offending local copies").
+
+       WHICH ONES IS THE USER'S CALL, ROW BY ROW, since 2026-09-15: the rows arrive from the dialog
+       (RetireShadowsFT.dg) with bTicked set, and only a ticked row is touched. The dialog ticks an
+       identical copy and leaves a DIFFERENT one unticked, because measured on five workspaces
+       every library-file copy differed from the library's - each a fork until someone looks - and
+       that is Nils's call ("we probably need to suggest this on a file-by-file basis"). It replaced
+       two earlier shapes, both his calls in their day: retire every override behind one confirm
+       (2026-08-30), and skip for ever a copy found live again after a retire (dropped 2026-09-15 -
+       a REVERT puts a file back too, and the skipped copies stayed in front of the shipped file for
+       every other program while the row kept offering a press with nothing to do).
+
+       Both halves of the safety are built in, whatever is ticked:
+
+         - BACKED UP FIRST, then RENAMED - never deleted - to <name>.shadowed. Two undo paths, and
+           they are not redundant: Revert restores from the backup folder (the app's own undo, and
+           the one a user reaches for), while renaming the .shadowed twin back works even if this
+           program never runs again. A file whose backup fails is LEFT ALONE, exactly as the engine
+           leaves a file it could not back up. rfRenameFile also refuses to overwrite, so an earlier
+           retire's twin is never destroyed by a later one - and since 2026-09-14 a later retire takes
+           the next free NUMBERED name (ShadowTargetName) instead of failing on that twin.
+         - A copy can be a DELIBERATE FORK. Retiring MonthCalendarPrompt.dg on the workspace this
+           was built for BREAKS the build - the install copy declares oMonthCalendarPrompt while the
+           app calls oCalendar - and Prnt_dlg.pkg has form: three guards there produced 543 errors
+           on 2026-08-26 ([[feedback_guard_must_not_remove_what_the_file_calls]]). The dialog shows
+           the content verdict per row and starts a different copy unticked; the board says REBUILD
+           afterwards, because the effect of a retire is invisible until the compiler runs again.
+
+       Returns how many were renamed. asFailed comes back holding one "leaf - reason" line per
+       ticked file that could not be renamed; asTwins one line per file that took a NUMBERED name
+       because an earlier twin was there, saying whether that twin is identical; iLiveDone the
+       class-0 renames, the only ones the next compile can feel. A partial result is normal and is
+       reported, never rolled back - rolling back would undo renames that succeeded and are wanted. */
+    Function RetireShadowCopies tShadowCopy[] ByRef aRows String[] ByRef asFailed String[] ByRef asTwins Integer ByRef iLiveDone Returns Integer
+        String[] asTaken
+        String sWhy sTo sPlain sToLeaf sLeaf sPath
+        Boolean bOk bSame
+        Integer i iLast iDone
+
+        Move (ResizeArray(asFailed, 0)) to asFailed
+        Move (ResizeArray(asTwins, 0)) to asTwins
+        Move 0 to iDone
+        Move 0 to iLiveDone
+        Move (SizeOfArray(aRows) - 1) to iLast
+        For i from 0 to iLast
+            If (aRows[i].bTicked = True) Begin
+                Move aRows[i].sLeaf to sLeaf
+                Move aRows[i].sPath to sPath
+                /* BACK UP FIRST, AND DO NOT TOUCH THE FILE IF THAT FAILS (Nils 2026-08-30: "Are
+                   you saying that the [Rename them] doesn't take a backup first? if so, that is a
+                   bug"). It is the engine's contract for every other write this app makes - see
+                   the SaveBackupFile call in cRefactorEngine, which returns eEngineBackupErr and
+                   changes nothing when the copy fails - and a retire had been skipping it.
+
+                   "The .shadowed twin is already the backup" was the wrong answer. It is safe
+                   from DATA LOSS, but it is not the app's undo: Revert reads the backup FOLDER,
+                   so a retire nothing had backed up was the one change this tool could make that
+                   its own Revert could not take back. It also left the only copy sitting in the
+                   user's source tree, where a tidy-up or a VCS clean can take it. */
+                Get SaveBackupFile of ghoApplication sPath to bOk
+                If (bOk = False) Begin
+                    Move (sLeaf + " - could not be copied to the backup area, so it was left alone") ;
+                        to asFailed[SizeOfArray(asFailed)]
+                End
+                Else Begin
+                    // The first free twin name: <file>.shadowed, or numbered past the ones there.
+                    Get _ShadowNamesTaken sPath to asTaken
+                    Get ShadowTargetName sPath asTaken to sTo
+                    If (sTo = "") Begin
+                        Move (sLeaf + " - every .shadowed name up to 99 is already taken beside it") ;
+                            to asFailed[SizeOfArray(asFailed)]
+                    End
+                    Else Begin
+                        Move (rfRenameFile(sPath, sTo)) to sWhy
+                        If (sWhy = "") Begin
+                            Increment iDone
+                            If (aRows[i].iClass = 0) ;
+                                Increment iLiveDone
+                            /* A NUMBERED NAME SAYS WHY, and whether the older twin still matters: a
+                               Revert brings back the same bytes, so the two are usually identical and
+                               the older twin is redundant; when they differ the reader is told to look
+                               before retiring the older one by hand. Neither is deleted here. */
+                            Move (sPath + ".shadowed") to sPlain
+                            If (Lowercase(sTo) <> Lowercase(sPlain)) Begin
+                                Get _SameFileContent sTo sPlain to bSame
+                                Move (Right(sTo, (Length(sTo) - RightPos(CS_DirSeparator, sTo)))) to sToLeaf
+                                If (bSame = True) ;
+                                    Move (sLeaf + " - renamed to " + sToLeaf + "; an earlier " + sLeaf ;
+                                        + ".shadowed was already there, identical to this copy, and is kept") ;
+                                        to asTwins[SizeOfArray(asTwins)]
+                                Else ;
+                                    Move (sLeaf + " - renamed to " + sToLeaf + "; an earlier " + sLeaf ;
+                                        + ".shadowed was already there, DIFFERENT from this copy, and is kept - compare" ;
+                                        + " the two before retiring the older one by hand") to asTwins[SizeOfArray(asTwins)]
+                            End
+                        End
+                        Else ;
+                            Move (sLeaf + " - " + sWhy) to asFailed[SizeOfArray(asFailed)]
+                    End
+                End
+            End
+        Loop
+        Function_Return iDone
+    End_Function
+
+
+    /* PART 2 - the library FOLDER a migration left behind, which is where most shadowed files come
+       from. Returns how many were found; writes its own section.
+
+       Nils, 2026-08-30, after finding Libraries\VDFQuery beside the VDFQuery20 package: "I had
+       removed the DUF as a library, and added it as a package. But the DUF library is still there
+       on disk." The Libraries dialog edits the .sws, which is its job - deleting a folder would be
+       a surprising and irreversible side effect of a list edit - so nothing said the old tree was
+       still there, still on the search path, and still able to win.
+
+       TWO SIGNALS, BOTH REQUIRED, because either alone lies. The listing says nothing from the
+       folder was COMPILED - but a library used only by another project in the workspace would fail
+       that test innocently. The .sws text says nothing DECLARES it - but a declared folder can sit
+       unused. Reported only when both agree.
+
+       AND IT NEVER OFFERS TO DELETE. Measured on that workspace, the stale trees were not copies
+       of their packages at all: Libraries\DUF held 154 source files, 16 matching the package, 49
+       differing, and 86 present nowhere in it. Whatever those 86 are - an older bundled
+       sub-library, or a local patch someone made years ago - they are not the tool's to discard.
+       The report states the numbers and prints a rename the user can run and undo. */
+    Function _StaleLibraryFolders String sHome String[] ByRef asListing Integer iCh Returns Integer
+        tRFSearchResult[] aDirs
+        String  sLibRoot sName sDir sSws sPkg sLowDir
+        Integer i iLast iFound iSame iDiffer iOnlyHere iLine iLineLast
+        Boolean bCompiled
+
+        Move (vFolderFormat(sHome) + "Libraries") to sLibRoot
+        Move (rfFileSearch((vFolderFormat(sLibRoot) + "*.*"), DIRMODE_DIRECTORIES_ONLY, False)) to aDirs
+        Move (SizeOfArray(aDirs) - 1) to iLast
+        If (iLast < 0) ;
+            Function_Return 0
+        Get SwsDeclarationText sHome to sSws
+        Move 0 to iFound
+        Move (SizeOfArray(asListing) - 1) to iLineLast
+        For i from 0 to iLast
+            Move (Trim(aDirs[i].sFilename)) to sName
+            If (sName <> "" and sName <> "." and sName <> "..") Begin
+                Move (vFolderFormat(sLibRoot) + sName) to sDir
+                Move (Lowercase(CS_DirSeparator + "libraries" + CS_DirSeparator + Lowercase(sName) + CS_DirSeparator)) to sLowDir
+                // Did anything under it reach the compiler?
+                Move False to bCompiled
+                For iLine from 0 to iLineLast
+                    If (Lowercase(asListing[iLine]) contains sLowDir) Begin
+                        Move True to bCompiled
+                        Move iLineLast to iLine
+                    End
+                Loop
+                If (bCompiled = False and (not(sSws contains (Lowercase("libraries/" + sName))))) Begin
+                    If (not(sSws contains (Lowercase("libraries" + CS_DirSeparator + sName)))) Begin
+                        If (iFound = 0) Begin
+                            Writeln channel iCh ""
+                            Writeln channel iCh "=== Library folders the workspace no longer uses ==="
+                            Writeln channel iCh "Nothing under these was compiled into this program, and no .sws mentions them."
+                            Writeln channel iCh "Typically what a move to git packages leaves behind - the package supplies the"
+                            Writeln channel iCh "library now, and the old tree stays on disk where it can still win the search path."
+                            Writeln channel iCh ""
+                        End
+                        Increment iFound
+                        Writeln channel iCh ("=== " + sName + " ===")
+                        Writeln channel iCh ("  folder        : " + sDir)
+                        Get PackageFolderFor sHome sName to sPkg
+                        If (sPkg <> "") Begin
+                            Send FolderVersusPackage sDir sPkg (&iSame) (&iDiffer) (&iOnlyHere)
+                            Writeln channel iCh ("  replaced by   : " + sPkg)
+                            Writeln channel iCh ("  source files  : " + String(iSame) + " same size as the package, " ;
+                                + String(iDiffer) + " differ, " + String(iOnlyHere) + " exist ONLY here")
+                            If (iOnlyHere > 0) ;
+                                Writeln channel iCh ("  READ THIS     : " + String(iOnlyHere) + " file(s) are in no form in the package - check what they are before removing anything.")
+                        End
+                        Else ;
+                            Writeln channel iCh "  replaced by   : no matching package found - this may be a library you removed on purpose."
+                        Writeln channel iCh ("  to retire it  : ren " + '"' + sDir + '" "' + sName + '.OLD"')
+                        Writeln channel iCh "                  (a rename, so a compile proves nothing needed it; rename back to undo)"
+                        Writeln channel iCh ""
+                    End
+                End
+            End
+        Loop
+        Function_Return iFound
+    End_Function
+
+    /* ---- WHAT A DIFFERENT COPY ADDS, AND WHETHER ANYTHING USES IT (Nils 2026-11-12) ----
+
+       A copy that differs from the file it stands in front of starts unticked: it may be a fork. Nils,
+       on 2026-11-12, of a copy whose additions nothing in the workspace uses: it comes TICKED. Measured on
+       a workspace's 1998 copy of Prnt_dlg.pkg (2026-11-01): it differed by 268 lines and added a property,
+       two methods and two Types that neither the shipped file nor the packages it Uses declare; nothing in
+       the workspace used any of them, and renamed, its 608 errors went and none came from it.
+
+       WHAT "ADDS" MEANS: a name the copy declares (DeclaredNamesOf) that neither the shipped file nor a
+       file it Uses declares (ShippedNamesOf). WHAT "USES" MEANS (NameUseOnLine): the name in any other
+       source file under the workspace, comments left out, as a whole word - and a name declared inside a
+       Class only as a message: Get / Send / Set X, X(Self, msg_X / get_X / set_X, or a method of that
+       name elsewhere. A copy's method can share its name with a DataFlex built-in function the workspace
+       calls everywhere; Prnt_dlg.pkg's PointerToString did.
+
+       WHAT IT CANNOT SEE: a change INSIDE a method both files have. A copy that only edits method bodies
+       adds nothing, so it is ticked too - Nils's call, with that said. A copy in which no declaration is
+       found at all (a menu built by DFCreate_Menu) tells nothing either way and stays unticked. A rename
+       is reversible, and a name that turns out to be used fails the next compile. */
+
+    // PURE. Is c, one character of an uppercased line, part of a name?
+    Function _IsNameChar String c Returns Boolean
+        If (c = "") ;
+            Function_Return False
+        Function_Return (Pos(c, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_#$@") > 0)
+    End_Function
+
+    // PURE. Does sLine (uppercased) hold sWord as a whole word? A dot in front makes it a field's name.
+    Function _HasWord String sLine String sWord Returns Boolean
+        String sRest sBefore sAfter
+        Integer iAt iLen
+
+        Move (Length(sWord)) to iLen
+        If (iLen = 0) ;
+            Function_Return False
+        Move sLine to sRest
+        Move (Pos(sWord, sRest)) to iAt
+        While (iAt > 0)
+            Move "" to sBefore
+            If (iAt > 1) ;
+                Move (Mid(sRest, 1, (iAt - 1))) to sBefore
+            Move (Mid(sRest, 1, (iAt + iLen))) to sAfter
+            If (_IsNameChar(Self, sBefore) = False and sBefore <> "." and _IsNameChar(Self, sAfter) = False) ;
+                Function_Return True
+            Move (Right(sRest, (Length(sRest) - iAt))) to sRest
+            Move (Pos(sWord, sRest)) to iAt
+        Loop
+        Function_Return False
+    End_Function
+
+    // PURE. The words of a line, tabs as spaces, no empty ones.
+    Function _Words String sLine Returns String[]
+        String[] asAll asOut
+        Integer i iLast
+
+        Move (StrSplitToArray(Trim(Replaces(Character(9), sLine, " ")), " ")) to asAll
+        Move (SizeOfArray(asAll) - 1) to iLast
+        For i from 0 to iLast
+            If (asAll[i] <> "") ;
+                Move asAll[i] to asOut[SizeOfArray(asOut)]
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // PURE. The lines with their comments blanked: from // to the end of a line, and block comments across
+    // lines. A comment marker inside a string is cut too - that only ever hides a name, never adds one.
+    Function _CodeOnlyLines String[] ByRef asLines Returns String[]
+        String[] asOut
+        String sLine
+        Integer i iLast iAt iBlock iEnd
+        Boolean bBlock
+
+        Move False to bBlock
+        Move (SizeOfArray(asLines) - 1) to iLast
+        For i from 0 to iLast
+            Move asLines[i] to sLine
+            If (bBlock = True) Begin
+                Move (Pos("*/", sLine)) to iEnd
+                If (iEnd = 0) ;
+                    Move "" to sLine
+                Else Begin
+                    Move (Right(sLine, (Length(sLine) - iEnd - 1))) to sLine
+                    Move False to bBlock
+                End
+            End
+            If (bBlock = False) Begin
+                Move (Pos("//", sLine)) to iAt
+                Move (Pos("/*", sLine)) to iBlock
+                If (iBlock > 0 and (iAt = 0 or iBlock < iAt)) Begin
+                    Move (Pos("*/", Right(sLine, (Length(sLine) - iBlock - 1)))) to iEnd
+                    If (iEnd = 0) Begin
+                        Move (Left(sLine, (iBlock - 1))) to sLine
+                        Move True to bBlock
+                    End
+                    Else ;
+                        Move (Left(sLine, (iBlock - 1)) + " " + Right(sLine, (Length(sLine) - iBlock - iEnd - 2))) to sLine
+                    Move (Pos("//", sLine)) to iAt
+                End
+                If (iAt > 0) ;
+                    Move (Left(sLine, (iAt - 1))) to sLine
+            End
+            Move sLine to asOut[i]
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // Uppercased into the list, once.
+    Procedure _AddUpperOnce String[] ByRef asList String sName
+        Move (Uppercase(Trim(sName))) to sName
+        If (sName <> "" and SearchArray(sName, asList) = -1) ;
+            Move sName to asList[SizeOfArray(asList)]
+    End_Procedure
+
+    /* PURE. What a source file DECLARES, by a line's first word: Class, Procedure (Procedure Set X gives
+       X), Function, Object, Define, #REPLACE, Property (its name is the third word), Struct, Type,
+       #COMMAND and External_Function - uppercased, once each, comments left out. A Procedure, Function or
+       Property inside a Class goes to asMethods too: it is used as a message (NameUseOnLine). */
+    Procedure DeclaredNamesOf String[] ByRef asLines String[] ByRef asNames String[] ByRef asMethods
+        String[] asCode asWords
+        String sFirst sName
+        Integer i iLast iDepth iWords
+
+        Move (ResizeArray(asNames, 0))   to asNames
+        Move (ResizeArray(asMethods, 0)) to asMethods
+        Get _CodeOnlyLines (&asLines) to asCode
+        Move 0 to iDepth
+        Move (SizeOfArray(asCode) - 1) to iLast
+        For i from 0 to iLast
+            Get _Words asCode[i] to asWords
+            Move (SizeOfArray(asWords)) to iWords
+            If (iWords > 0) Begin
+                Move (Lowercase(asWords[0])) to sFirst
+                Move "" to sName
+                If (sFirst = "class" and iWords > 1) Begin
+                    Move asWords[1] to sName
+                    Increment iDepth
+                End
+                Else If (sFirst = "end_class") Begin
+                    If (iDepth > 0) ;
+                        Decrement iDepth
+                End
+                Else If ((sFirst = "procedure" or sFirst = "function") and iWords > 1) Begin
+                    Move asWords[1] to sName
+                    If (sFirst = "procedure" and Lowercase(asWords[1]) = "set" and iWords > 2) ;
+                        Move asWords[2] to sName
+                    If (iDepth > 0) ;
+                        Send _AddUpperOnce (&asMethods) sName
+                End
+                Else If (sFirst = "property" and iWords > 2) Begin
+                    Move asWords[2] to sName
+                    If (iDepth > 0) ;
+                        Send _AddUpperOnce (&asMethods) sName
+                End
+                Else If (iWords > 1) Begin
+                    If (sFirst = "object" or sFirst = "define" or sFirst = "#replace" or sFirst = "struct" or sFirst = "type" or sFirst = "#command" or sFirst = "external_function") ;
+                        Move asWords[1] to sName
+                End
+                If (sName <> "") ;
+                    Send _AddUpperOnce (&asNames) sName
+            End
+        Loop
+    End_Procedure
+
+    /* The names the SHIPPED file stands for, SORTED: what it declares and what the files it Uses declare,
+       looked up in its own folder and then the install's Pkg folder - at most 100 files. A copy declaring a
+       Struct the shipped file gets from Dftypes.pkg adds nothing. */
+    Function ShippedNamesOf String sShipped String sInstall Returns String[]
+        String[] asQueue asSeen asLines asCode asWords asNames asMine asMethods
+        String sPath sLeaf sTry sDir
+        Integer iNext i iLast j jLast
+        Boolean bThere
+
+        Move (Trim(sShipped)) to asQueue[0]
+        Move 0 to iNext
+        While (iNext < SizeOfArray(asQueue) and SizeOfArray(asSeen) < 100)
+            Move asQueue[iNext] to sPath
+            Increment iNext
+            If (SearchArray(Lowercase(sPath), asSeen) = -1) Begin
+                Move (Lowercase(sPath)) to asSeen[SizeOfArray(asSeen)]
+                File_Exist sPath bThere
+                If (bThere = True) Begin
+                    Move (rfReadEncodedFileAsStringArray(sPath)) to asLines
+                    Send DeclaredNamesOf (&asLines) (&asMine) (&asMethods)
+                    Move (SizeOfArray(asMine) - 1) to jLast
+                    For j from 0 to jLast
+                        If (SearchArray(asMine[j], asNames) = -1) ;
+                            Move asMine[j] to asNames[SizeOfArray(asNames)]
+                    Loop
+                    Move (Left(sPath, RightPos("\", sPath))) to sDir
+                    Get _CodeOnlyLines (&asLines) to asCode
+                    Move (SizeOfArray(asCode) - 1) to iLast
+                    For i from 0 to iLast
+                        Get _Words asCode[i] to asWords
+                        If (SizeOfArray(asWords) > 1) Begin
+                            If (Lowercase(asWords[0]) = "use") Begin
+                                Move (Replaces('"', asWords[1], "")) to sLeaf
+                                Move (Replaces("'", sLeaf, "")) to sLeaf
+                                If (Pos(".", ExtractFileName(sLeaf)) = 0) ;
+                                    Move (sLeaf + ".pkg") to sLeaf
+                                Move (sDir + sLeaf) to sTry
+                                File_Exist sTry bThere
+                                If (bThere = False and Trim(sInstall) <> "") Begin
+                                    Move (vFolderFormat(sInstall) + sLeaf) to sTry
+                                    File_Exist sTry bThere
+                                End
+                                If (bThere = True) ;
+                                    Move sTry to asQueue[SizeOfArray(asQueue)]
+                            End
+                        End
+                    Loop
+                End
+            End
+        Loop
+        Function_Return (SortArray(asNames))
+    End_Function
+
+    /* PURE. Does sLine - uppercased, comments out, one space between words - use sName? A plain name: as a
+       whole word. A method's (bMethod): only as a message - Get / Send / Set X, a method of that name,
+       X(Self, or msg_X / get_X / set_X - so a call of a built-in function of the same name is no use. */
+    Function NameUseOnLine String sLine String sName Boolean bMethod Returns Boolean
+        If (bMethod = False) ;
+            Function_Return (_HasWord(Self, sLine, sName))
+        If (_HasWord(Self, sLine, ("GET " + sName)) or _HasWord(Self, sLine, ("SEND " + sName)) or _HasWord(Self, sLine, ("SET " + sName))) ;
+            Function_Return True
+        If (_HasWord(Self, sLine, ("PROCEDURE " + sName)) or _HasWord(Self, sLine, ("FUNCTION " + sName))) ;
+            Function_Return True
+        If (_HasWord(Self, sLine, (sName + "(SELF")) or _HasWord(Self, sLine, (sName + " (SELF"))) ;
+            Function_Return True
+        Function_Return (_HasWord(Self, sLine, ("MSG_" + sName)) or _HasWord(Self, sLine, ("GET_" + sName)) or _HasWord(Self, sLine, ("SET_" + sName)))
+    End_Function
+
+    /* Marks every DIFFERENT row - not identical, not an always-rename, not kept - whose copy declares
+       something and adds no name anything else in the workspace uses: bAddsNothingUsed, and TICKED (Nils
+       2026-11-12). asFiles is the sweep of the home (WorkspaceSourceFiles); a file is read line by line
+       only when its text holds one of the added names at all. Returns the rows marked. */
+    Function MarkCopiesThatAddNothingUsed tShadowCopy[] ByRef aRows String[] ByRef asFiles String sInstall Returns Integer
+        String[] asCopyLines asMine asMethods asShipped asName asLines asCode
+        Integer[] aiOwner
+        Boolean[] abMethod abUsed abDeclares abCandidate
+        String sText sLine sPathLow
+        Integer i iLast j jLast k kLast iCount iFile iFileLast
+        Boolean bThere bAny
+
+        Move (SizeOfArray(aRows) - 1) to iLast
+        // each candidate's added names, in one list with the row that owns each
+        For i from 0 to iLast
+            Move False to abCandidate[i]
+            Move False to abDeclares[i]
+            If (aRows[i].bSame = False and aRows[i].bAlways = False and aRows[i].bKept = False) Begin
+                File_Exist aRows[i].sPath bThere
+                If (bThere = True) Begin
+                    Move True to abCandidate[i]
+                    Move (rfReadEncodedFileAsStringArray(aRows[i].sPath)) to asCopyLines
+                    Send DeclaredNamesOf (&asCopyLines) (&asMine) (&asMethods)
+                    Move (SizeOfArray(asMine) > 0) to abDeclares[i]
+                    Get ShippedNamesOf aRows[i].sShipped sInstall to asShipped
+                    Move (SizeOfArray(asMine) - 1) to jLast
+                    For j from 0 to jLast
+                        If (BinarySearchArray(asMine[j], asShipped) = -1) Begin
+                            Move asMine[j] to asName[SizeOfArray(asName)]
+                            Move i         to aiOwner[SizeOfArray(aiOwner)]
+                            Move (SearchArray(asMine[j], asMethods) <> -1) to abMethod[SizeOfArray(abMethod)]
+                            Move False     to abUsed[SizeOfArray(abUsed)]
+                        End
+                    Loop
+                End
+            End
+        Loop
+        // one pass over the workspace's source for all of them
+        Move (SizeOfArray(asName) - 1) to kLast
+        If (kLast >= 0) Begin
+            Move (SizeOfArray(asFiles) - 1) to iFileLast
+            For iFile from 0 to iFileLast
+                Move (Lowercase(Trim(asFiles[iFile]))) to sPathLow
+                Move (rfReadEncodedFileAsStringArray(asFiles[iFile])) to asLines
+                Move (Uppercase(StrJoinFromArray(asLines, " "))) to sText
+                Move False to bAny
+                For k from 0 to kLast
+                    If (abUsed[k] = False and Pos(asName[k], sText) > 0) Begin
+                        If (Lowercase(Trim(aRows[aiOwner[k]].sPath)) <> sPathLow) ;
+                            Move True to bAny
+                    End
+                Loop
+                If (bAny = True) Begin
+                    Get _CodeOnlyLines (&asLines) to asCode
+                    Move (SizeOfArray(asCode) - 1) to jLast
+                    For j from 0 to jLast
+                        Move (Uppercase(Trim(Replaces(Character(9), asCode[j], " ")))) to sLine
+                        If (sLine <> "") Begin
+                            While (Pos("  ", sLine) > 0)
+                                Move (Replaces("  ", sLine, " ")) to sLine
+                            Loop
+                            For k from 0 to kLast
+                                If (abUsed[k] = False and Pos(asName[k], sLine) > 0) Begin
+                                    If (Lowercase(Trim(aRows[aiOwner[k]].sPath)) <> sPathLow) Begin
+                                        If (NameUseOnLine(Self, sLine, asName[k], abMethod[k]) = True) ;
+                                            Move True to abUsed[k]
+                                    End
+                                End
+                            Loop
+                        End
+                    Loop
+                End
+            Loop
+        End
+        // a row whose copy declares something and none of whose added names is used
+        Move 0 to iCount
+        For i from 0 to iLast
+            If (abCandidate[i] = True and abDeclares[i] = True) Begin
+                Move False to bAny
+                For k from 0 to kLast
+                    If (aiOwner[k] = i and abUsed[k] = True) ;
+                        Move True to bAny
+                Loop
+                If (bAny = False) Begin
+                    Move True to aRows[i].bAddsNothingUsed
+                    Move True to aRows[i].bTicked
+                    Increment iCount
+                End
+            End
+        Loop
+        Function_Return iCount
+    End_Function
+
+    // PURE. The content verdict of one row, as the report prints it.
+    Function _ContentVerdict tShadowCopy Row Returns String
+        String sWhose
+
+        Move "the shipped file" to sWhose
+        If (Row.eKind = eShadowFailingPackage) ;
+            Move "the package's file" to sWhose
+        If (Row.bSame = True) ;
+            Function_Return ("identical to " + sWhose)
+        If (Row.bAddsNothingUsed = True) ;
+            Function_Return ("DIFFERENT from " + sWhose + ", but nothing in the workspace uses a name it adds - ticked for a rename (a change inside a method both have is not seen)")
+        Function_Return ("DIFFERENT from " + sWhose + " - compare the two before renaming")
+    End_Function
+
+    /* The report. Returns the number of shadowed files found.
+
+       TWO SOURCES, because neither alone is enough. The listing says which copy WON - the
+       compiler's own answer, which beats simulating the search path - but the losers never appear
+       in it, precisely because they were not opened. The filesystem sweep supplies those. So:
+       walk the listing for what was included, sweep the workspace for what else carries the same
+       name, and report only where the two disagree.
+
+       REPORT ONLY, and it always will be. A second copy of a package can be a deliberate local
+       fork - a real workspace carried a hand-tweaked "..._ext.pkg" beside the original, with
+       renamed functions, which had to stay - and no rule in a file name separates a fork from a
+       leftover. Deleting or rewriting one is a decision only the reader can make. */
+    Function FindShadowedPackageFiles Returns Integer
+        String[] asListing asAll asShadows
+        String[] asLeaf asWinner asErrFiles
+        tShadowCopy[] aRows
+        String   sHome sLogFile sListing sLine sPath sLeaf sPrev sInstall
+        Integer  iCh iLine iLineLast iIdx i iLast j jLast iTotal iStale iShadows iInsGone iLive iDormant iFail iSafe
+        Boolean  bPanel bCancel
+
+        Get psHomeTarget of ghoApplication to sHome
+        Move (vFolderFormat(sHome) + CS_BackupFolder + CS_DirSeparator + CS_ShadowedPackagesLogFile) to sLogFile
+        Get rfOpenOutput sLogFile to iCh
+        If (iCh < 0) ;
+            Function_Return 0
+        Set psLogFile to sLogFile
+
+        Writeln channel iCh "Shadowed package files  (report only - no changes made)."
+        Writeln channel iCh "Files that exist in more than one place under this workspace, and the copy the"
+        Writeln channel iCh "compiler actually used. A stale copy compiles perfectly - that is the problem:"
+        Writeln channel iCh "fix the library and the workspace keeps building the other file."
+        Writeln channel iCh ""
+
+        Move (ghoStatusPanel <> 0 and Active_State(ghoStatusPanel) = True) to bPanel
+        Get NewestListingFile sHome to sListing
+        Set psListingUsed to sListing
+        If (sListing = "") Begin
+            // NO EVIDENCE, so no verdict. Which copy wins is a fact about a build, and without a
+            // listing there has been no build to read it from. Saying "these names are duplicated"
+            // instead would be a different, far noisier report - and not the question asked.
+            Writeln channel iCh "No compiler listing (.prn) was found under this workspace, so there is nothing"
+            Writeln channel iCh "to read the resolution out of - which copy wins is a fact about a BUILD, not"
+            Writeln channel iCh "about the folders. Compile the program once, then run this report again."
+            Send rfCloseOutput iCh
+            Function_Return 0
+        End
+        Writeln channel iCh ("Resolution read from: " + sListing)
+        Writeln channel iCh ""
+
+        If (bPanel = True) Begin
+            Set Title_Text of ghoStatusPanel to "Reading the compiler listing:"
+            Set TableName_Text of ghoStatusPanel to sListing
+        End
+        Move (rfReadEncodedFileAsStringArray(sListing)) to asListing
+        Move (SizeOfArray(asListing)) to iLineLast
+        If (bPanel = True) Begin
+            Set piPosition of ghoProgressBar to 0
+            Set piMaximum  of ghoProgressBar to iLineLast
+        End
+        Decrement iLineLast
+        // PASS 1 - what the compile included, deduped by leaf. A package included from several
+        // places in one build keeps its FIRST resolution: that is the one the search path gives.
+        Move False to bCancel
+        For iLine from 0 to iLineLast
+            If (Mod(iLine, 500) = 0) Begin
+                If (bPanel = True) Begin
+                    Send Update_StatusPanel of ghoStatusPanel ("Listing line:" * String(iLine + 1) * "of:" * String(iLineLast + 1))
+                    Set piPosition of ghoProgressBar to (iLine + 1)
+                End
+                Get pbUserCancelRequested of ghoEngine to bCancel
+                If (bCancel = True) ;
+                    Move iLineLast to iLine
+            End
+            Move asListing[iLine] to sLine
+            Get IncludedFileFromPrnLine sLine (&sPath) to sLeaf
+            If (sLeaf <> "") Begin
+                Move (SearchArray(sLeaf, asLeaf)) to iIdx
+                If (iIdx = -1) Begin
+                    Move sLeaf to asLeaf[SizeOfArray(asLeaf)]
+                    Move sPath to asWinner[SizeOfArray(asWinner)]
+                End
+            End
+            Else Begin
+                Get ErrorFileFromPrnLine sLine to sPath
+                If (sPath <> "") ;
+                    Move sPath to asErrFiles[SizeOfArray(asErrFiles)]
+            End
+        Loop
+
+        // PASS 2 - every .pkg / .inc / .h under the workspace, so the copies that were NOT opened
+        // can be seen at all.
+        If (bCancel = False) Begin
+            If (bPanel = True) Begin
+                Set Title_Text of ghoStatusPanel to "Sweeping the workspace for copies:"
+                Set TableName_Text of ghoStatusPanel to sHome
+            End
+            Get WorkspaceSourceFiles sHome to asAll
+        End
+
+        Move 0 to iTotal
+        Move (SizeOfArray(asLeaf) - 1) to iLast
+        If (bPanel = True) Begin
+            Set piPosition of ghoProgressBar to 0
+            Set piMaximum  of ghoProgressBar to (iLast + 1)
+        End
+        For i from 0 to iLast
+            If (bCancel = True) ;
+                Move iLast to i
+            If (Mod(i, 20) = 0) Begin
+                If (bPanel = True) Begin
+                    Send Update_StatusPanel of ghoStatusPanel ("Comparing:" * String(i + 1) * "of:" * String(iLast + 1))
+                    Set piPosition of ghoProgressBar to (i + 1)
+                End
+                Get pbUserCancelRequested of ghoEngine to bCancel
+            End
+            Get ShadowCopiesOf asLeaf[i] asWinner[i] asAll to asShadows
+            Move (SizeOfArray(asShadows) - 1) to jLast
+            If (jLast >= 0) Begin
+                Increment iTotal
+                Writeln channel iCh ("=== " + asLeaf[i] + "  (" + String(jLast + 2) + " copies) ===")
+                Writeln channel iCh ("  compiled from : " + asWinner[i])
+                For j from 0 to jLast
+                    If (j = 0) ;
+                        Writeln channel iCh ("  also present  : " + asShadows[j])
+                    Else ;
+                        Writeln channel iCh ("                  " + asShadows[j])
+                Loop
+                Writeln channel iCh ""
+            End
+        Loop
+
+        // ---- PART 3: the workspace overriding a file of DataFlex OWN. ----
+        // FIRST in the log although it was added last: it is the only part here that can break a
+        // build in files the reader does not own, so it must not sit under two other lists.
+        Move 0 to iShadows
+        If (bCancel = False) ;
+            Get ShadowCopiesFrom (&asLeaf) (&asWinner) sHome (&asAll) (&asErrFiles) (&aRows) (&iInsGone) to iShadows
+        // which DIFFERENT copies add nothing the workspace uses (2026-11-12) - the content line says so
+        If (bCancel = False and iShadows > 0) Begin
+            Get psTargetPkgFolder of ghoApplication to sInstall
+            Get MarkCopiesThatAddNothingUsed (&aRows) (&asAll) sInstall to iSafe
+        End
+        Move 0 to iLive
+        Move 0 to iDormant
+        Move (SizeOfArray(aRows) - 1) to iLast
+        For i from 0 to iLast
+            If (aRows[i].eKind = eShadowInstall) Begin
+                If (aRows[i].iClass = 0) ;
+                    Increment iLive
+                Else ;
+                    Increment iDormant
+            End
+        Loop
+        If (iLive > 0) Begin
+            Writeln channel iCh "*** THE WORKSPACE IS OVERRIDING DATAFLEX SYSTEM FILES ***"
+            Writeln channel iCh ""
+            Writeln channel iCh "Each file below exists in the workspace under the SAME NAME as one that ships with"
+            Writeln channel iCh "DataFlex, and the workspace's copy is the one this build used. That is the most damaging shape of"
+            Writeln channel iCh "shadowing, because the errors it causes appear in DataFlex OWN packages - files you did"
+            Writeln channel iCh "not write and would never think to suspect."
+            Writeln channel iCh ""
+            Writeln channel iCh "A real case: a workspace carrying its own 1992 errornum.inc, holding 299 of the 392"
+            Writeln channel iCh "DFERR_* constants the installed DataFlex defines. It won, and its #IFDEF guard then"
+            Writeln channel iCh "stopped the real one loading at all. The build produced 573 errors, every one of them"
+            Writeln channel iCh "pointing at an install file, and the last was an End_Object without Object that read"
+            Writeln channel iCh "like a broken view in the application."
+            Writeln channel iCh ""
+            Writeln channel iCh "Before removing one, check whether it holds anything the installed version does not -"
+            Writeln channel iCh "an old copy is usually a strict SUBSET, and then nothing can depend on what it adds."
+            Writeln channel iCh ""
+            For i from 0 to iLast
+                If (aRows[i].eKind = eShadowInstall and aRows[i].iClass = 0) Begin
+                    Writeln channel iCh ("=== " + aRows[i].sLeaf + "  (overrides a DataFlex system file) ===")
+                    Writeln channel iCh ("  compiled from : " + aRows[i].sPath)
+                    Writeln channel iCh ("  shipped file  : " + aRows[i].sShipped)
+                    Writeln channel iCh ("  content       : " + (_ContentVerdict(Self, aRows[i])))
+                    If (aRows[i].bKept = True) ;
+                        Writeln channel iCh "  decision      : KEPT by you - off the board's line until you offer it again"
+                End
+            Loop
+            Writeln channel iCh ""
+        End
+        /* THE COPIES THIS BUILD NEVER READ - the same name, the same install file, and a listing
+           that shows the INSTALLED copy compiling (or the name absent). Harmless today; not for
+           ever. Listed apart from the overrides because the two need different sentences: one
+           changed this build, the other cannot change any build until it is reached. */
+        If (iDormant > 0) Begin
+            Writeln channel iCh "*** COPIES OF DATAFLEX SYSTEM FILES THIS BUILD DID NOT READ ***"
+            Writeln channel iCh ""
+            Writeln channel iCh "Each file below sits in the workspace's source under the same name as one that ships with"
+            Writeln channel iCh "DataFlex, but this build read the INSTALLED copy - or never included the name at"
+            Writeln channel iCh "all: the folder is off the search path, or nothing Uses it. It compiles nothing"
+            Writeln channel iCh "today and wins the day the compiler reaches it, and such a copy is usually years"
+            Writeln channel iCh "behind the package it is named after. Renaming it changes nothing this build"
+            Writeln channel iCh "compiled; a program this listing does not cover may still reach it on its own build."
+            Writeln channel iCh ""
+            For i from 0 to iLast
+                If (aRows[i].eKind = eShadowInstall and aRows[i].iClass <> 0) Begin
+                    Writeln channel iCh ("=== " + aRows[i].sLeaf + "  (a DataFlex system file this build did not read) ===")
+                    Writeln channel iCh ("  workspace copy: " + aRows[i].sPath)
+                    Writeln channel iCh ("  shipped file  : " + aRows[i].sShipped)
+                    Writeln channel iCh ("  content       : " + (_ContentVerdict(Self, aRows[i])))
+                    If (aRows[i].bKept = True) ;
+                        Writeln channel iCh "  decision      : KEPT by you - off the board's line until you offer it again"
+                End
+            Loop
+            Writeln channel iCh ""
+        End
+        /* A COPY COMPILED IN PLACE OF THE FILE OF A PACKAGE THAT FAILS (2026-11-12) - the one kind of
+           library-file copy listed since 2026-10-05; see FailingPackageCopies. */
+        Move 0 to iFail
+        For i from 0 to iLast
+            If (aRows[i].eKind = eShadowFailingPackage) ;
+                Increment iFail
+        Loop
+        If (iFail > 0) Begin
+            Writeln channel iCh "*** COPIES COMPILED IN PLACE OF THE FILE OF A PACKAGE THAT HAS ERRORS ***"
+            Writeln channel iCh ""
+            Writeln channel iCh "Each file below sits in the workspace's own source under the same name as a file of a"
+            Writeln channel iCh "package. This build compiled the workspace's copy in its place, and that package has"
+            Writeln channel iCh "errors in this build. The package's other files were written against its own copy, so"
+            Writeln channel iCh "the workspace's copy may be what breaks them: a leftover LANGUAGE.PKG gave a package"
+            Writeln channel iCh "76 errors that way. The package can also fail for reasons of its own - compare the two"
+            Writeln channel iCh "files, or rename the copy and compile again."
+            Writeln channel iCh ""
+            For i from 0 to iLast
+                If (aRows[i].eKind = eShadowFailingPackage) Begin
+                    Writeln channel iCh ("=== " + aRows[i].sLeaf + "  (compiled in place of " + aRows[i].sSource + "'s file) ===")
+                    Writeln channel iCh ("  compiled from : " + aRows[i].sPath)
+                    Writeln channel iCh ("  package file  : " + aRows[i].sShipped)
+                    Writeln channel iCh ("  package errors: " + String(aRows[i].iPackageErrors) + " in this build")
+                    Writeln channel iCh ("  content       : " + (_ContentVerdict(Self, aRows[i])))
+                    If (aRows[i].bKept = True) ;
+                        Writeln channel iCh "  decision      : KEPT by you - off the board's line until you offer it again"
+                End
+            Loop
+            Writeln channel iCh ""
+        End
+        /* ALREADY DEALT WITH, AND THE LISTING HAS NOT CAUGHT UP. These were named by the .prn but
+           are no longer on disk - renamed by [Rename them], or removed by hand - so they are not
+           listed above. Saying so stops a report run straight after a retire reading as "nothing
+           was ever wrong", and names the one thing that makes the difference: another compile. */
+        If (iInsGone > 0) Begin
+            Writeln channel iCh ("NOTE: " + String(iInsGone) + " overriding copy/copies named by this listing are no longer in the")
+            Writeln channel iCh "workspace - already renamed or removed. They are left out above because they cannot"
+            Writeln channel iCh "win another build. This listing still predates that change: compile again to confirm."
+            Writeln channel iCh ""
+        End
+
+
+        // ---- PART 2: whole library FOLDERS the workspace no longer uses. ----
+        If (bCancel = False) ;
+            Get _StaleLibraryFolders sHome asListing iCh to iStale
+
+        If (bPanel = True) ;
+            Set Title_Text of ghoStatusPanel to ""
+        If (bCancel = True) Begin
+            Writeln channel iCh ""
+            Writeln channel iCh "*** Cancelled by the user - this report is INCOMPLETE. ***"
+        End
+        Writeln channel iCh ""
+        If (iTotal = 0) Begin
+            If (iShadows = 0) ;
+                Writeln channel iCh "No shadowed files: every package this build included exists in exactly one place."
+            Else ;
+                Writeln channel iCh "No package is duplicated WITHIN the workspace - but see the copies of shipped files above."
+        End
+        Else Begin
+            Writeln channel iCh "What to do with these - none of it is automatic, and none of it is always right:"
+            Writeln channel iCh "  - A leftover copy under an old library folder, shadowing the package the workspace"
+            Writeln channel iCh "    now depends on: the copy is what compiles, so fixing the package changes nothing"
+            Writeln channel iCh "    until the copy goes."
+            Writeln channel iCh "  - A copy carried INSIDE another package: not to be edited there, and a package"
+            Writeln channel iCh "    update puts back anything you change. Fix it where that package is maintained,"
+            Writeln channel iCh "    then take a newer version of it - or get it to depend on the library rather"
+            Writeln channel iCh "    than carry its own copy."
+            Writeln channel iCh "  - A deliberate local fork, kept on purpose. Leave it - and consider renaming it,"
+            Writeln channel iCh "    so which one the compiler picks stops being a question about folder order."
+            Writeln channel iCh ""
+        End
+        Writeln channel iCh ("Total: " + String(iTotal) + " shadowed file(s), " + String(iStale) + " unused library folder(s).")
+        Send rfCloseOutput iCh
+        Function_Return (iTotal + iStale)
+    End_Function
+
+End_Class

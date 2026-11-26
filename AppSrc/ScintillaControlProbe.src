@@ -1,0 +1,1373 @@
+﻿//****************************************************************************
+// $Module type: Program
+// $Module name: ScintillaControlProbe
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-27
+//
+// Description : ScintillaControlProbe - the committed dev-harness for cScintillaControl (phase 1).
+//               Standalone program, not part of any shipped app: compiles the class, creates a REAL
+//               control, drives the surface, writes ok:/FAIL: lines to a file and exits. Every new
+//               batch of members gets its checks added here BEFORE the members are written.
+//               Creates a REAL Scintilla control, drives the v1 surface, writes ok:/FAIL: lines
+//               to DFRefactorProbe_zvscicore_out.txt in the Windows temp folder and exits (to
+//               Data\_zvscicore_out.txt until 2026-10-05). The window flashes briefly by design.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use DfAllEnt.pkg
+Use cTimer.pkg
+
+// The application object comes BEFORE the editor packages, as in every other program. One of them,
+// cRefactorEditorSettings.pkg (cScintillaSchemeView.pkg Uses it), creates the editor settings object and
+// loads the settings at the place it is Used, and that object asks the application for the workspace's
+// Data folder to find its file. With the application created below the Use lines - where it stood until
+// 2026-10-05 - a run opened with "Invalid message GET_PHOWORKSPACE", error 98 (Nils 2026-10-05), and the
+// settings were not read. The probe only reads Data\ScintillaEdit.json; nothing in it saves the settings.
+Object oApplication is a cApplication
+    // cEditorColourScheme asks the application for the target install's Pkg folder, to read the DataFlex
+    // scheme's colours from its language file. Blank means "no install to read" - the stub
+    // UnitTests.src carries for the same reason.
+    Property String psTargetPkgFolder ""
+End_Object
+
+// The editor package's "convert C declaration" command asks the function library, which this probe does
+// not load - and the probe never runs that command. Declared so the build resolves the name.
+Register_Function CDeclarationToDataFlex String sDecl String[] ByRef asNotes Returns String
+Use cRefactorEditorCommands.pkg    // the bridge + the three re-homed editor commands
+Use cEditorColourScheme.pkg        // the colour-scheme class (pure logic, probed here)
+Use cEncodingHelpers.pkg
+Use RefactorFileIO.pkg     // rfDeleteFile for fixture cleanup
+
+#IFNDEF WM_CHAR
+Define WM_CHAR for |CI$0102
+#ENDIF
+
+// Counting subclass: proves the SCN_ dispatch actually reaches the overridable
+// hooks. All the base-class checks run against this same instance, so the whole
+// probe doubles as a subclassing test.
+Class cScintillaProbeControl is a cRefactorEditorCommands
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Property Integer piSaveReachedCount 0
+        Property Integer piSaveLeftCount 0
+        Property Integer piCharAddedCount 0
+        Property Integer piLastCharAdded 0
+        Property Integer piModifiedCount 0
+        Property Integer piUpdateUICount 0
+        Property Integer piReadOnlyAttemptCount 0
+    End_Procedure
+
+    Procedure OnSavePointReached
+        Set piSaveReachedCount to (piSaveReachedCount(Self) + 1)
+    End_Procedure
+
+    Procedure OnSavePointLeft
+        Set piSaveLeftCount to (piSaveLeftCount(Self) + 1)
+    End_Procedure
+
+    Procedure OnCharacterAdded Integer iChar
+        Set piCharAddedCount to (piCharAddedCount(Self) + 1)
+        Set piLastCharAdded to iChar
+    End_Procedure
+
+    Procedure OnDocumentModified Integer iModificationType
+        Set piModifiedCount to (piModifiedCount(Self) + 1)
+    End_Procedure
+
+    Procedure OnEditorUpdateUI Integer iUpdatedFlags
+        Set piUpdateUICount to (piUpdateUICount(Self) + 1)
+    End_Procedure
+
+    Procedure OnModifyAttemptReadOnly
+        Set piReadOnlyAttemptCount to (piReadOnlyAttemptCount(Self) + 1)
+    End_Procedure
+End_Class
+
+Object oProbePanel is a Panel
+    Set Label to "_ZVSciCore probe"
+    Set Size to 220 320
+    Set Location to 40 40
+
+    Object oSci is a cScintillaProbeControl
+        Set Size to 180 300
+        Set Location to 10 8
+    End_Object
+
+    Property Integer piProbeChannel 0
+    Property String  psProbeFile ""
+
+    /* Append-and-close per line rather than holding the channel open. Slower, but a
+       probe that HANGS still says which check it hung on - buffered output loses
+       exactly the lines you need when a new member loops forever. */
+    Procedure Say String sLine
+        Integer iCh
+        Get piProbeChannel to iCh
+        Append_Output channel iCh (psProbeFile(Self))
+        Writeln channel iCh sLine
+        Close_Output channel iCh
+    End_Procedure
+
+    Function WriteProbeBytes UChar[] ucaBytes String sFilePath Returns Boolean
+        Integer iCh
+        Move (Seq_New_Channel()) to iCh
+        If (iCh < 0) ;
+            Function_Return False
+        Direct_Output Channel iCh ("binary:" + sFilePath)
+        Write Channel iCh ucaBytes
+        Close_Output Channel iCh
+        Send Seq_Release_Channel iCh
+        Function_Return True
+    End_Function
+
+    Function ReadProbeBytes String sFilePath Returns UChar[]
+        Integer iCh iSize
+        UChar[] ucaBytes
+
+        Move (rfFileSize(sFilePath)) to iSize
+        If (iSize <= 0) ;
+            Function_Return ucaBytes
+        Move (Seq_New_Channel()) to iCh
+        If (iCh < 0) ;
+            Function_Return ucaBytes
+        Direct_Input Channel iCh ("binary:" + sFilePath)
+        Read_Block Channel iCh ucaBytes iSize
+        Close_Input Channel iCh
+        Send Seq_Release_Channel iCh
+        Function_Return ucaBytes
+    End_Function
+
+    Function BytesEqual UChar[] ucaA UChar[] ucaB Returns Boolean
+        Integer i
+        If (SizeOfArray(ucaA) <> SizeOfArray(ucaB)) ;
+            Function_Return False
+        For i from 0 to (SizeOfArray(ucaA) - 1)
+            If (ucaA[i] <> ucaB[i]) ;
+                Function_Return False
+        Loop
+        Function_Return True
+    End_Function
+
+    Object oProbeTimer is a cTimer
+        Set piTimeout to 50
+        Set pbEnabled to True
+        Procedure OnTimer
+            Set pbEnabled to False
+            Delegate Send RunProbe
+        End_Procedure
+    End_Object
+
+    Procedure RunProbe
+        Integer iCh iVal iBytes iChars
+        String sVal sExpect
+        Boolean bVal
+
+        Get Seq_New_Channel to iCh
+        Set piProbeChannel to iCh
+        // The Windows temp folder; vGetTempPath is a method of the Desktop, not a global function.
+        Set psProbeFile to (vFolderFormat(vGetTempPath(Desktop)) + "DFRefactorProbe_zvscicore_out.txt")
+        Direct_Output channel iCh (psProbeFile(Self))   // truncate; Say appends from here
+        Close_Output channel iCh
+
+        // 1) The control is real.
+        If (Window_Handle(oSci) <> 0) ;
+            Send Say "ok:window created"
+        Else ;
+            Send Say "FAIL:window handle is 0 - control never paged"
+
+        // 2) UTF-8 mode + document text round trip. Line 3 carries a-ring (2 bytes UTF-8).
+        Send UseUtf8Encoding of oSci
+        Move ("Move iFoo to iBar" + C_NewLine + "Procedure TestProc" + C_NewLine + "Line3" + Character(229)) to sExpect
+        Send SetDocumentText of oSci sExpect
+        Get DocumentText of oSci to sVal
+        If (sVal = sExpect) ;
+            Send Say "ok:document text round trip"
+        Else ;
+            Send Say ("FAIL:document text round trip [" + sVal + "]")
+
+        // 3) Lines: count, exact text, EOL never included.
+        Get DocumentLineCount of oSci to iVal
+        If (iVal = 3) ;
+            Send Say "ok:line count 3"
+        Else ;
+            Send Say ("FAIL:line count " + String(iVal))
+        Get LineText of oSci 0 to sVal
+        If (sVal = "Move iFoo to iBar") ;
+            Send Say "ok:line 0 text"
+        Else ;
+            Send Say ("FAIL:line 0 text [" + sVal + "]")
+        Get LineText of oSci 1 to sVal
+        If (Pos(CS_CR, sVal) = 0 and Pos(CS_LF, sVal) = 0 and sVal = "Procedure TestProc") ;
+            Send Say "ok:line 1 text EOL-free"
+        Else ;
+            Send Say ("FAIL:line 1 [" + sVal + "]")
+        Get LineText of oSci 9 to sVal
+        If (sVal = "") ;
+            Send Say "ok:out-of-range line is empty"
+        Else ;
+            Send Say ("FAIL:out-of-range line [" + sVal + "]")
+
+        // 4) Positions are BYTES: the a-ring makes byte length exceed character count by 1.
+        Get ByteLength of oSci to iBytes
+        Get CharacterCount of oSci to iChars
+        If (iBytes = (iChars + 1)) ;
+            Send Say "ok:bytes vs characters differ by the multi-byte char"
+        Else ;
+            Send Say ("FAIL:bytes " + String(iBytes) + " chars " + String(iChars))
+
+        // 5) Navigation.
+        Send GotoLineNumber of oSci 2
+        Get CurrentLine of oSci to iVal
+        If (iVal = 2) ;
+            Send Say "ok:goto line 2 (0-based)"
+        Else ;
+            Send Say ("FAIL:current line " + String(iVal))
+
+        // 6) Selection by line/col + selected text.
+        Send SelectRange of oSci 0 5 0 9
+        Get SelectedText of oSci to sVal
+        If (sVal = "iFoo") ;
+            Send Say "ok:select range 0/5..0/9 = iFoo"
+        Else ;
+            Send Say ("FAIL:selected [" + sVal + "]")
+
+        // 7) Word at caret / at position.
+        Send SetCaretPosition of oSci 0 6
+        Get WordAtCaret of oSci to sVal
+        If (sVal = "iFoo") ;
+            Send Say "ok:word at caret = iFoo"
+        Else ;
+            Send Say ("FAIL:word at caret [" + sVal + "]")
+        Get WordAt of oSci 1 12 to sVal
+        If (sVal = "TestProc") ;
+            Send Say "ok:word at 1/12 = TestProc"
+        Else ;
+            Send Say ("FAIL:word at 1/12 [" + sVal + "]")
+
+        // 8) Modified lifecycle + undo (MarkSaved -> clean; edit -> dirty; undo works).
+        Send MarkSaved of oSci
+        Get IsModified of oSci to bVal
+        If (bVal = False) ;
+            Send Say "ok:clean after MarkSaved"
+        Else ;
+            Send Say "FAIL:still modified after MarkSaved"
+        Send SetCaretPosition of oSci 2 0
+        Send AddTextAtCaret of oSci "x"
+        Get IsModified of oSci to bVal
+        If (bVal = True) ;
+            Send Say "ok:modified after edit"
+        Else ;
+            Send Say "FAIL:not modified after edit"
+        Get CanUndo of oSci to bVal
+        If (bVal = True) ;
+            Send Say "ok:can undo"
+        Else ;
+            Send Say "FAIL:cannot undo after edit"
+        Send Undo of oSci
+        Get LineText of oSci 2 to sVal
+        If (sVal = ("Line3" + Character(229))) ;
+            Send Say "ok:undo restored line 2"
+        Else ;
+            Send Say ("FAIL:after undo line 2 [" + sVal + "]")
+
+        // 9) Config round trip.
+        Send SetTabWidth of oSci 3
+        Get TabWidth of oSci to iVal
+        If (iVal = 3) ;
+            Send Say "ok:tab width round trip"
+        Else ;
+            Send Say ("FAIL:tab width " + String(iVal))
+
+        Send ProbeFileIO
+        Send ProbeNotifications
+        Send ProbeLanguage
+        Send ProbeBridge
+        Send ProbeSearch
+        Send ProbeServices
+        Send ProbeLineKinds
+        Send ProbeEditorCommands
+        Send ProbeColourScheme
+        Send Say "done"
+        Close_Output channel iCh
+        Send Seq_Release_Channel iCh
+        Send Exit_Application
+    End_Procedure
+
+    // ---- The file-I/O batch: OpenFile/SaveFile with encoding detection. These checks
+    // were written BEFORE the members (the harness discipline). They mirror the GUI
+    // baseline pins on the OLD chain: OEM byte-exact round trip, BOM kept + never
+    // visible as text, clean-after-open, clean-after-save.
+    Procedure ProbeFileIO
+        Boolean bVal
+        Integer iVoid
+        String sVal sFileA sFileB sTempPath
+        UChar[] ucaIn ucaOut ucaEmpty
+
+        Move (vFolderFormat(vGetTempPath(Desktop))) to sTempPath
+        Move (sTempPath + "DFRefactorProbe_zvsciA.tmp") to sFileA
+        Move (sTempPath + "DFRefactorProbe_zvsciB.tmp") to sFileB
+
+        // A) OEM: "A" 134 "b" CRLF "x" - byte 134 = a-ring in CP437 AND CP850.
+        Move ucaEmpty to ucaIn
+        Move 65  to ucaIn[0]
+        Move 134 to ucaIn[1]
+        Move 98  to ucaIn[2]
+        Move 13  to ucaIn[3]
+        Move 10  to ucaIn[4]
+        Move 120 to ucaIn[5]
+        Get WriteProbeBytes ucaIn sFileA to bVal
+        Get OpenFile of oSci sFileA to bVal
+        If (bVal = True) ;
+            Send Say "ok:io open oem returns true"
+        Else ;
+            Send Say "FAIL:io open oem returned false"
+        Get pbUtf8Mode of oSci to bVal
+        If (bVal = False) ;
+            Send Say "ok:io no-BOM file lands in single-byte mode"
+        Else ;
+            Send Say "FAIL:io no-BOM file in utf8 mode"
+        Get IsModified of oSci to bVal
+        If (bVal = False) ;
+            Send Say "ok:io clean after open"
+        Else ;
+            Send Say "FAIL:io modified after open"
+        Get LineText of oSci 0 to sVal
+        If (sVal = ("A" + Character(229) + "b")) ;
+            Send Say "ok:io oem byte decodes to a-ring in text"
+        Else ;
+            Send Say ("FAIL:io oem line 0 [" + sVal + "]")
+        Get SaveFile of oSci sFileB to bVal
+        Get ReadProbeBytes sFileB to ucaOut
+        Get BytesEqual ucaIn ucaOut to bVal
+        If (bVal = True) ;
+            Send Say "ok:io oem byte-exact round trip"
+        Else ;
+            Send Say "FAIL:io oem round trip bytes differ"
+
+        // B) UTF-8 with BOM: BOM "A" "b" CRLF "C".
+        Move ucaEmpty to ucaIn
+        Move 239 to ucaIn[0]
+        Move 187 to ucaIn[1]
+        Move 191 to ucaIn[2]
+        Move 65  to ucaIn[3]
+        Move 98  to ucaIn[4]
+        Move 13  to ucaIn[5]
+        Move 10  to ucaIn[6]
+        Move 67  to ucaIn[7]
+        Get WriteProbeBytes ucaIn sFileA to bVal
+        Get OpenFile of oSci sFileA to bVal
+        Get pbUtf8Mode of oSci to bVal
+        If (bVal = True) ;
+            Send Say "ok:io BOM file lands in utf8 mode"
+        Else ;
+            Send Say "FAIL:io BOM file not in utf8 mode"
+        Get pbHasUtf8BOM of oSci to bVal
+        If (bVal = True) ;
+            Send Say "ok:io BOM remembered"
+        Else ;
+            Send Say "FAIL:io BOM not remembered"
+        Get LineText of oSci 0 to sVal
+        If (sVal = "Ab") ;
+            Send Say "ok:io BOM never visible as text"
+        Else ;
+            Send Say ("FAIL:io utf8 line 0 [" + sVal + "]")
+        Get SaveFile of oSci sFileB to bVal
+        Get ReadProbeBytes sFileB to ucaOut
+        Get BytesEqual ucaIn ucaOut to bVal
+        If (bVal = True) ;
+            Send Say "ok:io utf8 BOM byte-exact round trip"
+        Else ;
+            Send Say "FAIL:io utf8 round trip bytes differ"
+
+        // C) LF-only file: EOLs preserved verbatim through open -> save.
+        Move ucaEmpty to ucaIn
+        Move 65 to ucaIn[0]
+        Move 10 to ucaIn[1]
+        Move 66 to ucaIn[2]
+        Get WriteProbeBytes ucaIn sFileA to bVal
+        Get OpenFile of oSci sFileA to bVal
+        Get SaveFile of oSci sFileB to bVal
+        Get ReadProbeBytes sFileB to ucaOut
+        Get BytesEqual ucaIn ucaOut to bVal
+        If (bVal = True) ;
+            Send Say "ok:io LF-only EOL preserved"
+        Else ;
+            Send Say "FAIL:io LF-only round trip bytes differ"
+
+        // D) Edit then save -> clean again.
+        Send SetCaretPosition of oSci 0 0
+        Send AddTextAtCaret of oSci "y"
+        Get IsModified of oSci to bVal
+        If (bVal = True) ;
+            Send Say "ok:io modified after edit"
+        Else ;
+            Send Say "FAIL:io not modified after edit"
+        Get SaveFile of oSci sFileB to bVal
+        Get IsModified of oSci to bVal
+        If (bVal = False) ;
+            Send Say "ok:io clean after save"
+        Else ;
+            Send Say "FAIL:io still modified after save"
+
+        // E) Missing file -> False, no error dialog.
+        Get OpenFile of oSci (sTempPath + "DFRefactorProbe_zvsci_does_not_exist.tmp") to bVal
+        If (bVal = False) ;
+            Send Say "ok:io missing file returns false"
+        Else ;
+            Send Say "FAIL:io missing file returned true"
+
+        Move (rfDeleteFile(sFileA)) to iVoid
+        Move (rfDeleteFile(sFileB)) to iVoid
+    End_Procedure
+
+    // ---- Batch 3: the SCN_ notification dispatch, verified through the counting
+    // subclass. Checks written BEFORE the Notify implementation exists.
+    Procedure ProbeNotifications
+        Integer iVal
+        Boolean bVal
+
+        Send UseUtf8Encoding of oSci
+        Send SetDocumentText of oSci "abc"
+
+        // Save point reached: MarkSaved must dispatch OnSavePointReached.
+        Set piSaveReachedCount of oSci to 0
+        Send MarkSaved of oSci
+        Get piSaveReachedCount of oSci to iVal
+        If (iVal >= 1) ;
+            Send Say "ok:scn savepoint-reached dispatched"
+        Else ;
+            Send Say "FAIL:scn savepoint-reached never fired"
+
+        // First edit after a save point: OnSavePointLeft + OnDocumentModified.
+        Set piSaveLeftCount of oSci to 0
+        Set piModifiedCount of oSci to 0
+        Send SetCaretPosition of oSci 0 3
+        Send AddTextAtCaret of oSci "d"
+        Get piSaveLeftCount of oSci to iVal
+        If (iVal >= 1) ;
+            Send Say "ok:scn savepoint-left dispatched"
+        Else ;
+            Send Say "FAIL:scn savepoint-left never fired"
+        Get piModifiedCount of oSci to iVal
+        If (iVal >= 1) ;
+            Send Say "ok:scn modified dispatched"
+        Else ;
+            Send Say "FAIL:scn modified never fired"
+
+        // TYPING (WM_CHAR) is the only source of SCN_CHARADDED - the probe types 'y'.
+        Set piCharAddedCount of oSci to 0
+        Set piLastCharAdded of oSci to 0
+        Send EditorMessage of oSci WM_CHAR 121 0
+        Get piCharAddedCount of oSci to iVal
+        If (iVal = 1) ;
+            Send Say "ok:scn char-added fired once for typed char"
+        Else ;
+            Send Say ("FAIL:scn char-added count " + String(iVal))
+        Get piLastCharAdded of oSci to iVal
+        If (iVal = 121) ;
+            Send Say "ok:scn char-added carries the character"
+        Else ;
+            Send Say ("FAIL:scn char-added ch " + String(iVal))
+
+        // Typing into a read-only document: OnModifyAttemptReadOnly, and no insert.
+        Set piReadOnlyAttemptCount of oSci to 0
+        Send SetReadOnlyState of oSci True
+        Send EditorMessage of oSci WM_CHAR 122 0
+        Send SetReadOnlyState of oSci False
+        Get piReadOnlyAttemptCount of oSci to iVal
+        If (iVal >= 1) ;
+            Send Say "ok:scn read-only attempt dispatched"
+        Else ;
+            Send Say "FAIL:scn read-only attempt never fired"
+
+        // UPDATEUI arrives with idle/paint processing - pump once after a selection.
+        Set piUpdateUICount of oSci to 0
+        Send SelectRange of oSci 0 0 0 2
+        Send PumpMsgQueue of Desktop
+        Get piUpdateUICount of oSci to iVal
+        If (iVal >= 1) ;
+            Send Say "ok:scn update-ui dispatched"
+        Else ;
+            Send Say "FAIL:scn update-ui never fired"
+    End_Procedure
+
+    // ---- Batch 4: the native DataFlex lexer + styling primitives. Checks written
+    // BEFORE the members. The strongest check is REAL LEXING: colourise a DataFlex
+    // line and read the style byte Scintilla assigned at a keyword vs an identifier.
+    Procedure ProbeLanguage
+        Integer iVal iVal2
+        String sVal
+
+        Send UseDataFlexLexer of oSci
+        Get LexerName of oSci to sVal
+        If (sVal = "dataflex") ;
+            Send Say "ok:lex lexer is dataflex"
+        Else ;
+            Send Say ("FAIL:lex lexer name [" + sVal + "]")
+
+        // Keyword vs identifier styling - and case-insensitivity of the DF lexer
+        // (keywords fed lowercase, source says "Move").
+        Send UseUtf8Encoding of oSci
+        Send SetDocumentText of oSci "Move iFoo to iBar"
+        Send SetKeywordList of oSci 0 "move to"
+        Send Colourise of oSci
+        Get StyleAt of oSci 0 to iVal    // 'M' of Move
+        If (iVal = SCE_DF_WORD) ;
+            Send Say "ok:lex keyword styled as keyword"
+        Else ;
+            Send Say ("FAIL:lex style at keyword " + String(iVal))
+        Get StyleAt of oSci 5 to iVal2   // 'i' of iFoo
+        If (iVal2 = SCE_DF_IDENTIFIER) ;
+            Send Say "ok:lex identifier styled as identifier"
+        Else ;
+            Send Say ("FAIL:lex style at identifier " + String(iVal2))
+
+        // Scope keywords live in SET 1 and get their own style.
+        Send SetDocumentText of oSci "Procedure TestProc"
+        Send SetKeywordList of oSci 1 "procedure"
+        Send Colourise of oSci
+        Get StyleAt of oSci 0 to iVal
+        If (iVal = SCE_DF_SCOPEWORD) ;
+            Send Say "ok:lex scope keyword styled from set 1"
+        Else ;
+            Send Say ("FAIL:lex scope style " + String(iVal))
+
+        // Style appearance round trip: fore color readable back.
+        Send SetStyleAppearance of oSci SCE_DF_WORD clRed clWhite True False
+        Get StyleForeColor of oSci SCE_DF_WORD to iVal
+        If (iVal = clRed) ;
+            Send Say "ok:lex style fore color round trip"
+        Else ;
+            Send Say ("FAIL:lex fore color " + String(iVal))
+    End_Procedure
+
+    // ---- The BRIDGE layer (rebase step 1): selection mirror, hotkey verbs, plumbing.
+    Procedure ProbeBridge
+        Integer iVal
+        Boolean bVal
+        String sVal
+        String[] asLines
+
+        Send UseUtf8Encoding of oSci
+        Send SetDocumentText of oSci ("Move iFoo to iBar" + C_NewLine + "Set psName.Value to (Trim(sX))" + C_NewLine + "Third line here")
+
+        // Selection mirror: line/col properties follow the live selection.
+        Send SelectRange of oSci 0 5 0 9
+        Get RefreshSelectionState of oSci to bVal
+        If (bVal = True) ;
+            Send Say "ok:bridge selection reported non-empty"
+        Else ;
+            Send Say "FAIL:bridge selection reported empty"
+        Get piSelStartLine of oSci to iVal
+        Get piSelStartCol of oSci to bVal
+        If (iVal = 0) ;
+            Send Say "ok:bridge sel start line"
+        Else ;
+            Send Say ("FAIL:bridge sel start line " + String(iVal))
+        Get piSelEndCol of oSci to iVal
+        If (iVal = 9) ;
+            Send Say "ok:bridge sel end col"
+        Else ;
+            Send Say ("FAIL:bridge sel end col " + String(iVal))
+
+        // Dotted word at caret - caret inside "psName" of "psName.Value".
+        Send SetCaretPosition of oSci 1 8
+        Get WordAtCaretIncludingDots of oSci to sVal
+        If (sVal = "psName.Value") ;
+            Send Say "ok:bridge dotted word at caret"
+        Else ;
+            Send Say ("FAIL:bridge dotted word [" + sVal + "]")
+
+        // Hotkey verbs: duplicate, move, case, select-all.
+        Send SetDocumentText of oSci ("alpha" + C_NewLine + "beta")
+        Send GotoLineNumber of oSci 0
+        Send DuplicateSelection of oSci
+        Get DocumentLineCount of oSci to iVal
+        If (iVal = 3) ;
+            Send Say "ok:bridge duplicate selection added a line"
+        Else ;
+            Send Say ("FAIL:bridge duplicate line count " + String(iVal))
+
+        Send SetDocumentText of oSci ("alpha" + C_NewLine + "beta")
+        Send GotoLineNumber of oSci 1
+        Send MoveLineUp of oSci
+        Get LineText of oSci 0 to sVal
+        If (sVal = "beta") ;
+            Send Say "ok:bridge move line up"
+        Else ;
+            Send Say ("FAIL:bridge move line up [" + sVal + "]")
+
+        Send SetDocumentText of oSci "make me loud"
+        Send SelectAllText of oSci
+        Send UpperCaseSelection of oSci
+        Get LineText of oSci 0 to sVal
+        If (sVal = "MAKE ME LOUD") ;
+            Send Say "ok:bridge select-all + uppercase"
+        Else ;
+            Send Say ("FAIL:bridge uppercase [" + sVal + "]")
+
+        // Matching brace: caret just after the opening paren jumps to its partner.
+        Send SetDocumentText of oSci "If (Found and (Not(Found))) Begin"
+        Send SetCaretPosition of oSci 0 4
+        Send GotoMatchingBrace of oSci
+        Get EditorMessage of oSci SCI_GETCURRENTPOS to iVal
+        If (iVal = 26) ;
+            Send Say "ok:bridge goto matching brace"
+        Else ;
+            Send Say ("FAIL:bridge brace match pos " + String(iVal))
+
+        // Bookmarks: toggle on, find it, toggle off.
+        Send SetDocumentText of oSci ("one" + C_NewLine + "two" + C_NewLine + "three")
+        Send ClearAllBookmarks of oSci
+        Send GotoLineNumber of oSci 2
+        Send ToggleBookmark of oSci
+        Get LineHasBookmark of oSci 2 to bVal
+        If (bVal = True) ;
+            Send Say "ok:bridge bookmark set"
+        Else ;
+            Send Say "FAIL:bridge bookmark not set"
+        Send GotoLineNumber of oSci 0
+        Send NextBookmark of oSci
+        Get CurrentLine of oSci to iVal
+        If (iVal = 2) ;
+            Send Say "ok:bridge next bookmark jumped"
+        Else ;
+            Send Say ("FAIL:bridge next bookmark line " + String(iVal))
+        Send GotoLineNumber of oSci 2
+        Send ToggleBookmark of oSci
+        Get LineHasBookmark of oSci 2 to bVal
+        If (bVal = False) ;
+            Send Say "ok:bridge bookmark cleared"
+        Else ;
+            Send Say "FAIL:bridge bookmark still set"
+
+        // Plumbing: ClearDocument empties, tab/indent setters do not throw.
+        Send ShowLineNumbers of oSci True
+        Send ShowHorizontalScrollBar of oSci True
+        Send SetIndentationGuides of oSci True
+        Send SetUseTabs of oSci False
+        Send SetAutoIndentMode of oSci CI_AutoIndentScope
+        Get peAutoIndentMode of oSci to iVal
+        If (iVal = CI_AutoIndentPrevLine) ;
+            Send Say "ok:bridge indent scope collapses to prevline"
+        Else ;
+            Send Say ("FAIL:bridge indent mode " + String(iVal))
+        Send ClearDocument of oSci
+        Get ByteLength of oSci to iVal
+        If (iVal = 0) ;
+            Send Say "ok:bridge clear document"
+        Else ;
+            Send Say ("FAIL:bridge clear left " + String(iVal) + " bytes")
+    End_Procedure
+
+    // ---- Bucket C: the ported search engine. Every operation returns a value, so
+    // all of this is probe-testable without a dialog in sight.
+    Procedure ProbeSearch
+        Integer iVal
+        Boolean bVal
+        String sVal
+
+        Send UseUtf8Encoding of oSci
+        Send SetDocumentText of oSci ("alpha beta" + C_NewLine + "gamma beta delta" + C_NewLine + "beta end")
+
+        // Flags round trip through the plain-boolean API.
+        Get ApplySearchOptions of oSci False True False False to iVal
+        Get SearchMatchesCase of oSci to bVal
+        If (bVal = True) ;
+            Send Say "ok:search match-case flag set"
+        Else ;
+            Send Say "FAIL:search match-case flag missing"
+        Get SearchUsesRegExp of oSci to bVal
+        If (bVal = False) ;
+            Send Say "ok:search regexp flag clear"
+        Else ;
+            Send Say "FAIL:search regexp flag unexpectedly set"
+
+        // Find first from the top, then next, then wrap.
+        Get FindFirstOccurrence of oSci "beta" to bVal
+        Get SelectedText of oSci to sVal
+        If (bVal = True and sVal = "beta") ;
+            Send Say "ok:search find-first selects the match"
+        Else ;
+            Send Say ("FAIL:search find-first [" + sVal + "]")
+        Get CurrentLine of oSci to iVal
+        If (iVal = 0) ;
+            Send Say "ok:search find-first landed on line 0"
+        Else ;
+            Send Say ("FAIL:search find-first line " + String(iVal))
+
+        Get FindNextOccurrence of oSci "beta" to bVal
+        Get CurrentLine of oSci to iVal
+        If (bVal = True and iVal = 1) ;
+            Send Say "ok:search find-next advanced to line 1"
+        Else ;
+            Send Say ("FAIL:search find-next line " + String(iVal))
+
+        Get FindNextOccurrence of oSci "beta" to bVal
+        Get CurrentLine of oSci to iVal
+        If (bVal = True and iVal = 2) ;
+            Send Say "ok:search find-next advanced to line 2"
+        Else ;
+            Send Say ("FAIL:search find-next line " + String(iVal))
+
+        // Fourth call must WRAP to the first occurrence.
+        Get FindNextOccurrence of oSci "beta" to bVal
+        Get CurrentLine of oSci to iVal
+        If (bVal = True and iVal = 0) ;
+            Send Say "ok:search find-next wrapped to the top"
+        Else ;
+            Send Say ("FAIL:search wrap line " + String(iVal))
+
+        // Backwards.
+        Send GotoLineNumber of oSci 2
+        Get FindPreviousOccurrence of oSci "beta" to bVal
+        Get CurrentLine of oSci to iVal
+        If (bVal = True and iVal = 1) ;
+            Send Say "ok:search find-previous went backwards"
+        Else ;
+            Send Say ("FAIL:search find-previous line " + String(iVal))
+
+        // Missing needle reports honestly.
+        Get FindFirstOccurrence of oSci "nosuchtext" to bVal
+        If (bVal = False) ;
+            Send Say "ok:search missing needle returns false"
+        Else ;
+            Send Say "FAIL:search missing needle returned true"
+
+        // Replace the current match.
+        Get FindFirstOccurrence of oSci "alpha" to bVal
+        Get ReplaceSelectionWith of oSci "ALPHA" to bVal
+        Get LineText of oSci 0 to sVal
+        If (sVal = "ALPHA beta") ;
+            Send Say "ok:search replace selection"
+        Else ;
+            Send Say ("FAIL:search replace [" + sVal + "]")
+
+        // Replace all - three betas, one undo unit.
+        Get ReplaceAllOccurrences of oSci "beta" "BETA" to iVal
+        If (iVal = 3) ;
+            Send Say "ok:search replace-all replaced 3"
+        Else ;
+            Send Say ("FAIL:search replace-all count " + String(iVal))
+        Get LineText of oSci 1 to sVal
+        If (sVal = "gamma BETA delta") ;
+            Send Say "ok:search replace-all rewrote line 1"
+        Else ;
+            Send Say ("FAIL:search replace-all line 1 [" + sVal + "]")
+        Send Undo of oSci
+        Get LineText of oSci 1 to sVal
+        If (sVal = "gamma beta delta") ;
+            Send Say "ok:search replace-all undoes as ONE unit"
+        Else ;
+            Send Say ("FAIL:search undo left [" + sVal + "]")
+
+        // A replacement CONTAINING the needle must terminate (the classic trap).
+        Send SetDocumentText of oSci "x x x"
+        Get ReplaceAllOccurrences of oSci "x" "xx" to iVal
+        Get LineText of oSci 0 to sVal
+        If (iVal = 3 and sVal = "xx xx xx") ;
+            Send Say "ok:search replace-all terminates when replacement contains needle"
+        Else ;
+            Send Say ("FAIL:search self-containing replace [" + sVal + "] count " + String(iVal))
+
+        // Mark all - one bookmark per matching LINE.
+        Send SetDocumentText of oSci ("hit one" + C_NewLine + "miss" + C_NewLine + "hit two")
+        Send ClearAllBookmarks of oSci
+        Get MarkAllOccurrences of oSci "hit" to iVal
+        Get LineHasBookmark of oSci 0 to bVal
+        If (iVal = 2 and bVal = True) ;
+            Send Say "ok:search mark-all bookmarked the matches"
+        Else ;
+            Send Say ("FAIL:search mark-all count " + String(iVal))
+        Get LineHasBookmark of oSci 1 to bVal
+        If (bVal = False) ;
+            Send Say "ok:search mark-all skipped the non-match"
+        Else ;
+            Send Say "FAIL:search mark-all bookmarked a non-match"
+
+        // OEM mode: an extended-character needle must still match (the codec path).
+        Send UseOemEncoding of oSci
+        Send SetDocumentText of oSci ("caf" + Character(233) + " bar")
+        Get FindFirstOccurrence of oSci ("caf" + Character(233)) to bVal
+        Get SelectedText of oSci to sVal
+        If (bVal = True and sVal = ("caf" + Character(233))) ;
+            Send Say "ok:search extended-char needle matches in OEM mode"
+        Else ;
+            Send Say ("FAIL:search OEM needle [" + sVal + "]")
+        Send UseUtf8Encoding of oSci
+    End_Procedure
+
+    // ---- Bucket E: the interactive services. Auto-indent is the behaviour users
+    // feel on EVERY line, so it gets the most checks - including the scope-aware
+    // extra indent and the single-undo-unit rule.
+    Procedure ProbeServices
+        Integer iVal iOuter iInner
+        String sVal
+
+        Send UseUtf8Encoding of oSci
+        Send UseDataFlexLexer of oSci
+        // Scope words must live ONLY in sets 1/2 - a word that is also in set 0 is
+        // styled as a plain keyword and never opens a fold.
+        Send SetKeywordList of oSci 0 "move to"
+        Send SetKeywordList of oSci 1 "procedure"        // scope open
+        Send SetKeywordList of oSci 2 "end_procedure"    // scope close
+        Send EnableFolding of oSci True
+        Send EnableBookmarkMargin of oSci True
+        Send SetUseTabs of oSci False
+        Send SetTabWidth of oSci 4
+        Send SetAutoIndentMode of oSci CI_AutoIndentPrevLine
+
+        // Indentation read/write round trip.
+        Send SetDocumentText of oSci "        indented line"
+        Get LineIndentation of oSci 0 to iVal
+        If (iVal = 8) ;
+            Send Say "ok:svc line indentation read"
+        Else ;
+            Send Say ("FAIL:svc indentation " + String(iVal))
+        Send SetLineIndentation of oSci 0 4
+        Get LineText of oSci 0 to sVal
+        If (sVal = "    indented line") ;
+            Send Say "ok:svc set line indentation (spaces, per use-tabs)"
+        Else ;
+            Send Say ("FAIL:svc set indentation [" + sVal + "]")
+
+        // ENTER keeps the current indentation.
+        Send SetDocumentText of oSci "    Move x to y"
+        Send SetCaretPosition of oSci 0 15
+        Send HandleReturnKey of oSci
+        Get DocumentLineCount of oSci to iVal
+        If (iVal = 2) ;
+            Send Say "ok:svc return added a line"
+        Else ;
+            Send Say ("FAIL:svc return line count " + String(iVal))
+        Get LineIndentation of oSci 1 to iVal
+        If (iVal = 4) ;
+            Send Say "ok:svc return matched previous indentation"
+        Else ;
+            Send Say ("FAIL:svc return indent " + String(iVal))
+
+        // Caret column - the auto-indent's "am I inside the leading whitespace?" test.
+        Send SetDocumentText of oSci "    Move x to y"
+        Send SetCaretPosition of oSci 0 7
+        Get CaretColumn of oSci to iVal
+        If (iVal = 7) ;
+            Send Say "ok:svc caret column"
+        Else ;
+            Send Say ("FAIL:svc caret column " + String(iVal))
+
+        // ENTER from INSIDE the leading whitespace splits the line and leaves the tail
+        // where it was - it must not be pushed further right.
+        Send SetDocumentText of oSci "        Move x to y"
+        Send SetCaretPosition of oSci 0 2
+        Send HandleReturnKey of oSci
+        Get LineIndentation of oSci 1 to iVal
+        If (iVal = 6) ;
+            Send Say "ok:svc return inside the indent does not re-indent"
+        Else ;
+            Send Say ("FAIL:svc return inside indent " + String(iVal))
+
+        // ENTER after a SCOPE opener indents one tab width DEEPER. This is the real
+        // editing shape - the scope has a close below it, which is what lets the lexer
+        // mark the opener as a fold header.
+        Send SetDocumentText of oSci ("Procedure Foo" + C_NewLine + "End_Procedure")
+        Send Colourise of oSci
+        Get LineOpensScope of oSci 0 to iVal
+        If (iVal = True) ;
+            Send Say "ok:svc scope opener is a fold header"
+        Else ;
+            Send Say "FAIL:svc scope opener not flagged as a fold header"
+        Send SetCaretPosition of oSci 0 13
+        Send HandleReturnKey of oSci
+        Get LineIndentation of oSci 1 to iVal
+        If (iVal = 4) ;
+            Send Say "ok:svc return indents deeper after a scope opener"
+        Else ;
+            Send Say ("FAIL:svc scope indent " + String(iVal))
+
+        // ONE undo unit: Ctrl+Z takes back the newline AND its indentation.
+        Send SetDocumentText of oSci "    Move x to y"
+        Send MarkSaved of oSci
+        Send SetCaretPosition of oSci 0 15
+        Send HandleReturnKey of oSci
+        Send Undo of oSci
+        Get DocumentLineCount of oSci to iVal
+        Get LineText of oSci 0 to sVal
+        If (iVal = 1 and sVal = "    Move x to y") ;
+            Send Say "ok:svc return undoes as ONE unit"
+        Else ;
+            Send Say ("FAIL:svc undo left " + String(iVal) + " lines [" + sVal + "]")
+
+        // Fold levels: a scope opener nests what follows.
+        Send SetDocumentText of oSci ("Procedure Foo" + C_NewLine + "    Move x to y" + C_NewLine + "End_Procedure")
+        Send Colourise of oSci
+        Get LineFoldLevel of oSci 0 to iOuter
+        Get LineFoldLevel of oSci 1 to iInner
+        If (iInner > iOuter) ;
+            Send Say "ok:svc fold level deepens inside a scope"
+        Else ;
+            Send Say ("FAIL:svc fold levels " + String(iOuter) + "/" + String(iInner))
+        Get FoldParentLine of oSci 1 to iVal
+        If (iVal = 0) ;
+            Send Say "ok:svc fold parent of an inner line"
+        Else ;
+            Send Say ("FAIL:svc fold parent " + String(iVal))
+        Send ToggleFoldAtLine of oSci 0
+        Send ToggleFoldAtLine of oSci 0
+        Send Say "ok:svc fold toggle round trip"
+
+        // Brace highlighting must not throw on matched, unmatched or no brace.
+        Send SetDocumentText of oSci "If (Found) Begin"
+        Send ShowMatchingBraces of oSci 4
+        Send SetDocumentText of oSci "If (Found Begin"
+        Send ShowMatchingBraces of oSci 4
+        Send SetDocumentText of oSci "no braces here"
+        Send ShowMatchingBraces of oSci 3
+        Send Say "ok:svc brace highlight handles matched/unmatched/none"
+
+        // A bookmark must survive the margin being set up (marker bit vs margin mask).
+        Send SetDocumentText of oSci ("one" + C_NewLine + "two" + C_NewLine + "three")
+        Send GotoLineNumber of oSci 1
+        Send ToggleBookmark of oSci
+        Get LineHasBookmark of oSci 1 to iVal
+        If (iVal = True) ;
+            Send Say "ok:svc bookmark set on the marker margin"
+        Else ;
+            Send Say "FAIL:svc bookmark not set"
+
+        Send EnableFolding of oSci False
+        Send EnableBookmarkMargin of oSci False
+
+        // ---- The last three members the editor still reaches into the old chain for.
+        // Encoding mode as a single answer (was TextEncoding).
+        Send UseUtf8Encoding of oSci
+        Get EncodingMode of oSci to iVal
+        If (iVal = eTE_UTF8) ;
+            Send Say "ok:svc encoding mode utf8"
+        Else ;
+            Send Say ("FAIL:svc encoding mode utf8 " + String(iVal))
+        Send UseOemEncoding of oSci
+        Get EncodingMode of oSci to iVal
+        If (iVal = eTE_OEM) ;
+            Send Say "ok:svc encoding mode oem"
+        Else ;
+            Send Say ("FAIL:svc encoding mode oem " + String(iVal))
+        Send UseAnsiEncoding of oSci
+        Get EncodingMode of oSci to iVal
+        If (iVal = eTE_ANSI) ;
+            Send Say "ok:svc encoding mode ansi"
+        Else ;
+            Send Say ("FAIL:svc encoding mode ansi " + String(iVal))
+        Send UseUtf8Encoding of oSci
+
+        // EOL mode (was CM_EnableCRLF) - and the matching EOL text, which callers
+        // splice between lines.
+        Send SetLineEndings of oSci False
+        Get LineEndingText of oSci to sVal
+        If (sVal = CS_LF) ;
+            Send Say "ok:svc EOL mode LF"
+        Else ;
+            Send Say "FAIL:svc EOL mode LF"
+        Send SetLineEndings of oSci True
+        Get LineEndingText of oSci to sVal
+        If (sVal = C_NewLine) ;
+            Send Say "ok:svc EOL mode CRLF"
+        Else ;
+            Send Say "FAIL:svc EOL mode CRLF"
+
+        // The keyword-list normalizer (was SCKeywords): the settings store keeps one
+        // keyword per "\n"; Scintilla wants them space separated.
+        Get KeywordListAsWords of oSci "move\nto\nself" to sVal
+        If (sVal = "move to self") ;
+            Send Say "ok:svc keyword list to words"
+        Else ;
+            Send Say ("FAIL:svc keyword list [" + sVal + "]")
+    End_Procedure
+
+    // ---- The line-classification layer: what re-indent and normalize-case ask about
+    // a line before they touch it. All of it reads the LEXER's style bytes rather than
+    // re-parsing the text, so it agrees with what the user sees coloured on screen.
+    Procedure ProbeLineKinds
+        Integer iVal
+        String sVal
+
+        Send UseUtf8Encoding of oSci
+        Send UseDataFlexLexer of oSci
+        Send SetKeywordList of oSci 0 "move to"
+        Send SetKeywordList of oSci 1 "procedure"
+        Send SetKeywordList of oSci 2 "end_procedure"
+        Send SetUseTabs of oSci False
+        Send SetTabWidth of oSci 4
+
+        // Replacing a line's text, leaving its neighbours alone.
+        Send SetDocumentText of oSci ("one" + C_NewLine + "two" + C_NewLine + "three")
+        Send SetLineText of oSci 1 "TWO"
+        Get LineText of oSci 1 to sVal
+        Get DocumentLineCount of oSci to iVal
+        If (sVal = "TWO" and iVal = 3) ;
+            Send Say "ok:kind set line text in place"
+        Else ;
+            Send Say ("FAIL:kind set line text [" + sVal + "] lines " + String(iVal))
+        Get LineText of oSci 2 to sVal
+        If (sVal = "three") ;
+            Send Say "ok:kind set line text left the next line alone"
+        Else ;
+            Send Say ("FAIL:kind neighbour [" + sVal + "]")
+
+        // Comment vs code, read off the lexer.
+        Send SetDocumentText of oSci ("    // a comment" + C_NewLine + "    Move x to y")
+        Send Colourise of oSci
+        Get LineIsComment of oSci 0 to iVal
+        If (iVal = True) ;
+            Send Say "ok:kind comment line"
+        Else ;
+            Send Say "FAIL:kind comment line not detected"
+        Get LineIsComment of oSci 1 to iVal
+        If (iVal = False) ;
+            Send Say "ok:kind code line is not a comment"
+        Else ;
+            Send Say "FAIL:kind code line reported as comment"
+
+        // A goto label - trailing colon, no embedded blanks.
+        Send SetDocumentText of oSci ("MyLabel:" + C_NewLine + "    Move x to y")
+        Send Colourise of oSci
+        Get LineIsGotoLabel of oSci 0 to iVal
+        If (iVal = True) ;
+            Send Say "ok:kind goto label"
+        Else ;
+            Send Say "FAIL:kind goto label not detected"
+        Get LineIsGotoLabel of oSci 1 to iVal
+        If (iVal = False) ;
+            Send Say "ok:kind code line is not a label"
+        Else ;
+            Send Say "FAIL:kind code line reported as a label"
+
+        // Strings blanked, comment tail dropped, POSITIONS preserved - that last part
+        // is what the callers depend on when they splice by column.
+        Send SetDocumentText of oSci ("Move " + Character(34) + "a b" + Character(34) + " to x // tail")
+        Get LineWithoutStringsAndComments of oSci 0 to sVal
+        If (Pos("a b", sVal) = 0 and Pos("tail", sVal) = 0 and Pos("to x", sVal) > 0) ;
+            Send Say "ok:kind string and comment blanking"
+        Else ;
+            Send Say ("FAIL:kind blanking [" + sVal + "]")
+        Send SetDocumentText of oSci "Move x to y"
+        Get LineWithoutStringsAndComments of oSci 0 to sVal
+        If (sVal = "Move x to y") ;
+            Send Say "ok:kind plain line survives blanking unchanged"
+        Else ;
+            Send Say ("FAIL:kind plain line [" + sVal + "]")
+
+        // A report image and a multi-line string: re-indent must leave both alone,
+        // because moving them changes what the file actually says.
+        // A character-mode report image page: opened by a /PageName label, closed by /*.
+        Send SetDocumentText of oSci ("/PageTitle" + C_NewLine + "  report body text" + C_NewLine + "/*")
+        Send Colourise of oSci
+        Get LineIsReportImage of oSci 1 to iVal
+        If (iVal = True) ;
+            Send Say "ok:kind report image body"
+        Else ;
+            Send Say "FAIL:kind report image body not detected"
+
+        Send SetDocumentText of oSci ("Move " + Repeat('"', 3) + C_NewLine + "inside the string" + C_NewLine + Repeat('"', 3) + " to sX")
+        Send Colourise of oSci
+        Get LineIsMultiLineString of oSci 1 to iVal
+        If (iVal = True) ;
+            Send Say "ok:kind multi-line string body"
+        Else ;
+            Send Say "FAIL:kind multi-line string body not detected"
+        Send SetDocumentText of oSci "    Move x to y"
+        Send Colourise of oSci
+        Get LineIsMultiLineString of oSci 0 to iVal
+        If (iVal = False) ;
+            Send Say "ok:kind plain line is not a multi-line string"
+        Else ;
+            Send Say "FAIL:kind plain line reported as multi-line string"
+
+        // Indentation text follows the tabs/spaces setting.
+        Get IndentationText of oSci 8 to sVal
+        If (sVal = "        ") ;
+            Send Say "ok:kind indentation text as spaces"
+        Else ;
+            Send Say ("FAIL:kind indent spaces [" + sVal + "]")
+        Send SetUseTabs of oSci True
+        Get IndentationText of oSci 8 to sVal
+        If (sVal = (Character(9) + Character(9))) ;
+            Send Say "ok:kind indentation text as tabs"
+        Else ;
+            Send Say "FAIL:kind indent tabs"
+        Send SetUseTabs of oSci False
+    End_Procedure
+
+    /* ---- The three re-homed editor commands. Normalize Case and Drop Self are not
+       driven end-to-end here: the first works from the keyword lists in the editor
+       settings, so its result would depend on what that file holds, and the second is a
+       confirmation dialog per occurrence. What IS covered is everything they decide
+       WITH - the classification helpers - plus Re-indent run end to end on a real
+       document, which is the command that rewrites every line of the file. */
+    Object oProbeScheme is a cEditorColourScheme
+    End_Object
+
+    // ---- The colour-scheme class. Pure logic, so the unit suite is its real home -
+    // this runs the same ground per line so a hang says exactly where it stopped.
+    Procedure ProbeColourScheme
+        Integer iVal
+        String sVal
+        tEditorStyle Appearance
+
+        Send Say "ok:scheme probe entered"
+        Send LoadBuiltIn of oProbeScheme "White"
+        Send Say "ok:scheme built-in white loaded"
+        Get ElementCount of oProbeScheme to iVal
+        Send Say ("ok:scheme element count " + String(iVal))
+        Get ElementName of oProbeScheme eEC_Keywords to sVal
+        Send Say ("ok:scheme element name [" + sVal + "]")
+        Get ElementTag of oProbeScheme eEC_ScopeKeywords to sVal
+        Send Say ("ok:scheme element tag [" + sVal + "]")
+        Get ElementFromTag of oProbeScheme "ScopeKeywords" to iVal
+        Send Say ("ok:scheme tag back to element " + String(iVal))
+        Get StyleFor of oProbeScheme eEC_Keywords to Appearance
+        Send Say ("ok:scheme style fore " + String(Appearance.iForeColor))
+        Get ColourToText of oProbeScheme (RGB(0,0,255)) to sVal
+        Send Say ("ok:scheme colour to text [" + sVal + "]")
+        Get ColourFromText of oProbeScheme "0,0,255" to iVal
+        Send Say ("ok:scheme colour from text " + String(iVal))
+        Get SerializeScheme of oProbeScheme to sVal
+        Send Say ("ok:scheme serialize length " + String(Length(sVal)))
+        Send DeserializeScheme of oProbeScheme sVal
+        Send Say "ok:scheme deserialize survived"
+        Send LoadBuiltIn of oProbeScheme "Serene"
+        Send Say "ok:scheme built-in serene loaded"
+
+        // The packed adapter: one known colour out and back.
+        Get PackedColourChunk of oProbeScheme (RGB(115,205,235)) to sVal
+        Send Say ("ok:scheme packed chunk [" + sVal + "]")
+        Send LoadBuiltIn of oProbeScheme CS_ThemeBlue
+        Get LegacyPackedColors of oProbeScheme to sVal
+        Send Say ("ok:scheme packed length " + String(Length(sVal)))
+        Send Say ("ok:scheme packed keywords slot [" + Mid(sVal, 12, 97) + "]")
+        Get StyleFor of oProbeScheme eEC_Keywords to Appearance
+        Send Say ("ok:scheme blue keywords fore " + String(Appearance.iForeColor))
+
+        Send LoadBuiltIn of oProbeScheme CS_ThemeBlue
+        Get LegacyPackedColors of oProbeScheme to sVal
+        Send LoadLegacyPacked of oProbeScheme CS_ThemeBlue sVal ""
+        Get StyleFor of oProbeScheme eEC_Keywords to Appearance
+        Send Say ("ok:scheme round-tripped keywords fore " + String(Appearance.iForeColor))
+
+        Send Say "ok:scheme probe complete"
+    End_Procedure
+
+    Procedure ProbeEditorCommands
+        Integer iVal iPrev
+        String sVal
+        String[] asKeys
+
+        Send UseUtf8Encoding of oSci
+        Send UseDataFlexLexer of oSci
+        Send SetKeywordList of oSci 0 "move to case begin end break if else use"
+        Send SetKeywordList of oSci 1 "procedure"
+        Send SetKeywordList of oSci 2 "end_procedure"
+        Send EnableFolding of oSci True
+        Send SetUseTabs of oSci False
+        Send SetTabWidth of oSci 4
+
+        // Case-statement classification drives the extra Case-body indent.
+        Get LineCaseStatus of oSci "    Case Begin" to iVal
+        If (iVal = CI_CaseBegin) ;
+            Send Say "ok:cmd case begin"
+        Else ;
+            Send Say ("FAIL:cmd case begin " + String(iVal))
+        Get LineCaseStatus of oSci "        Case (x = 1)" to iVal
+        If (iVal = CI_CaseCondition) ;
+            Send Say "ok:cmd case condition"
+        Else ;
+            Send Say ("FAIL:cmd case condition " + String(iVal))
+        Get LineCaseStatus of oSci "            Case Break" to iVal
+        If (iVal = CI_CaseBreak) ;
+            Send Say "ok:cmd case break"
+        Else ;
+            Send Say ("FAIL:cmd case break " + String(iVal))
+        Get LineCaseStatus of oSci "    Case End" to iVal
+        If (iVal = CI_CaseEnd) ;
+            Send Say "ok:cmd case end"
+        Else ;
+            Send Say ("FAIL:cmd case end " + String(iVal))
+        Get LineCaseStatus of oSci "    Move x to y" to iVal
+        If (iVal = CI_CaseNone) ;
+            Send Say "ok:cmd non-case line"
+        Else ;
+            Send Say ("FAIL:cmd non-case line " + String(iVal))
+
+        // A one-line If continued with a trailing semicolon.
+        Send SetDocumentText of oSci ("    If (x = 1) ;" + C_NewLine + "        Move a to b")
+        Send Colourise of oSci
+        Get LineIsContinuedIfElse of oSci 0 "    If (x = 1) ;" False to iVal
+        If (iVal = True) ;
+            Send Say "ok:cmd continued if"
+        Else ;
+            Send Say "FAIL:cmd continued if not detected"
+        Get LineIsContinuedIfElse of oSci 1 "        Move a to b" False to iVal
+        If (iVal = False) ;
+            Send Say "ok:cmd plain line is not a continued if"
+        Else ;
+            Send Say "FAIL:cmd plain line reported as continued if"
+        // A trailing semicolon INSIDE a comment must not count.
+        Send SetDocumentText of oSci "    If (x = 1) // note ;"
+        Send Colourise of oSci
+        Get LineIsContinuedIfElse of oSci 0 "    If (x = 1) // note ;" False to iVal
+        If (iVal = False) ;
+            Send Say "ok:cmd semicolon in a comment is not a continuation"
+        Else ;
+            Send Say "FAIL:cmd comment semicolon counted"
+
+        // #COMMAND bodies keep the author's own layout.
+        Get LineOpensOrContinuesCommandMacro of oSci 0 "#COMMAND MyCmd" False to iVal
+        If (iVal = True or iVal = False) ;
+            Send Say "ok:cmd command-macro probe callable"
+        Else ;
+            Send Say "FAIL:cmd command-macro probe"
+        Get LineOpensOrContinuesCommandMacro of oSci 0 "    Move x to y" True to iVal
+        If (iVal = True) ;
+            Send Say "ok:cmd macro stays open across its body"
+        Else ;
+            Send Say "FAIL:cmd macro closed too early"
+        Get LineOpensOrContinuesCommandMacro of oSci 0 "#ENDCOMMAND" True to iVal
+        If (iVal = False) ;
+            Send Say "ok:cmd macro closes on ENDCOMMAND"
+        Else ;
+            Send Say "FAIL:cmd macro did not close"
+
+        // Drop Self target validity.
+        Get IsDropSelfTargetValid of oSci "oCustomer" to iVal
+        If (iVal = True) ;
+            Send Say "ok:cmd drop-self accepts an object name"
+        Else ;
+            Send Say "FAIL:cmd drop-self rejected an object name"
+        Get IsDropSelfTargetValid of oSci "Parent" to iVal
+        If (iVal = False) ;
+            Send Say "ok:cmd drop-self refuses Parent"
+        Else ;
+            Send Say "FAIL:cmd drop-self accepted Parent"
+
+        // The per-object memory: asked once, remembered after.
+        Send ForgetDropSelfResponses of oSci
+        Get DropSelfAutoResponse of oSci "oFoo" to iVal
+        If (iVal = 0) ;
+            Send Say "ok:cmd drop-self has no answer before asking"
+        Else ;
+            Send Say ("FAIL:cmd drop-self stale answer " + String(iVal))
+        Send RememberDropSelfResponse of oSci "oFoo" MBR_Yes False
+        Get DropSelfAutoResponse of oSci "oFoo" to iVal
+        If (iVal = MBR_Yes) ;
+            Send Say "ok:cmd drop-self remembers per object"
+        Else ;
+            Send Say ("FAIL:cmd drop-self remembered " + String(iVal))
+        Send ForgetDropSelfResponses of oSci
+
+        // Blanking the compound part so a method call reads as if it began the line.
+        Move "    If (bFound) Send DoIt of (oFoo(Self))" to sVal
+        Move (Length(sVal)) to iVal
+        Send BlankCompoundBeforeMethod of oSci (&sVal)
+        If (Left(LTrim(sVal), 5) = "Send " and Length(sVal) = iVal) ;
+            Send Say "ok:cmd compound blanked, length preserved"
+        Else ;
+            Send Say ("FAIL:cmd compound blank [" + sVal + "] len " + String(Length(sVal)))
+
+        // Re-indent, end to end on a real document.
+        Send SetDocumentText of oSci ("Procedure Foo" + C_NewLine + "Move x to y" + C_NewLine + "End_Procedure")
+        Send ReIndentWholeFile of oSci
+        Get LineText of oSci 1 to sVal
+        If (sVal = "    Move x to y") ;
+            Send Say "ok:cmd reindent indented the scope body"
+        Else ;
+            Send Say ("FAIL:cmd reindent body [" + sVal + "]")
+        Get LineText of oSci 0 to sVal
+        If (sVal = "Procedure Foo") ;
+            Send Say "ok:cmd reindent left the scope opener at column 0"
+        Else ;
+            Send Say ("FAIL:cmd reindent opener [" + sVal + "]")
+        Get DocumentLineCount of oSci to iVal
+        If (iVal = 3) ;
+            Send Say "ok:cmd reindent kept the line count"
+        Else ;
+            Send Say ("FAIL:cmd reindent line count " + String(iVal))
+
+        // A Use line is dragged back to column 0 whatever it arrived as.
+        Send SetDocumentText of oSci ("Procedure Foo" + C_NewLine + "        Use Foo.pkg" + C_NewLine + "End_Procedure")
+        Send ReIndentWholeFile of oSci
+        Get LineText of oSci 1 to sVal
+        If (sVal = "Use Foo.pkg") ;
+            Send Say "ok:cmd reindent pulls a Use line to column 0"
+        Else ;
+            Send Say ("FAIL:cmd reindent use line [" + sVal + "]")
+
+        // Re-indent is undoable as one action.
+        Send SetDocumentText of oSci ("Procedure Foo" + C_NewLine + "Move x to y" + C_NewLine + "End_Procedure")
+        Send MarkSaved of oSci
+        Send ReIndentWholeFile of oSci
+        Send Undo of oSci
+        Get LineText of oSci 1 to sVal
+        If (sVal = "Move x to y") ;
+            Send Say "ok:cmd reindent undoes as ONE unit"
+        Else ;
+            Send Say ("FAIL:cmd reindent undo [" + sVal + "]")
+
+        // The indentation helper advances its running level.
+        Send SetDocumentText of oSci ("Procedure Foo" + C_NewLine + "Move x to y" + C_NewLine + "End_Procedure")
+        Send Colourise of oSci
+        Move 0 to iPrev
+        Get ReIndentTextForLine of oSci 1 3 (&iPrev) to sVal
+        If (sVal = "    ") ;
+            Send Say "ok:cmd indentation text for a scope body"
+        Else ;
+            Send Say ("FAIL:cmd indent text [" + sVal + "]")
+
+        // Key-binding names the settings dialog writes, mapped to Scintilla's codes.
+        // Enter is the one that matters most: the old fifteen-branch Case fell through
+        // from ENTER to UP, so clearing Enter cleared the wrong key entirely.
+        Get ScintillaKeyCode of oSci "ENTER" to iVal
+        If (iVal = SCK_RETURN) ;
+            Send Say "ok:keys ENTER maps to Return, not Up"
+        Else ;
+            Send Say ("FAIL:keys ENTER mapped to " + String(iVal))
+        Get ScintillaKeyCode of oSci "UP" to iVal
+        If (iVal = SCK_UP) ;
+            Send Say "ok:keys UP maps to Up"
+        Else ;
+            Send Say ("FAIL:keys UP mapped to " + String(iVal))
+        Get ScintillaKeyCode of oSci "F3" to iVal
+        If (iVal = VK_F3) ;
+            Send Say "ok:keys F3"
+        Else ;
+            Send Say ("FAIL:keys F3 " + String(iVal))
+        Get ScintillaKeyCode of oSci "H" to iVal
+        If (iVal = Ascii("H")) ;
+            Send Say "ok:keys single character"
+        Else ;
+            Send Say ("FAIL:keys single char " + String(iVal))
+        Get ScintillaKeyCode of oSci "WHATEVER" to iVal
+        If (iVal = 0) ;
+            Send Say "ok:keys unknown name yields nothing"
+        Else ;
+            Send Say ("FAIL:keys unknown name " + String(iVal))
+
+        // The register-then-clear cycle empties its own list.
+        Send RegisterKeyBindingToClear of oSci "Ctrl + Shift + H"
+        Send RegisterKeyBindingToClear of oSci "Ctrl + D"
+        Get psClearKeyBindings of oSci to asKeys
+        If (SizeOfArray(asKeys) = 2) ;
+            Send Say "ok:keys bindings collected"
+        Else ;
+            Send Say ("FAIL:keys collected " + String(SizeOfArray(asKeys)))
+        Send ClearRegisteredKeyBindings of oSci
+        Get psClearKeyBindings of oSci to asKeys
+        If (SizeOfArray(asKeys) = 0) ;
+            Send Say "ok:keys list emptied after clearing"
+        Else ;
+            Send Say ("FAIL:keys list still holds " + String(SizeOfArray(asKeys)))
+
+        Send EnableFolding of oSci False
+    End_Procedure
+End_Object
+
+Start_UI

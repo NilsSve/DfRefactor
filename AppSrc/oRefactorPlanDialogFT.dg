@@ -1,0 +1,561 @@
+﻿//****************************************************************************
+// $Module type: Object
+// $Module name: oRefactorPlanDialog
+// $Author     : Nils Svedmyr, RDC Tools International
+//
+// Description :
+//   "Refactoring Plan" preview/select dialog for the Modernization Analyzer.
+//   Shown by Test Compile's "Auto Select" (-> StartAutoSelect in TestCompile.dg).
+//
+//   LEFT  : a DD-bound grid (cFTDbCJGrid on cFunctionsDataDictionary) of the
+//           suggested Refactoring Functions, CONSTRAINED to the plan. Tick to
+//           include (Functions.Selected), edit the Parameter inline (combo of
+//           valid values from Functions.ParameterValidation; "ANY" = free text),
+//           Function_Help on hover, sorted by name. Parameter edits + tick state
+//           persist straight to the Functions table (like the Select Functions
+//           view). Every plan function is ticked by default.
+//   RIGHT : the affected source files - a data-source checkbox list.
+//
+//   Usage:
+//       Get ShowPlan of oRefactorPlanDialog asFunctions asFiles sHeadsUp to bProceed
+//   After Proceed:
+//       Get SelectedFunctions of oRefactorPlanDialog to asSelFunctions   // ticked
+//       Get SelectedFiles     of oRefactorPlanDialog to asSelFiles       // ticked
+//****************************************************************************
+Use Windows.pkg
+Use cFTDbModalPanel.pkg
+Use cDbSplitterContainer.pkg
+Use cFTDbCJGrid.pkg
+Use cRDCDbCJGridColumn.pkg
+Use cFunctionParameterColumn.pkg // the Parameter column: the in-cell combo per row, the REQUIRED tooltip
+Use cFTCJSelectionGrid.pkg
+Use cCJGridColumnRowIndicator.pkg
+Use cRDCButtonDPI.pkg
+Use FTAllWebControlClasses.pkg   // FT: cFTWebButton - the Show-all toggle and the Proceed/Cancel bar
+Use cFTGridHost.pkg              // FT: their hosts - a grid of 8 px columns (RDCFlexTron)
+Use RefactorConstants.h.pkg
+
+Use cFunctionsDataDictionary.dd
+Use FTThemeColors.pkg            // FTWebBg / FTCJTheme - the FT palette
+
+// The Parameter column names these two, which are defined after it in the grid.
+Register_Object oFunc_ParameterHelp
+Register_Object oFunc_ParameterValidation
+
+Object oRefactorPlanDialog is a cFTDbModalPanel
+    Set Label to "Refactoring Plan - review and select before running"
+    Set Size to 274 714
+    Set piMinSize to 230 520
+    Set Location to 2 2
+    Set Icon to "DFRefactor.ico"
+
+    Property Boolean  pbProceed False
+    Property String[] pasPlanFunctions   // the plan's function names (constraint + default tick)
+    Property String[] pasPlanFiles
+    /* THE FUNCTIONS TO TICK ON OPEN, when not all of them (2026-08-16). Set by the caller before
+       ShowPlan; empty = tick every plan function (the old default). The board's "67 rows convert
+       automatically" opened a dialog with 8 functions ticked and 756 files, because Review rows ride
+       in the same plan and every function was ticked (Nils: "Is that really correct?"). Now the
+       caller ticks the Auto-fix functions only; the Review ones stay listed, unticked - opt in.
+       Consumed and cleared by ShowPlan. */
+    Property String[] pasPlanPreTicked
+    Property Handle   phoFiles_grd
+    Property Boolean  pbShowAllFunctions False   // toggled by the Show-all button (oShowAllBtn): plan-only vs. full catalogue
+    Property Handle   phoShowAll_btn
+    
+    Object oFunctions_DD is a cFunctionsDataDictionary
+        // Show only the plan's suggested functions (published). The per-record "as"
+        // filter keys off the dialog's plan-name list; the Functions table is small.
+        Procedure OnConstrain
+            Constrain Functions.bPublished eq True
+            // Default = the plan's suggested functions only. The "Show all functions" toggle drops the
+            // per-plan filter so the whole published catalogue shows (plan functions still ticked) - letting
+            // the user ADD functions, not just remove. SelectedFunctions then reads the full ticked set.
+            If (pbShowAllFunctions(oRefactorPlanDialog) = False) ;
+                Constrain Functions as (SearchArray(Trim(Functions.Function_Name), pasPlanFunctions(oRefactorPlanDialog)) >= 0)
+        End_Procedure
+    End_Object
+
+    Set Main_DD to oFunctions_DD
+    Set Server  to oFunctions_DD
+
+    Object oSplitterContainer is a cDbSplitterContainer
+        Set piSplitterLocation to 364
+
+        Object oFunctions_child is a cDbSplitterContainerChild
+            Set peNeighborhood to nhPublic
+
+            Object oFunctions_lbl is a TextBox
+                Set Auto_Size_State to False
+                Set Size to 10 340
+                Set Location to 4 13
+                Set Label to "Suggested Refactoring Functions (tick to include; click Parameter to edit):"
+                Set peAnchors to anTopLeftRight
+                Set Justification_Mode to JMode_Left
+                Set FontWeight to fw_Bold
+            End_Object
+
+            Object oFunctions_grd is a cFTDbCJGrid
+                Set Size to 230 346
+                Set Location to 16 13
+                Set Ordering to 2                      // sort by Function_Name (alphabetical)
+                Set pbDbShowInvertSelectionsMenuItem to True
+                Set pbEditOnClick to True
+                Set pbEditOnKeyNavigation to False
+                Set pbHeaderPrompts to False
+                Set pbDbShowEditMenuItem to False
+                Set pbAllowDeleteRow to False
+                Set pbStaticData to True
+                Set pbAllowInsertRow to False
+                Set pbAllowAppendRow to False
+                Set pbShowNonActiveInPlaceButton to False
+
+                Object oFuncRowInd is a cCJGridColumnRowIndicator
+                    Set piWidth to 19
+                    Set pbResizable to False
+                End_Object
+
+                Object oFunc_Name is a cRDCDbCJGridColumn
+                    Entry_Item Functions.Function_Name
+                    Set piWidth to 266
+                    Set psCaption to "Refactoring Function"
+                    Set pbEditable to False
+                    Set pbAllowRemove to False
+                    Set phoData_Col to Self
+
+                    // Tooltip = the function's Help text (hidden Function_Help column).
+                    Function OnGetTooltip Integer iRow String sValue String sText Returns String
+                        Get RowValue of oFunc_Help iRow to sText
+                        If (sText <> "") Begin
+                            Move (Replaces("\r\n", sText, C_NewLine)) to sText
+                            Move (Replaces("\n", sText, C_NewLine))   to sText
+                        End
+                        Function_Return sText
+                    End_Function
+                End_Object
+
+                Object oFunc_Parameter is a cFunctionParameterColumn
+                    Entry_Item Functions.Parameter
+                    Set piWidth to 256
+                    Set psToolTip to "Click for dropdown choices when there is a value. You can only change existing values (unless the function's parameter validation is 'ANY')."
+                    Set Status_Help to (psToolTip(Self))
+
+                    // The grid's columns the class reads: the values list, the row's help, the name (for REQUIRED).
+                    Function ParameterValidationColumn Returns Handle
+                        Function_Return (oFunc_ParameterValidation(Self))
+                    End_Function
+
+                    Function ParameterHelpColumn Returns Handle
+                        Function_Return (oFunc_ParameterHelp(Self))
+                    End_Function
+
+                    Function FunctionNameColumn Returns Handle
+                        Function_Return (oFunc_Name(Self))
+                    End_Function
+                End_Object
+
+                Object oFunc_Selected is a cRDCDbCJGridColumn
+                    Entry_Item Functions.Selected
+                    Set piWidth to 36
+                    Set psCaption to "Select"
+                    Set psToolTip to "Tick the functions to run in this refactoring. All suggested functions are ticked by default."
+                    Set Status_Help to (psToolTip(Self))
+                    Set pbAllowRemove to False
+                    Set pbCheckbox to True
+                    Set peHeaderAlignment to xtpAlignmentCenter
+                    Set peFooterAlignment to xtpAlignmentCenter
+                    Set phoCheckbox_Col to Self
+                End_Object
+
+                // Hidden - source for the Function_Name tooltip.
+                Object oFunc_Help is a cRDCDbCJGridColumn
+                    Entry_Item Functions.Function_Help
+                    Set pbVisible to False
+                    Set pbShowInFieldChooser to False
+                End_Object
+
+                // Hidden - source for the Parameter tooltip.
+                Object oFunc_ParameterHelp is a cRDCDbCJGridColumn
+
+                    Entry_Item Functions.ParameterHelp
+                    Set pbVisible to False
+                    Set pbShowInFieldChooser to False
+                End_Object
+
+                // Hidden: the Parameter combo reads its list from here, per row (ComboFillListForRow).
+                Object oFunc_ParameterValidation is a cRDCDbCJGridColumn
+                    Entry_Item Functions.ParameterValidation
+                    Set piWidth to 150
+                    Set psCaption to "Parameter Validation"
+                    Set pbVisible to False
+                    Set pbShowInFieldChooser to False
+                End_Object
+
+                // The Parameter combo's list follows the ROW, not the cell entry - see ComboFillListForRow.
+                Procedure OnRowChanged Integer iOldRow Integer iNewSelectedRow
+                    Forward Send OnRowChanged iOldRow iNewSelectedRow
+                    Send ComboFillListForRow of oFunc_Parameter iNewSelectedRow
+                End_Procedure
+
+                // No drill-in edit view from this grid.
+                Procedure Request_Edit
+                End_Procedure
+
+                Procedure Request_Clear
+                End_Procedure
+            
+                /* LOAD FROM THE TOP, under the DD's current constraints (2026-10-04). Not RefreshDataFromDD: that
+                   reloads AROUND the DD's current record, and this static grid, asked for a record its set does
+                   not hold - none at all, when every plan function is on the never-pick list - resets its cache
+                   and shows NOTHING, in either view (Nils: "the list/left grid is empty. It is even empty after
+                   selecting Show all functions"). The Reset first, because a static data source that is already
+                   at its top would otherwise keep the rows it read before the constraints changed. */
+                Procedure ReloadFromTop
+                    Send Reset of (phoDataSource(Self))
+                    Send MoveToFirstRow
+                End_Procedure
+
+                // Load AFTER the grid is paged - grid messages are invalid before paging. Fires on every Popup,
+                // so the per-plan constraint + the default ticks (set in ShowPlan just before Popup) are
+                // reflected each time, not only the first.
+                Procedure Activating
+                    Forward Send Activating
+                    Send ReloadFromTop
+                End_Procedure
+                
+            End_Object
+
+            // Note: Due to a DataFlex bug, we cannot set justification_mode to jmode_left,
+            //       when we are using splitters. 
+            Object oInfo1_tb is a TextBox
+                Set Location to 250 12
+                Set Size to 10 257
+                Set Label to "The Analyze grid's 'Fix' column shows 'Review' for functions that."
+                Set peAnchors to anBottomLeft
+            End_Object
+
+            Object oInfo1_tb is a TextBox
+                Set Location to 260 13
+                Set Size to 10 143
+                Set Label to "has parameters Check that the parameters above are correct!"
+                Set peAnchors to anBottomLeft
+            End_Object
+
+            /* THE SHOW-ALL TOGGLE: one framework button (cFTWebButton, RDCFlexTron) on a grid host of 8 px columns.
+               Its work is a plain DD/grid op, run inside the click as the chip ran it. The caption says what the
+               next click does and follows pbShowAllFunctions (ShowAllCaption) - on each toggle, and on each open,
+               where ShowPlan puts the plan-only view back (the panel's Activating). 17 columns fit the longer
+               caption (Show all functions ~118 px, Show plan only ~103, measured 2026-09-30); text only - the
+               pane's info text leaves no room for a glyph. */
+            Object oWebShowAllBar is a cFTGridHost
+                Set Location to 252 230
+                Set Size to 20 130
+                Set peAnchors to anBottomRight
+                Set piColumnCount to 18         // column 0, then the button's 17
+                Set psColumnWidths to "0/1fr"   // column 0 takes the extra width
+
+                Object oShowAllBtn is a cFTWebButton
+                    Set piColumnIndex to 1
+                    Set piColumnSpan to 17
+                    Set psCaption to "Show all functions"
+                    Set psToolTip to "Show every published refactoring function (the plan stays ticked) so you can add functions, not just remove them."
+                    Delegate Set phoShowAll_btn to Self
+
+                    // The caption follows pbShowAllFunctions. UpdateCaption (RDCFlexTron) stores it for a page
+                    // that loads and pushes it to a page that is up - the two ways an FT dialog's content
+                    // reaches its page.
+                    Procedure ShowAllCaption
+                        If (pbShowAllFunctions(oRefactorPlanDialog)) ;
+                            Send UpdateCaption "Show plan only"
+                        Else ;
+                            Send UpdateCaption "Show all functions"
+                    End_Procedure
+
+                    // The toggle, inside the click: a plain DD + grid op.
+                    Procedure OnClick
+                        Boolean bShowAll
+                        Get pbShowAllFunctions of oRefactorPlanDialog to bShowAll
+                        Set pbShowAllFunctions of oRefactorPlanDialog to (not(bShowAll))
+                        Send Rebuild_Constraints of oFunctions_DD
+                        Send ReloadFromTop of oFunctions_grd
+                        Send ShowAllCaption
+                        Forward Send OnClick
+                    End_Procedure
+                End_Object
+            End_Object
+
+        End_Object
+
+        Object oFiles_child is a cDbSplitterContainerChild
+            Set peNeighborhood to nhPublic
+
+            Object oFiles_lbl is a TextBox
+                Set Auto_Size_State to False
+                Set Size to 10 296
+                Set Location to 4 4
+                Set Label to "Affected Files:"
+                Set Justification_Mode to JMode_Left
+                Set FontWeight to fw_Bold
+            End_Object
+
+            Object oFiles_grd is a cFTCJSelectionGrid
+                Set Size to 230 332
+                Set Location to 17 6
+                Delegate Set phoFiles_grd to Self
+                // Guards LoadData so the (expensive) row build runs ONCE per ShowPlan, not on every Activating.
+                Property Boolean pbDataLoaded False
+
+                Object oFileRowInd is a cCJGridColumnRowIndicator
+                    Set piWidth to 22
+                    Set pbResizable to False
+                End_Object
+
+                Object oFileName_col is a cCJGridColumn
+                    Set phoData_Col to Self
+                    Set piWidth to 531
+                    Set psCaption to "File (with warnings/errors)"
+                    Set psToolTip to "Source files the analyzer will refactor. Untick any you want to leave untouched."
+                End_Object
+
+                Procedure LoadData
+                    Handle hoDataSource hoDock
+                    tDataSourceRow[] TheData TheDataEmpty
+                    String[] asFiles
+                    Integer iSize iRow iCount iNameCol iCheckCol
+
+                    If (not(IsComObjectCreated(Self))) ;
+                        Procedure_Return
+                    // Activating fires repeatedly; each call re-materialized EVERY file row (the dominant cost
+                    // for a big plan). Build once - ShowPlan resets pbDataLoaded for each new plan.
+                    If (pbDataLoaded(Self)) ;
+                        Procedure_Return
+                    Get pasPlanFiles of oRefactorPlanDialog to asFiles
+                    Move (SizeOfArray(asFiles)) to iSize
+                    Get phoDataSource to hoDataSource
+                    Get DataSource of hoDataSource to TheData
+                    Move TheDataEmpty to TheData
+                    Get piColumnId of oFileName_col to iNameCol
+                    Get piColumnId of (phoCheckbox_Col(Self)) to iCheckCol
+                    // This build is the "dominant cost for a big plan" and runs INSIDE Popup, where the
+                    // StartAutoSelect plan-build ticker is no longer beating - so the status bar used to
+                    // freeze at the plan-build's elapsed ("stuck at 2s") until this finished and jumped
+                    // to the total (Nils, a 6151-row plan, 2026-07-17). Drive the dock's own elapsed
+                    // ticker (DoYieldToUI - it reads piPlanBuildStartTick + pumps) every 64 rows so the
+                    // wait counts UP live. Resolved once, before the loop.
+                    Get phoTestCompileFT of ghoApplication to hoDock
+                    Move 0 to iRow
+                    Decrement iSize
+                    For iCount from 0 to iSize
+                        If (Mod(iCount, 64) = 0) Begin
+                            If (hoDock <> 0) ;
+                                Send DoYieldToUI of hoDock
+                            Else ;
+                                Send PumpMsgQueue of Desktop
+                        End
+                        Move asFiles[iCount] to TheData[iRow].sValue[iNameCol]
+                        Move True            to TheData[iRow].sValue[iCheckCol]
+                        Increment iRow
+                    Loop
+                    If (iRow <> 0) Begin
+                        Send ReInitializeData TheData False
+                        Send MoveToFirstRow
+                    End
+                    Else ;
+                        Send InitializeData TheDataEmpty
+                    Send DoSetCheckboxFooterText
+                    // Stop the build marquee/cursor StartAutoSelect left running across ShowPlan, now the file
+                    // list is loaded (hoDock resolved above for the per-row ticker beat).
+                    If (hoDock <> 0) ;
+                        Send StopBuildFeedback of hoDock
+                    Set pbDataLoaded to True
+                End_Procedure
+
+                // A grid's Activating fires on every (re)focus, and the base cRDCCJSelectionGrid Activating
+                // re-runs the WHOLE load each time - LoadData plus DoChangeFontSize/ComRedraw, which re-renders
+                // all materialized rows. Loading a CodeJock grid with many rows isn't cheap, and doing it
+                // repeatedly was the bulk of this dialog's open time. Run the base load ONCE; ShowPlan resets
+                // pbDataLoaded so a fresh plan reloads. Safe here - a modal can't be switched away from, so
+                // the grid never loses its window handle mid-life.
+                Procedure Activating
+                    If (pbDataLoaded(Self)) ;
+                        Procedure_Return
+                    Forward Send Activating
+                End_Procedure
+            
+            End_Object
+            
+            /* THE BUTTON BAR: Proceed / Cancel, framework buttons on a grid host of 8 px columns, as in
+               ShowOtherLogFilesFT.dg, spanning the Files pane. A button's work runs in OnButtonClick, after the
+               web click has returned (the library's click relay), so the check's info box and Close_Panel can
+               run there - no timer of this dialog's own. Column 0 takes the rest of the width; the spans fit
+               the captions (Proceed ~86 px, Cancel ~78, measured 2026-09-30). */
+            Object oWebButtonBar is a cFTGridHost
+                Set Location to 252 6
+                Set Size to 20 332
+                Set peAnchors to anBottomLeftRight
+                Set piColumnCount to 26         // column 0, then Proceed's 13 and Cancel's 12
+                Set psColumnWidths to "0/1fr"   // column 0 takes the extra width
+
+                Object oProceedBtn is a cFTWebButton
+                    Set piColumnIndex to 1
+                    Set piColumnSpan to 13
+                    Set psCaption to "Proceed"
+                    Set psCSSClass to "ftbtn ftg-check"
+                    Set psToolTip to "Run the ticked functions on the ticked files"
+
+                    Procedure OnButtonClick
+                        Send DoProceed of (oRefactorPlanDialog(Self))
+                    End_Procedure
+                End_Object
+
+                Object oCancelBtn is a cFTWebButton
+                    Set piColumnIndex to 14
+                    Set piColumnSpan to 12
+                    Set psCaption to "Cancel"
+                    Set psCSSClass to "ftbtn ftg-close"
+                    Set psToolTip to "Close without refactoring (leaves the suggested functions ticked)"
+
+                    Procedure OnButtonClick
+                        Send DoCancel of (oRefactorPlanDialog(Self))
+                    End_Procedure
+                End_Object
+            End_Object
+
+        End_Object
+
+    End_Object
+
+    // FT: the Proceed VALIDATE + close (the tail of the old oProceed_btn.OnClick), run from the Proceed button's
+    // OnButtonClick, after the web click. Validates FUNCTIONS only, via the table-reading SelectedFunctions (Find Eq
+    // Functions - a disk read, which works from there). The files grid is NOT queried here: any by-handle grid
+    // message (e.g. `Get CheckedItems of oFiles_grd`) faults err 98 from a timer - the click relay is one - the same
+    // by-handle-grid wall as the save. The no-files case is caught downstream: StartAutoSelect re-reads
+    // SelectedFiles in native context and returns if empty.
+    Procedure DoProceed
+        String[] asFns
+        Get SelectedFunctions to asFns
+        If (SizeOfArray(asFns) = 0) Begin
+            Send FTInfoBox "Tick at least one function to run (or Cancel)."
+            Procedure_Return
+        End
+        Set pbProceed to True
+        Send Close_Panel
+    End_Procedure
+
+    // FT: the Cancel action (was oCancel_btn.OnClick), run from the Cancel button's OnButtonClick, after the click.
+    Procedure DoCancel
+        Set pbProceed to False
+        Send Close_Panel
+    End_Procedure
+
+    // Every ticked published function (Functions.Selected = 1). With "Show all functions" OFF this is
+    // just the plan's still-ticked suggestions; with it ON it also includes any function the user added.
+    // ShowPlan clears ALL ticks before re-ticking the plan, so nothing stale from a prior session leaks in.
+    Function SelectedFunctions Returns String[]
+        String[] asSel
+        Get SelectedPublishedFunctionNames of oFunctions_DD to asSel
+        Function_Return asSel
+    End_Function
+
+    Function SelectedFiles Returns String[]
+        String[] asSel
+        Get SelectedItems of (phoFiles_grd(Self)) to asSel
+        Function_Return asSel
+    End_Function
+
+    // Populate + pop modally; return True only when the user clicked Proceed.
+    Function ShowPlan String[] asFunctions String[] asFiles String sHeadsUp Returns Boolean
+        Boolean bProceed
+        String sText
+        String[] asSelected asPreTicked asNone asListed
+        Integer i iMax iSetAside
+
+        Set pasPlanFunctions to asFunctions
+        Set pasPlanFiles     to asFiles
+        // New file set each open - force the files grid to rebuild once (LoadData then skips redundant reloads).
+        Set pbDataLoaded of (phoFiles_grd(Self)) to False
+
+        // Each open starts in plan-only view: reset the toggle + its button caption and re-narrow the
+        // constraint, in case a previous run left "Show all functions" on. (Rebuild_Constraints is a DD
+        // message - safe before Popup; the grid itself refreshes in its own Activating.)
+        Set pbShowAllFunctions to False
+        // The Show-all button's caption follows in the panel's Activating, once this Popup starts (ShowAllCaption).
+        Send Rebuild_Constraints of oFunctions_DD
+
+        // Default = every suggested function ticked. UnSelect all first so ONLY the plan's
+        // functions end up selected, then select the plan's set. (The grid is constrained to the
+        // plan + refreshed in its OWN Activating - grid messages aren't valid until it's paged,
+        // which is why the refresh can't happen here, before Popup.)
+        Send UnSelectAllRecords           of oFunctions_DD
+        // Tick the caller's pre-tick set when it gave one (the Auto-fix functions), else every plan function.
+        Get pasPlanPreTicked to asPreTicked
+        // THE USER'S "NEVER PICK" LIST WINS over either default (Nils 2026-09-23): a listed
+        // function is never ticked here, however the Check classed it - it waits under Show all
+        // functions for the user's own tick. See cRefactorApplication.NeverPickFunctions.
+        If (SizeOfArray(asPreTicked) > 0) ;
+            Get NeverPickFiltered of ghoApplication asPreTicked to asPreTicked
+        Else ;
+            Get NeverPickFiltered of ghoApplication asFunctions to asPreTicked
+        Send SelectRecordsFromStringArray of oFunctions_DD asPreTicked
+        Set pasPlanPreTicked to asNone
+        /* THE PLAN-ONLY VIEW IS THE TICKED SET, AND NOTHING ELSE (Nils 2026-08-17: "only 24 of 35 are
+           ticked. Why? ... if the button says Auto-fix why show something else? If the user wants to
+           see all functions there already is a Show all functions button"). It used to list the
+           WHOLE plan set - the Auto-fix functions ticked and the Review ones unticked, as an opt-in -
+           and 11 unticked rows in a list you were told to run read as noise. Now: with a pre-tick set
+           (the Auto-fix functions, from the board's "Run the refactoring plan"), the view lists exactly
+           those, all ticked; without one, every plan function, all ticked. Anything beyond that is
+           what "Show all functions" is for. asFunctions already carries the indicator companion when the
+           plan needs it (DeclareRefactoredIndicators, added by AddNeededIndicatorCompanions), and the
+           pre-tick set carries it too, so re-reading the ticked set is what lists it. */
+        Get SelectedPublishedFunctionNames of oFunctions_DD to asSelected
+        Move asSelected to asListed
+        /* ...AND WHAT THE USER SET ASIDE, UNTICKED (Nils 2026-10-04: "If there are two 'never-pick'
+           functions, they should be shown in the grid, but un-ticked"). A never-pick function is a
+           default, not a block - the user's own tick still runs it - so the plan shows it where that
+           tick can be given. Listed only by the ticked set, a plan whose functions were all set aside
+           opened with an EMPTY list. */
+        Move 0 to iSetAside
+        Move (SizeOfArray(asFunctions) - 1) to iMax
+        For i from 0 to iMax
+            If (IsNeverPickFunction(ghoApplication, asFunctions[i]) = True and SearchArray(asFunctions[i], asListed, Desktop, RefFunc(DFSTRICMP)) = -1) Begin
+                Move asFunctions[i] to asListed[-1]
+                Increment iSetAside
+            End
+        Loop
+        Set pasPlanFunctions to asListed
+        // The status line still counts what the Check named beyond the listed set - the door to it is
+        // "Show all functions", and a number is the honest reason to press it.
+        Move ("Functions: " + String(SizeOfArray(asSelected)) + "      Files: " + String(SizeOfArray(asFiles))) to sText
+        If (iSetAside > 0) ;
+            Move (sText + "      " + String(iSetAside) + " on your never-pick list - listed unticked; they do not run even if ticked") to sText
+        If (SizeOfArray(asFunctions) > SizeOfArray(asListed)) ;
+            Move (sText + "      " + String(SizeOfArray(asFunctions) - SizeOfArray(asListed)) + " more (Review) that the Check named are under Show all functions - ticking one adds its files when the plan runs") to sText
+        /* THE ONE FUNCTION THAT RUNS THREE OTHERS (Nils 2026-10-05: a plan listing only
+           ConvertGridSubclassToCodeJock over 1,143 files "does not seem right" - the files are the objects of
+           the subclasses, converted by the dbGrid, dbList and Grid converters, which that function runs itself
+           and which are therefore not on the list). Said here, where the list is read. */
+        If (SearchArray("ConvertGridSubclassToCodeJock", asListed, Desktop, RefFunc(DFSTRICMP)) <> -1) ;
+            Move (sText + "      ConvertGridSubclassToCodeJock runs RefactorDbGridTocDbCJGrid, RefactorDbListTocDbCJGridPromptList and RefactorGridToCJGrid itself, on the objects of the workspace's subclasses - those three need not be listed, and their parameters are not used") to sText
+        Set StatusText to sText
+
+        Set pbProceed to False
+        Send Popup
+        Get pbProceed to bProceed
+        Function_Return bProceed
+    End_Function
+
+    // Each open: ShowPlan has just put the plan-only view back, so the Show-all button's caption follows.
+    Procedure Activating
+        Handle hoBtn
+        Forward Send Activating
+        Get phoShowAll_btn to hoBtn
+        If (hoBtn <> 0) ;
+            Send ShowAllCaption of hoBtn
+    End_Procedure
+
+    Procedure Request_Clear
+    End_Procedure
+
+    On_Key kCancel Send Close_Panel
+End_Object

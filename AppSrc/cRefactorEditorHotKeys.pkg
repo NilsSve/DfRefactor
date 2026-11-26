@@ -1,0 +1,570 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cRefactorEditorHotKeys
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-27
+//
+// Description : DFRefactor's copy of the editor hotkey mixin (Nils, 2026-07-27). The library
+//               original dispatches to the CodeMax-era verb names; this one dispatches to the new
+//               vocabulary on cScintillaEditorBridge / cRefactorEditorCommands, so the editor can
+//               leave the old chain behind. The SciControlLib fork keeps its own copy untouched for
+//               the Hammer heritage and the other pool apps.
+//
+//               Deliberately a FAITHFUL copy apart from the verb renames: every DefineOnKey binding
+//               is carried across exactly as it was, including the ones whose handlers dispatch to
+//               Hammer features DFRefactor does not implement. Those bindings behave here precisely
+//               as they behave today, and pruning them is a separate, testable pass - dropping one
+//               by accident would silently kill a shortcut with nothing to notice it.
+//
+//               Renamed verbs, old -> new:
+//                 GotoMatchBrace        -> GotoMatchingBrace
+//                 SC_LineCut            -> CutLine
+//                 SC_LowercaseSelection -> LowerCaseSelection
+//                 SC_UppercaseSelection -> UpperCaseSelection
+//                 BookmarkToggle        -> ToggleBookmark
+//                 BookmarkNext          -> NextBookmark
+//                 BookmarkPrevious      -> PreviousBookmark
+//                 BookmarkClearAll      -> ClearAllBookmarks
+//                 BookmarkJumpToFirst   -> FirstBookmark
+//                 BookmarkJumpToLast    -> LastBookmark
+//                 RefactorDropSelf      -> DropSelfFromHere
+//                 RefactorReIndent      -> ReIndentWholeFile
+//                 phoCodeMaxEditor      -> phoEditorControl
+//
+//               The HKSC_* handler names keep their original spelling: they are the message
+//               identities the DefineOnKey table points at, and renaming them buys nothing.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use VdfBase.pkg
+Use ScintillaLexerApi.h.pkg  // the CMD_* command ids
+Use cRefactorHotKeys.pkg     // oSciCommandHotKeys, tSciCommandHotKey, CommandHotKeyText,
+                             // FindCommand, DataFlexOnKey, HotKeyHasAlt. Named explicitly:
+                             // it used to arrive transitively, and the comment here used
+                             // to credit cSciLexer.h with tSciCommandHotKey, which never
+                             // declared it.
+Use RefactorMessageQueue.pkg // DispatchHotkey / DispatchAnyKey - global, no dependencies
+
+
+Register_Procedure CME_Find
+Register_Procedure Properties // the settings dialog - implemented by the host
+Register_Procedure CME_FindNext
+Register_Procedure CME_FindPrevious
+Register_Procedure CME_FindReplace
+Register_Procedure CME_GotoLine
+Register_Procedure CME_SelectAll
+Register_Procedure PushQuickMark   // Quick Marks - defined on cRefactorScintillaEditor, reached
+Register_Procedure PopQuickMark    // through the two HKSC_QuickMark* handlers below
+Register_Procedure GotoDefinition  // likewise, through HKSC_GotoDefinition
+Register_Function phoEditorEditView Returns Handle // it's actually a property, but this should do
+Register_Procedure CAPopUpFindInFiles
+Register_Procedure CASaveFile
+Register_Procedure CASaveFileAs
+Register_Procedure CASaveAllFiles
+Register_Procedure CACloseFile
+Register_Procedure CACloseAllFiles
+Register_Procedure CASelectWorkSpace
+Register_Procedure CABuildRun
+Register_Procedure CABuildRunCurrent
+Register_Procedure CABuildCompile
+Register_Procedure CABuildPreCompile
+Register_Procedure CABuildExecute
+Register_Procedure CABuildDebugRun
+Register_Procedure CABuildDebugRunCurrent
+
+Register_Procedure Define_EditViewHotkeys Handle hoEditView
+
+//
+// The hotkeys have to be defined in any object that is part of the main Editor view and as
+// such it is best declared in a mixin, so that it becomes easy to include.
+//
+Class cRefactorEditorHotKeys is a Mixin
+
+    // DataFlex's mixin convention: the importing class sends Define_<mixin name>.
+    Procedure Define_cRefactorEditorHotKeys
+        // The (command, message) pairs DefineOnKey binds, kept so that the Key override below can
+        // send a chord the On_Key table cannot hold to the same handler the table would have used.
+        Property Integer[] piaOnKeyCmds
+        Property Integer[] piaOnKeyMsgs
+        Send Define_EditorHotKeys
+    End_Procedure
+
+    //
+    // If the focus is not in the editorview or editor control itself then it might even be outside of
+    // the client area (like in one of the toolpanels). In that case we need to reroute the hotkey action
+    // to the editor control. In that case we override this function and return true, so that we know
+    // the action needs to be rerouted.
+    //
+    Function RerouteHotKeys Returns Boolean
+        Function_Return False
+    End_Function
+
+    Function IsInEditorView Returns Boolean
+        Boolean bInEditView
+        Integer hoEditView
+
+        Move False to bInEditView
+        Get phoEditorEditView to hoEditView
+        If (hoEditView=Self) Begin
+            Move True to bInEditView
+        End
+        Function_Return bInEditView
+    End_Function
+
+    // Note: This *must* be here for the DFRefactor project,
+    //       else no assigned function keys works.
+    Procedure DefineOnKey Integer iCmd Integer iMsg
+        Boolean bInEditView
+        Handle  hoEdit
+        Integer iDfKey
+        String  sKey
+        tSciCommandHotKey Command
+
+        Send RecordOnKeyMessage iCmd iMsg
+        Get CommandHotKeyText iCmd to sKey
+        If (sKey<>"") Begin
+
+            If (phoEditorEditView(Self)=Self) Begin // only run in EditorEditView
+                Get phoEditorControl to hoEdit
+                If (hoEdit) Begin
+                    // if we define a new keybinding, then we need to remove any old keybinding also
+                    // as otherwise you end up with both actions.
+                    Send RegisterKeyBindingToClear of hoEdit sKey
+                End
+            End
+            Get FindCommand of oSciCommandHotKeys iCmd to Command
+            If (Command.iCmd=iCmd) Begin
+                If (SizeOfArray(Command.HotKey.VKcode)>0) Begin
+                    Get DataFlexOnKey of oSciCommandHotKeys Command.HotKey  to iDfkey
+                    On_Key iDFKey Send iMsg
+                End
+                If (SizeOfArray(Command.HotKey2.VKcode)>0) Begin
+                    Get DataFlexOnKey of oSciCommandHotKeys Command.HotKey2 to iDfkey
+                    On_Key iDFKey Send iMsg
+                End
+            End
+        End
+    End_Procedure
+
+    Procedure RecordOnKeyMessage Integer iCmd Integer iMsg
+        Integer[] aiCmds aiMsgs
+
+        Get piaOnKeyCmds to aiCmds
+        Get piaOnKeyMsgs to aiMsgs
+        Move iCmd to aiCmds[SizeOfArray(aiCmds)]
+        Move iMsg to aiMsgs[SizeOfArray(aiMsgs)]
+        Set piaOnKeyCmds to aiCmds
+        Set piaOnKeyMsgs to aiMsgs
+    End_Procedure
+
+    // The message DefineOnKey bound for a command, 0 when it never saw the command.
+    Function OnKeyMessageForCommand Integer iCmd Returns Integer
+        Integer[] aiCmds aiMsgs
+        Integer iAt
+
+        Get piaOnKeyCmds to aiCmds
+        Get piaOnKeyMsgs to aiMsgs
+        Move (SearchArray(iCmd, aiCmds)) to iAt
+        If (iAt = -1) ;
+            Function_Return 0
+        Function_Return aiMsgs[iAt]
+    End_Function
+
+    // The two chords that ship as Shift chords, for a settings file saved before their commands
+    // existed (the table then has nothing to match - see the On_Key note in the editor). The codes
+    // are the compiler's own constants, which the probe showed the Key event carries verbatim.
+    Function DefaultShiftChordCommand Integer iDfKey Returns Integer
+        If (iDfKey = (Key_Ctrl+Key_Shift+Key_G)) ;
+            Function_Return CMD_GotoDefinition
+        If (iDfKey = (Key_Ctrl+Key_Shift+Key_Q)) ;
+            Function_Return CMD_QuickMarkPop
+        Function_Return -1
+    End_Function
+
+    /* THE CHORDS On_Key CANNOT HOLD. An On_Key written with Key_Shift on a letter compiles and
+       never fires - Ctrl+Shift+G reached Scintilla untouched and typed a BEL (Nils 2026-09-10) -
+       yet the keystroke is not lost: DataFlex delivers it as a Key event whose code IS that
+       constant (3143 for Ctrl+Shift+G; CommandForDfKey in cRefactorHotKeys has the probe), and a
+       key On_Key did claim never arrives here at all. So Key is where those chords are caught. The
+       code is looked up in the table - it is the very value the Keyboard page captured, so a
+       rebinding on the page is honoured - and the message DefineOnKey bound for that command is
+       sent. A table from before the command existed falls back to the shipped default for the two
+       chords that ship as Shift chords, the way the hardcoded On_Key lines answer for Ctrl+G and
+       Ctrl+Q. Anything unmatched is forwarded and reaches the control as before. The handlers
+       remove the character the chord also queued (SwallowPendingChar); returning without the
+       Forward is what keeps DataFlex from handing the keystroke on. */
+    Procedure Key Integer iKey Returns Integer
+        Integer iCmd iMsg iRet
+
+        Get CommandForDfKey of oSciCommandHotKeys iKey to iCmd
+        If (iCmd < 0) ;
+            Get DefaultShiftChordCommand iKey to iCmd
+        If (iCmd >= 0) Begin
+            Get OnKeyMessageForCommand iCmd to iMsg
+            If (iMsg <> 0) Begin
+                Send iMsg
+                Procedure_Return 0
+            End
+        End
+        Forward Get Msg_Key iKey to iRet
+        Procedure_Return iRet
+    End_Procedure
+
+    Procedure onPreHotKey Integer iCmd
+        Boolean bHasAlt
+
+        Get HotKeyHasAlt of oSciCommandHotKeys iCmd to bHasAlt
+        If (bHasAlt) Begin
+            Send DispatchHotkey
+        End
+    End_Procedure
+
+    Procedure HKSC_GotoMatchBrace
+        Send onPreHotKey CMD_GOTOMATCHBRACE
+        Send GotoMatchingBrace
+    End_Procedure
+
+    // HKSC => Hot Key SCintilla
+    Procedure HKSC_OpenFile
+        Send DispatchHotkey  // don't leak a shortcut key into the text window
+        Send CAOpenFile
+    End_Procedure
+
+    Procedure HKSC_NewFile
+        Send DispatchHotkey  // don't leak a shortcut key into the text window
+        Send CANewFile
+    End_Procedure
+
+    Procedure HKSC_Properties
+        Send onPreHotKey CMD_PROPERTIES
+        Send Properties
+    End_Procedure
+
+    Procedure HKSC_LineCut
+        Send CutLine
+    End_Procedure
+
+    Procedure HKSC_LowercaseSelection
+        Send LowerCaseSelection
+    End_Procedure
+
+    Procedure HKSC_UppercaseSelection
+        Send UpperCaseSelection
+    End_Procedure
+
+    Procedure HKSC_BookmarkToggle
+        Send onPreHotKey CMD_BOOKMARKTOGGLE
+        Send ToggleBookmark
+    End_Procedure
+
+    Procedure HKSC_BookmarkNext
+        Send onPreHotKey CMD_BOOKMARKNEXT
+        Send NextBookmark
+    End_Procedure
+
+    Procedure HKSC_BookmarkPrevious
+        Send onPreHotKey CMD_BOOKMARKPREV
+        Send PreviousBookmark
+    End_Procedure
+
+    Procedure HKSC_BookmarkClearAll
+        Send onPreHotKey CMD_BOOKMARKCLEARALL
+        Send ClearAllBookmarks
+    End_Procedure
+
+    Procedure HKSC_BookmarkJumpToFirst
+        Send onPreHotKey CMD_BOOKMARKJUMPTOFIRST
+        Send FirstBookmark
+    End_Procedure
+
+    Procedure HKSC_BookmarkJumpToLast
+        Send onPreHotKey CMD_BOOKMARKJUMPTOLAST
+        Send LastBookmark
+    End_Procedure
+
+    /* Quick Marks and Go to definition. Not onPreHotKey, which clears the queue for Alt
+       combinations alone: Ctrl+Q is one of the keys Nils saw typing a control character into
+       the source (2026-08-03), and until 2026-09-10 the editor claimed it only to swallow it.
+       SwallowPendingChar takes the queued character by name, then DispatchAnyKey is the house
+       remedy behind it (RefactorMessageQueue.pkg says why both). */
+    Procedure HKSC_QuickMarkPush
+        Send SwallowPendingChar
+        Send DispatchAnyKey
+        Send PushQuickMark
+    End_Procedure
+
+    Procedure HKSC_QuickMarkPop
+        Send SwallowPendingChar
+        Send DispatchAnyKey
+        Send PopQuickMark
+    End_Procedure
+
+    Procedure HKSC_GotoDefinition
+        Send SwallowPendingChar
+        Send DispatchAnyKey
+        Send GotoDefinition
+    End_Procedure
+
+    Procedure HKSC_MoveLineUp
+        //    Send onPreHotKey CMD_MOVELINEUP
+        Send MoveLineUp
+    End_Procedure
+
+    Procedure HKSC_MoveLineDown
+        //    Send onPreHotKey CMD_MOVELINEDOWN
+        Send MoveLineDown
+    End_Procedure
+
+    Procedure HKSC_DuplicateSelection
+        //    Send onPreHotKey CMD_DUPLICATESELECTION
+        Send DuplicateSelection
+    End_Procedure
+
+    Procedure HKSC_InsertHeaderGlobal
+        //    Send onPreHotKey CMD_ToolsInsertHeaderGlobal
+        Send InsertHeaderGlobal
+    End_Procedure
+
+    Procedure HKSC_InsertHeaderUser
+        //    Send OnPreHotKey CMD_ToolsInsertHeaderUser
+        Send InsertHeaderUser
+    End_Procedure
+
+    Procedure HKSC_OpenFileUnderCursor
+        //    Send OnPreHotKey CMD_OpenFileUnderCursor
+        Send OpenFileUnderCursor
+    End_Procedure
+
+    Procedure HKSC_InsertRevision
+        //    Send OnPreHotKey CMD_InsertRevisionMark
+        Send InsertRevision
+    End_Procedure
+
+    Procedure HKSC_InsertColorValue
+        //    Send OnPreHotKey CMD_InsertColor
+        Send InsertColorValue
+    End_Procedure
+
+    Procedure HKSC_WindowSwitchToCodeView
+        //    Send OnPreHotKey CMD_WindowSwitchToCodeView
+        Send WindowSwitchToCodeView
+    End_Procedure
+
+    Procedure HKSC_PAWindowSwitchToErrorView
+        //    Send OnPreHotKey CMD_WindowSwitchToErrorView
+        Send PAWindowSwitchToErrorView
+    End_Procedure
+
+    Procedure HKSC_SyncCodeView
+        //    Send OnPreHotKey CMD_WindowSyncCodeView
+        Send SyncCodeView
+    End_Procedure
+
+    Procedure HKSC_CASwitchToNextView
+        //    Send OnPreHotKey CMD_WindowNextView
+        Send CASwitchToNextView
+    End_Procedure
+
+    Procedure HKSC_CASwitchToPreviousView
+        //    Send OnPreHotKey CMD_WindowPreviousView
+        Send CASwitchToPreviousView
+    End_Procedure
+
+    Procedure HKSC_ListCreator
+        //    Send OnPreHotKey CMD_ListCreator
+        Send ListCreator
+    End_Procedure
+
+    Procedure HKSC_ListObjects
+        //    Send OnPreHotKey CMD_ListObjects
+        Send ListObjects
+    End_Procedure
+
+    Procedure HKSC_ListVars
+        //    Send OnPreHotKey CMD_ListVars
+        Send ListVars
+    End_Procedure
+
+    Procedure HKSC_ListKeys
+        //    Send OnPreHotKey CMD_ListKeys
+        Send ListKeys
+    End_Procedure
+
+    Procedure HKSC_ListProcedures
+        //    Send OnPreHotKey CMD_ListProcedures
+        Send ListProcedures
+    End_Procedure
+
+    Procedure HKSC_ListFunctions
+        //    Send OnPreHotKey CMD_ListFunctions
+        Send ListFunctions
+    End_Procedure
+
+    Procedure HKSC_ListClasses
+        //    Send OnPreHotKey CMD_ListClasses
+        Send ListClasses
+    End_Procedure
+
+    Procedure HKSC_ListIDETags
+        //    Send OnPreHotKey CMD_ListIDETags
+        Send ListIDETags
+    End_Procedure
+
+    Procedure HKSC_ToggleComment
+        //    Send OnPreHotKey CMD_ToggleComment
+        Send ToggleComment
+    End_Procedure
+
+    Procedure HKSC_Toggle_OnItem_AddItem
+        //    Send OnPreHotKey CMD_ConvertOnItemToAddItem
+        Send Toggle_OnItem_AddItem
+    End_Procedure
+
+    Procedure HKSC_ConvertCStructToVDF
+        //    Send OnPreHotKey CMD_ConvertCStructToVDF
+        Send ConvertCStructToVDF
+    End_Procedure
+
+    Procedure HKSC_ConvertCDllCallToVDF
+        //    Send OnPreHotKey CMD_ConvertCDllCallToVDF
+        Send ConvertCDllCallToVDF
+    End_Procedure
+
+    Procedure HKSC_ConvertVDFTypeToHandler
+        //    Send OnPreHotKey CMD_ConvertVDFTypeToHandler
+        Send ConvertVDFTypeToHandler
+    End_Procedure
+
+    Procedure HKSC_MarkScopeBlock
+        //    Send OnPreHotKey CMD_MarkScopeBlock
+        Send MarkScopeBlock
+    End_Procedure
+
+    Procedure HKSC_PerfCounters
+        //    Send OnPreHotKey CMD_DEBUGPERFCOUNTERS
+        Send DisplayPerfCounters of ghoApplication
+    End_Procedure
+
+    Procedure HKSC_RefactorDropSelf
+        //    Send DispatchHotkey  // don't leak a shortcut key into the text window
+        Send DropSelfFromHere
+    End_Procedure
+
+    Procedure HKSC_RefactorObjectNeighborhood
+        //    Send DispatchHotkey
+        Send RefactorObjectNeighborhood
+    End_Procedure
+
+    Procedure HKSC_RefactorReindent
+        Send DispatchHotkey
+        Send ReIndentWholeFile
+    End_Procedure
+
+    Procedure HKSC_GotoFirstIndentMismatch
+        Send DispatchHotkey
+        Send GoToFirstIndentationMismatch
+    End_Procedure
+
+    Procedure HKSC_RefactorMethodExtract
+        Send DispatchHotkey
+        Send RefactorMethodExtract
+    End_Procedure
+
+    Procedure DefinePredefinedHotKeys
+        //For iKey from CMD_FIRST To CMD_OVERTYPEOFF
+        //  Get CM_ExecuteCmd CMD_GOTOLINE iNr  To iRet
+        //Loop
+        Send DefineOnKey CMD_GOTOMATCHBRACE           (RefProc(HKSC_GotoMatchBrace))
+        Send DefineOnKey CMD_FIND                     (RefProc(CME_Find))
+        Send DefineOnKey CMD_FINDNEXT                 (RefProc(CME_FindNext))
+        Send DefineOnKey CMD_FINDPREV                 (RefProc(CME_FindPrevious))
+        Send DefineOnKey CMD_FINDREPLACE              (RefProc(CME_FindReplace))
+        Send DefineOnKey CMD_GOTOLINE                 (RefProc(CME_GotoLine))
+        Send DefineOnKey CMD_SELECTALL                (RefProc(CME_SelectAll))
+        Send DefineOnKey CMD_PROPERTIES               (RefProc(HKSC_Properties))
+        Send DefineOnKey CMD_LINECUT                  (RefProc(HKSC_LineCut))
+        Send DefineOnKey CMD_LOWERCASESELECTION       (RefProc(HKSC_LowercaseSelection))
+        Send DefineOnKey CMD_UPPERCASESELECTION       (RefProc(HKSC_UppercaseSelection))
+        Send DefineOnKey CMD_BOOKMARKTOGGLE           (RefProc(HKSC_BookmarkToggle))
+        Send DefineOnKey CMD_BOOKMARKNEXT             (RefProc(HKSC_BookmarkNext))
+        Send DefineOnKey CMD_BOOKMARKPREV             (RefProc(HKSC_BookmarkPrevious))
+        Send DefineOnKey CMD_BOOKMARKCLEARALL         (RefProc(HKSC_BookmarkClearAll))
+        Send DefineOnKey CMD_BOOKMARKJUMPTOFIRST      (RefProc(HKSC_BookmarkJumpToFirst))
+        Send DefineOnKey CMD_BOOKMARKJUMPTOLAST       (RefProc(HKSC_BookmarkJumpToLast))
+        Send DefineOnKey CMD_QuickMarkPush            (RefProc(HKSC_QuickMarkPush))
+        Send DefineOnKey CMD_QuickMarkPop             (RefProc(HKSC_QuickMarkPop))
+        Send DefineOnKey CMD_GotoDefinition           (RefProc(HKSC_GotoDefinition))
+        Send DefineOnKey CMD_MOVELINEUP               (RefProc(HKSC_MoveLineUp))
+        Send DefineOnKey CMD_MOVELINEDOWN             (RefProc(HKSC_MoveLineDown))
+        Send DefineOnKey CMD_DUPLICATESELECTION       (RefProc(HKSC_DuplicateSelection))
+
+
+        // Window Menu.
+        //    Send DefineOnKey CMD_WindowSwitchToCodeView   (RefProc(HKSC_WindowSwitchToCodeView))
+        //    Send DefineOnKey CMD_WindowSwitchToErrorView  (RefProc(HKSC_PAWindowSwitchToErrorView))
+        //    Send DefineOnKey CMD_WindowSyncCodeView       (RefProc(HKSC_SyncCodeView))
+        //    Send DefineOnKey CMD_WindowNextView           (RefProc(HKSC_CASwitchToNextView))
+        //    Send DefineOnKey CMD_WindowPreviousView       (RefProc(HKSC_CASwitchToPreviousView))
+
+        // Lists.
+        //    Send DefineOnKey CMD_ListCreator              (RefProc(HKSC_ListCreator))
+        //    Send DefineOnKey CMD_ListObjects              (RefProc(HKSC_ListObjects))
+        //    Send DefineOnKey CMD_ListVars                 (RefProc(HKSC_ListVars))
+        //    Send DefineOnKey CMD_ListKeys                 (RefProc(HKSC_ListKeys))
+        //    Send DefineOnKey CMD_ListProcedures           (RefProc(HKSC_ListProcedures))
+        //    Send DefineOnKey CMD_ListFunctions            (RefProc(HKSC_ListFunctions))
+        //    Send DefineOnKey CMD_ListClasses              (RefProc(HKSC_ListClasses))
+        //    Send DefineOnKey CMD_ListIDETags              (RefProc(HKSC_ListIDETags))
+
+        // Mixed
+        Send DefineOnKey CMD_ToggleComment            (RefProc(HKSC_ToggleComment))
+        Send DefineOnKey CMD_ToolsInsertHeaderGlobal  (RefProc(HKSC_InsertHeaderGlobal))
+        Send DefineOnKey CMD_ToolsInsertHeaderUser    (RefProc(HKSC_InsertHeaderUser))
+        Send DefineOnKey CMD_OpenFileUnderCursor      (RefProc(HKSC_OpenFileUnderCursor))
+        Send DefineOnKey CMD_InsertRevisionMark       (RefProc(HKSC_InsertRevision))
+        Send DefineOnKey CMD_InsertColor              (RefProc(HKSC_InsertColorValue))
+
+        // Convetion.
+        Send DefineOnKey CMD_ConvertOnItemToAddItem   (RefProc(HKSC_Toggle_OnItem_AddItem))
+        Send DefineOnKey CMD_ConvertCStructToVDF      (RefProc(HKSC_ConvertCStructToVDF))
+        Send DefineOnKey CMD_ConvertCDllCallToVDF     (RefProc(HKSC_ConvertCDllCallToVDF))
+        Send DefineOnKey CMD_ConvertVDFTypeToHandler  (RefProc(HKSC_ConvertVDFTypeToHandler))
+
+        Send DefineOnKey CMD_MarkScopeBlock           (RefProc(HKSC_MarkScopeBlock))
+
+
+        Send DefineOnKey CMD_DEBUGPERFCOUNTERS        (RefProc(HKSC_PerfCounters))
+        Send DefineOnKey CMD_REFACTORDROPSELF         (RefProc(HKSC_RefactorDropSelf))
+        Send DefineOnKey CMD_REFACTOROBJECTNEIGHBORHOOD (RefProc(HKSC_RefactorObjectNeighborhood))
+        Send DefineOnKey CMD_REFACTORREINDENT         (RefProc(HKSC_RefactorReindent))
+        Send DefineOnKey CMD_GOTOFIRSTINDENTMISMATCH  (RefProc(HKSC_GotoFirstIndentMismatch))
+        Send DefineOnKey CMD_REFACTORMETHODEXTRACT    (RefProc(HKSC_RefactorMethodExtract))
+    End_Procedure
+
+    Procedure CurrentViewHotKeyReroute Integer iMsg
+        Handle hoView
+
+        //    Get CurrentView To hoView
+        If (hoView<>0) Begin
+            Send DispatchHotkey
+            Send iMsg to hoView
+        End
+    End_Procedure
+    // This defines the on_key commands via editor hotkeys
+    Procedure Define_EditorHotKeys
+
+        //    Can't set the definition here as the message isn't known in the subclass
+        //      Send DefineOnKey CMD_FileNewFile msg_CANewFile
+
+        If (phoEditorEditView(Self)=Self) Begin
+            // Calls method in clientArea object to then execute the above DefineOnKey
+            Delegate Send Define_EditViewHotkeys Self
+        End
+        //
+        Send DefinePredefinedHotKeys
+        //
+    End_Procedure
+
+End_Class

@@ -1,4 +1,4 @@
-﻿// Original work by Sean Bamforth, APG.
+﻿// Original work by Sean Bamforth.
 // Adapted to this project by Nils Svedmyr, RDC Tools International
 // 2023-11-19 Changed from BusinessProcess to cObject as we dynamically instantiate this
 // class from the cRefactorFuncLib class, which already uses a BusinessProcess.
@@ -8,6 +8,7 @@ Use vWin32fh.pkg
 Use GlobalFunctionsProcedures.pkg
 Use RefactorConstants.h.pkg
 Use cEncodingHelpers.pkg
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
 
 // Note: "Other" log files names (not CS_SummaryLogfileName) must end 
 //       with ".log.txt", to be shown in the "Other log files" dialog,
@@ -47,6 +48,11 @@ Class cUnusedSourceFiles is a cObject
         Property String[] pasAllFiles
         Property Integer piNoOfUnusedSourceFiles 0
         Property Boolean pbOK True
+        // Set by BuildNodeGraph when the user cancels mid-scan. A PARTIAL dependency
+        // graph must never produce a report: unscanned files have no out-edges, so
+        // their Use targets would falsely list as unused - and the companion .bat
+        // MOVES the listed files. RunUnusedSourceFiles aborts without writing.
+        Property Boolean pbCancelled False
     End_Procedure
 
     Function FilesAsStructArray String[] asFiles Returns tUnusedSourceFiles[]
@@ -95,7 +101,7 @@ Class cUnusedSourceFiles is a cObject
     Function ReadSourceFile String sFilename Returns String[]
         String[] asFile
 
-        Move (RFReadEncodedFileAsStringArray(sFilename)) to asFile
+        Move (rfReadEncodedFileAsStringArray(sFilename)) to asFile
         Function_Return asFile
     End_Function
 
@@ -116,8 +122,11 @@ Class cUnusedSourceFiles is a cObject
 
         Get ParseFolderName sFullFilename  to sPath
         Get ParseFileName   sFullFilename  to sFilename
-        Set Title_Text of ghoStatusPanel   to ("Scanning for 'Use':" * String(sPath))
-        Set Message_Text of ghoStatusPanel to ("in file:" * String(sFilename))
+        // Panel field conventions (see RefactorStatusPanel.pkg): Title keeps the folder (the
+        // engine's own Title precedent), the FILE name goes to the multi-line TableName line,
+        // and Message_Text stays the function-in-action text.
+        Set Title_Text of ghoStatusPanel     to ("Scanning for 'Use':" * String(sPath))
+        Set TableName_Text of ghoStatusPanel to ("in file:" * String(sFilename))
         Decrement iSize
         For iCount from 0 to iSize
             Move asFile[iCount] to sLine
@@ -133,8 +142,8 @@ Class cUnusedSourceFiles is a cObject
             End
         Loop
 
-        Set Title_Text   of ghoStatusPanel to ""
-        Set Message_Text of ghoStatusPanel to ""
+        Set Title_Text     of ghoStatusPanel to ""
+        Set TableName_Text of ghoStatusPanel to ""
 
         Function_Return asRetVal
     End_Function
@@ -153,6 +162,7 @@ Class cUnusedSourceFiles is a cObject
         tNodeEdges[] aNodes
         Integer iCount iSize
         String sFullName sExt
+        Boolean bCancel
 
         Move (SizeOfArray(asSourceAllFiles)) to iSize
         Set piMaximumTot of ghoStatusPanel to iSize   // file-count progress (this is the per-file disk-read pass)
@@ -170,6 +180,14 @@ Class cUnusedSourceFiles is a cObject
             // runs with the panel up).
             Set Caption_Text of ghoStatusPanel to ("Unused source files - File No:" * String(iCount + 1) * "of:" * String(iSize + 1))
             Send DoAdvanceTot of ghoStatusPanel
+            // Mid-run cancel (the Cancel button): poll the safe accessor (NEVER Cancel_Check -
+            // it consumes the signal). A partial graph is UNSAFE to report from (see
+            // pbCancelled), so flag it for RunUnusedSourceFiles to abort outright.
+            Get pbUserCancelRequested of ghoEngine to bCancel
+            If (bCancel = True) Begin
+                Set pbCancelled to True
+                Move iSize to iCount
+            End
         Loop
 
         Function_Return aNodes
@@ -351,6 +369,15 @@ Class cUnusedSourceFiles is a cObject
         Get pasAllFiles                                          to asFiles
         Get FilesAsStructArray asFiles                           to asAllSourceFiles
         Get UsedPackageFiles asAllSourceFiles                    to asUsedFilenames
+        // Cancelled mid-scan: the graph is partial, so "unused" would include files whose
+        // only users were never scanned - and the companion .bat MOVES files. Write NO
+        // report at all (unlike the report-only functions, a truncated result here is
+        // actively dangerous, not just incomplete).
+        If (pbCancelled(Self)) Begin
+            Set piNoOfUnusedSourceFiles to 0
+            Set pbOK to False
+            Procedure_Return
+        End
         Get UnusedPackages asUsedFilenames asAllSourceFiles      to asUnusedSource
         Set piNoOfUnusedSourceFiles to (SizeOfArray(asUnusedSource))
 

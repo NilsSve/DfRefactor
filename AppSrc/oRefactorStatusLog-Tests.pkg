@@ -1,0 +1,116 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oRefactorStatusLog-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-16
+//
+// Description : Unit tests for the status/error logger (cRefactorStatusLog.Log_Status).
+//
+//               Since DUF 1_8 (2026-08-14) StatLog.ID sits ALONE in Index.2 - a UNIQUE index - and is
+//               meant to be assigned by the data dictionary's Field_Auto_Increment from DFLastID. But the
+//               logger writes with a raw SaveRecord (deliberately: it runs inside error paths and must not
+//               drag a DD's validation and messaging in), which bypasses that. Unassigned, every entry
+//               stored ID = 0, and every entry after the first faulted err 28 (duplicate) against the first
+//               one; the retry in Error_Report then re-saved it as an UPDATE of the half-landed record, so
+//               the log kept "working" - at the price of one internal error and a "[log retry after
+//               internal error 28]" tail on every entry. Found 2026-08-16 by Nils's own hunch ("I recently
+//               changed to use the DFLastID table ... I wonder if that might be the culprit?").
+//
+//               The logger now draws its ID from DFLastID itself, under its own lock. These tests pin
+//               that: two back-to-back entries land with consecutive non-zero IDs, are findable by ID,
+//               and carry no retry tail. The probe rows are removed again - Nils's real StatLog is the
+//               table under test.
+//
+//               AND THEY FOUND A SECOND, OLDER 28 (2026-08-16): with unique IDs in place, entry 2 still
+//               retried ~50% of runs. Forensics in the assert message (ids, recnums, stamps) + the faulting
+//               address in the retry tail pinned it to `SaveRecord StatLog` on Index.1 (Time, FunctionName,
+//               Recnum): two entries in the SAME MILLISECOND with the same FunctionName collide, Recnum
+//               segment notwithstanding - 0/16 failures with a distinct millisecond or FunctionName, a full
+//               reindex changed nothing. Log_Status now guarantees a distinct stamp per entry; this test is
+//               the demanding case on purpose (same FunctionName, no gap): back to back, no retry.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+    Object oRefactorStatusLog_Tests is a cTestFixture
+        Set psFunctionName to "Log_Status"
+
+        Procedure _RemoveProbeRow Integer iId
+            Clear StatLog
+            Move iId to StatLog.ID
+            Find eq StatLog by Index.2
+            If (Found) Begin
+                Delete StatLog
+            End
+            Clear StatLog
+        End_Procedure
+
+        // Two consecutive raw saves: distinct, ascending, non-zero IDs; no internal-error retry.
+        {Published = True}
+        Procedure StatLog_TwoEntriesGetDistinctIds
+            Integer iId1 iId2 iRec1 iRec2
+            Boolean bState
+            String sDesc1 sDesc2 sTime1 sTime2 sWhere
+
+            Get pbStatusLogState of ghoStatusLog to bState
+            Set pbStatusLogState of ghoStatusLog to True
+            Send Log_Status of ghoStatusLog "DFUnit probe 1 - StatLog id allocation"
+            Move StatLog.ID     to iId1
+            Move StatLog.Recnum to iRec1
+            Move StatLog.Time   to sTime1
+            Send Log_Status of ghoStatusLog "DFUnit probe 2 - StatLog id allocation"
+            Move StatLog.ID     to iId2
+            Move StatLog.Recnum to iRec2
+            Move StatLog.Time   to sTime2
+            Set pbStatusLogState of ghoStatusLog to bState
+            Move ("[id " + String(iId1) + "/" + String(iId2) + " rec " + String(iRec1) + "/" + String(iRec2) + " time '" + sTime1 + "' / '" + sTime2 + "']") to sWhere
+
+            Send Assert (iId1 > 0) "first entry got no ID"
+            Send AssertIAreEqual (iId1 + 1) iId2
+
+            // Both really landed under their ID (Index.2 is the ID index) ...
+            Clear StatLog
+            Move iId1 to StatLog.ID
+            Find eq StatLog by Index.2
+            Send Assert (Found) ("entry 1 not found by ID " + String(iId1))
+            Move (Trim(StatLog.Description)) to sDesc1
+            Clear StatLog
+            Move iId2 to StatLog.ID
+            Find eq StatLog by Index.2
+            Send Assert (Found) ("entry 2 not found by ID " + String(iId2))
+            Move (Trim(StatLog.Description)) to sDesc2
+
+            // ... with the text intact and NO retry tail - the signature of the ID collision.
+            Send Assert ((Pos("DFUnit probe 1", sDesc1)) > 0) ("entry 1 text: " + sDesc1)
+            Send Assert ((Pos("DFUnit probe 2", sDesc2)) > 0) ("entry 2 text: " + sDesc2)
+            Send Assert ((Pos("[log retry", sDesc1)) = 0) ("entry 1 carries a retry tail: " + sDesc1 + " " + sWhere)
+            Send Assert ((Pos("[log retry", sDesc2)) = 0) ("entry 2 carries a retry tail: " + sDesc2 + " " + sWhere)
+
+            Send _RemoveProbeRow iId1
+            Send _RemoveProbeRow iId2
+        End_Procedure
+
+        // The pool moves with the log: after an entry, DFLastID.StatLogID IS that entry's ID,
+        // so a DD save (the error-log grid's path) and the raw logger never hand out the same
+        // number.
+        {Published = True}
+        Procedure StatLog_PoolFollowsTheLastEntry
+            Integer iId iPool
+            Boolean bState
+
+            Get pbStatusLogState of ghoStatusLog to bState
+            Set pbStatusLogState of ghoStatusLog to True
+            Send Log_Status of ghoStatusLog "DFUnit probe 3 - StatLog pool"
+            Move StatLog.ID to iId
+            Set pbStatusLogState of ghoStatusLog to bState
+
+            Reread DFLastID
+            Move DFLastID.StatLogID to iPool
+            Unlock
+            Send AssertIAreEqual iId iPool
+
+            Send _RemoveProbeRow iId
+        End_Procedure
+
+    End_Object

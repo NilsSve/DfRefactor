@@ -32,10 +32,11 @@
 Use Windows.pkg
 Use seq_chnl.pkg
 Use cSCWsGrid.pkg
-Use cRegex.pkg
 Use RefactorConstants.h.pkg
 Use RefactorStatusPanel.pkg
 Use cEncodingHelpers.pkg
+Use cWinAPICatalogStore.pkg      // the Windows API catalogues as editable JSON - the seed stays the floor
+Use cDfLanguageFile.pkg          // the Studio language definition - grammar for _AddAllKeyWords
 Use cRefactorExpressionParser.pkg
 
 // Error object for DFUnit testing.
@@ -63,6 +64,19 @@ Class cBaseFuncLib is a cRefactorExpressionParser
         Property Integer piTabSize
         Property Boolean pbReadOnly False  // If = True, no changes will be made and only shows statistics.
         Property String[] pasOtherLogFiles
+        /* RUN NOTES - one line a refactoring function wants printed UNDER its own line in the
+           run summary (Nils 2026-08-03: "nobody will go looking in the StatLog table, that is
+           for internal engine errors only"). Stored as "FunctionName|note" and emitted by
+           cRefactorEngine.CollectSummary, so a note appears exactly where the reader already
+           is - beside the count it explains. Cleared per run by _InitializeFuncLib below. */
+        Property String[] pasRunNotes
+        /* THE WORD A FUNCTION'S SUMMARY COUNT IS IN (2026-09-05). The engine says "N lines" for a
+           line-by-line or one-file function and "N file(s)" for an all-files one - but a class converter
+           returns the number of OBJECTS it converted, so a 985-file run read "1505 file(s) Refactored:
+           DbGrid -> cDbCJGrid". A function that counts something else declares its word here, once per
+           run (SetSummaryUnit), and CollectSummary prints that instead. Packed "NAME|unit"; cleared with
+           the run notes. */
+        Property String[] pasSummaryUnits
 
         Property tRefactorSettings pRefactorSettings
         //
@@ -72,6 +86,12 @@ Class cBaseFuncLib is a cRefactorExpressionParser
         // Old school text strings that ends each line with a semi-colon (;)
         // Used in conjunction with the tTokenizer bHasEndSemiColon member.
         Property Boolean pbIsInSemiColonMultiLineString False
+        /* A ';'-continued 'Indicate ... as <expr>' in flight (ChangeLegacyIndicators, 2026-09-17): the
+           Move target the opening line could not place. The opening line becomes 'If (ind) Move (<expr> ;'
+           and remembers the target here; the line that ENDS the statement (no trailing ';') closes it
+           with ') to <target>'. Cleared with the rest of the line state (_ClearRefactoringProperties),
+           so a dry-run of one isolated line - which clears before and after - can never leak it. */
+        Property String psPendingIndicateTarget ""
 
         // Char-scan state to resume on the next physical line when an old-school
         // multi-line string literal ("..." or '...', opened on one line and
@@ -84,6 +104,395 @@ Class cBaseFuncLib is a cRefactorExpressionParser
         // *** To be used by all cRefactorFuncLib functions ***
         Property tTokenizer pTokenizer
 
+        // Per-file PINNED indicator names (UPPERCASE): indicators the converters must leave ENTIRELY
+        // legacy in this file because some reference to them cannot be safely converted - a GROUP/ALL
+        // 'indicate' form (no modern Move equivalent), or a name read by a 'use'd local include that is
+        // NOT itself converted. The engine (re)computes this per file (_ComputePinnedIndicators) before
+        // the line pass; all four indicator converters consult it (_IndicatorIsPinned / the shim +
+        // rename exclusion). Empty by default (and in unit tests), so it is a no-op unless a file pins.
+        // (Nils 2026-07-09, a legacy customer workspace: 'indicate grp_flag GROUP ANY [...]' + a 'use
+        // SHARED.MAC' reading a converted indicator - identifiers generalized.)
+        /* The class -> package index for MakeFileAutonomous, built ONCE per run and reused.
+           Scanning the install's Pkg plus the workspace source is far too heavy to repeat per file
+           (a whole-file function is called once per file, so the first cut rebuilt it thousands of
+           times). Keyed on the target Pkg folder + the folder list, so a target or scope change
+           rebuilds; destroyed and cleared by _InitializeFuncLib. */
+        Property Handle phoClassPkgIndex 0
+        Property String psClassPkgIndexKey ""
+        /* THE RUN'S NAME READERS (RefactorBareGlobalsToGlobalVariable, 2026-10-31): every name the code of a run
+           file uses without declaring it at file scope, UPPERCASE and sorted (pasNameReaderWords), with the run
+           file that uses it (paiNameReader, an index into pasNameReaderFiles). Built once per run on first need
+           (_BuildNameReaders); cleared by _InitializeFuncLib. */
+        Property String[]  pasNameReaderWords
+        Property Integer[] paiNameReader
+        Property String[]  pasNameReaderFiles
+        Property Boolean   pbNameReadersBuilt False
+        /* THE NAME READERS OUTSIDE THE RUN (the Type converters, 2026-11-01): the same index over the source files of
+           the workspace and its libraries that the run does not cover (_BuildOutsideNameReaders), built once per run
+           on first need; cleared by _InitializeFuncLib. pasOutsideReaderFolders replaces the workspace's folders -
+           a unit test names its own. */
+        Property String[]  pasOutsideReaderWords
+        Property Integer[] paiOutsideReader
+        Property String[]  pasOutsideReaderFiles
+        Property Boolean   pbOutsideReadersBuilt False
+        Property String[]  pasOutsideReaderFolders
+        /* THE ERROR NUMBERS CODE READS, AND THE TEXTS Flexerrs.dat HOLDS (ChangeErrorNumberToGenericError, 2026-11-05).
+           pasErrorReaderScope is the Deep Scan's file list, for a scan with no run behind it; pasFlexErrsFolders replaces
+           the target's folders, a unit test names its own. Built on first need; cleared by _InitializeFuncLib. */
+        Property String[]  pasErrorNumberReaders
+        Property Boolean   pbErrorReadersBuilt False
+        Property String[]  pasErrorReaderScope
+        Property Integer[] paiFlexErrsHeld
+        Property Boolean   pbFlexErrsRead False
+        Property Boolean   pbFlexErrsUnreadable False
+        Property String[]  pasFlexErrsFolders
+        // The macro lines RunWholeFileFunction set aside for the function it is running: the function sees sentinels.
+        Property String[]  pasMaskedMacroLines
+        // _CJFindInWorkspace's source folders when set - a unit test names its own; empty = the workspace's (2026-11-01).
+        Property String[]  pasCJSourceRootsOverride
+
+        /* THE LINE PASS'S OWN FILE - for the one thing a line-by-line function cannot do by itself:
+           look at the lines after its own. A command converter that drops a side product of the
+           legacy string commands (Found, strmark, strlen) has to know whether anything below still
+           reads it, or it turns working code into a silent run-time bug. See _SideProductVeto in
+           cRefactorFuncLib. (Nils 2026-09-08, a workspace's date parser.)
+
+           Set by the engine's LineByLineFunctions: the array once per FILE, the index once per
+           LINE, and only when a converter that asks for them is selected (_NoteIfLookAheadNeeded) -
+           a property Set of a String[] copies the whole array, so an ungated stash would pay for
+           every file of every run. pbLinePassSideProducts is the second gate: False for a file that
+           mentions neither found nor strmark nor strlen, which is nearly every file, and the veto
+           then never reads the array at all.
+
+           Empty everywhere else - the unit tests, the test bench, the analyzer's single-line dry
+           run - and an EMPTY look-ahead means CONVERT, so every converter behaves exactly as it did
+           before it was wired up. */
+        // The file's lines (Set pasLinePassSource, below) and its file walk, made once when the lines are set
+        // (ScanSourceFile): the look-ahead reads which lines are code from it (2026-10-29).
+        Property String[]    private.pasLinePassSource
+        Property tLineInfo[] paLinePassInfo
+        Property Integer  piLinePassIndex        -1
+        Property Boolean  pbLinePassSideProducts False
+
+        Property String[] pasPinnedIndicators
+        /* WHY each name above is pinned, one entry per pasPinnedIndicators entry, SAME INDEX
+           (Nils 2026-07-30). Two forms, prefixed so neither can be mistaken for the other ('|' is
+           not legal in a Windows filename, so a bare name can never look like a tagged one):
+               "GROUP|"            - a GROUP/ALL Indicate participant
+               "USE|<filename>"    - read by that 'use'd local include
+           The analyzer's demotion hint used to state BOTH reasons as an either/or and lead with the
+           GROUP one. That is the rare case - Nils has met it "a handful of times" - so the hint
+           almost always led with the wrong half, and a correct verdict read like a misfire (his
+           report: 'Indicate not_hist_sch true' pinned because a shared .MAC reads it, explained as a
+           GROUP/ALL participant in a file that contains no group Indicate at all).
+
+           Kept as a PARALLEL array rather than a struct because the pinned set is threaded through
+           SearchArray / BinarySearchArray membership probes all over the converters; a struct array
+           would cost every one of them a projection. Set only by _ComputePinnedIndicators, and
+           cleared wherever the pinned set itself is cleared - a reason surviving its name could
+           attach the wrong file to a later pin of the same identifier. */
+        Property String[] pasPinnedReasons
+        // 1-entry cache for _ComputePinnedIndicators keyed "<path>|<lineCount>" - a same-file repeat
+        // (a file's many messages all guard-probe it) returns the stored set instantly; a real file
+        // change (different line count) self-invalidates. Cleared on _InitializeFuncLib. (Nils 2026-07-09,
+        // the 8s->23s Run Plan fix.) 1-slot is sufficient because the pinned compute is now LAZY
+        // (cModAnalyzer PlanFromMessages / ModAnalyzerFT: run only on the first indicator-fn recipe
+        // guarded per file), so the plan recomputes pinned for very few files. A multi-slot jagged
+        // version was tried 2026-07-17 for cross-phase reuse but reverted - it added a full-cache
+        // String[][] deep-copy per Get/Set for no measured gain over 1-slot + lazy.
+        Property String   psPinnedCacheKey ""
+        Property String[] pasPinnedCacheSet
+        // The reasons for pasPinnedCacheSet, cached with it - a cache hit that returned names but
+        // left the reasons from the PREVIOUS file in place would mislabel every hint on this one.
+        Property String[] pasPinnedCacheReasons
+        // Cross-FILE memo for the pin include-scan: every DISTINCT local include is scanned ONCE per
+        // run into identifier-membership keys, because the same handful of .MAC/.inc files is used by
+        // most of a workspace's programs and re-scanning them per main file was 24.4s of a 55s
+        // LegacyApp Analyze (measured 2026-07-22). FLAT arrays, deliberately: a String[][] jagged
+        // cache regressed here before (Get/Set deep-copies the whole cache; see psPinnedCacheKey
+        // above). pasPinIncScanned holds one "<pathLc>|<size>" entry per scanned include; pasPinIncKeys
+        // holds the SORTED "<pathLc>|<size>|<IDENT>" membership keys BinarySearchArray probes. Size in
+        // the key so an include edited mid-session re-scans (same staleness class as the 1-slot cache).
+        Property String[] pasPinIncScanned
+        Property String[] pasPinIncKeys
+        /* THE INCLUDE LIFT (2026-09-14; the contract is the block above _LiftIncludeVerdict in
+           cRefactorFuncLib). pasRunFiles = the run's file set, lowercased + sorted, for "every file
+           that 'use's the include is in the run": the engine sets the selection; the analyzer sets
+           the one entry "*" (every file counts - it cannot know the plan's final list while building
+           it, and the engine re-judges exactly at run time); EMPTY means no run context, so no
+           include ever lifts and pin reason (2) reads exactly as it did. pasRunFolders = the folders
+           the users scan reads besides an include's own (the run's, trailing separator on).
+           The memos below are per run - cleared by _ClearLiftMemos (from _SetRunFiles* and
+           _InitializeFuncLib) and keyed with the file size like pasPinIncKeys, the same staleness
+           class. Flat arrays, for the reason pasPinIncKeys gives. */
+        Property String[] pasRunFiles
+        Property String[] pasRunFolders
+        // "<pathLc>|<size>|1" or "<pathLc>|<size>|0|<why>" per include the verdict has been asked of.
+        Property String[] pasLiftVerdicts
+        // "<pathLc>|<size>" per file whose facts are known, and INDEX-PARALLEL the facts of that file as
+        // ONE packed row (_LiftPackFacts): the names its own walk (1) pins, the renameable indicator
+        // names it uses or declares, the local includes it 'use's. Found by exact key, one native search.
+        // It used to be one SORTED flat key array, copied + re-sorted + stored again for EVERY file whose
+        // facts were added - O(files^2) over the 1,414 users of one include (2026-09-21, a 12-minute
+        // stall on one report view).
+        Property String[] pasLiftUserScanned
+        Property String[] pasLiftFactRows
+        // The run's 'Use' index, built ONCE per run (_LiftEnsureUseIndex): the folders it covers
+        // (lowercase, trailing separator), then index-parallel the lowercase LEAF of every 'use'd file and
+        // the full paths of the files that 'use' it (Character(2)-separated). Replaces one whole-workspace
+        // read per include asked about.
+        Property String[] pasLiftUseFolders
+        Property String[] pasLiftUseLeafs
+        Property String[] pasLiftUseUsers
+        // True while a lift walk has retargeted the per-file progress bar to its own count;
+        // _ComputePinnedIndicators hands the bar back to the file it pins and clears it.
+        Property Boolean pbLiftBarRetargeted False
+        // What the walk decided: the includes that convert WITH the run (full paths; the engine appends
+        // them to its list), and per lifted read the NAME (UPPERCASE) and the include's leaf name,
+        // index-parallel, for the analyzer's hint on the row that converts.
+        Property String[] pasRunIncludes
+        Property String[] pasLiftedNames
+        Property String[] pasLiftedNameIncs
+        // Per-run verdict cache for the companion scan (_ScopeHasUndeclaredNamedIndicator): one
+        // "<pathLc>|<size>|0-or-1" entry per already-evaluated file. The scan answers ONE boolean per
+        // plan build, its all-miss case must tokenize every indicator file (~47s on LegacyApp,
+        // measured 2026-07-23), and Run Plan is clicked repeatedly per session against unchanged
+        // files - so the verdict is remembered per file. Cleared by _InitializeFuncLib, which fires
+        // when an engine run starts - exactly the moment the files are about to change.
+        Property String[] pasCompanionVerdicts
+
+        // SESSION-scoped memo for the whole-file dry-run probe (cModAnalyzer.VerifyAutoFixWholeFile:
+        // "would running this whole-file converter change this file?"). Keyed "<path>|<fn>|<lineCount>",
+        // parallel arrays. Lives on the funclib (not the per-analyze cModAnalyzer object) so it PERSISTS
+        // ACROSS ANALYZES: the honesty demote for the Unicode pointer pair + ChangeObjectFunctionCallToGet
+        // costs a full per-line tokenize (~1.58s/file) once per (file, fn) - 271s of a 40k-warning WinServ
+        // analyze - and re-running it every analyze for UNCHANGED files was pure waste. A line-count change
+        // self-invalidates that key (same-line-count edits are the documented residual staleness, like
+        // [[pinned cache]]); _InitializeFuncLib clears it - and that fires before every engine RUN, so a
+        // run's edits always start from a clean cache. (Nils 2026-07-17.)
+        Property String[]  pasWholeFileSessKey
+        Property Integer[] paiWholeFileSessVal
+
+        // PER-RUN memo of the install's Global function-name catalogue. InstallGlobalFuncNames probes its
+        // cache file for staleness AND parses the JSON on EVERY call, so a whole-file converter that needs
+        // it (GuardRedundantGlobalFunctions) was paying that per FILE - thousands of parses on a big
+        // workspace, which read as the run hanging between files while the progress caption still showed
+        // the previous file's last line nudge (Nils 2026-07-21). Declared here, at/above
+        // _InitializeFuncLib, so that reset can reach it: the memo must never outlive one engine run.
+        Property String[] pasRunNativeGlobals
+        Property Boolean  pbRunNativeGlobalsLoaded False
+
+        // PER-RUN tally for ChangeAmbiguousCallToGet. A whole-file converter reports only "N lines changed",
+        // so a run that converts 1 and declines 220 looks identical to a broken one - which is exactly how
+        // it read (Nils 2026-07-21: "feels like we're going round in circles"). Counting WHY lines were left
+        // alone turns that into a next action: legacy-operator lines need ChangeLegacyOperators first,
+        // two-line calls need hand work. Cleared by _InitializeFuncLib, so they describe ONE run.
+        Property Integer piGuardedCount
+        /* Declarations found ALREADY guarded - matched the native catalogue, but a #IF was sitting
+           above them so the run left them alone (2026-08-15).
+
+           Counted because "guarded 0" has two very different causes and the caller could not tell
+           them apart: nothing matched the catalogue, or everything matched and was already done.
+           Reporting the first when the truth is the second sends the user off to rename functions
+           that are correctly guarded already. */
+        Property Integer piAlreadyGuardedCount
+        // External_Function declarations a guard run SKIPPED because they already carry one. Kept
+        // apart from the change count so a zero-change run can say WHICH zero it was: nothing this
+        // could reach, or everything already done.
+        Property Integer piAlreadyGuardedExternalCount
+        // Declarations a guard run REFUSED because this file calls them: "name (called at line N)".
+        Property String[] pasGuardSkippedCalled
+        /* WHY the guard run changed nothing, when it changed nothing for a reason it KNOWS.
+
+           GuardRedundantGlobalFunctions has three silent "Function_Return 0" exits - no target
+           version, an unparsable one, and an empty native catalogue. All three look identical to
+           the caller, which then explained a 0 with the only cause it could name ("not in the Pkg
+           folder") and was wrong whenever the truth was one of these. Blank means the run really
+           did scan and match nothing. */
+        Property String psGuardSkipReason
+        // Same tally for GuardDuplicateExternalFunctions (the External_Function flavor of 4390).
+        Property Integer piGuardedExternalCount
+        // And for GuardAnsiExternalFunctionWithWide (pairs and Use-arms written this run): the E 4390
+        // row's "Guard it" runs it silent over a name's declaring files and needs the tally back, to
+        // know whether to fall through to the same-width guard (2026-09-03).
+        Property Integer piGuardedAnsiWideCount
+        // And for RenameCollidingGlobalFunction - lines renamed across the run, so the guided
+        // offer can state a real outcome after a silent scoped run.
+        Property Integer piRenamedGlobalCount
+        // And for RenameSameNamedMethod (2026-09-04) - lines renamed across the run - plus the one-shot
+        // that lets _RenameGlobalNameInLines rename a keyword-less Function declaration for it.
+        Property Integer piRenamedMethodCount
+        Property Boolean pbRenameMethodDecl False
+        // ChangeDFCreateMenuToCodeJock: hand-written Procedure/Function declarations found in the menu
+        // block being converted (the program's own lines + fragments from its own folder, never the
+        // shipped *_PM.inc ones). > 0 refuses the program - see _CJConvertMenuInFile (2026-09-04).
+        Property Integer piCJUserProcs
+        Property String  psCJFirstUserProc ""
+        // ...and the lines of a SHIPPED fragment's own code (File_pm.inc's OnInitMenu, its #warning)
+        // omitted from the inlined block rather than carried as ~40 TODO comments per pulldown.
+        Property Integer piCJShippedOmitted
+        // ...an EMPTY legacy menu retired in place (commented, no menu bar emitted) - a change with no
+        // items in it, so the caller writes the file on this, not on the item count (2026-09-11)...
+        Property Boolean pbCJEmptyMenu False
+        // ...and why a program with a legacy menu was NOT converted, for the run notes ("" = no menu
+        // there, or the refusal piCJUserProcs already explains).
+        Property String  psCJDecline ""
+        // The program's legacy menu was left as it is and 'Use Dfdeomnu.pkg' added for it (_CJConvertProgramFile, 2026-11-01).
+        Property Boolean pbCJLegacyMenuKept False
+        // And for RenameCollidingClass - class references renamed across the run (2026-09-03).
+        Property Integer piRenamedClassCount
+        // Session cache: every External_Function NAME the target install's Pkg source declares
+        // (UPPERCASE, sorted for BinarySearchArray). One walk per run; cleared by _InitializeFuncLib.
+        Property String[] pasInstallExternalNames
+        Property Boolean  pbInstallExternalNamesLoaded False
+        /* The CLASS names the target install's Pkg source declares ("Class <Name> is a ..."), UPPERCASED
+           and SORTED, the declaring package packed "NAME|leaf.pkg" beside them - the 4345 duplicate-name
+           row's owner lookup (2026-09-03). Same walk discipline as the External_Function catalogue above.
+           A class the RUNTIME owns (cRegEx) is in no Pkg file and reads back absent - by design. */
+        Property String[] pasInstallClassNames
+        Property String[] pasInstallClassPkgs
+        Property Boolean  pbInstallClassNamesLoaded False
+        /* THE WORKSPACE'S LEGACY SUBCLASSES, for a converter whose parameter is EMPTY (Nils 2026-09-05:
+           "a legacy grid should be handled the same way as a legacy dbgrid, when no params are being
+           specified"). The Deep Scan learns the "Class X is a Grid" pairs (cDeepScanner, v50) - the object
+           rows the board lists came from them - and the four grid converters ask LearnedSubclassesOf which
+           classes descend from their legacy root, so the empty parameter converts those objects as well as
+           the plain class. A name-ending pattern could not do that safely for Grid / List: a modern subclass
+           such as "cLookupGrid is a cDbCJGrid" ends in "grid" too and would be re-converted (the 2026-07-07
+           note in cGridToCJGrid). phoSubclassSource answers LearnedSubclassPairs - the FT deep-scan driver
+           registers itself at construction; with no source the two arrays below answer (tests set them; a
+           batch run leaves them empty = the plain class only). Lowercase, parallel; the roots are the scan's
+           rule tokens ("grid", "dbgrid", "list", "dblist", "edit", ...). */
+        Property Handle   phoSubclassSource 0
+        Property String[] pasLearnedSubclassNames
+        Property String[] pasLearnedSubclassRoots
+        /* ...and whether ConvertGridSubclassToCodeJock converts each grid subclass in place (2026-10-04). The
+           scan asks the converter once per subclass and Check (cDeepScanner.JudgeGridSubclasses); the analyzer
+           reads the answer here for a compiler row inside an object of such a subclass
+           (cModAnalyzer.VerifyBeginRow -> GridSubclassWhy). Lowercase names; "" = it converts, else why not.
+           phoSubclassSource answers LearnedGridVerdicts when there is one; else these two (tests set them). */
+        Property String[] pasLearnedPortNames
+        Property String[] pasLearnedPortWhy
+        // The SAME declarations packed as "NAME|dll|entry" (see _ExternalFnBindingsFromLines), filled
+        // by the same walk and governed by the same loaded flag. Unsorted: it is a packed lookup, not
+        // a parallel array, so nothing can re-order it out of correspondence.
+        Property String[] pasInstallExternalBindings
+        // ...and the declaring PACKAGE of each, packed "NAME|leaf.pkg" (same walk, same flag, unsorted for
+        // the same reason). The wide guard's Use-arm names it: a name the target install declares itself
+        // gets 'Use <that package>' on the modern arm instead of a second declaration (error 4390).
+        Property String[] pasInstallExternalPkgs
+        // Session cache: the target install's own STRUCT names, packed "WIN32NAME|tWinName" (see
+        // RunInstallStructNames). Per-run like the declarations above, because a target switch
+        // changes the answer - a struct DataFlex added in 26 is not there in 23.
+        Property String[] pasInstallStructNames
+        // ...and their MEMBER TYPE lists, "TWINNAME|Type;Type;...", filled on the same walk. Needed
+        // because a nested member's alignment is its struct's, computed recursively - assuming 8
+        // mispredicts every struct that nests a 4-aligned one like tWinFileTime.
+        Property String[] pasInstallStructMembers
+        Property Boolean  pbInstallStructNamesLoaded False
+        // Session cache: the COMPILER's built-in globals, from the target install's own
+        // Lib\GlobalFunctions.lst (see RunBuiltInFuncNames). A different population from the two
+        // above - those are what the Pkg source DECLARES, this is what the compiler implements and
+        // declares nowhere. Cleared by _InitializeFuncLib, because the target install can change.
+        Property tBuiltInFunc[] paBuiltInFuncs
+        Property Boolean        pbBuiltInFuncsLoaded False
+        // Session cache: the target install's NAMED error numbers, from its Pkg\errornum.inc (see
+        // RunErrorNames). Cleared by _InitializeFuncLib, like the built-ins above.
+        Property tErrorName[]   paErrorNames
+        Property Boolean        pbErrorNamesLoaded False
+        /* The install's language definition + the Pkg folder it was read for. NOT cleared by
+           _InitializeFuncLib: this is the language, not per-run state, and _AddAllKeyWords runs on
+           every re-init. It self-invalidates when the target install changes, which is the only
+           event that can change the answer. */
+        Property tDfLanguage paInstallLanguage
+        Property String      psLangCacheKey ""
+        // The target install's Pkg folder, PUSHED here by cRefactorApplication.ResolveTargetDataFlex.
+        // Not read off ghoApplication: _AddAllKeyWords runs at construct time, where the app may be a
+        // plain cApplication that has no such property (see _InstallLanguage).
+        Property String      psLangPkgFolder ""
+        /* Scope openers and their partners, PARALLEL and unsorted - entry i closes with entry i.
+           pasScopeStart / pasScopeEnd above are sorted lookup sets and cannot carry this: sorting
+           either one breaks the correspondence. Empty when the install could not be read. */
+        Property String[] pasScopePairStart
+        Property String[] pasScopePairEnd
+        Property Integer piHoistConverted
+        Property Integer piHoistSkipLegacy
+        Property Integer piHoistSkipTwoLine
+        // ChangeObjectFunctionCallToGet's per-run tally, so the 4379 row action can report what it did
+        // (the function's return value is per FILE - the engine calls it once per file). 2026-08-19.
+        Property Integer piObjCallsConverted
+        // DropSurplusCallArguments' per-run tally, for the same reason (the arity row's action reports it). 2026-09-04.
+        Property Integer piSurplusArgsDropped
+        // Oem_Translate_State READ sites a guard stopped RetireOemTranslateState from touching - hand
+        // work, and named as such rather than silently skipped. 2026-08-19.
+        Property Integer piOemStateDeclined
+        // A declined call whose legacy word is a Find / Constrain / VConstrain MODE - not a comparison,
+        // so ChangeLegacyOperators must never touch it and the operators offer must not be made for it
+        // (Nils 2026-08-17: 'Constrain WEB_FORM.NR eq (Value(oX))' drove two 0-of-170 runs in a row).
+        Property Integer piHoistSkipDbMode
+        // WHERE each declined call is, not just how many. The counts alone leave the user with a
+        // number and no way to walk the work: a log file can be read but not navigated. Entries are
+        // "<file>|<line>|<reason>", filled by the converter and turned into clickable rows by the
+        // findings list. psHoistCurrentFile is set per file by the wrapper (the pure core has no
+        // business knowing about the engine), so the core stays testable with it empty.
+        Property String[] pasHoistDeclined
+        Property String   psHoistCurrentFile ""
+        // The DECLARATION sites FunctionReturnMismatchReport found, same "<file>|<line>|<what>|<why>"
+        // shape, so they can become Manual Changes rows too. A report can be read but not walked, and
+        // these few lines ARE the work for a 4544 (Nils 2026-07-22: "this is the point where the Manual
+        // Changes grid should be filled with all the right places that needs changes").
+        Property String[] pasReturnMismatchDecls
+        // The same sites with the bare declared TYPE in the third field ("<file>|<line>|<type>"): what the
+        // even-split align offer shows the user before asking which type all of them should take (2026-09-03).
+        Property String[] pasReturnMismatchOwnTypes
+        // The character-mode inventory's totals (CharacterModeInventoryReport, 2026-09-20), for the
+        // guided board's notice; the report zeroes and refills them on every run.
+        Property tCharModeInventory pCharModeInventory
+        // ChangeCollidingMethodName: what it renamed, and the call sites it could NOT prove a receiver
+        // for ("<file>|<line>|<what>|<why>"). A rename that guesses is a rename that breaks a build, so
+        // anything unprovable is handed back as Manual Changes rows instead of being touched.
+        Property Integer  piRenamedDecls
+        Property Integer  piRenamedCalls
+        Property String[] pasRenameUnproven
+        Property String[] pasRenameSharedFiles
+        // Which of the two 4544 fixes applies, decided by FunctionReturnMismatchReport and read by the
+        // guided view. When DataFlex owns the contested name its type cannot move, so the only fix is to
+        // RENAME ours. When only our own declarations disagree, renaming them all would carry the very
+        // same disagreement to the new name - there the fix is to ALIGN the odd one out to the majority
+        // type (Nils 2026-07-22: pbSilent, String in one package and Boolean in two others).
+        Property Integer  piMismatchDfDecls
+        Property String   psMismatchDfType ""
+        Property String   psMismatchMajorityType ""
+        Property String[] pasReturnMismatchOdd
+        Property Integer  piAlignedDecls
+        Property Integer  piOverloadSkips   // Overloaded declarations AlignCollidingDeclarationType left alone
+        // Could the TARGET install's Pkg folder actually be READ? "No declarations found" and "the
+        // folder is not there" are the same empty array, and presenting the second as the first is how
+        // a missing install turns into confident, wrong advice: every name looks unowned by DataFlex,
+        // so a rename is never offered and an align is offered for names that DO clash with the
+        // runtime. Found live (Nils 2026-07-22): DataFlex 26 was uninstalled mid-session while the
+        // workspace still targeted it, and the report calmly reported absence.
+        // ChangeCollidingMethodName renames CLASS methods: it walks a class family and types the
+        // receivers. A GLOBAL function has no class, so it finds no seed and returns 0 - which without
+        // this flag is indistinguishable from "nothing needed renaming" and reads as a silent no-op.
+        // The first CLASS that declares the contested name, "" when none does. A rename converter that
+        // walks class families cannot touch a global, so this is what decides whether offering a rename
+        // is honest - and it is also the only justified source for a suggested new name.
+        Property String  psMismatchDeclClass ""
+        // How many of the workspace's declarations carry the Global keyword. "Declared outside any
+        // class" and "declared Global" are NOT the same thing, and Split is one of each - a Global in
+        // wslibrary and a plain file-scope Function in HPGSEM (Nils 2026-07-22). Calling both global
+        // was simply untrue, so the count is carried and the wording follows the facts.
+        Property Integer piMismatchGlobalDecls
+        Property Boolean pbRenameNoClassSeeds
+        Property Boolean pbInstallScanFailed
+        Property String  psInstallScanPath ""
+        // The narrowed name's 4390 flavor: EVERY declaration on both sides is an External_Function
+        // (the WinInet pair, LegacyApp 2026-07-23). Both sides then bind the SAME Windows API, so the
+        // fix is delete-or-guard the duplicate - the rename/align/rewrite offer chain does not apply
+        // and the guided view skips it. Set only for a single-name (narrowed) report run.
+        Property Boolean pbMismatchExternalDup False
+
         // All commands from the manual list in this class.
         Property String[] pasCommands
         // These are commands that has been depriated (removed) since DF 18.1
@@ -93,6 +502,51 @@ Class cBaseFuncLib is a cRefactorExpressionParser
         Property String[] pasLocalVariableTypes
         Property String[] pasLocalVariableArrayTypes
         Property String[] pasSystemBooleans
+        // The Win32 APIs the target DataFlex does NOT declare itself, each with the SDK's own C
+        // prototype, packed "dll|entry|prototype". Data lives in WinAPICatalog.inc. This is the
+        // complement of RunInstallExternalFnNames: that reads what the install DOES declare, live;
+        // this curates the head of what it does not. Built once at keyword-init, not per run - the
+        // catalogue is knowledge about Windows, not about the selected target.
+        Property String[] pasWinAPICatalog
+        // Tier-2 shipped-struct verification: the target install tWinStructs.pkg as a flat
+        // member table, one row per declared member. See _RefreshWinStructCatalog.
+        Property String[] pasWinStructMember
+        Property String   psWinStructCatalogFile ""
+        Property Boolean  pbWinStructCatalogLoaded False
+        /* A TESTABLE SEAM, and not optional. Under UnitTests ghoApplication is a plain
+           cApplication, so psTargetPkgFolder is "" and the catalogue would load empty - which the
+           verification correctly reads as "refuse everything", leaving a fixture green while it
+           exercises nothing (the silent-empty trap). A test points this at its own tWinStructs.pkg
+           and asserts on real answers; production never sets it. */
+        Property String   psWinStructPkgOverride ""
+        // Package families with no successor, packed "token|why" (DeadDependencies.inc).
+        // Read at COLLECTION, so their files never enter a refactor run at all.
+        Property String[] pasDeadDependencies
+        // ...and the STRUCT layouts, packed "NAME|body" (WinAPIStructCatalog.inc). Same lifetime and
+        // the same reasoning: knowledge about Windows, not about the selected target.
+        Property String[] pasWinAPIStructCatalog
+        /* The Win32 APIs whose ENTRY POINT changes with the build's bitness, packed
+           "dfname|dll|entry64|params64|entry32|params32" (WinAPICatalog.inc).
+
+           A SEPARATE LIST BECAUSE IT ANSWERS A DIFFERENT QUESTION. Almost every x86-era
+           declaration is fixed by ONE corrected declaration: DataFlex sizes Pointer, Handle and
+           LongPtr per build (Pkg\Dll.pkg defines POINTER_DTSIZE as 8 or 4 under IS$WIN64), so a
+           single line is already right on both platforms and an #IFDEF around it would emit two
+           identical arms. These four are the exception - GetWindowLongPtrW is exported only on
+           x64, and on x86 the caller must reach GetWindowLongW with a different return type - so
+           here, and only here, both arms must be written. Lifted from Pkg\Winuser.pkg, which
+           guards exactly these four. */
+        Property String[] pasWinAPIBitnessSplit
+        // False until the JSON layer has been applied over the compiled seeds. LAZY, not done at
+        // keyword-init: that runs before any workspace exists, and it must not touch the disk.
+        Property Boolean pbWinAPICatalogsLoaded False
+        // Why any catalogue came back empty - one line each, "" when all three loaded.
+        Property String[] pasWinAPILoadProblems
+        // Legacy DEO menu message -> the CodeJock class that already implements it, packed
+        // "message|class" (CJMenuCatalog.inc). Keyed on the MESSAGE because captions and file
+        // names drift between workspace copies while the message cannot. Same build-once
+        // lifetime as the Win32 catalogues - knowledge about the framework, not the target.
+        Property String[] pasCJMenuCatalog
         // Data from the Scintilla editor. See ScintillaParameters.dg
         // Scoped words are; Begin/End While/Loop, Procedure/End_Procedure etc.
         Property String[] pasScopeStart
@@ -111,6 +565,19 @@ Class cBaseFuncLib is a cRefactorExpressionParser
         Property String[] pasObjectNames
 
     End_Procedure
+
+    // The line pass's look-ahead lines (see Construct_Object); setting them walks them once (ScanSourceFile).
+    Procedure Set pasLinePassSource String[] asLines
+        tLineInfo[] aInfo
+
+        Set private.pasLinePassSource to asLines
+        Get ScanSourceFile (&asLines) to aInfo
+        Set paLinePassInfo to aInfo
+    End_Procedure
+
+    Function pasLinePassSource Returns String[]
+        Function_Return (private.pasLinePassSource(Self))
+    End_Function
 
     Procedure Set pbIgnoreErrorState Boolean bState
         Set private.pbIgnoreErrorState to bState
@@ -136,33 +603,126 @@ Class cBaseFuncLib is a cRefactorExpressionParser
 
     // *** System (private) Messages ***
     //
-    // This is called from _InitializeFuncLib and fills some keyword string array properties.
+    /* The install's language definition for the TARGET version, parsed once and then reused until the
+       target changes. Empty when there is no install to read.
+
+       Cached on the Pkg folder rather than cleared by _InitializeFuncLib like the other session
+       caches: this one is not per-run state, it is what the language IS, and _AddAllKeyWords runs on
+       every re-init (every unit-test TearDown among others). Keying on the folder means picking a
+       different compiler re-reads it and nothing else does - which is exactly when it should change. */
+    Function _InstallLanguage Returns tDfLanguage
+        tDfLanguage Lang
+        Handle ho
+        String sPkg
+
+        /* PUSHED, never pulled. psTargetPkgFolder lives on cRefactorApplication, and _AddAllKeyWords
+           runs from End_Construct_Object - so asking ghoApplication for it here faults with
+           "Invalid message GET_PSTARGETPKGFOLDER" (error 98) the moment the funclib is constructed
+           under a plain cApplication, which is exactly what UnitTests declares (Nils
+           2026-08-01). The install-scanning functions elsewhere in this chain get away with the same
+           Get only because they run during a RUN, never at construct time.
+
+           So the application SETS this when it resolves the target (cRefactorApplication
+           ResolveTargetDataFlex) and re-seeds the keywords. Blank here simply means "not told yet",
+           and the editor-settings fallback covers it.
+
+           The ghoApplication read stays as the SECOND choice, for the case the push cannot cover: a
+           session where the compiler is never re-set after the funclib exists would otherwise never
+           learn the folder at all. It is safe as a fallback because UnitTests now declares
+           the property on its cApplication - the same stub it already keeps for pSCLanguage. */
+        Get psLangPkgFolder to sPkg
+        If (Trim(sPkg) = "") ;
+            Get psTargetPkgFolder of ghoApplication to sPkg
+        If (Trim(sPkg) <> "" and Lowercase(Trim(sPkg)) = Lowercase(psLangCacheKey(Self))) ;
+            Function_Return (paInstallLanguage(Self))
+        Get Create (RefClass(cDfLanguageFile)) to ho
+        Get LoadFromInstall of ho sPkg to Lang
+        Send Destroy of ho
+        Set psLangCacheKey     to (Lowercase(Trim(sPkg)))
+        Set paInstallLanguage  to Lang
+        Function_Return Lang
+    End_Function
+
+    /* The six legacy comparison words join the operator list whatever the catalogue says. The list is
+       seeded from the target install's DataFlex.lng, and DataFlex 26's holds only the modern operators
+       - right for the editor, wrong for a tool whose subject is the legacy code: _IsOperator is asked
+       about these words (the expression-tail cut) and answered no in the app while the runner, seeded
+       from the editor settings, said yes (a workspace, 2026-09-05: one report file, six times Error 52). Lowercase, to
+       match _LowercaseArrayValues; the caller sorts afterwards. */
+    Procedure _EnsureLegacyOperatorWords String[] ByRef asOperators
+        String[] asWords
+        Integer i iLast
+
+        Move (StrSplitToArray("eq|ne|gt|ge|lt|le", CS_D)) to asWords
+        Move (SizeOfArray(asWords) - 1) to iLast
+        For i from 0 to iLast
+            If (SearchArray(asWords[i], asOperators) = -1) ;
+                Move asWords[i] to asOperators[SizeOfArray(asOperators)]
+        Loop
+    End_Procedure
+
+    /* This is called from _InitializeFuncLib and fills some keyword string array properties.
+
+       THE INSTALL WINS, the editor settings are the fallback. These arrays decide what the refactoring
+       engine believes DataFlex IS, and they used to come from the editor's syntax-highlighting
+       language settings - which the user can edit. Turning a word off to change how it is COLOURED
+       then quietly changed how source was parsed. Highlighting is a preference; the grammar is not.
+       Since 2026-08-01 the grammar comes from the target install's own Lib\DataFlex.lng, and the
+       editor settings are used only when there is no install to read (see _InstallLanguage). */
     Procedure _AddAllKeyWords
         String[] Empty asScopeStart asScopeEnd asKeywords asOperators asCommands asOther
+        String[] asPairStart asPairEnd
         tSCLanguage SCLanguage
+        tDfLanguage Lang
 
         Get pSCLanguage of ghoApplication to SCLanguage
+        Get _InstallLanguage to Lang
 
         // Scoped words
-        Move SCLanguage.saScopeStart to asScopeStart
+        If ((SizeOfArray(Lang.asScopeStart)) > 0) ;
+            Move Lang.asScopeStart to asScopeStart
+        Else ;
+            Move SCLanguage.saScopeStart to asScopeStart
         Get _LowercaseArrayValues asScopeStart to asScopeStart
+        /* THE PAIRS, kept BEFORE the sort and in their own arrays. asScopeStart is about to be sorted
+           into a lookup set, and sorting it destroys the correspondence with asScopeEnd - entry i no
+           longer closes with entry i. The pairing is the one thing the flat sets could never express
+           (Begin closes with End, Loop OR Until), so it travels separately and unsorted. */
+        Move (ResizeArray(asPairStart, 0)) to asPairStart
+        Move (ResizeArray(asPairEnd, 0))   to asPairEnd
+        If ((SizeOfArray(Lang.asScopeStart)) > 0) Begin
+            Get _LowercaseArrayValues Lang.asScopeStart to asPairStart
+            Get _LowercaseArrayValues Lang.asScopeEnd   to asPairEnd
+        End
+        Set pasScopePairStart to asPairStart
+        Set pasScopePairEnd   to asPairEnd
         Move (SortArray(asScopeStart)) to asScopeStart
         Set pasScopeStart to asScopeStart
 
-        Move SCLanguage.saScopeStop to asScopeEnd
+        If ((SizeOfArray(Lang.asScopeEnd)) > 0) ;
+            Move Lang.asScopeEnd to asScopeEnd
+        Else ;
+            Move SCLanguage.saScopeStop to asScopeEnd
         Get _LowercaseArrayValues asScopeEnd to asScopeEnd
         Move (SortArray(asScopeEnd)) to asScopeEnd
         Set pasScopeEnd to asScopeEnd
 
         // Keywords
-        Move SCLanguage.saKeywords to asKeywords
+        If ((SizeOfArray(Lang.asKeywords)) > 0) ;
+            Move Lang.asKeywords to asKeywords
+        Else ;
+            Move SCLanguage.saKeywords to asKeywords
         Get _LowercaseArrayValues asKeywords to asKeywords
         Move (SortArray(asKeywords)) to asKeywords
         Set pasKeyWords to asKeywords
 
         // Operators
-        Move SCLanguage.saOperators to asOperators
+        If ((SizeOfArray(Lang.asOperators)) > 0) ;
+            Move Lang.asOperators to asOperators
+        Else ;
+            Move SCLanguage.saOperators to asOperators
         Get _LowercaseArrayValues asOperators to asOperators
+        Send _EnsureLegacyOperatorWords (&asOperators)
         Move (SortArray(asOperators)) to asOperators
         Set pasOperators to asOperators
 
@@ -176,10 +736,15 @@ Class cBaseFuncLib is a cRefactorExpressionParser
         // Other commands need more parameters and in such case we can improve our success rate
         // by adding a space character.
         //
-        Send _CreateDecpreatedCommandsArray
+        Send _CreateDeprecatedCommandsArray
         Send _CreateLocalVariableTypes
         Send _CreateCommandFunctionArray
         Send _CreateSystemBooleansArray
+        Send _CreateWinAPICatalogArray
+        Send _CreateDeadDependencyArray
+        Send _CreateWinAPIStructCatalogArray
+        Send _CreateWinAPIBitnessSplitArray
+        Send _CreateCJMenuCatalogArray
 
         // Using keywords from Scintilla instead of our own list (above).
         Move asKeywords to asCommands
@@ -209,53 +774,254 @@ Class cBaseFuncLib is a cRefactorExpressionParser
     End_Procedure
 
     // Commands that were removed after DF 18.2:
-    Procedure _CreateDecpreatedCommandsArray
-        String sCommands
+    /* Append one word to a seed list, lowercased and trimmed.
+
+       The .inc files call this once per entry. Normalising HERE rather than at each call site is
+       the point: these lists are compared with an exact SearchArray, so one stray space makes an
+       entry unreachable - which is exactly how nine deprecated commands sat dead in the old
+       comma-separated literal (see DeprecatedCommands.inc). */
+    Procedure _AddListWord String[] ByRef asList String sWord
+        Move (Lowercase(Trim(sWord))) to sWord
+        If (sWord <> "") ;
+            Move sWord to asList[SizeOfArray(asList)]
+    End_Procedure
+
+    /* The commands DataFlex has REMOVED. Data lives in DeprecatedCommands.inc - see that file for
+       why it is curated rather than harvested, and why it is one entry per line. */
+    Procedure _CreateDeprecatedCommandsArray
         String[] asRemovedCommands
 
-        Move (Lowercase("calc,moveint,movenum,movereal,movestr,accept,backfield,clear_option,endgroup,entagain,entdisplay,enter, ;
-            enterend,entergroup,entermode,entfind,entsfind,entry,entupdate,file$mode,find$page,;
-            format,format$range,getxy,help,inherit_screen,inkey,inkey$,os$call, ;
-            outclose,outfile,page,report,reportend,section,set_option,setchange,sub_page, ;
-            screen_optimize,get_cursor_visible,set_cursor_visible,compute_screen_crc,set_video_mode,get_video_mode, ;
-            dfbeginheader,dfendheader,dffont,dffontsize,dfheaderframe,dfheaderlinecheck,dfheadermargin,dfheaderpos, ;
-            dfheaderwrap,dflinecheck,dftopmargin,dfbottommargin,dfleftmargin,dfrightmargin,dfsetmargins,dfwrite, ;
-            dfwritebmp,dfwriteellip,dfwriteline,dfwriteln,dfwritelnpos,dfwritepos,dfwriterect,dfwritexyline, ;
-            report_breaks,report_data_set,report_index,report_main_file, ;
-            set_file_owner,get_file_owner,compiler_desktop_method_warnings")) to sCommands
-            Move (StrSplitToArray(sCommands, ",")) to asRemovedCommands
+        #Include DeprecatedCommands.inc
 
         Set pasRemovedCommands to asRemovedCommands
     End_Procedure
 
+    // One dead-dependency entry, packed "token|why". The reason travels with the token so whatever
+    // reports the skip can say WHY without a second lookup - and so that adding a token without a
+    // justification is visibly incomplete.
+    Procedure _AddDeadDependency String[] ByRef asList String sToken String sWhy
+        Move (Lowercase(Trim(sToken)) + "|" + Trim(sWhy)) to asList[SizeOfArray(asList)]
+    End_Procedure
+
+    /* Package families with no successor - nothing inside them is worth refactoring because the
+       whole file is going away. Data lives in DeadDependencies.inc; see that file for the measured
+       cost of scanning them and for why the skip list is narrower than the warning. */
+    Procedure _CreateDeadDependencyArray
+        String[] asDeadDeps
+
+        #Include DeadDependencies.inc
+
+        Set pasDeadDependencies to asDeadDeps
+    End_Procedure
+
+    // One catalogue entry, packed "dll|entry|C prototype". Packed rather than three parallel arrays
+    // for the reason recorded on pasScopePairStart: parallel arrays lose their correspondence the
+    // moment anything sorts one of them, and this list is walked, never sorted.
+    Procedure _AddWinAPI String[] ByRef asList String sDll String sEntry String sProto
+        Move (Lowercase(Trim(sDll)) + "|" + Lowercase(Trim(sEntry)) + "|" + Trim(sProto)) to asList[SizeOfArray(asList)]
+    End_Procedure
+
+    /* The Win32 APIs DataFlex does NOT ship a declaration for, with the SDK's own prototype. Data
+       lives in WinAPICatalog.inc - see that file for what it covers, why the prototype is stored
+       raw instead of a DataFlex signature, and how to rebuild it. */
+    /* Apply the JSON layer over the three compiled seeds - once, on first use of any catalogue.
+
+       LAZY BY NECESSITY. Keyword-init builds the seeds before a workspace is resolved, so the path
+       is unknowable there and the filesystem is the wrong thing to touch anyway. First use is the
+       earliest moment the answer can be right.
+
+       Silently a no-op when the path cannot be resolved (no workspace yet): the seed then stands,
+       which is what every consumer already handles. */
+    /* Load the three catalogues from Data\WinAPI*.json - once, on first use of any of them.
+
+       LAZY BY NECESSITY. Keyword-init runs before a workspace exists, so the path is unknowable
+       there; reading the application at that point is also what raised err 98 in the DFUnit runner
+       (pOrgWS is cRefactorApplication's, and the runner is plain cApplication).
+
+       A catalogue that comes back empty RECORDS WHY in pasWinAPILoadProblems. It degrades safely -
+       every converter refuses an API it cannot find - but silently, and "no conversions" reads
+       exactly like "nothing needed converting". */
+    Procedure RefreshWinAPICatalogsFromJson
+        Handle hoStore
+        String[] asRows asProblems
+        String sPath sProblem
+        Boolean bDone
+
+        Get pbWinAPICatalogsLoaded to bDone
+        If (bDone = True) ;
+            Procedure_Return
+        // The bail must come BEFORE the latch: latching an aborted load marked EMPTY as LOADED -
+        // no rows, no recorded problem - and nothing ever retried for the rest of the session.
+        If (ghoApplication = 0) ;
+            Procedure_Return
+        Set pbWinAPICatalogsLoaded to True
+        Get Create (RefClass(cWinAPICatalogStore)) to hoStore
+
+        Get CatalogJsonPath of hoStore CS_WinAPICatalogJson to sPath
+        Get LoadCatalog of hoStore sPath to asRows
+        /* SORTED HERE, AT THE ONE LOAD POINT - the invariant _WinAPICatalogFindRow's binary search
+           rests on. The harvester writes the file sorted, but a hand-added row lands wherever the
+           editor put it, and an unsorted array would make the search silently miss rows - the
+           worst failure shape, a lookup that works for most keys. Case-insensitive to match the
+           search's lowercase compares. */
+        Move (SortArray(asRows, Desktop, RefFunc(DFSTRICMP))) to asRows
+        Set pasWinAPICatalog to asRows
+        Get psLastProblem of hoStore to sProblem
+        If (sProblem <> "") ;
+            Move sProblem to asProblems[SizeOfArray(asProblems)]
+
+        Get CatalogJsonPath of hoStore CS_WinAPIStructCatalogJson to sPath
+        Get LoadCatalog of hoStore sPath to asRows
+        Set pasWinAPIStructCatalog to asRows
+        Get psLastProblem of hoStore to sProblem
+        If (sProblem <> "") ;
+            Move sProblem to asProblems[SizeOfArray(asProblems)]
+
+        Get CatalogJsonPath of hoStore CS_WinAPIBitnessSplitJson to sPath
+        Get LoadCatalog of hoStore sPath to asRows
+        Set pasWinAPIBitnessSplit to asRows
+        Get psLastProblem of hoStore to sProblem
+        If (sProblem <> "") ;
+            Move sProblem to asProblems[SizeOfArray(asProblems)]
+
+        Send Destroy of hoStore
+        Set pasWinAPILoadProblems to asProblems
+    End_Procedure
+
+    /* Left EMPTY here on purpose. The catalogue lives in Data\WinAPICatalog.json and is loaded by
+       RefreshWinAPICatalogsFromJson on first use - there is no compiled copy any more, because two
+       tracked originals drift and a seed would overwrite a row the user had edited. */
+    Procedure _CreateWinAPICatalogArray
+        String[] asWinAPI
+
+        Set pasWinAPICatalog to asWinAPI
+        /* Seeding EMPTY means BACK TO UNLOADED. _AddAllKeyWords re-runs the seeds on every
+           compiler/target switch, and leaving the one-shot load latch armed across the wipe
+           served empty lookups for the rest of the session with no problem recorded anywhere -
+           the 2026-08-28 WinServ plan run: both WinAPI converters reported "0 lines" over files
+           whose declarations verifiably qualified, no note, and the converters proved sound
+           headlessly. The latch drops with the rows, so the next use reloads the JSON. */
+        Set pbWinAPICatalogsLoaded to False
+    End_Procedure
+
+    /* The handful of Win32 APIs that need BOTH arms written, because the exported entry point
+       itself changes with the bitness. Data lives in WinAPICatalog.inc beside the prototypes. */
+    /* Left EMPTY here on purpose. The catalogue lives in Data\WinAPIBitnessSplit.json and is loaded by
+       RefreshWinAPICatalogsFromJson on first use - there is no compiled copy any more, because two
+       tracked originals drift and a seed would overwrite a row the user had edited. */
+    Procedure _CreateWinAPIBitnessSplitArray
+        String[] asWinAPISplit
+
+        Set pasWinAPIBitnessSplit to asWinAPISplit
+        // Re-seed = back to unloaded; see _CreateWinAPICatalogArray.
+        Set pbWinAPICatalogsLoaded to False
+    End_Procedure
+
+    // One bitness-split API, packed "dfname|dll|entry64|params64|entry32|params32". Walked, never
+    // sorted, like its neighbours. The parameter text is stored VERBATIM from the install rather
+    // than normalised: SetWindowLongPtr's x86 arm really does say "Number wlong" where its x64 arm
+    // says "Longptr wlong", and tidying that would be inventing a signature DataFlex does not use.
+    Procedure _AddWinAPIBitnessSplit String[] ByRef asList String sName String sDll String sEntry64 ;
+            String sParams64 String sEntry32 String sParams32
+        Move (Lowercase(Trim(sName)) + "|" + Lowercase(Trim(sDll)) + "|" + Trim(sEntry64) + "|" + ;
+              Trim(sParams64) + "|" + Trim(sEntry32) + "|" + Trim(sParams32)) to asList[SizeOfArray(asList)]
+    End_Procedure
+
+    // One struct entry, packed "NAME|body". Same packing as the API catalogue and for the same
+    // reason - a walked list, never sorted, so nothing can put two parallel arrays out of step.
+    Procedure _AddWinAPIStruct String[] ByRef asList String sName String sBody
+        Move (Uppercase(Trim(sName)) + "|" + Trim(sBody)) to asList[SizeOfArray(asList)]
+    End_Procedure
+
+    // One menu mapping, packed "message|class". Message lowercased for a case-insensitive probe
+    // (DataFlex is case-insensitive and the legacy sources spell 'send'/'Send' both ways); the
+    // class name keeps its casing because it is EMITTED into source, not compared.
+    Procedure _AddCJMenuItem String[] ByRef asList String sMessage String sClass
+        Move (Lowercase(Trim(sMessage)) + "|" + Trim(sClass)) to asList[SizeOfArray(asList)]
+    End_Procedure
+
+    /* Legacy DEO menu messages and the CodeJock classes that replace them. Data lives in
+       CJMenuCatalog.inc - see that file for why the match is keyed on the message rather than
+       the caption or the include file name, and why a catalogue hit deliberately emits no
+       psCaption (the class carries its own localized one). */
+    Procedure _CreateCJMenuCatalogArray
+        String[] asCJMenu
+
+        #Include CJMenuCatalog.inc
+
+        Set pasCJMenuCatalog to asCJMenu
+    End_Procedure
+
+    /* The CodeJock class that replaces a legacy On_Item's message, or "" when the catalogue does not
+       know it. "" is the NORMAL answer for a program's own items (Send Activate_MyView) - the caller
+       emits a generic cCJMenuItem with an OnExecute that sends the same message, so an unknown item is
+       carried across intact rather than dropped. Callers must not treat "" as a failure. */
+    Function CJMenuClassForMessage String sMessage Returns String
+        String[] asCat
+        String sKey sEntry
+        Integer iCount iSize iBar
+
+        Move (Lowercase(Trim(sMessage))) to sKey
+        If (sKey = "") ;
+            Function_Return ""
+        Get pasCJMenuCatalog to asCat
+        Move (SizeOfArray(asCat) - 1) to iSize
+        For iCount from 0 to iSize
+            Move asCat[iCount] to sEntry
+            Move (Pos("|", sEntry)) to iBar
+            If (iBar > 1) Begin
+                If (Left(sEntry, (iBar - 1)) = sKey) ;
+                    Function_Return (Mid(sEntry, (Length(sEntry) - iBar), (iBar + 1)))
+            End
+        Loop
+        Function_Return ""
+    End_Function
+
+    /* The Win32 STRUCT layouts DataFlex does not ship, with the SDK's own body. Data lives in
+       WinAPIStructCatalog.inc - see that file for what it covers and how it was extracted. The
+       companion to the API catalogue: that one answers what a function TAKES, this one what the
+       thing it takes is MADE OF. */
+    /* Left EMPTY here on purpose. The catalogue lives in Data\WinAPIStructCatalog.json and is loaded by
+       RefreshWinAPICatalogsFromJson on first use - there is no compiled copy any more, because two
+       tracked originals drift and a seed would overwrite a row the user had edited. */
+    Procedure _CreateWinAPIStructCatalogArray
+        String[] asWinAPIStruct
+
+        // Re-seed = back to unloaded; see _CreateWinAPICatalogArray.
+        Set pbWinAPICatalogsLoaded to False
+
+        Set pasWinAPIStructCatalog to asWinAPIStruct
+    End_Procedure
+
     // Local variable declarations
+    // Local variable declaration types. Data lives in LocalVariableTypes.inc.
     Procedure _CreateLocalVariableTypes
         String[] asLocalVariableTypes
-        Move (StrSplitToArray(CS_VarTypes, ";")) to asLocalVariableTypes
-        Get _LowercaseArrayValues asLocalVariableTypes to asLocalVariableTypes
+
+        #Include LocalVariableTypes.inc
+
         Move (SortArray(asLocalVariableTypes)) to asLocalVariableTypes
         Set pasLocalVariableTypes to asLocalVariableTypes
         Set _LocalVariableArrayTypes to asLocalVariableTypes
     End_Procedure
 
     // Commands that also exists as DataFlex functions;
+    // Commands that also exist as DataFlex functions. Data lives in CommandFunctions.inc.
     Procedure _CreateCommandFunctionArray
         String[] asCommandFunctions
-        String sCommandFunctions
 
-        Move (Lowercase("Append,Ascii,Character,Else,If,Insert,Left,Length,Mid,Pad,Pos,Repeat,Replace,Right,Trim,Uppercase")) to sCommandFunctions
-        Move (StrSplitToArray(sCommandFunctions, ",")) to asCommandFunctions
+        #Include CommandFunctions.inc
 
         Set pasCommandFunctions to asCommandFunctions
     End_Procedure
 
     // DataFlex system booleans
+    // DataFlex system booleans. Data lives in SystemBooleans.inc.
     Procedure _CreateSystemBooleansArray
         String[] asSystemBooleans
-        String sSystemBooleans
 
-        Move (Lowercase("err,false,finderr,found,is,local,seqeof,seqeol,true")) to sSystemBooleans
-        Move (StrSplitToArray(sSystemBooleans, ",")) to asSystemBooleans
+        #Include SystemBooleans.inc
+
         Set pasSystemBooleans to asSystemBooleans
     End_Procedure
 
@@ -282,9 +1048,281 @@ Class cBaseFuncLib is a cRefactorExpressionParser
 
     // Must be send before the refactoring process is started
     // It initializes necessary parameters.
+    /* Record a note to print under sFunctionName's line in the run summary. Deliberately NOT
+       Log_Status: that writes StatLog, which is the internal engine-error log and not where a
+       user looks for "why did this function do nothing". */
+    /* DEDUPED. A note describes a CONDITION of the run ("no parameter was given", "the editor had
+       no window"), not an event, and the notes survive the per-file ClearFuncLibProperties so they
+       can be summarised at the end. Without this a whole-run condition was re-added on every file
+       and the summary repeated one identical sentence hundreds of times - Nils, 2026-08-03: "The
+       logfile is now full with SKIPPED ... messages." Callers stay free to add unconditionally;
+       saying the same thing twice is never the useful outcome. */
+    Procedure AddRunNote String sFunctionName String sNote
+        String[] asNotes
+        String   sEntry
+        Integer  i iMax
+
+        Move (Trim(sFunctionName) + "|" + Trim(sNote)) to sEntry
+        Get pasRunNotes to asNotes
+        Move (SizeOfArray(asNotes) - 1) to iMax
+        For i from 0 to iMax
+            If (asNotes[i] = sEntry) ;
+                Procedure_Return
+        Loop
+        Move sEntry to asNotes[SizeOfArray(asNotes)]
+        Set pasRunNotes to asNotes
+    End_Procedure
+
+    /* Every note for one function, already formatted as summary lines with sIndent in front,
+       or "" when it has none. The engine appends this straight after the function's own line. */
+    Function RunNotesText String sFunctionName String sIndent Returns String
+        String[] asNotes
+        String   sOut sKey sEntry
+        Integer  i iMax iPos
+
+        Move (Uppercase(Trim(sFunctionName)) + "|") to sKey
+        Get pasRunNotes to asNotes
+        Move (SizeOfArray(asNotes) - 1) to iMax
+        Move "" to sOut
+        For i from 0 to iMax
+            Move asNotes[i] to sEntry
+            Move (Pos("|", sEntry)) to iPos
+            If (iPos > 1) Begin
+                If (Uppercase(Left(sEntry, iPos)) = sKey) ;
+                    Move (sOut + "\n" + sIndent + Trim(Mid(sEntry, (Length(sEntry) - iPos), (iPos + 1)))) to sOut
+            End
+        Loop
+        Function_Return sOut
+    End_Function
+
+    // The word a function's summary count is in ("grid object(s)", "declaration(s)") - see pasSummaryUnits.
+    Procedure SetSummaryUnit String sFunctionName String sUnit
+        String[] asUnits
+        String   sKey
+        Integer  i iMax
+
+        Move (Uppercase(Trim(sFunctionName)) + "|") to sKey
+        If (sKey = "|" or Trim(sUnit) = "") ;
+            Procedure_Return
+        Get pasSummaryUnits to asUnits
+        Move (SizeOfArray(asUnits) - 1) to iMax
+        For i from 0 to iMax
+            If (Left(asUnits[i], Length(sKey)) = sKey) Begin
+                Move (sKey + Trim(sUnit)) to asUnits[i]
+                Set pasSummaryUnits to asUnits
+                Procedure_Return
+            End
+        Loop
+        Move (sKey + Trim(sUnit)) to asUnits[SizeOfArray(asUnits)]
+        Set pasSummaryUnits to asUnits
+    End_Procedure
+
+    // "" when the function declared none - the engine then uses its default word for the function type.
+    Function SummaryUnit String sFunctionName Returns String
+        String[] asUnits
+        String   sKey
+        Integer  i iMax
+
+        Move (Uppercase(Trim(sFunctionName)) + "|") to sKey
+        Get pasSummaryUnits to asUnits
+        Move (SizeOfArray(asUnits) - 1) to iMax
+        For i from 0 to iMax
+            If (Left(asUnits[i], Length(sKey)) = sKey) ;
+                Function_Return (Right(asUnits[i], (Length(asUnits[i]) - Length(sKey))))
+        Loop
+        Function_Return ""
+    End_Function
+
+    /* The learned "Class X is a <legacy>" pairs (see the property block). The default source is the two
+       arrays; the FT deep-scan driver, registered in phoSubclassSource, answers this same message from its
+       last scan - or from the saved scan cache after a restart. Lowercase, parallel arrays. */
+    Procedure LearnedSubclassPairs String[] ByRef asNames String[] ByRef asRoots
+        Get pasLearnedSubclassNames to asNames
+        Get pasLearnedSubclassRoots to asRoots
+    End_Procedure
+
+    // The verdicts of the last scan on the grid subclasses (see pasLearnedPortNames) - the default source.
+    Procedure LearnedGridVerdicts String[] ByRef asNames String[] ByRef asWhy
+        Get pasLearnedPortNames to asNames
+        Get pasLearnedPortWhy   to asWhy
+    End_Procedure
+
+    // The verdict on one grid subclass (lowercase name): "" = ConvertGridSubclassToCodeJock converts it in place,
+    // else why not. bKnown comes back False when the last scan judged no such class.
+    Function GridSubclassWhy String sClassLc Boolean ByRef bKnown Returns String
+        String[] asNames asWhy
+        Integer  iAt
+        Handle   hoSource
+
+        Move False to bKnown
+        Get phoSubclassSource to hoSource
+        If (hoSource = 0) ;
+            Move Self to hoSource
+        Send LearnedGridVerdicts of hoSource (&asNames) (&asWhy)
+        Move (SearchArray(sClassLc, asNames)) to iAt
+        If (iAt = -1 or iAt >= SizeOfArray(asWhy)) ;
+            Function_Return ""
+        Move True to bKnown
+        Function_Return asWhy[iAt]
+    End_Function
+
+    // The learned subclasses (lowercase) of one legacy root token: "grid" -> mygrid, ceditgrid, ...
+    Function LearnedSubclassesOf String sRoot Returns String[]
+        String[] asNames asRoots asOut
+        String   sRootLc
+        Integer  i iLast
+        Handle   hoSource
+
+        Get phoSubclassSource to hoSource
+        If (hoSource = 0) ;
+            Move Self to hoSource
+        Send LearnedSubclassPairs of hoSource (&asNames) (&asRoots)
+        Move (Lowercase(Trim(sRoot))) to sRootLc
+        Move (SizeOfArray(asNames) - 1) to iLast
+        If (SizeOfArray(asRoots) < SizeOfArray(asNames)) ;
+            Move (SizeOfArray(asRoots) - 1) to iLast
+        For i from 0 to iLast
+            If (Lowercase(Trim(asRoots[i])) = sRootLc and Trim(asNames[i]) <> "") ;
+                Move (Lowercase(Trim(asNames[i]))) to asOut[SizeOfArray(asOut)]
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // Every per-run memo of the include lift, plus the lifted lists and the 1-slot pinned cache (a
+    // per-file set computed under one run's file set must not serve the next). See pasRunFiles.
+    Procedure _ClearLiftMemos
+        String[] asEmpty
+        Set pasLiftVerdicts       to asEmpty
+        Set pasLiftUserScanned    to asEmpty
+        Set pasLiftFactRows       to asEmpty
+        Set pasLiftUseFolders     to asEmpty
+        Set pasLiftUseLeafs       to asEmpty
+        Set pasLiftUseUsers       to asEmpty
+        Set pasRunIncludes        to asEmpty
+        Set pasLiftedNames        to asEmpty
+        Set pasLiftedNameIncs     to asEmpty
+        Set psPinnedCacheKey      to ""
+        Set pasPinnedCacheSet     to asEmpty
+        Set pasPinnedCacheReasons to asEmpty
+    End_Procedure
+
     Procedure _InitializeFuncLib
         String[] asEmtpty
+        Integer[] aiEmpty
+        tBuiltInFunc[] aEmptyBuiltIns
+        tErrorName[] aEmptyErrorNames
+        Handle hoIdx
+
         Set pasOtherLogFiles to asEmtpty
+        Set pasRunNotes      to asEmtpty
+        Set pasSummaryUnits  to asEmtpty
+        // Per-file pinned set is engine-scoped (set fresh per file); clear it on a full re-init so a
+        // unit-test fixture that sets it can't leak into the next test (TearDown -> _InitializeFuncLib).
+        // The run-scoped class index: destroy it so the next run re-reads packages that may have
+        // changed, and so a target switch cannot serve a stale map.
+        Move (phoClassPkgIndex(Self)) to hoIdx
+        If (hoIdx <> 0) ;
+            Send Destroy of hoIdx
+        Set phoClassPkgIndex   to 0
+        Set psClassPkgIndexKey to ""
+        Set pasNameReaderWords to asEmtpty
+        Set paiNameReader      to aiEmpty
+        Set pasNameReaderFiles to asEmtpty
+        Set pbNameReadersBuilt to False
+        Set pasOutsideReaderWords   to asEmtpty
+        Set paiOutsideReader        to aiEmpty
+        Set pasOutsideReaderFiles   to asEmtpty
+        Set pbOutsideReadersBuilt   to False
+        Set pasOutsideReaderFolders to asEmtpty
+        Set pasErrorNumberReaders   to asEmtpty
+        Set pbErrorReadersBuilt     to False
+        Set pasErrorReaderScope     to asEmtpty
+        Set paiFlexErrsHeld         to aiEmpty
+        Set pbFlexErrsRead          to False
+        Set pbFlexErrsUnreadable    to False
+        Set pasFlexErrsFolders      to asEmtpty
+        Set pasCJSourceRootsOverride to asEmtpty
+        Set pasPinnedIndicators  to asEmtpty
+        Set pasPinnedReasons     to asEmtpty
+        Set psPinnedCacheKey     to ""
+        Set pasPinnedCacheSet    to asEmtpty
+        Set pasPinnedCacheReasons to asEmtpty
+        Set pasPinIncScanned     to asEmtpty
+        Set pasPinIncKeys        to asEmtpty
+        Set pasRunFiles          to asEmtpty
+        Set pasRunFolders        to asEmtpty
+        Send _ClearLiftMemos
+        Set pasCompanionVerdicts to asEmtpty
+        // The line pass's look-ahead is engine-scoped as well (set fresh per file, cleared on the
+        // way out); cleared here for the same leak reason as the pinned set above. It must NOT be
+        // cleared in ClearFuncLibProperties - LineByLineFunctions sends that at its own top, which
+        // would empty the look-ahead before the first line of every file.
+        Set pasLinePassSource      to asEmtpty
+        Set piLinePassIndex        to -1
+        Set pbLinePassSideProducts to False
+        // Whole-file probe memo is session-scoped (survives across analyzes); clear it here so it
+        // starts fresh before an engine RUN (this fires there) and between DFUnit tests.
+        Set pasWholeFileSessKey  to asEmtpty
+        Set paiWholeFileSessVal  to aiEmpty
+        // Per-run install-catalogue memo: fresh for every run, so a target-version switch between runs can
+        // never be answered from the previous target's catalogue.
+        Set pasRunNativeGlobals      to asEmtpty
+        Set pbRunNativeGlobalsLoaded to False
+        Set pasInstallExternalNames      to asEmtpty
+        Set pasInstallExternalBindings   to asEmtpty
+        Set pasInstallExternalPkgs       to asEmtpty
+        Set pbInstallExternalNamesLoaded to False
+        Set pasInstallClassNames         to asEmtpty
+        Set pasInstallClassPkgs          to asEmtpty
+        Set pbInstallClassNamesLoaded    to False
+        Set pasInstallStructNames        to asEmtpty
+        Set pasInstallStructMembers      to asEmtpty
+        Set pbInstallStructNamesLoaded   to False
+        Set paBuiltInFuncs       to aEmptyBuiltIns
+        Set pbBuiltInFuncsLoaded to False
+        Set paErrorNames         to aEmptyErrorNames
+        Set pbErrorNamesLoaded   to False
+        Set piGuardedCount         to 0
+        Set piAlreadyGuardedCount  to 0
+        Set piAlreadyGuardedExternalCount to 0
+        Set pasGuardSkippedCalled to asEmtpty
+        Set psGuardSkipReason      to ""
+        Set piGuardedExternalCount to 0
+        Set piGuardedAnsiWideCount to 0
+        Set piRenamedGlobalCount   to 0
+        Set piRenamedMethodCount   to 0
+        Set pbRenameMethodDecl     to False
+        Set piCJUserProcs          to 0
+        Set psCJFirstUserProc      to ""
+        Set piCJShippedOmitted     to 0
+        Set piRenamedClassCount    to 0
+        Set piHoistConverted   to 0
+        Set piHoistSkipLegacy  to 0
+        Set piHoistSkipTwoLine to 0
+        Set piHoistSkipDbMode  to 0
+        Set piObjCallsConverted to 0
+        Set piSurplusArgsDropped to 0
+        Set piOemStateDeclined  to 0
+        Set pasHoistDeclined   to asEmtpty
+        Set psHoistCurrentFile to ""
+        Set pasReturnMismatchDecls to asEmtpty
+        Set pasReturnMismatchOwnTypes to asEmtpty
+        Set piRenamedDecls       to 0
+        Set piRenamedCalls       to 0
+        Set pasRenameUnproven    to asEmtpty
+        Set pasRenameSharedFiles to asEmtpty
+        Set piMismatchDfDecls       to 0
+        Set psMismatchDfType        to ""
+        Set psMismatchMajorityType  to ""
+        Set pasReturnMismatchOdd    to asEmtpty
+        Set piAlignedDecls          to 0
+        Set piOverloadSkips         to 0
+        Set psMismatchDeclClass     to ""
+        Set piMismatchGlobalDecls   to 0
+        Set pbRenameNoClassSeeds    to False
+        Set pbInstallScanFailed     to False
+        Set psInstallScanPath       to ""
+        Set pbMismatchExternalDup   to False
         Send SaveErrorState
         Send _InitTabSize
         Send ClearFuncLibProperties
@@ -295,14 +1333,42 @@ Class cBaseFuncLib is a cRefactorExpressionParser
         Set pbInProcedure to False
         Set pbInFunction to False
         Set pbInCommand to False
+        Set pbInHeader to False
         Set pbInClass to False
         Set pbInStruct to False
         Set pbInObject to False
         Set piScopeDepth to 0
         Set pbIsInSemiColonMultiLineString to False
+        Set psPendingIndicateTarget to ""
         Set piSemiColonStringScanState to eOverstrikeStateOutside
         Set pbIsInDF23MultiLineComment to False
         Set piMultiLineStringType to MLS_None
+    End_Procedure
+
+    /* Clear the scope flags for a METHOD that just ended, WITHOUT dropping the ENCLOSING
+       #HEADER / #COMMAND context.
+
+       A #COMMAND macro body legally contains complete Function/Procedure bodies - LegacyApp's
+       Deferred_View macro holds two Functions and two Procedures - but the blanket
+       _ClearRefactoringProperties above wipes EVERY scope flag. So the first End_Function
+       inside a macro turned pbInCommand OFF, and every remaining body line then looked like
+       ordinary refactorable code. That is how "[Found ~Found] Begin" - the goto-label masking
+       trick guarding a "Create_!1:" label - was rewritten to "If (Found and (Not(Found)))"
+       INSIDE a macro, 30 lines past the #COMMAND that was supposed to protect it
+       (Nils 2026-07-26).
+
+       Same reasoning as the End_Object branch in cRefactorLexer.pkg: only the scope that
+       actually ENDED may be cleared. Every other reset the blanket clear performs (multi-line
+       string/comment state, scope depth, page state) is kept exactly as it was - a method end
+       is still a clean slate for those. */
+    Procedure _ClearMethodScopeProperties
+        Boolean bInHeader bInCommand
+
+        Get pbInHeader  to bInHeader
+        Get pbInCommand to bInCommand
+        Send _ClearRefactoringProperties
+        Set pbInHeader  to bInHeader
+        Set pbInCommand to bInCommand
     End_Procedure
 
     // True when sParameter denotes the given enum member - by NAME or by numeric VALUE.
@@ -335,9 +1401,30 @@ Class cBaseFuncLib is a cRefactorExpressionParser
     // eModernizeSelect parameter.
     Function _IndicatorIsNonRefactorable tTokenizer TokenizerData Returns Boolean
         String[] asBlack
+        Boolean bHit
+        Move (StrSplitToArray(Uppercase(CS_NonRefactorableIndicators), ",")) to asBlack
+        Get _LineIndicatorInList TokenizerData asBlack to bHit
+        Function_Return bHit
+    End_Function
+
+    // True when THIS line's indicator (a [bracket] token, or the name right after an Indicate command) is
+    // one of asBlack (UPPERCASE names). The shared core of _IndicatorIsNonRefactorable (blacklist =
+    // CS_NonRefactorableIndicators) and _IndicatorIsPinned (blacklist = the per-file pinned set).
+    Function _LineIndicatorInList tTokenizer TokenizerData String[] asBlack Returns Boolean
+        String sName
+        Get _LineIndicatorNameInList TokenizerData asBlack to sName
+        Function_Return (sName <> "")
+    End_Function
+
+    // The NAME-returning core of _LineIndicatorInList: the matched blacklist name (UPPERCASE), or ""
+    // when the line touches none. Split out 2026-07-30 so the analyzer can say WHICH indicator pinned
+    // a row (and therefore look up WHY) instead of only that one did. The Boolean form above is a
+    // wrapper, so both answers come from one implementation and cannot drift.
+    Function _LineIndicatorNameInList tTokenizer TokenizerData String[] asBlack Returns String
         String sToken
         Integer iItem iSize iIndicate
-        Move (StrSplitToArray(Uppercase(CS_NonRefactorableIndicators), ",")) to asBlack
+        If (SizeOfArray(asBlack) = 0) ;
+            Function_Return ""
         Move (SizeOfArray(TokenizerData.asLineTokens) - 1) to iSize
         // (a) bracket-indicator tokens: [X], [~X], or the parts of [Not X ...]
         For iItem from 0 to iSize
@@ -345,7 +1432,7 @@ Class cBaseFuncLib is a cRefactorExpressionParser
             If ((Pos("[", sToken) > 0) or (Pos("]", sToken) > 0)) Begin
                 Move (Uppercase(Replaces("~", Replaces("]", Replaces("[", sToken, ""), ""), ""))) to sToken
                 If (SearchArray(sToken, asBlack) <> -1) ;
-                    Function_Return True
+                    Function_Return sToken
             End
         Loop
         // (b) the indicator named immediately after an Indicate command
@@ -353,9 +1440,84 @@ Class cBaseFuncLib is a cRefactorExpressionParser
         If (iIndicate <> -1 and (iIndicate + 1) <= iSize) Begin
             Move (Uppercase(Replaces("~", Replaces("]", Replaces("[", TokenizerData.asLineTokens[iIndicate + 1], ""), ""), ""))) to sToken
             If (SearchArray(sToken, asBlack) <> -1) ;
-                Function_Return True
+                Function_Return sToken
         End
-        Function_Return False
+        Function_Return ""
+    End_Function
+
+    // True when THIS line references a PINNED indicator (pasPinnedIndicators) - one the converters
+    // must leave entirely legacy for this file (a GROUP/ALL 'indicate' participant, or a name read by an
+    // unconverted 'use'd include). Consulted UNCONDITIONALLY by the line converters (unlike the SELECT
+    // blacklist, which the eModernizeSelect opt-in bypasses - a pinned name has no safe modern form at
+    // all). Empty set (unit tests / no pin) -> always False, so existing behaviour is unchanged.
+    Function _IndicatorIsPinned tTokenizer TokenizerData Returns Boolean
+        String[] asBlack
+        Boolean bHit
+        Get pasPinnedIndicators to asBlack
+        Get _LineIndicatorInList TokenizerData asBlack to bHit
+        Function_Return bHit
+    End_Function
+
+    // True when the line touches a PINNED indicator in ANY of the converters' forms - a bracket / Indicate
+    // USAGE ([X], Indicate X) OR an 'Indicator X [Y Z]' DECLARATION. Used by the analyzer's VerifyAutoFix to
+    // DEMOTE a pinned indicator row to Explain, so the grid never promises an Auto-fix that the converters
+    // now (correctly) leave legacy. Empty pinned set -> False, so existing classification is unchanged.
+    /* The pinned indicator NAME this line touches (UPPERCASE), or "" for none. Used by the analyzer's
+       VerifyAutoFix to DEMOTE a pinned indicator row to Explain, so the grid never promises an
+       Auto-fix the converters now (correctly) leave legacy - and, since 2026-07-30, to look the
+       name's REASON up (pasPinnedReasons) so the hint can name the actual cause. Knowing only that
+       SOMETHING on the line was pinned is what forced the old either/or wording.
+
+       Replaces _LineHasPinnededIndicator, which returned only a Boolean and had no callers left once
+       the analyzer needed the name. Empty pinned set -> "", so existing classification is unchanged. */
+    Function _IndicatorOnLineInList tTokenizer TokenizerData String[] asList Returns String
+        String sName
+        Integer i iLast
+        If (SizeOfArray(asList) = 0) ;
+            Function_Return ""
+        // usage ([X] / Indicate X)
+        Get _LineIndicatorNameInList TokenizerData asList to sName
+        If (sName <> "") ;
+            Function_Return sName
+        // declaration 'Indicator A [B C]' -> any declared name listed?
+        If (SizeOfArray(TokenizerData.asLineTokens) >= 2 and Lowercase(Trim(TokenizerData.asLineTokens[0])) = "indicator") Begin
+            Move (SizeOfArray(TokenizerData.asLineTokens) - 1) to iLast
+            For i from 1 to iLast
+                Move (Uppercase(Trim(TokenizerData.asLineTokens[i]))) to sName
+                If (SearchArray(sName, asList) <> -1) ;
+                    Function_Return sName
+            Loop
+        End
+        Function_Return ""
+    End_Function
+
+    // The pinned-set form of _IndicatorOnLineInList above (which is the list-taking core since
+    // 2026-09-14: the analyzer asks it with the LIFTED names too, to say on a row that converts
+    // which include converts with it).
+    Function _PinnedIndicatorOnLine tTokenizer TokenizerData Returns String
+        String[] asBlack
+        String sName
+        Get pasPinnedIndicators to asBlack
+        Get _IndicatorOnLineInList TokenizerData asBlack to sName
+        Function_Return sName
+    End_Function
+
+    /* Why sName is pinned, as the tagged reason _ComputePinnedIndicators recorded ("GROUP|" or
+       "USE|<filename>"), or "" when the name is not pinned / predates the reason tracking. Callers
+       must tolerate "": the pinned set can be Set directly (the engine's per-file hand-off, a unit
+       test), and a hint that cannot name its reason falls back to the generic wording rather than
+       inventing one. */
+    Function _PinnedIndicatorReason String sName Returns String
+        String[] asBlack asReasons
+        Integer iIdx
+        Get pasPinnedIndicators to asBlack
+        Move (SearchArray(Uppercase(Trim(sName)), asBlack)) to iIdx
+        If (iIdx = -1) ;
+            Function_Return ""
+        Get pasPinnedReasons to asReasons
+        If (iIdx >= SizeOfArray(asReasons)) ;
+            Function_Return ""
+        Function_Return asReasons[iIdx]
     End_Function
 
     // Sets the pasLocalVariableArrayTypes array property based on content
@@ -512,5 +1674,104 @@ Class cBaseFuncLib is a cRefactorExpressionParser
         Loop
         Function_Return False
     End_Function
+
+    // Fast whole-file content GATE for whole-file (eOtherFunction) refactors: True when ANY line
+    // contains sNeedleLC (pass it pre-lowercased). RAW text scan - comments and string literals
+    // COUNT as hits on purpose: a false HIT just runs the function's normal (correct) pass, while
+    // a gate must never false-MISS. Motivation (run profiler, 2026-07-04): three whole-file
+    // functions each tokenized EVERY line of EVERY file (~420ms x 756 files x 3 = 15.8 of a 27-min
+    // run) when most files contained nothing for them - "no needle text anywhere" proves that
+    // without tokenizing a single line. asCode ByRef = copy-avoidance only, never modified.
+    Function _FileContainsText String[] ByRef asCode String sNeedleLC Returns Boolean
+        Integer i iMax
+        Move (SizeOfArray(asCode) - 1) to iMax
+        For i from 0 to iMax
+            If (Pos(sNeedleLC, Lowercase(asCode[i])) > 0) Begin
+                Function_Return True
+            End
+        Loop
+        Function_Return False
+    End_Function
+
+    // Multi-needle variant of _FileContainsText for the keyword-CATALOG scanners (the legacy
+    // DB-API / Registry / SQL / field-options report cores, the ...A call-site pass): True when
+    // ANY line contains ANY needle (pass them pre-lowercased - the scanners' watch lists already
+    // are, so the gate maintains itself when a list grows). Each line is lowercased ONCE and
+    // tested with native Pos against every needle - a no-hit file costs one native pass instead
+    // of the scanner's per-line masked splits (Nils 2026-07-16, the LegacyApp2 x64 lap: 1:10 -> 0:37
+    // from gating just two scanners). Same semantics as _FileContainsText: RAW text, a false hit
+    // just runs the normal scan, never a false miss. Both arrays ByRef = copy-avoidance only.
+    Function _FileContainsAnyText String[] ByRef asCode String[] ByRef asNeedlesLC Returns Boolean
+        Integer i iMax iTok iTokMax
+        String sLow
+        Move (SizeOfArray(asCode) - 1)      to iMax
+        Move (SizeOfArray(asNeedlesLC) - 1) to iTokMax
+        For i from 0 to iMax
+            Move (Lowercase(asCode[i])) to sLow
+            For iTok from 0 to iTokMax
+                If (Pos(asNeedlesLC[iTok], sLow) > 0) ;
+                    Function_Return True
+            Loop
+        Loop
+        Function_Return False
+    End_Function
+
+    /* TWO FILE-LEVEL HELPERS FOR THE PAIR CONVERTERS (cParsePathPairToFilePath, and the buffer pairs of
+       cUnicodePointerToString): each collapses a two-line legacy shape into one line, and both asked the same
+       two questions in copies of their own. */
+
+    // How many times sName occurs as a WHOLE WORD outside the two lines of a pair - a pair collapses only when
+    // nothing but its own declaration still names the variable it drops. Boundary-aware via _FindKeywordPos:
+    // a bare Pos would count "aBuf" inside "aBufLen" and refuse a safe collapse (or, worse, miss "aBuf" where a
+    // substring match hid a real use). Bounded by the line length, not just by the "not found" return: a
+    // scanner that only stops when told to is one bad return from hanging, and a hang here would look like a
+    // frozen refactoring run. asCode ByRef = copy-avoidance only, never modified.
+    Function _WordUsesOutsidePair String[] ByRef asCode String sName Integer iLine1 Integer iLine2 Returns Integer
+        Integer i iMax iPos iHits
+        String  sLine
+
+        Move 0 to iHits
+        Move (SizeOfArray(asCode) - 1) to iMax
+        For i from 0 to iMax
+            If (i <> iLine1 and i <> iLine2) Begin
+                Move asCode[i] to sLine
+                Move 1 to iPos
+                While (iPos > 0 and iPos <= (Length(sLine)))
+                    Get _FindKeywordPos sLine sName True iPos to iPos
+                    If (iPos > 0) Begin
+                        Increment iHits
+                        Increment iPos
+                    End
+                Loop
+            End
+        Loop
+        Function_Return iHits
+    End_Function
+
+    // Drops the lines whose indexes aiDelete names, in ONE rebuild after the walk that collected them -
+    // removing them inside the walk would shift every index it still depends on. Nothing to drop = untouched.
+    Procedure _RemoveLinesAt String[] ByRef asCode Integer[] aiDelete
+        String[] asOut
+        Integer iLine iLast iItem iDel iKeep
+        Boolean bDrop
+
+        Move (SizeOfArray(aiDelete)) to iDel
+        If (iDel = 0) ;
+            Procedure_Return
+        Move (SizeOfArray(asCode) - 1) to iLast
+        Move 0 to iKeep
+        For iLine from 0 to iLast
+            Move False to bDrop
+            For iItem from 0 to (iDel - 1)
+                If (aiDelete[iItem] = iLine) ;
+                    Move True to bDrop
+            Loop
+            If (bDrop = False) Begin
+                Move asCode[iLine] to asOut[iKeep]
+                Increment iKeep
+            End
+        Loop
+        Move asOut to asCode
+    End_Procedure
 
 End_Class

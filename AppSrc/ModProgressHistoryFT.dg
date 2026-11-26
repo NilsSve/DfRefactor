@@ -1,0 +1,438 @@
+﻿Use Windows.pkg
+Use cFTModalPanel.pkg
+Use RefactorConstants.h.pkg
+Use cFTGridHost.pkg              // FT: the dialog's one host - a grid of 8 px columns, the page over a row of buttons (RDCFlexTron)
+Use FTAllWebControlClasses.pkg   // FT: cFTWebButton - Copy, Reset and Close
+Use cFTHtmlPage.pkg              // FT: the history's page - its title (psLabel) and the glyph beside it
+Use FTMarkupBuilders.pkg         // the HTML vocabulary - OpenHtml, IconLabel, the builders
+Use ModProgressCounts.pkg        // what a progress entry's counts mean, and what to call them
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+
+// Modernization Progress History (phase 2 of the burn-down counters). Opened from the dashboard's
+// progress strip (DashboardFT ProgressTileHtml -> CI_DashViewProgress -> ShowProgressHistory). Shows the
+// per-workspace history (cRefactorApplication ReadModProgress -> Data\ModProgress-<wskey>.json) as a table
+// (newest first) + a one-line trend, with a Reset that clears the file for a fresh baseline. The body is
+// rendered from HistoryHtml, which links CssStyle/modprogress.css (it carried its own inline <style> until
+// the CSS sweep of 2026-08-21) and matches the web dashboard.
+//
+// A PAGE OVER A ROW OF BUTTONS (2026-09-30), built the way the library's message box is: one grid host,
+// which cFTModalPanel fits to the panel (phoClientHost); the history in a cFTHtmlPage - the heading is the
+// page's own title, and the body under it scrolls as a whole; and Copy, Reset and Close as framework
+// buttons (cFTWebButton) at the bottom right. Until then the three were chips in the page's HTML footer,
+// and a click on one only ARMED a 1 ms defer timer: a web OnClick runs inside the WebView2 pump, where
+// Reset's Yes/No box or ending the modal faults err 4410. A button's OnButtonClick runs after the click
+// has returned, so the timer is gone.
+//
+// THE HISTORY ON EACH OPEN: it may have changed while the dialog was closed, so the panel's Activating
+// renders it again (RefreshHistory) - stored for a page that loads (Set psHtml) and pushed to a page that
+// is up (UpdateHtml, WebSet), the two ways an FT dialog's content reaches its page. That replaced the
+// Set psHtml plus a timed UpdateHtml that ShowProgressHistory did.
+
+Object oModProgressHistory_dg is a cFTModalPanel
+    Set Label to "Modernization Progress History"
+    Set Size to 220 470
+    Set Location to 2 40
+    Set piMinSize to 120 360
+    Set Icon to "Modernize.ico"
+
+    Object oWebHost is a cFTGridHost
+        Set Location to 4 4
+        Set Size to 196 462
+        Set peAnchors to anNone         // placed by cFTModalPanel (phoClientHost)
+        // Row 0, the page, takes the extra height, and row 1 is 8 px of air above the buttons in row 2. Column 0
+        // takes the extra width, so the buttons keep to the right edge; the page spans every column.
+        Set piColumnCount to 34         // column 0, then Copy's, Reset's and Close's 11
+        Set psColumnWidths to "0/1fr"   // column 0 takes the extra width
+        Set psRowHeights to "0/1fr 1/8px"
+
+        /* The series NAME as the user should read it. The value in sProgram is a stored key - for a
+           source-analyze lap it is the reserved CS_ModProgressDeepScanLabel, which is frozen at
+           "Deep Scan" because it is what is already written in every workspace's ModProgress json
+           (the trend matches rows BY it). Everything on screen goes through here instead, so the
+           feature can be called whatever it is called today without orphaning that history.
+           For a real program the key IS the .src name, which is its own display text. */
+        Function SeriesText String sProgram Returns String
+            If (sProgram = CS_ModProgressDeepScanLabel) ;
+                Function_Return CS_ModProgressScanSeriesText
+            Function_Return sProgram
+        End_Function
+
+        // Builds the page's body from the history RefreshHistory has read: the stylesheet + a one-line trend
+        // summary + the burn-down sparkline + the table (one row per recorded analyze, NEWEST FIRST). The
+        // heading is the page's own title, and the buttons are framework buttons under the page. Empty
+        // history -> a muted placeholder.
+        Function HistoryHtml tModProgressFile Hist Returns String
+            String sHtml sRows sHead sSeries sNoun sCleanTd sBars sBarCls sTip
+            tModProgressEntry E
+            Integer iN i iFirstWarn iLastWarn
+            Integer iMax iH iShown iFrom iLast
+            Integer[] aiIdx
+            Boolean bAnyErr bAnyClear
+
+            Move (SizeOfArray(Hist.aEntries)) to iN
+
+            // The stylesheet is AppHtml/CssStyle/modprogress.css, every rule in it scoped to the body's .mph;
+            // the palette's tokens it uses come with the host (cFTThemeHost_mixin).
+            Move (CS_ModProgressCssLink + (DivOpen("mph"))) to sHtml
+            If (iN = 0) Begin
+                Move (sHtml + ((DivOpen("mph-sub")) + 'Per-workspace burn-down across Compile ') + CS_RArrow + ' Analyze ' + CS_RArrow + ' Run cycles and Analyze Source ' + CS_RArrow + (' Run cycles.' + CS_DivEnd)) to sHtml
+                Move (sHtml + (((DivOpen("mph-empty")) + ('No cycles recorded yet.' + CS_Br + 'Run an Analyze or an Analyze Source to start tracking the burn-down.')) + CS_DivEnd)) to sHtml
+                Function_Return (sHtml + CS_DivEnd)
+            End
+
+            // trend summary: the LATEST entry vs the FIRST entry of the SAME series (matched by sProgram -
+            // the file interleaves programs and, since 2026-07-16, Deep Scan laps under the reserved
+            // CS_ModProgressDeepScanLabel series). Comparing across series was always shaky and turns
+            // meaningless with scans in the file: a scan's finding count and a compiler's warning count
+            // are different magnitudes. The scan series says "findings"; the walk below always
+            // terminates because the latest entry itself matches its own series.
+            Move Hist.aEntries[iN - 1] to E
+            // The TOTAL is the magnitude a lap was burning down - and it is exactly the number the
+            // single iWarn field held before the split, for an old row and a new one alike, so this
+            // trend and the sparkline below read the same as they always did (2026-09-15).
+            Move (ModProgressTotalCount(E)) to iLastWarn
+            Move E.sProgram to sSeries
+            Move 0 to i
+            While (Hist.aEntries[i].sProgram <> sSeries)
+                Increment i
+            Loop
+            Move (ModProgressTotalCount(Hist.aEntries[i])) to iFirstWarn
+            Move (ModProgressCountNoun(sSeries)) to sNoun
+            Move (sHtml + (DivOpen("mph-sub")) + String(iN) + ' entries ' + CS_MidDot + ' ' + (SeriesText(Self, sSeries)) + ' ' + sNoun + ' ' + String(iFirstWarn) + ' ' + CS_RArrow + ' ' + String(iLastWarn)) to sHtml
+            If (iFirstWarn > iLastWarn) ;
+                Move (sHtml + (' ' + (SpanOpen("mph-down")) + ('(' + CS_DownTriangle + ' ')) + String(iFirstWarn - iLastWarn) + (' fewer)' + CS_SpanEnd)) to sHtml
+            Move (sHtml + CS_DivEnd) to sHtml
+
+            /* BURN-DOWN SPARKLINE - the same series the trend line above reports on, and for the same
+               reason: the file interleaves programs (and Deep Scan laps under CS_ModProgressDeepScanLabel),
+               so bars spanning a program switch would put a compiler's warning count and a scan's finding
+               count on one scale. Height = warnings against the series maximum; COLOUR carries the one fact
+               the table makes you hunt for - whether that lap still had errors. Needs two laps to be a
+               trend, so a single-entry series renders nothing.
+
+               Pure CSS: one flex row of divs with a percentage height. No canvas, no library - it has to
+               survive being a string injected into the framework's DOM like the rest of this dialog. */
+            Move 0 to i
+            While (i < iN)
+                If (Hist.aEntries[i].sProgram = sSeries) ;
+                    Move i to aiIdx[-1]
+                Increment i
+            Loop
+            Move (SizeOfArray(aiIdx)) to iShown
+            If (iShown > 1) Begin
+                // Cap at the most recent 24: below ~3px a bar stops being readable, and the table
+                // underneath still carries every row.
+                Move 0 to iFrom
+                If (iShown > 24) ;
+                    Move (iShown - 24) to iFrom
+                Move 1 to iMax
+                Move iFrom to i
+                While (i < iShown)
+                    If ((ModProgressTotalCount(Hist.aEntries[aiIdx[i]])) > iMax) ;
+                        Move (ModProgressTotalCount(Hist.aEntries[aiIdx[i]])) to iMax
+                    Increment i
+                Loop
+                Move (DivOpen("mph-spark")) to sBars
+                Move iFrom to i
+                While (i < iShown)
+                    Move Hist.aEntries[aiIdx[i]] to E
+                    Move (((ModProgressTotalCount(E)) * 100) / iMax) to iH
+                    If (iH < 2) ;
+                        Move 2 to iH
+                    Move "sp-b" to sBarCls
+                    If (E.iErr > 0) ;
+                        Move "sp-b e" to sBarCls
+                    If (i = (iShown - 1)) ;
+                        Move "sp-b now" to sBarCls
+                    /* Which swatches the legend needs. The LATEST bar always paints pale -
+                       its own error state is not visible on it - so only the bars before it
+                       can put "errors present" or "errors cleared" on screen. Naming a colour
+                       nothing is drawn in sends the reader hunting for a bar that is not there. */
+                    If (i < (iShown - 1)) Begin
+                        If (E.iErr > 0) ;
+                            Move True to bAnyErr
+                        Else ;
+                            Move True to bAnyClear
+                    End
+                    Move (E.sDate + ' - ' + String(ModProgressTotalCount(E)) + ' ' + sNoun + ', ' + String(E.iErr) + ' errors') to sTip
+                    Move (sBars + '<div class="' + sBarCls + '" style="height:' + String(iH) + '%" title="' + sTip + ('">' + CS_DivEnd)) to sBars
+                    Increment i
+                Loop
+                Move (sBars + CS_DivEnd) to sBars
+                Move Hist.aEntries[aiIdx[iFrom]]      to E
+                Move (sBars + ((DivOpen("mph-meta")) + CS_SpanOpen) + E.sDate + ' ' + CS_MidDot + ' ' + String(ModProgressTotalCount(E)) + CS_SpanEnd) to sBars
+                Move (sBars + CS_SpanOpen) to sBars
+                If (bAnyErr) ;
+                    Move (sBars + '<i class="lg-e"></i>errors present') to sBars
+                If (bAnyClear) ;
+                    Move (sBars + '<i class="lg-c"></i>errors cleared') to sBars
+                Move (sBars + ('<i class="lg-n"></i>latest' + CS_SpanEnd)) to sBars
+                Move Hist.aEntries[aiIdx[iShown - 1]] to E
+                Move (sBars + CS_SpanOpen + E.sDate + ' ' + CS_MidDot + ' ' + String(ModProgressTotalCount(E)) + (CS_SpanEnd + CS_DivEnd)) to sBars
+                Move (sHtml + sBars) to sHtml
+            End
+
+            // table, NEWEST first. The trailing Clean column is DERIVED per row (Nils 2026-07-16), never
+            // stored: a lap is terminal when it recorded no errors and nothing actionable (auto+review = 0)
+            // - remaining warnings/findings are informational or out of scope by definition. One formula
+            // covers both series (a compile row's iErr matters; a scan row's iErr is always 0); only the
+            // tooltip wording differs ("clean" vs the scan loop's "exhausted"). Being derived, it also
+            // back-fills every row recorded before the column existed.
+            Move ((RowHtml("", (HeadCellHtml("l", "When")) + (HeadCellHtml("l", "Program")) ;
+                + (HeadCellHtml("", "Err")) ;
+                + (HeadCellTipHtml("", ("Compiler warnings on this lap. An Analyze Source lap reads source" ;
+                    + " and never invokes the compiler, so its rows are 0 here - and a lap recorded before" ;
+                    + " the two were counted apart keeps whatever it had under this column."), "Warn")) ;
+                + (HeadCellTipHtml("", ("Source-scan findings on this lap - obsolete code the SCANNER found" ;
+                    + " and the compiler never reports. An Analyze Source lap is all findings; a Compile lap" ;
+                    + " shows a number here only where pending findings were merged into that analysis."), "Find")) ;
+                + (HeadCellHtml("", "Auto")) + (HeadCellHtml("", "Review")) ;
+                + (HeadCellHtml("l", "Target")) ;
+                + (HeadCellTipHtml("l", ("The platform the measured build targeted. Blank for an Analyze Source cycle," ;
+                    + " which reads source and is the same whatever the build targets - and for cycles recorded" ;
+                    + " before this was tracked."), "Platform")) ;
+                + (HeadCellTipHtml("", ("A check mark = this cycle came back with no errors and nothing actionable" ;
+                    + " - the cycle converged here."), "Clean"))))) to sHead
+            Move (iN - 1) to i
+            While (i >= 0)
+                Move Hist.aEntries[i] to E
+                If (E.iErr = 0 and E.iAuto = 0 and E.iSuggest = 0) Begin
+                    If (E.sProgram = CS_ModProgressDeepScanLabel) ;
+                        Move (CellTipHtml("c-clean", ("Scan exhausted - this cycle found nothing a fix plan" ;
+                            + " can act on (remaining findings are informational)."), CS_Check)) to sCleanTd
+                    Else ;
+                        Move (CellTipHtml("c-clean", ("Clean - no compiler errors and nothing actionable left" ;
+                            + " (remaining warnings are informational / out of scope)."), CS_Check)) to sCleanTd
+                End
+                Else ;
+                    Move (CellHtml("", "")) to sCleanTd
+                Move (sRows + (RowHtml("", (CellHtml("l", E.sDate)) ;
+                    + (CellHtml("l", (SeriesText(Self, E.sProgram)))) ;
+                    + (CellHtml("c-err", (String(E.iErr)))) + (CellHtml("c-warn", (String(E.iWarn)))) ;
+                    + (CellHtml("c-scan", (String(E.iScan)))) ;
+                    + (CellHtml("c-auto", (String(E.iAuto)))) + (CellHtml("c-rev", (String(E.iSuggest)))) ;
+                    + (CellHtml("l", E.sDfVersion)) + (CellHtml("l", E.sPlatform)) ;
+                    + sCleanTd))) to sRows
+                Decrement i
+            Loop
+            // The table in its frame. The page scrolls, and the table's header row stays in view (modprogress.css).
+            Move ((DivOpen("mph-table")) ;
+                + (TableHtml("", (TheadHtml(sHead)) + (TbodyHtml(sRows)))) ;
+                + CS_DivEnd) to sRows
+            Move (sHtml + sRows + CS_DivEnd) to sHtml
+            Function_Return sHtml
+        End_Function
+
+        // The clipboard export of the same history (Nils 2026-07-19: the testers are consultants -
+        // a pasteable progress table for THEIR customers). Plain text with TAB-separated columns:
+        // tabs paste into Excel as columns and read fine in an e-mail. Two deliberate divergences
+        // from the on-screen table: rows run OLDEST -> NEWEST (the export's audience reads it as
+        // the burn-down story - start high, end low - while the dialog serves the working user
+        // newest-first), and the Clean check mark becomes the words Clean / Exhausted (a check
+        // glyph survives some paste targets poorly). Returns "" on an empty history (Copy is
+        // shut without rows; this is the belt).
+        Function HistoryClipboardText Returns String
+            String sText sTab sNL sSeries sNoun sCleanTxt sWS
+            tModProgressFile Hist
+            tModProgressEntry E
+            Integer iN i iFirstWarn iLastWarn
+
+            Get ReadModProgress of ghoApplication to Hist
+            Move (SizeOfArray(Hist.aEntries)) to iN
+            If (iN = 0) ;
+                Function_Return ""
+
+            Move (Character(9)) to sTab
+            Move (Character(13) + Character(10)) to sNL
+
+            // Same series walk as HistoryHtml's trend line: latest entry vs the FIRST entry of the
+            // SAME series (programs and Deep Scan laps interleave in the file).
+            Move Hist.aEntries[iN - 1] to E
+            Move (ModProgressTotalCount(E)) to iLastWarn
+            Move E.sProgram to sSeries
+            Move 0 to i
+            While (Hist.aEntries[i].sProgram <> sSeries)
+                Increment i
+            Loop
+            Move (ModProgressTotalCount(Hist.aEntries[i])) to iFirstWarn
+            Move (ModProgressCountNoun(sSeries)) to sNoun
+
+            Get psSWSFile of ghoApplication to sWS
+            Move ("Modernization progress - " + sWS + sNL) to sText
+            Move (sText + "Exported: " + String(CurrentDateTime()) + sNL) to sText
+            Move (sText + (SeriesText(Self, sSeries)) + " " + sNoun + ": " + String(iFirstWarn) + " -> " + String(iLastWarn)) to sText
+            If (iFirstWarn > iLastWarn) ;
+                Move (sText + " (" + String(iFirstWarn - iLastWarn) + " fewer)") to sText
+            Move (sText + sNL + sNL) to sText
+
+            // Warnings and findings in their own columns, as in the table.
+            Move (sText + "When" + sTab + "Program" + sTab + "Errors" + sTab + "Warnings" + sTab + "Findings" + sTab + "Auto-fix" + sTab + "Review" + sTab + "Target" + sTab + "Clean" + sNL) to sText
+            Move 0 to i
+            While (i < iN)
+                Move Hist.aEntries[i] to E
+                Move "" to sCleanTxt
+                If (E.iErr = 0 and E.iAuto = 0 and E.iSuggest = 0) Begin
+                    If (E.sProgram = CS_ModProgressDeepScanLabel) ;
+                        Move "Exhausted" to sCleanTxt
+                    Else ;
+                        Move "Clean" to sCleanTxt
+                End
+                Move (sText + E.sDate + sTab + (SeriesText(Self, E.sProgram)) + sTab + String(E.iErr) + sTab + String(E.iWarn) + sTab + String(E.iScan) + sTab + String(E.iAuto) + sTab + String(E.iSuggest) + sTab + E.sDfVersion + sTab + sCleanTxt + sNL) to sText
+                Increment i
+            Loop
+            Function_Return sText
+        End_Function
+
+        // Row 0: the history. Its heading is the page's title, beside the dashboard's progress glyph (trend).
+        Object oHistoryPage is a cFTHtmlPage
+            Set piRowIndex to 0
+            Set piColumnSpan to 34
+            Set pbFillHeight to True        // the body scrolls in the page, under its title
+            Set psLabel to "Modernization progress"
+            Set psCSSClass to "ftpage ftg-trend"
+            /* A SAMPLE FOR THE STUDIO'S DESIGNER, which draws a literal psHtml: HistoryHtml's markup with four made-up
+               laps, so the Designer shows the table where the class would show its Lorem ipsum. The program never
+               shows it - the panel's Activating renders the real history before the page loads (RefreshHistory). */
+            Set psHtml to """
+            <link rel="stylesheet" href="CssStyle/modprogress.css">
+            <div class="mph">
+                <div class="mph-sub">4 entries &middot; DFRefactor.src warnings 70 &rarr; 4 <span class="mph-down">(&#9660; 66 fewer)</span></div>
+                <div class="mph-spark">
+                    <div class="sp-b e" style="height:100%"></div>
+                    <div class="sp-b e" style="height:58%"></div>
+                    <div class="sp-b" style="height:17%"></div>
+                    <div class="sp-b now" style="height:5%"></div></div>
+                <div class="mph-meta"><span>2026-09-22 08:58 &middot; 70</span>
+                    <span><i class="lg-e"></i>errors present<i class="lg-c"></i>errors cleared<i class="lg-n"></i>latest</span>
+                    <span>2026-09-30 10:12 &middot; 4</span></div>
+                <div class="mph-table">
+                    <table>
+                        <thead>
+                            <tr><th class="l">When</th><th class="l">Program</th><th>Err</th><th>Warn</th><th>Find</th><th>Auto</th><th>Review</th>
+                                <th class="l">Target</th><th class="l">Platform</th><th>Clean</th></tr></thead>
+                        <tbody>
+                            <tr><td class="l">2026-09-30 10:12</td><td class="l">DFRefactor.src</td><td class="c-err">0</td><td class="c-warn">4</td>
+                                <td class="c-scan">0</td><td class="c-auto">0</td><td class="c-rev">0</td><td class="l">26.0</td><td class="l">x64</td>
+                                <td class="c-clean">&#10003;</td></tr>
+                            <tr><td class="l">2026-09-27 15:22</td><td class="l">DFRefactor.src</td><td class="c-err">0</td><td class="c-warn">12</td>
+                                <td class="c-scan">0</td><td class="c-auto">3</td><td class="c-rev">4</td><td class="l">26.0</td><td class="l">x64</td><td></td></tr>
+                            <tr><td class="l">2026-09-24 10:44</td><td class="l">DFRefactor.src</td><td class="c-err">6</td><td class="c-warn">41</td>
+                                <td class="c-scan">0</td><td class="c-auto">11</td><td class="c-rev">9</td><td class="l">26.0</td><td class="l">x64</td><td></td></tr>
+                            <tr><td class="l">2026-09-22 08:58</td><td class="l">DFRefactor.src</td><td class="c-err">15</td><td class="c-warn">70</td>
+                                <td class="c-scan">0</td><td class="c-auto">18</td><td class="c-rev">12</td><td class="l">26.0</td><td class="l">x64</td><td></td></tr></tbody></table></div></div>
+            """
+        End_Object
+
+        /* Row 2, THE BUTTONS: Copy, Reset and Close, framework buttons (cFTWebButton, RDCFlexTron) at the bottom
+           right. Each one's work runs in its OnButtonClick, after the web click has returned (the library's
+           click relay), so Reset's Yes/No box, Copy's acknowledgement and Close_Panel can run there. 11 columns
+           (78 px) each fit the captions (Copy ~70 px, Reset ~72, Close ~72, measured 2026-09-30). Copy and
+           Reset are shut while the history is empty (RefreshHistory). */
+        Object oCopyBtn is a cFTWebButton
+            Set piRowIndex to 2
+            Set piColumnIndex to 1
+            Set piColumnSpan to 11
+            Set psCaption to "Copy"
+            Set psCSSClass to "ftbtn ftg-copy"
+            Set psToolTip to "Copy this history as a text table to the Windows clipboard - ready to paste into an e-mail or Excel."
+
+            Procedure OnButtonClick
+                Send DoCopy of (oModProgressHistory_dg(Self))
+            End_Procedure
+        End_Object
+
+        Object oResetBtn is a cFTWebButton
+            Set piRowIndex to 2
+            Set piColumnIndex to 12
+            Set piColumnSpan to 11
+            Set psCaption to "Reset"
+            Set psCSSClass to "ftbtn ftg-eraser mph-reset"   // mph-reset: its hover warns, as the chip's did (modprogress.css)
+            Set psToolTip to "Clear this workspace history and start a fresh baseline. Cannot be undone."
+
+            Procedure OnButtonClick
+                Send DoReset of (oModProgressHistory_dg(Self))
+            End_Procedure
+        End_Object
+
+        Object oCloseBtn is a cFTWebButton
+            Set piRowIndex to 2
+            Set piColumnIndex to 23
+            Set piColumnSpan to 11
+            Set psCaption to "Close"
+            Set psCSSClass to "ftbtn ftg-close"
+
+            Procedure OnButtonClick
+                Send DoClose of (oModProgressHistory_dg(Self))
+            End_Procedure
+        End_Object
+    End_Object
+
+    // cFTModalPanel fits the host to the panel, when it is shown and on every resize.
+    Set phoClientHost to (oWebHost(Self))
+
+    // Each open: the history may have changed while the dialog was closed.
+    Procedure Activating
+        Forward Send Activating
+        Send RefreshHistory
+    End_Procedure
+
+    /* THE PAGE AND THE BUTTONS from the history file - on each open and after a Reset. UpdateHtml keeps the
+       page for a mount still to come and pushes it to a page that is up; the buttons' setters WebSet the same
+       way. */
+    Procedure RefreshHistory
+        Handle hoHost hoPage hoCopy hoReset
+        String sHtml
+        Boolean bAny
+        tModProgressFile Hist
+        Move (oWebHost(Self)) to hoHost
+        Move (oHistoryPage(hoHost)) to hoPage
+        Move (oCopyBtn(hoHost)) to hoCopy
+        Move (oResetBtn(hoHost)) to hoReset
+        Get ReadModProgress of ghoApplication to Hist
+        Get HistoryHtml of hoHost Hist to sHtml
+        Move (SizeOfArray(Hist.aEntries) > 0) to bAny
+        Send UpdateHtml of hoPage sHtml
+        Send UpdateEnabled of hoCopy bAny
+        Send UpdateEnabled of hoReset bAny
+    End_Procedure
+
+    // Reset (clear this workspace's history), from the Reset button's OnButtonClick - after the web click, where
+    // the Yes/No box can open. Confirmed -> delete the file (per-workspace; others keep theirs) -> re-render (now
+    // the empty placeholder, with Copy and Reset shut), pushed at once.
+    Procedure DoReset
+        Integer iRet
+        Get FTYesNoBox "Reset the modernization progress history for this workspace?\n\nThis clears the recorded burn-down so the next analyze starts a fresh baseline. Other workspaces keep their history.\n\nThis cannot be undone. Continue?" to iRet
+        If (iRet <> MBR_Yes) ;
+            Procedure_Return
+        Send ResetModProgress of ghoApplication
+        Send RefreshHistory
+        Send CheckUpdateWebUI of (oWebHost(Self))
+    End_Procedure
+
+    // Copy the history table to the Windows clipboard, from the Copy button's OnButtonClick - after the web
+    // click, where the acknowledgement box can open. rfSetClipboardText (RefactorFileIO.pkg) is the one
+    // way onto the clipboard.
+    Procedure DoCopy
+        Boolean bOk
+        String sData
+        Get HistoryClipboardText of (oWebHost(Self)) to sData
+        If (sData = "") ;
+            Procedure_Return
+        Get rfSetClipboardText sData to bOk
+        If (bOk = False) ;
+            Procedure_Return
+        Send FTInfoBox "History copied to the Windows clipboard.\nPress Ctrl+V to paste it into an e-mail or a spreadsheet." "Copy History"
+    End_Procedure
+
+    // Close, from the Close button's OnButtonClick - after the web click, where the modal can end.
+    Procedure DoClose
+        Send Close_Panel
+    End_Procedure
+
+End_Object
+
+// Pop the modal; its Activating renders the history. File-scope (like FillBackupFilesDialog) so it compiles into
+// the command-bar client that Uses this .dg; the dashboard calls it via Send ...of (Client_Id(ghoCommandBars)).
+Procedure ShowProgressHistory
+    Send Popup of (oModProgressHistory_dg(Self))
+End_Procedure

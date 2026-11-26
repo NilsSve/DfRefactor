@@ -1,0 +1,1871 @@
+﻿Use Windows.pkg
+Use Cursor.pkg
+Use RefactorConstants.h.pkg      // the CS_Glyph* / CS_Ico* icon names
+Use cRefactorApplication.pkg
+Use cFTModalPanel.pkg         // FT: the dark modal, same base as BackupFilesFT.dg
+Use cFTCJSelectionGrid.pkg
+Use FTAllWebControlClasses.pkg   // FT: cFTWebButton - the two button bars; cFTWebHtmlBox - the status band
+Use cFTLocalWebControlHost.pkg     // FT: hosts the status band in this modal panel
+Use cFTGridHost.pkg              // FT: the button bars' hosts - a grid of 8 px columns (RDCFlexTron)
+Use cWorkspaceCopyPlan.pkg
+Use cFTDeferTimer.pkg          // oCopyDeferTimer - load the copy OFF the accelerator's call stack
+Use RDCRunProgram.pkg           // RDCOpenUrl - show the finished copy in Explorer
+Use cRDCAsyncProcess.pkg          // RDCRunProgramBounded - df-cli, which can PROMPT, must not hang us
+Use cDfCliPackages.pkg         // DfCliCaptureIn - df-cli through the wrapper that makes a prompt FAIL, and keeps its words
+Use FTMarkupBuilders.pkg         // the HTML vocabulary - OpenHtml, IconLabel, the builders
+Use FTThemeColors.pkg            // FTWebBg / FTCJTheme - the FT palette
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use FTMessageBox.pkg             // FTStopBox / FTYesNoBox (RDCFlexTron)
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+
+/*  Migration step 0 - WHAT gets copied to the new location.
+
+    Copying the workspace first is what turns a DataFlex-version migration into a DERIVATION rather
+    than an in-place mutation: the original keeps compiling and running while the copy takes the new
+    .sws, the retargeted libraries and the refactoring.
+
+    A MODAL DIALOG, not a view (Nils 2026-08-05). The copy scope is answered once, at the start of a
+    migration, and then acted on - a question, not a workspace state you return to.
+
+    SHAPED LIKE SelectFoldersViewFT (Nils 2026-08-05) - web select bar above a selection grid, same
+    button chips, same dark surface - minus the three things that belong to that view and not here:
+    no DB grid (this plan is never persisted), no file-extension filter (irrelevant to folders), and
+    no "Continue" (a modal ends in OK / Cancel, not a hand-off to the next view).
+
+    BUILT ON cFTCJSelectionGrid, the same grid the Undo Refactoring dialog uses. It supplies the
+    checkbox column, Select All / None / Invert, the right-click menu (cFTGridContext_mnu) and the
+    Space / Ctrl+A / Ctrl+N / Ctrl+I keys - all of it for free. A stock cCJGrid was the first attempt
+    and was wrong twice over: no phoCheckbox_Col (Set resolves at RUNTIME, so it passed the compiler
+    and died with error 98), and it meant hand-rolling selection behaviour that already existed.
+
+    WHY THIS IS NOT SelectFoldersView's STORE. That view answers a different question (which SOURCE
+    folders to refactor) and persists it per workspace in FolderSelHea/FolderSelDtl. Two meanings in
+    one store would need a discriminator column, and preparing a migration would silently rewrite the
+    scope the user curated for refactoring - which must never be auto-modified.
+
+    WHY THE ROWS ARE WHAT THEY ARE. Measured on a real 19.1 workspace 2026-08-05: the folders the
+    workspace DECLARES total 978 MB / 3,199 files, while its home directory holds 6,540 MB / 12,965
+    files. The 5.5 GB difference is six dead "Data - *" copies that nothing references and that no
+    disk walk can tell from the live one. So declared paths come ticked and everything else is listed
+    below them, unticked. See cWorkspaceCopyPlan for the resolution rules. */
+/*  Is this a FULL path - a drive or a UNC share?
+
+    Declared at the top of the file because both users need it and they sit on opposite sides of the
+    dialog object: DoConfirm inside it, RunWorkspaceCopy at file scope below. cLibraryInventory has
+    _IsAbsolutePath, but that is a class function on the plan object and neither of these is one.
+
+    Why it exists at all: a relative destination is not an error to Windows, it is an instruction to
+    write somewhere else - see the note in DoConfirm. */
+Function IsFullPathForCopy Global String sPath Returns Boolean
+    Move (Trim(sPath)) to sPath
+    If (sPath = "") ;
+        Function_Return False
+    If (Mid(sPath, 1, 2) = ":") ;
+        Function_Return True
+    If (Left(sPath, 2) = "\\") ;
+        Function_Return True
+    Function_Return False
+End_Function
+
+Object oSelectCopyScope_dg is a cFTModalPanel
+    Set Size to 252 700
+    Set Location to 2 0
+    Set piMinSize to 208 560
+    Set Label to "Migration - what to copy"
+    Set Icon to "DFRefactor.ico"
+
+    /* THE ANSWER. Read through the access method at the foot of this file rather than poked at
+       directly. A struct ARRAY survives a cross-object Get; a BARE struct would not - it comes back
+       empty with no error raised, which is why nothing here hands back a single row. */
+    Property tCopyItem[] paCopyItems
+    Property Boolean pbConfirmed False
+    Property String psPlanForSws ""
+    // Where the copy goes. Empty until chosen; OK refuses to return without it.
+    Property String psDestination ""
+
+    /* THE SELECT BAR: the selection verbs, framework buttons (cFTWebButton, RDCFlexTron) on a grid host of
+       8 px columns, as RetireShadowsFT's - from the left edge, column 55 takes the rest of the width. Each
+       works on the grid INSIDE the click - an OnClick override, then Forward - as the chips' OnClick did:
+       the grid op is quick, and a grid read from the click relay's timer faults (err 98). Spans fit the
+       captions (Declared only ~116 px, Select All ~91, Select None ~107, Invert ~73, measured 2026-09-30). */
+    Object oWebSelectBar is a cFTGridHost
+        Set Location to 5 14
+        Set Size to 20 672
+        Set peAnchors to anTopLeftRight
+        Set piColumnCount to 56         // Declared only's 16, Select All's 13, Select None's 15, Invert's 11, then column 55
+        Set psColumnWidths to "55/1fr"  // column 55 takes the extra width
+
+        Object oDeclaredOnlyBtn is a cFTWebButton
+            Set piColumnIndex to 0
+            Set piColumnSpan to 16
+            Set psCaption to "Declared only"
+            Set psCSSClass to "ftbtn ftg-check"
+            Set psToolTip to "The recommended answer - every folder this workspace declares, and nothing it does not."
+
+            Procedure OnClick
+                Send SelectDeclaredOnly of oSelectCopyScope_dg
+                Forward Send OnClick
+            End_Procedure
+        End_Object
+
+        Object oSelectAllBtn is a cFTWebButton
+            Set piColumnIndex to 16
+            Set piColumnSpan to 13
+            Set psCaption to "Select All"
+            Set psCSSClass to "ftbtn ftg-selectall"
+
+            Procedure OnClick
+                Send SelectAll of oScope_grd
+                Send AfterGridSelectionChanged of oSelectCopyScope_dg
+                Forward Send OnClick
+            End_Procedure
+        End_Object
+
+        Object oSelectNoneBtn is a cFTWebButton
+            Set piColumnIndex to 29
+            Set piColumnSpan to 15
+            Set psCaption to "Select None"
+            Set psCSSClass to "ftbtn ftg-selectnone"
+
+            Procedure OnClick
+                Send SelectNone of oScope_grd
+                Send AfterGridSelectionChanged of oSelectCopyScope_dg
+                Forward Send OnClick
+            End_Procedure
+        End_Object
+
+        Object oInvertBtn is a cFTWebButton
+            Set piColumnIndex to 44
+            Set piColumnSpan to 11
+            Set psCaption to "Invert"
+            Set psCSSClass to "ftbtn ftg-invert"
+
+            Procedure OnClick
+                Send SelectInvert of oScope_grd
+                Send AfterGridSelectionChanged of oSelectCopyScope_dg
+                Forward Send OnClick
+            End_Procedure
+        End_Object
+    End_Object
+
+    Object oScope_grd is a cFTCJSelectionGrid
+        Set Location to 29 14
+        Set Size to 168 672
+        Set peAnchors to anAll
+        // Turns on the two context-menu items the class already ships: "Add Folder" (Ins ->
+        // BrowseForFolder) and "Remove From Grid" (Del -> Request_Delete). Both are overridden
+        // below so they act on the PLAN rather than on the grid's own data.
+        Set pbShowAddFolderMenuItem to True
+        Set pbShowRemoveFolderMenuItem to True
+        // A footer row: the ticked rows' file and size totals sit under their columns (Nils
+        // 2026-08-18: "the Size column - it would help if the sum would be presented in the footer").
+        // Filled by UpdateTotals, which is what every tick / measure / add path already calls.
+        Set pbShowFooter to True
+
+        Object oCJGridColumnRowIndicator is a cCJGridColumnRowIndicator
+            Set piWidth to 24
+            Set pbResizable to False
+        End_Object
+
+        Object oFolder_col is a cCJGridColumn
+            // The IDENTITY column - the selection grid reads phoData_Col to say which rows are
+            // ticked, and a full path is the only value here that is unique per row.
+            Set phoData_Col to Self
+            Set piWidth to 300
+            Set psCaption to "Folder"
+        End_Object
+
+        Object oRole_col is a cCJGridColumn
+            Set piWidth to 105
+            Set psCaption to "Role"
+            Set psToolTip to "What the workspace uses this folder for. 'not referenced' means nothing in the workspace points at it."
+        End_Object
+
+        Object oFiles_col is a cCJGridColumn
+            Set piWidth to 65
+            Set psCaption to "Files"
+        End_Object
+
+        Object oSize_col is a cCJGridColumn
+            Set piWidth to 80
+            Set psCaption to "Size"
+        End_Object
+
+        Object oNote_col is a cCJGridColumn
+            Set piWidth to 300
+            Set psCaption to "Note"
+        End_Object
+
+        /* THE designed fill point. cFTCJSelectionGrid declares an empty LoadData and calls it
+           from its own Activating - so the grid asks for its data at the one moment when the COM
+           control exists and the panel is up. That is why BackupFilesFT.dg needs no panel-level
+           hook, and why a Procedure Activate override on the DIALOG does not work: the panel
+           activates before the grid does, so rendering from there finds nothing to render into and
+           silently leaves an EMPTY GRID rather than an error. */
+        Procedure LoadData
+            Send RenderRows of (Parent(Self))
+            Send RefreshHeader of (Parent(Self))
+        End_Procedure
+
+        /* Ins / "Add Folder". cRDCCJGrid.BrowseForFolder pops the folder picker and then sends
+           AddItem with whatever was chosen - so this is the hook, not BrowseForFolder itself. */
+        Procedure AddItem String sFolderName
+            Send AddCopyFolder of (Parent(Self)) sFolderName
+        End_Procedure
+
+        /* A SINGLE tick, mouse or keyboard. The grid's own RefreshSelectionUpdate only fires from
+           the context-menu verbs (Select All / None / Invert), so gating OK on "at least one
+           folder" without this hook would leave OK dead until the user happened to use the menu.
+           DoSetCheckboxFooterText is the one thing both ToggleCurrentItem and OnComMouseUp send.
+
+           Sync + UpdateTotals only - NOT RenderRows, which re-initialises the grid's data and is
+           no thing to do underneath the click that is still being handled. */
+        Procedure DoSetCheckboxFooterText
+            Forward Send DoSetCheckboxFooterText
+            Send SyncSelectionFromGrid of (Parent(Self))
+            Send UpdateTotals of (Parent(Self))
+        End_Procedure
+
+        /* Del / "Remove From Grid" - ONE row, the current one.
+
+           Overridden because the inherited behaviour on Del was Request_Clear_All, which empties
+           the whole grid (Nils 2026-08-05). The row is identified by the value in the identity
+           column rather than by index: the grid can be sorted by any column, so a positional
+           delete would remove whichever folder happened to be sitting in that slot. */
+        Procedure Request_Delete
+            String sPath
+            Get SelectedRowValue of oFolder_col to sPath
+            If (Trim(sPath) <> "") ;
+                Send RemoveCopyFolder of (Parent(Self)) sPath
+        End_Procedure
+
+        On_Key Key_Delete Send Request_Delete
+        On_Key Key_Insert Send BrowseForFolder
+    End_Object
+
+    /* ONE status line under the grid, built as ONE string: what will be copied, then where it is
+       going and for which DataFlex version.
+
+       Deliberately not two textboxes. The settings have to sit immediately after the totals, and the
+       totals vary in length with the selection - so any fixed x-position for a second box is either
+       too far right (a gap) or too far left (a collision), and the right-justified attempt pushed
+       the path off the edge entirely. Concatenation puts it exactly one separator after the text it
+       follows, whatever that text currently says. Nils 2026-08-05. */
+    /* THE STATUS LINE, as three independently coloured segments (Nils 2026-08-10).
+
+       It was a cRefactorTextbox, and a textbox has ONE TextColor - so the amber that flagged a
+       missing destination had to be spent on the whole line, colouring the folder count and the
+       target version too. Everything looked wrong when one thing was. A textbox cannot colour part
+       of itself, so the control had to change: an HTML band can mark exactly the segment at fault
+       and leave the rest reading as normal information.
+
+       Slightly taller than the textbox it replaces (18 units against 10, starting at 199 rather
+       than 202) because a web band needs room for its own line box; it still clears the grid above
+       (ends at 197) and the button row below (starts at 218). */
+    Object oWebStatusBar is a cFTLocalWebControlHost
+        Set Location to 199 14
+        Set Size to 18 672
+        Set peAnchors to anBottomLeftRight
+
+        // The band's chrome. The SEGMENTS are composed by the dialog (StatusSegmentHtml) - this
+        // only wraps them, so the wording and the styling stay in separate places.
+        Function StatusHtml String sInner Returns String
+            String sHtml
+            Move (CS_PaletteCssLink + CS_PageFitCssLink + CssLink("selectcopyscope")) to sHtml
+            Move (sHtml + (DivOpen("stbar")) + sInner + CS_DivEnd) to sHtml
+            Function_Return sHtml
+        End_Function
+
+        Object oWebStatus_htm is a cFTWebHtmlBox
+            Set piColumnSpan  to 1
+            // Nothing here is clickable - it is a readout. The verbs are on the row below.
+            Set pbServerOnClick to False
+            // DESIGN-TIME PLACEHOLDER for the Studio's Windows Designer, which models the LAST literal
+            // psHtml it can parse. It is the string the runtime seeds (dumped by the cFTWebHtmlBox design
+            // dump, no workspace loaded); the runtime expression sits in End_Construct_Object below.
+            Set psHtml to """
+            <link rel="stylesheet" href="RDCFlexTron/palette.css">
+            <link rel="stylesheet" href="RDCFlexTron/buttons.css">
+            <link rel="stylesheet" href="RDCFlexTron/bars.css">
+            <link rel="stylesheet" href="RDCFlexTron/pagefit.css">
+            <link rel="stylesheet" href="CssStyle/selectcopyscope.css">
+            <div class="stbar"></div>
+            """
+
+            // RUNTIME content - here rather than in the object body, so the Designer keeps the literal above.
+            Procedure End_Construct_Object
+                Forward Send End_Construct_Object
+                Set psHtml to (StatusHtml(Self, ""))
+            End_Procedure
+        End_Object
+    End_Object
+
+    /* THE CLOSER ROW (Nils 2026-08-10): Target version..., Destination... and Measure - the things you do
+       once before committing - then OK and Cancel against the right edge. Framework buttons (cFTWebButton,
+       RDCFlexTron) on a grid host of 8 px columns since 2026-09-30, in ONE host: column 46, between the two
+       groups, takes the rest of the width, so a narrow panel closes the gap and every button stays whole.
+       The chips' row indented the first group by its own width, to start where Measure had ended on the
+       old top bar; the select bar above starts at the left edge now, and so does this group.
+
+       Target version... and Destination... open their dialogs in OnButtonClick, after the web click - the
+       chips opened them inside it. Measure and OK sync the ticks from the grid INSIDE the click (OnClick,
+       then Forward) - a grid read from the click relay's timer faults (err 98) - and measure or confirm in
+       OnButtonClick, after it: the walk reads the whole tree of every ticked folder, and DoConfirm's
+       message boxes and Close_Panel belong after the click. OK is shut while something is missing, with
+       the reason as its tooltip (RefreshBottomButtons): a greyed button that still answered would look
+       dead and still copy 1 GB. Cancel is never shut - leaving must always work. Spans fit the captions
+       (Target version... ~125 px, Destination... ~111, Measure ~89, OK ~59, Cancel ~78, measured
+       2026-09-30). */
+    Object oWebBottomBar is a cFTGridHost
+        Set Location to 218 14
+        Set Size to 20 672
+        Set peAnchors to anBottomLeftRight
+        Set piColumnCount to 70         // Target's 17, Destination's 16, Measure's 13, column 46, OK's 11, Cancel's 12
+        Set psColumnWidths to "46/1fr"  // column 46 takes the extra width
+
+        Object oTargetBtn is a cFTWebButton
+            Set piColumnIndex to 0
+            Set piColumnSpan to 17
+            Set psCaption to "Target version..."
+            Set psCSSClass to "ftbtn ftg-compile"
+            Set psToolTip to "The DataFlex version this workspace is being migrated TO. It comes from the selected compiler, and decides the new .sws version, which build each library needs, and the suggested name for the copy. NOTE: the compiler is a program-wide setting, so changing it here also changes it for Test Compile."
+
+            Procedure OnButtonClick
+                Send ChooseTargetVersion of oSelectCopyScope_dg
+            End_Procedure
+        End_Object
+
+        Object oDestinationBtn is a cFTWebButton
+            Set piColumnIndex to 17
+            Set piColumnSpan to 16
+            Set psCaption to "Destination..."
+            Set psCSSClass to "ftbtn ftg-refresh"
+            Set psToolTip to "Choose the folder the copy is written to. It must be empty, and outside this workspace."
+
+            Procedure OnButtonClick
+                Send ChooseDestination of oSelectCopyScope_dg
+            End_Procedure
+        End_Object
+
+        Object oMeasureBtn is a cFTWebButton
+            Set piColumnIndex to 33
+            Set piColumnSpan to 13
+            Set psCaption to "Measure"
+            Set psCSSClass to "ftbtn ftg-scan"
+            Set psToolTip to "Count the files and bytes in the ticked folders. Not done on open, because it reads the whole tree."
+
+            Procedure OnClick
+                Send SyncSelectionFromGrid of oSelectCopyScope_dg
+                Forward Send OnClick
+            End_Procedure
+
+            Procedure OnButtonClick
+                Send MeasureAllRows of oSelectCopyScope_dg
+            End_Procedure
+        End_Object
+
+        Object oOkBtn is a cFTWebButton
+            Set piColumnIndex to 47
+            Set piColumnSpan to 11
+            Set psCaption to "OK"
+            Set psCSSClass to "ftbtn ftg-check"
+            // Shut until the first UpdateTotals sets the real state - nothing can be chosen at construct time.
+            Set pbEnabled to False
+            Set psToolTip to "Still needed: a target DataFlex version, a destination folder, at least one folder ticked."
+
+            Procedure OnClick
+                Send SyncSelectionFromGrid of oSelectCopyScope_dg
+                Forward Send OnClick
+            End_Procedure
+
+            Procedure OnButtonClick
+                Send DoConfirm of oSelectCopyScope_dg
+            End_Procedure
+        End_Object
+
+        Object oCancelBtn is a cFTWebButton
+            Set piColumnIndex to 58
+            Set piColumnSpan to 12
+            Set psCaption to "Cancel"
+            Set psCSSClass to "ftbtn ftg-close"
+
+            Procedure OnButtonClick
+                Send DoCancel of oSelectCopyScope_dg
+            End_Procedure
+        End_Object
+    End_Object
+
+    // "<workspace name> DF<target>" beside the workspace's own folder - a default that says what the
+    // copy IS. Derived from the target version, which is why the target has to be settled first.
+    Function SuggestedDestination Returns String
+        String sSws sHome sName sVer sParent
+        Integer iPos
+
+        Get psSWSFile of ghoApplication to sSws
+        If (sSws = "") ;
+            Function_Return ""
+        /* psHomeTarget - the OPEN workspace's folder. This read psHome of phoWorkspace, which is
+           DFRefactor's OWN workspace (the mistake RunWorkspaceCopy's comment describes), so the
+           suggestion landed beside DFRefactor's folder instead of beside the workspace being copied
+           (found 2026-10-07). */
+        Get psHomeTarget of ghoApplication to sHome
+        Move (RemoveFolderSeperator(Self, sHome)) to sHome
+        Move (RightPos("\", sHome)) to iPos
+        If (iPos = 0) ;
+            Function_Return ""
+        Move (Left(sHome, iPos - 1)) to sParent
+        Move (Right(sHome, (Length(sHome) - iPos))) to sName
+        Get psTargetDfVersion of ghoApplication to sVer
+        If (sVer = "") ;
+            Function_Return (sParent + "\" + sName + " migrated")
+        Function_Return (sParent + "\" + sName + " DF" + sVer)
+    End_Function
+
+    // Local mirror of the plan class's helper - this dialog has no cRefactorApplication method to
+    // send to for it.
+    Function RemoveFolderSeperator String sPath Returns String
+        If (Right(sPath, 1) = "\") ;
+            Function_Return (Left(sPath, Length(sPath) - 1))
+        Function_Return sPath
+    End_Function
+
+    /* Change the target DataFlex version WITHOUT leaving the dialog.
+
+       The gate in SelectMigrationCopyScope only fires when no compiler is set at all, so a user who
+       already has one - which is everyone, most of the time - would otherwise never be offered the
+       choice, and the target is the single most consequential decision in a migration. Hence a
+       button that is always there.
+
+       Re-suggests the destination when the version changes, but ONLY while the destination is still
+       the suggestion: once the user has picked a folder deliberately, moving it under them would be
+       the tool overruling a decision it asked for. */
+    Procedure ChooseTargetVersion
+        String sBefore sAfter sDest sWasSuggested
+
+        Get SuggestedDestination to sWasSuggested
+        Get psTargetDfVersion of ghoApplication to sBefore
+        Send Popup of (oCompilerSetup_dg(Client_Id(ghoCommandBars)))
+        Get psTargetDfVersion of ghoApplication to sAfter
+
+        If (sAfter <> sBefore) Begin
+            Get psDestination to sDest
+            If (sDest = "" or Lowercase(sDest) = Lowercase(sWasSuggested)) ;
+                Set psDestination to ""
+        End
+        Send RefreshHeader
+    End_Procedure
+
+    Procedure ChooseDestination
+        String sStart sFolder sCurrent
+        Handle ho
+
+        Get psDestination to sCurrent
+        If (sCurrent <> "") ;
+            Move sCurrent to sStart
+        Else ;
+            Get SuggestedDestination to sStart
+        Get Create (RefClass(cSelectFolderDialog)) to ho
+        Get SelectFolder of ho "Copy this workspace to" sStart to sFolder
+        Send Destroy of ho
+        If (sFolder <> "") Begin
+            Set psDestination to (RemoveFolderSeperator(Self, sFolder))
+            Send RefreshHeader
+        End
+    End_Procedure
+
+    // Selected rows. Its own function because three things now ask the same question - the totals
+    // line, the OK gate and the status wording - and they must never disagree.
+    Function SelectedFolderCount Returns Integer
+        tCopyItem[] aItems
+        Integer i iMax iRows
+        Get paCopyItems to aItems
+        Move 0 to iRows
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            If (aItems[i].bSelected = True) ;
+                Increment iRows
+        Loop
+        Function_Return iRows
+    End_Function
+
+    /* What is still missing before a copy can run, as a phrase - "" when nothing is.
+       ONE definition of ready, read by the status line's colour, by the OK button's enabled state
+       and by its tooltip, so the panel cannot grey OK for a reason it declines to name. DoConfirm
+       keeps its own Stop_Boxes: a disabled button should not be the only thing standing between a
+       user and a 1 GB copy over the wrong folder. */
+    Function MissingText Returns String
+        String sVer sDest sText
+
+        Get psTargetDfVersion of ghoApplication to sVer
+        Get psDestination to sDest
+        Move "" to sText
+        If (sVer = "") ;
+            Move "a target DataFlex version" to sText
+        If (sDest = "") Begin
+            If (sText <> "") ;
+                Move (sText + ", ") to sText
+            Move (sText + "a destination folder") to sText
+        End
+        If (SelectedFolderCount(Self) = 0) Begin
+            If (sText <> "") ;
+                Move (sText + ", ") to sText
+            Move (sText + "at least one folder ticked") to sText
+        End
+        Function_Return sText
+    End_Function
+
+    // Minimal HTML escape for values that reach the band. Windows paths cannot hold < > | ", but a
+    // folder name may legally contain "&" - and one unescaped ampersand truncates the rest.
+    Function StatusEscaped String sText Returns String
+        String sOut
+        Move (Replaces("&", sText, "&amp;")) to sOut
+        Move (Replaces("<", sOut, "&lt;"))   to sOut
+        Function_Return sOut
+    End_Function
+
+    /* ONE segment of the status band. bWarn is what makes this worth having: amber marks exactly
+       the thing that is missing and nothing else, which is the whole reason the line stopped being
+       a textbox. bPath widens the ellipsis rule to the one segment that can be long.
+
+       A missing value still spells itself out in CAPITALS naming the key press - a reader who does
+       not register the colour must still be told, and the colour is not available to a screen
+       reader at all. */
+    Function StatusSegmentHtml String sText Boolean bWarn Boolean bPath Returns String
+        String sCls
+        Move "stseg" to sCls
+        If (bPath = True) ;
+            Move "stpath" to sCls
+        If (bWarn = True) ;
+            Move (sCls + " stwarn") to sCls
+        Function_Return ((SpanOpen(sCls)) + (StatusEscaped(Self, sText)) + CS_SpanEnd)
+    End_Function
+
+    Function StatusSeparatorHtml Returns String
+        Function_Return (((SpanOpen("stsep")) + '|') + CS_SpanEnd)
+    End_Function
+
+    // A settings change repaints the whole band, because the counts and the settings share it.
+    Procedure RefreshHeader
+        Send UpdateTotals
+    End_Procedure
+
+    /* Push the composed band. UpdateHtml is safe either side of mount - cFTWebHtmlBox folds a pre-init
+       push into Set psHtml, which the page's init sync then serves - and its CheckUpdateWebUI companion
+       waits for the page: this also runs from the grid's LoadData at first paint, squarely inside the
+       window where a hidden WebView2 has not initialised. */
+    Procedure RefreshStatusBar String sInner
+        String sHtml
+        Handle hoBar hoBox
+        Move (oWebStatusBar(Self))  to hoBar
+        Move (oWebStatus_htm(Self)) to hoBox
+        Get StatusHtml of hoBar sInner to sHtml
+        Send UpdateHtml of hoBox sHtml
+        If (IsComObjectCreated(hoBox) and pbInitWebApp(hoBar) = False) ;
+            Send CheckUpdateWebUI of hoBar
+    End_Procedure
+
+    /* OK's state, from MissingText - shut, with the reason as its tooltip, while something is missing.
+       Stored for a page that loads (Set) and pushed to a page that is up (WebSet), each only when it
+       changed. Called from UpdateTotals, so every path that can change readiness - target, destination,
+       bulk selection, a single tick - lands here without its own wiring; the first call comes from the
+       grid's LoadData at first paint, before the bar's page has called home, and its Set is what the
+       page's init then serves. */
+    Procedure RefreshBottomButtons
+        String sMissing sTip
+        Boolean bReady
+        Handle hoBar hoOk
+
+        Get MissingText to sMissing
+        Move (sMissing = "") to bReady
+        If (bReady = True) ;
+            Move "Copy the ticked folders to the chosen destination." to sTip
+        Else ;
+            Move ("Still needed: " + sMissing + ".") to sTip
+        Move (oWebBottomBar(Self)) to hoBar
+        Move (oOkBtn(hoBar)) to hoOk
+        Send UpdateEnabled of hoOk bReady
+        Send UpdateToolTip of hoOk sTip
+        If (not(pbInitWebApp(hoBar))) ;
+            Send CheckUpdateWebUI of hoBar
+    End_Procedure
+
+    /* Bytes as something a person can compare at a glance. Sizes here span a text file to several
+       GB, so one unit would be unreadable at one end or the other.
+
+       Defined ABOVE its callers: a class function used in EXPRESSION form must already be known to
+       the compiler, and DoConfirm reads it. */
+    Function SizeText Number nBytes Returns String
+        If (nBytes <= 0) ;
+            Function_Return ""
+        If (nBytes < 1024.0) ;
+            Function_Return (String(Integer(nBytes)) + " B")
+        If (nBytes < 1048576.0) ;
+            Function_Return (String(Integer(nBytes / 1024.0)) + " KB")
+        If (nBytes < 1073741824.0) ;
+            Function_Return (String(Integer(nBytes / 1048576.0)) + " MB")
+        Function_Return (String(Integer((nBytes / 1073741824.0) * 10.0) / 10.0) + " GB")
+    End_Function
+
+    /* OK. Validates before answering, because everything downstream is expensive or destructive:
+       the caller copies ~1 GB, then writes a new .sws over it.
+
+       The destination must be OUTSIDE the workspace home - a copy into a subfolder of its own source
+       walks into what it is writing. And it must be empty: merging a workspace into an existing one
+       silently produces a hybrid that compiles, which is the worst possible outcome.
+
+       Runs from the OK button's OnButtonClick, after the web click, where the message boxes and
+       Close_Panel are safe. The ticks were synced from the grid by its OnClick, inside the click -
+       not here: this runs from the click relay's timer, where a grid read faults (err 98). */
+    Procedure DoConfirm
+        String sDest sHome sDestLow sHomeLow sOtherSws sLeaf sWhy sSuggested
+        tRFFolderSize lsSize
+        Number nNeed nFree
+        Integer iRetval iUnmeasured
+        Boolean bFolderName
+
+        Get psDestination to sDest
+        If (sDest = "") Begin
+            Send FTStopBox "Choose a destination folder first - press Destination... on the button bar." "No destination"
+            Procedure_Return
+        End
+
+        /* NOT ABSOLUTE = not a destination, whatever else it looks like.
+
+           A relative path passes every other test here - it is not empty, not a drive root, not
+           inside the source - and then Windows resolves it against the PROCESS working directory.
+           On 2026-08-12 that put a whole workspace and its sibling library under
+           C:\Users\...\OneDrive\Documents while the E: drive the user chose stayed empty, silently,
+           because writing to a valid relative path is not an error. Asked FIRST, so the message
+           names the real problem rather than whatever the later tests happen to say about it. */
+        If (IsFullPathForCopy(sDest) = False) Begin
+            Send FTStopBox ("The destination is not a full path:" * sDest + Character(10) + Character(10) + "It has to start with a drive (C:\...) or a server (\\server\share). A path without one is resolved against whatever folder this program happens to be running in, so the copy would be written somewhere neither of us chose. Press Destination... and pick the folder again.") "Destination is not a full path"
+            Procedure_Return
+        End
+
+        /* A DRIVE ROOT is never a workspace folder, and picking one is how a shared folder gets
+           collided with: an out-of-home library row lands at <destination>\<leaf>, so a destination
+           of "E:\" aims it straight at E:\libraries - which may well belong to other workspaces
+           (Nils 2026-08-06). A copy is meant to be a self-contained folder. */
+        If (Length(RemoveFolderSeperator(Self, sDest)) <= 2) Begin
+            Send FTStopBox "Choose a FOLDER, not a drive root. The copy needs its own folder - writing it to a drive root scatters the workspace across that drive and can collide with folders other workspaces use." "Destination is a drive root"
+            Procedure_Return
+        End
+
+        // The workspace being COPIED - psHomeTarget. This compared against psHome of phoWorkspace,
+        // DFRefactor's own folder, so a destination inside the real workspace passed and one under
+        // DFRefactor's folder was refused (found 2026-10-07).
+        Get psHomeTarget of ghoApplication to sHome
+        Move (Lowercase(RemoveFolderSeperator(Self, sDest))) to sDestLow
+        Move (Lowercase(RemoveFolderSeperator(Self, sHome))) to sHomeLow
+        If (sDestLow = sHomeLow or Left(sDestLow, Length(sHomeLow) + 1) = (sHomeLow + "\")) Begin
+            Send FTStopBox "The destination is inside the workspace you are copying. Choose a folder outside it." "Destination inside the source"
+            Procedure_Return
+        End
+
+        /* INSIDE ANOTHER WORKSPACE'S FOLDER, OR NAMED LIKE ONE OF A WORKSPACE'S OWN FOLDERS: allowed, but asked
+           (2026-10-31). On 2026-10-05 a copy went into a new folder E:\LegacyApp5\Programs - inside the folder of
+           an older copy, one level too deep - and every test here passed it. The two tests are the function
+           library's (WorkspaceFileAbove, IsWorkspaceFolderName). Defaults to No, like the next question: a copy
+           in the wrong place looks like a real one. */
+        Get WorkspaceFileAbove of ghoFuncLib sDest to sOtherSws
+        Get IsWorkspaceFolderName of ghoFuncLib sDest to bFolderName
+        If (sOtherSws <> "" or bFolderName = True) Begin
+            Move "" to sWhy
+            If (sOtherSws <> "") ;
+                Move ("It is inside another workspace's folder (" + sOtherSws + " is above it), so the copy would become part of that workspace.") to sWhy
+            If (bFolderName = True) Begin
+                Move (RemoveFolderSeperator(Self, sDest)) to sLeaf
+                Move (Right(sLeaf, (Length(sLeaf) - RightPos("\", sLeaf)))) to sLeaf
+                If (sWhy <> "") ;
+                    Move (sWhy + Character(10) + Character(10)) to sWhy
+                Move (sWhy + "Its name, " + sLeaf + ", is the name of one of a workspace's own folders (Data, Programs, Bitmaps ...).") to sWhy
+            End
+            Get SuggestedDestination to sSuggested
+            If (sSuggested <> "" and Lowercase(sSuggested) <> sDestLow) ;
+                Move (sWhy + Character(10) + Character(10) + "A copy normally gets a folder of its own beside the workspace, such as:" + Character(10) + sSuggested) to sWhy
+            Get FTYesNoBox ("Please check the destination:" + Character(10) + sDest + Character(10) + Character(10) + sWhy + Character(10) + Character(10) + "Copy there anyway?") "Check the destination" MB_DEFBUTTON2 to iRetval
+            If (iRetval <> MBR_Yes) ;
+                Procedure_Return
+        End
+
+        // Non-empty destination: allowed, but never silently.
+        If (vFolderExists(sDest) <> 0) Begin
+            Move (rfFolderSize(sDest)) to lsSize
+            If (lsSize.iFiles > 0) Begin
+                // Defaults to No: this one silently produces a hybrid workspace that still compiles,
+                // so the safe answer must be the one a hurried Enter gives.
+                Get FTYesNoBox ("The destination already holds" * String(lsSize.iFiles) * "files. Copying into it will mix two workspaces together. Continue anyway?") "Destination is not empty" MB_DEFBUTTON2 to iRetval
+                If (iRetval <> MBR_Yes) ;
+                    Procedure_Return
+            End
+        End
+
+        /* FREE SPACE - the check that makes Measure load-bearing rather than informational.
+
+           Only enforceable once the ticked rows have been measured, so an unmeasured plan WARNS
+           instead of blocking: refusing on a number nobody has computed would be a guess wearing a
+           refusal's clothes. Running out mid-copy leaves a half-written workspace that looks real,
+           which is worse than either. */
+        Get SelectedBytes to nNeed
+        Get UnmeasuredCount to iUnmeasured
+        If (iUnmeasured > 0) Begin
+            Get FTYesNoBox ("Not all of the ticked folders have been measured, so the size of this copy is unknown. Press Cancel, then Measure, to check it against the free space first." + Character(10) + Character(10) + "Continue without checking?") "Size not measured" MB_DEFBUTTON2 to iRetval
+            If (iRetval <> MBR_Yes) ;
+                Procedure_Return
+        End
+        Else Begin
+            Move (rfFreeDiskBytes(sDest)) to nFree
+            If (nFree >= 0 and nFree < nNeed) Begin
+                Send FTStopBox ("This copy needs" * SizeText(Self, nNeed) * "but the destination volume has only" * SizeText(Self, nFree) * "free. Free some space, or untick folders you do not need - the database is usually the bulk of it.") "Not enough free space"
+                Procedure_Return
+            End
+        End
+
+        Set pbConfirmed to True
+        Send Close_Panel
+    End_Procedure
+
+    // Bytes across the ticked, measured rows - the size of the copy about to be made.
+    Function SelectedBytes Returns Number
+        tCopyItem[] aItems
+        Number nBytes
+        Integer i iMax
+        Get paCopyItems to aItems
+        Move 0 to nBytes
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            If (aItems[i].bSelected = True and aItems[i].bMeasured = True) ;
+                Move (nBytes + aItems[i].nBytes) to nBytes
+        Loop
+        Function_Return nBytes
+    End_Function
+
+    // Ticked rows whose size is still unknown - the reason a free-space check may not be possible.
+    Function UnmeasuredCount Returns Integer
+        tCopyItem[] aItems
+        Integer i iMax iCount
+        Get paCopyItems to aItems
+        Move 0 to iCount
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            If (aItems[i].bSelected = True and aItems[i].bMeasured = False) ;
+                Increment iCount
+        Loop
+        Function_Return iCount
+    End_Function
+
+    Procedure DoCancel
+        Set pbConfirmed to False
+        Send Close_Panel
+    End_Procedure
+
+    // Human text for a role. Shown rather than inferred from the folder name, because "Data" and
+    // "Data - OLD" differ only in whether anything references them.
+    Function RoleText Integer eRole Returns String
+        If (eRole = eCopyConfig)        Function_Return "configuration"
+        If (eRole = eCopySource)        Function_Return "source"
+        If (eRole = eCopyData)          Function_Return "database"
+        If (eRole = eCopyOutput)        Function_Return "programs"
+        If (eRole = eCopyResource)      Function_Return "resources"
+        If (eRole = eCopyLibrary)       Function_Return "library"
+        If (eRole = eCopyDeclaredOther) Function_Return "declared"
+        If (eRole = eCopyUndeclared)    Function_Return "not referenced"
+        If (eRole = eCopyExcluded)      Function_Return "never copied"
+        If (eRole = eCopyStudio)        Function_Return "Studio only"
+        If (eRole = eCopyAdded)         Function_Return "added by you"
+        Function_Return ""
+    End_Function
+
+    // Why a row deserves a second look. Only states that CHANGE what the copy does earn a note.
+    Function NoteText tCopyItem Item Returns String
+        If (Item.bIsLink = True) ;
+            Function_Return "junction - copied as a link, its target is not duplicated"
+        If (Item.bExists = False) ;
+            Function_Return "declared, but not present on disk"
+        If (Item.eRole = eCopyExcluded) ;
+            Function_Return "backup / version-control data - never copied"
+        If (Item.eRole = eCopyUndeclared) ;
+            Function_Return "nothing in this workspace references it"
+        If (Item.eRole = eCopyStudio) ;
+            Function_Return "Studio project files, not application source"
+        If (Item.eRole = eCopyAdded) ;
+            Function_Return "added by hand"
+        If (Item.eRole = eCopyDeclaredOther) ;
+            Function_Return ("declared by " + Item.sKey)
+        Function_Return ""
+    End_Function
+
+    /* Render paCopyItems into the grid. One direction only - the array is the truth.
+
+       GUARDED ON THE COM OBJECT, and that is not belt-and-braces: the CodeJock grid is a COM control
+       that does not exist until the dialog is created, and reaching into it early raises error 4399,
+       "pvComObject is NULL". */
+    Procedure RenderRows
+        Handle hoDataSource
+        tDataSourceRow[] TheData TheDataEmpty
+        tCopyItem[] aItems
+        tCopyItem Item
+        Integer i iMax iFolder iRole iFiles iSize iNote iCheck
+
+        If (not(IsComObjectCreated(oScope_grd))) ;
+            Procedure_Return
+        Get paCopyItems to aItems
+        Get phoDataSource of oScope_grd to hoDataSource
+        If (hoDataSource = 0) ;
+            Procedure_Return
+        Get DataSource of hoDataSource to TheData
+        Move TheDataEmpty to TheData
+
+        Get piColumnId of oFolder_col to iFolder
+        Get piColumnId of oRole_col   to iRole
+        Get piColumnId of oFiles_col  to iFiles
+        Get piColumnId of oSize_col   to iSize
+        Get piColumnId of oNote_col   to iNote
+        Get piColumnId of (phoCheckbox_Col(oScope_grd)) to iCheck
+
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            Move aItems[i] to Item
+            Move Item.sPath to TheData[i].sValue[iFolder]
+            Move (RoleText(Self, Item.eRole)) to TheData[i].sValue[iRole]
+            If (Item.bMeasured = True) ;
+                Move (String(Item.iFiles)) to TheData[i].sValue[iFiles]
+            Else ;
+                Move "" to TheData[i].sValue[iFiles]
+            Move (SizeText(Self, Item.nBytes)) to TheData[i].sValue[iSize]
+            Move (NoteText(Self, Item)) to TheData[i].sValue[iNote]
+            // A Boolean, not "1"/"0" - the selection grid reads this slot straight back into a
+            // Boolean, so the raw value has to be one it wrote itself.
+            Move Item.bSelected to TheData[i].sValue[iCheck]
+        Loop
+
+        Send InitializeData of oScope_grd TheData
+        Send UpdateTotals
+    End_Procedure
+
+    /* Copy the grid's tick state back into paCopyItems, matching rows by PATH.
+
+       Matched by path rather than by index because the grid can be sorted by any column - a
+       positional copy would silently assign one folder's answer to another.
+
+       This is also where the exclusion rule is ENFORCED rather than merely displayed: Select All
+       and the right-click menu will happily tick a backup tree, so anything marked eCopyExcluded is
+       forced back off here, however it got ticked. */
+    Procedure SyncSelectionFromGrid
+        tFolderData[] aGrid
+        tCopyItem[] aItems
+        Integer i j iMax jMax
+
+        Get AllItems of oScope_grd to aGrid
+        Get paCopyItems to aItems
+        Move (SizeOfArray(aItems) - 1) to iMax
+        Move (SizeOfArray(aGrid) - 1) to jMax
+        For i from 0 to iMax
+            If (aItems[i].eRole = eCopyExcluded) Begin
+                Move False to aItems[i].bSelected
+            End
+            Else Begin
+                For j from 0 to jMax
+                    If (Lowercase(Trim(aGrid[j].sFolderName)) = Lowercase(Trim(aItems[i].sPath))) ;
+                        Move aGrid[j].bSelected to aItems[i].bSelected
+                Loop
+            End
+        Loop
+        Set paCopyItems to aItems
+    End_Procedure
+
+    // Read the grid's own selection change, apply our rules, repaint from the array. The display can
+    // then never disagree with the answer that will be returned.
+    Procedure AfterGridSelectionChanged
+        Send SyncSelectionFromGrid
+        Send RenderRows
+    End_Procedure
+
+    // The running total over the SELECTED rows, naming what is still unmeasured rather than quietly
+    // reporting a total that leaves it out.
+    Procedure UpdateTotals
+        tCopyItem[] aItems
+        Number nBytes
+        Integer i iMax iFiles iRows iUnmeasured
+        String sText sInner sVer sDest
+
+        Get paCopyItems to aItems
+        Move 0 to nBytes
+        Move 0 to iFiles
+        Move 0 to iRows
+        Move 0 to iUnmeasured
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            If (aItems[i].bSelected = True) Begin
+                Increment iRows
+                If (aItems[i].bMeasured = True) Begin
+                    Move (nBytes + aItems[i].nBytes) to nBytes
+                    Move (iFiles + aItems[i].iFiles) to iFiles
+                End
+                Else ;
+                    Increment iUnmeasured
+            End
+        Loop
+
+        /* THREE SEGMENTS, each answering for itself. Only the one at fault goes amber - the
+           folder count says nothing about the destination, and colouring it because the
+           destination is missing made the whole line read as broken (Nils 2026-08-10). */
+        Move ("Copying " + String(iRows) + " of " + String(SizeOfArray(aItems)) + " folders") to sText
+        If (iFiles > 0) ;
+            Move (sText + " - " + String(iFiles) + " files, " + SizeText(Self, nBytes)) to sText
+        If (iUnmeasured > 0) ;
+            Move (sText + " (" + String(iUnmeasured) + " not measured)") to sText
+        // Nothing ticked is a genuine blocker, so this segment names it rather than reporting "0 of 30".
+        If (iRows = 0) ;
+            Move ("NO FOLDERS TICKED - tick at least one of the " + String(SizeOfArray(aItems))) to sText
+        Move (StatusSegmentHtml(Self, sText, (iRows = 0), False)) to sInner
+
+        Get psTargetDfVersion of ghoApplication to sVer
+        If (sVer = "") ;
+            Move "Target: NOT CHOSEN - press Target version..." to sText
+        Else ;
+            Move ("Target: DataFlex " + sVer) to sText
+        Move (sInner + StatusSeparatorHtml(Self)) to sInner
+        Move (sInner + StatusSegmentHtml(Self, sText, (sVer = ""), False)) to sInner
+
+        Get psDestination to sDest
+        If (sDest = "") ;
+            Move "Copy to: NOT CHOSEN - press Destination..." to sText
+        Else ;
+            Move ("Copy to: " + sDest) to sText
+        Move (sInner + StatusSeparatorHtml(Self)) to sInner
+        Move (sInner + StatusSegmentHtml(Self, sText, (sDest = ""), True)) to sInner
+
+        Send RefreshStatusBar sInner
+        /* THE GRID FOOTER: the same totals, under the columns they belong to (Nils 2026-08-18). Ticked
+           rows only - the unticked ones are deliberately never measured (see MeasureAllRows) - and an
+           unmeasured ticked row is said, so a partial sum never reads as the whole. */
+        If (iRows = 0) Begin
+            Set psFooterText of oFolder_col to ""
+            Set psFooterText of oFiles_col  to ""
+            Set psFooterText of oSize_col   to ""
+        End
+        Else Begin
+            Set psFooterText of oFolder_col to ("Ticked: " + String(iRows) + " of " + String(SizeOfArray(aItems)) + " folders")
+            If (iUnmeasured > 0) Begin
+                Set psFooterText of oFiles_col to (String(iFiles) + " +?")
+                Set psFooterText of oSize_col  to (SizeText(Self, nBytes) + " +?")
+            End
+            Else Begin
+                Set psFooterText of oFiles_col to (String(iFiles))
+                Set psFooterText of oSize_col  to (SizeText(Self, nBytes))
+            End
+        End
+        // Decided in ONE place (MissingText), so the band, the OK button and its tooltip agree.
+        Send RefreshBottomButtons
+    End_Procedure
+
+    // Back to the recommended answer - everything the workspace declares, nothing it does not.
+    // A folder the user ADDED by hand survives this: they asked for it explicitly, and silently
+    // dropping it would make the button destructive rather than corrective.
+    Procedure SelectDeclaredOnly
+        tCopyItem[] aItems
+        Integer i iMax
+        Get paCopyItems to aItems
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            Move ((aItems[i].bDeclared or aItems[i].eRole = eCopyAdded) and aItems[i].eRole <> eCopyExcluded) to aItems[i].bSelected
+        Loop
+        Set paCopyItems to aItems
+        Send RenderRows
+    End_Procedure
+
+    // Add a hand-picked folder (Ins / "Add Folder"), then repaint so the new row is visible and
+    // counted in the total straight away.
+    Procedure AddCopyFolder String sFolder
+        tCopyItem[] aItems
+        Handle hoPlan
+        Send SyncSelectionFromGrid
+        Get paCopyItems to aItems
+        Get Create (RefClass(cWorkspaceCopyPlan)) to hoPlan
+        Get AddFolderToPlan of hoPlan aItems sFolder to aItems
+        Send Destroy of hoPlan
+        Set paCopyItems to aItems
+        Send RenderRows
+    End_Procedure
+
+    // Drop one folder from the plan (Del / "Remove From Grid"). Re-opening the dialog rebuilds the
+    // plan from scratch, so a deletion is never permanent.
+    Procedure RemoveCopyFolder String sFolder
+        tCopyItem[] aItems
+        Handle hoPlan
+        Send SyncSelectionFromGrid
+        Get paCopyItems to aItems
+        Get Create (RefClass(cWorkspaceCopyPlan)) to hoPlan
+        Get RemoveFolderFromPlan of hoPlan aItems sFolder to aItems
+        Send Destroy of hoPlan
+        Set paCopyItems to aItems
+        Send RenderRows
+    End_Procedure
+
+    /* Walk the ticked rows and price them.
+
+       Only the ticked ones: on a real workspace the unticked rows are the 5.5 GB of dead Data
+       copies, and reading them to report a number nobody asked for is the slowest possible way to
+       be unhelpful.
+
+       Runs from the Measure button's OnButtonClick, after the web click. The ticks were synced from
+       the grid by its OnClick, inside the click - not here: this runs from the click relay's timer,
+       where a grid read faults (err 98). */
+    Procedure MeasureAllRows
+        tCopyItem[] aItems
+        Handle hoPlan
+        Integer i iMax
+
+        Get paCopyItems to aItems
+        Move (SizeOfArray(aItems) - 1) to iMax
+        If (iMax < 0) ;
+            Procedure_Return
+
+        // Cursor_Control, NOT Desktop - "of Desktop" compiles (Send resolves at runtime) then dies
+        // with error 98.
+        Send Cursor_Wait of Cursor_Control
+        Get Create (RefClass(cWorkspaceCopyPlan)) to hoPlan
+        For i from 0 to iMax
+            If (aItems[i].bSelected = True and aItems[i].bMeasured = False) ;
+                Get MeasureCopyItems of hoPlan aItems i to aItems
+        Loop
+        Send Destroy of hoPlan
+        Set paCopyItems to aItems
+        Send RenderRows
+        Send Cursor_Ready of Cursor_Control
+    End_Procedure
+
+    /* Build the plan for the workspace that is currently open. Fills the ARRAY only - it must not
+       touch the grid, because it runs from Popup, before the dialog (and the grid's COM control)
+       exists. The grid's own LoadData does the rendering, once there is something to render into. */
+    Procedure BuildPlan
+        tCopyItem[] aItems
+        Handle hoPlan
+        String sSws
+
+        Get psSWSFile of ghoApplication to sSws
+        Set psPlanForSws to sSws
+        If (sSws = "") Begin
+            Set paCopyItems to aItems
+            Procedure_Return
+        End
+        Get Create (RefClass(cWorkspaceCopyPlan)) to hoPlan
+        Get BuildCopyPlan of hoPlan sSws to aItems
+        Send Destroy of hoPlan
+        Set paCopyItems to aItems
+    End_Procedure
+
+    /* Every Popup starts from a FRESH plan and an unconfirmed answer.
+
+       Deliberate: the dialog object outlives one migration, so a stale pbConfirmed would read as
+       consent the user never gave this time - the same "verdict outrunning its evidence" failure the
+       guided trail's Ready state had to be fixed for. */
+    Procedure Popup
+        Set pbConfirmed to False
+        Set psPlanForSws to ""
+        Send BuildPlan
+        Forward Send Popup
+    End_Procedure
+
+    On_Key Key_Alt+Key_A  Send SelectAll    of oScope_grd
+    On_Key Key_Alt+Key_N  Send SelectNone   of oScope_grd
+    On_Key Key_Alt+Key_I  Send SelectInvert of oScope_grd
+    On_Key Key_Alt+Key_C  Send DoCancel
+End_Object
+
+/*  Loads the copied workspace OFF the current call stack.
+
+    Loading a workspace clears every view and re-pages the MDI, and the dashboard has never done
+    that inline from a click handler - every path there (recent chip, banner, Open dialog) arms
+    oDeferTimer and lets OnTimer do it. RunWorkspaceCopy runs inside the Alt+P accelerator's stack,
+    which is the same situation, and calling it there simply did nothing.
+
+    Nils 2026-08-06: the copy completed and the workspace stayed unchanged - no error, no clue. */
+Object oCopyDeferTimer is a cFTDeferTimer
+    // Show the copy's Libraries dialog once it is open (2026-08-17) - so the dialog and the title
+    // name the same workspace. One-shot, like the copy's .sws, which ArmAction parks as the parameter.
+    Property Boolean pbLibrariesAfterOpen False
+
+    // sParam is the copy's .sws.
+    Procedure OnDeferredAction Integer iAction String sParam
+        Boolean bLibs bOk
+
+        Get pbLibrariesAfterOpen to bLibs
+        Set pbLibrariesAfterOpen to False
+        If (sParam = "") ;
+            Procedure_Return
+        // Recorded in the recent list by UpdateWorkspaceSelectorDisplay itself, BEFORE its broadcast
+        // repaints the Start Center (2026-09-03) - a call here, after it, came too late for that paint.
+        Send UpdateWorkspaceSelectorDisplay of ghoApplication sParam
+        /* AFTER THE SCOPE QUESTION, not before it (Nils 2026-09-14: the Libraries dialog came up
+           first, then "Choose what to scan" landed on top of it with the view switched underneath).
+           The dashboard asks about scope from its own deferred timer once the board has rendered; a
+           modal opened HERE is still up when that timer fires, and the two interleave. So the wish
+           is parked on the application, stamped with the copy's own .sws, and the dashboard's timer
+           opens the Libraries dialog right after its question - see oScopeOfferTimer
+           (DashboardFT.vw). Stamped, so a wish nobody consumed can never fire on a later workspace. */
+        If (bLibs = True) ;
+            Set psLibrariesAfterScopeWS of ghoApplication to sParam
+    End_Procedure
+End_Object
+
+// The destination the dialog was left holding. Separate from the row list because the two answer
+// different questions - what to copy, and where to put it.
+Function MigrationCopyDestination Global Returns String
+    String sDest
+    Get psDestination of (oSelectCopyScope_dg(Self)) to sDest
+    Function_Return sDest
+End_Function
+
+// sPath relative to sHome WITHOUT a leading ".\", or "" when not under sHome. Places a file at the
+// same spot inside the copy as it occupied in the original.
+Function RelativeInsideHome Global String sPath String sHome Returns String
+    String sLow sHomeLow
+    Move (Lowercase(sPath)) to sLow
+    Move (Lowercase(sHome)) to sHomeLow
+    If (Right(sHomeLow, 1) = "\") ;
+        Move (Left(sHomeLow, Length(sHomeLow) - 1)) to sHomeLow
+    If (sHomeLow = "") ;
+        Function_Return ""
+    If (Left(sLow, Length(sHomeLow) + 1) <> (sHomeLow + "\")) ;
+        Function_Return ""
+    Function_Return (Mid(sPath, Length(sPath), Length(sHomeLow) + 2))
+End_Function
+
+/*  One line of feedback for a copy step that has no count of its own.
+
+    The copy loop has a file count and a progress bar; everything after it is a handful of discrete
+    steps, one of which (df-cli) can take a while. This puts the step name where the panel's other
+    users put theirs - Message is the phase, TableName is the detail line and also ticks the elapsed
+    clock - and pumps once through Check_StatusPanel so the text reaches the screen BEFORE the step
+    begins rather than after it ends.
+
+    GLOBAL, because its only caller is: RunWorkspaceCopy is a global function, so there is no Self
+    to send a message to. Defined above it for the same reason every global here is.
+
+    The return from Check_StatusPanel is deliberately dropped: Cancel is switched OFF for these
+    steps (see the note where that happens), so there is no answer to honour.  */
+Procedure CopyPhase Global String sWhat
+    Integer iCheck
+    /* ONE field, not three (Nils 2026-08-14: "that is repeated three times on the status_panel ...
+       Once is enough"). The first cut set Message, TableName and Action to the same string, which
+       filled the panel with one sentence printed three times. Message_Text is the phase line - the
+       other two have their own jobs during the file loop (the path, and the n-of-m count) and are
+       cleared once when the panel switches to phase mode. */
+    Set Message_Text of ghoStatusPanel to sWhat
+    // Pumps the queue, so the text is on screen BEFORE the step runs rather than after it.
+    Get Check_StatusPanel of ghoStatusPanel to iCheck
+End_Procedure
+
+/*  THE COPY EXECUTOR. Writes the derived workspace, then reports what it could not settle.
+
+    Order matters and is not arbitrary:
+      1. the FILES, because everything after them writes INTO the tree they create;
+      2. the .ws, rewritten so the copy's folder paths point at the copy (a no-op for an all-relative
+         workspace, and the difference between a real copy and a decoy for an absolute one);
+      3. the .sws, carrying the target version and the retargeted [Libraries];
+      4. synthesised library headers, written into the COPY's Libraries tree - never the original's,
+         which would modify the very workspace this exists to leave untouched.
+
+    Cancel leaves a PARTIAL tree and says so. It is deliberately not rolled back: deleting a tree the
+    user pointed us at is a bigger risk than leaving one they can inspect and remove themselves.
+
+    Returns True when the copy completed. */
+Function RunWorkspaceCopy Global tCopyItem[] aChosen String sNewHome String sTargetVersion Returns Boolean
+    Handle hoPlan
+    tCopyPair[] aFiles
+    tLibrarySwsToAdd[] aAdd
+    String[] asLines asShared asMissing asReused asWritten asUnresolved asDropRaw
+    String[] asListedPrograms asNowPrograms asLostPrograms asCliLines
+    tLibraryInfo[] aLeftOut
+    String sSws sOldHome sNewSws sLeaf sStem sMsg sNewLibSws sDestWs sSrcVer sDfCli sConvertNote sLostNote sCliSaid
+    Integer i iMax iPos iTotal iCheck iRetval iKept iSwsFormat iRunResult iOutputsSkipped
+    Boolean bOk bCancel bTick bSkip bConverted bVersionedLibNames
+
+    Get psSWSFile of ghoApplication to sSws
+    If (sSws = "" or sNewHome = "") ;
+        Function_Return False
+
+    /* REFUSED BEFORE ANYTHING IS WRITTEN, and said out loud rather than returning a quiet False.
+
+       This is the last gate a relative destination passes through, and it is reachable without the
+       dialog - so the check cannot live only in DoConfirm. A relative path is not rejected by
+       Windows; it is resolved against the PROCESS working directory, so the copy runs, reports
+       success, and puts the workspace somewhere nobody chose. On 2026-08-12 that was
+       C:\Users\...\OneDrive\Documents, while the E: drive the user picked stayed empty. */
+    If (IsFullPathForCopy(sNewHome) = False) Begin
+        Send FTStopBox ("Nothing was copied. The destination is not a full path:" * sNewHome + Character(10) + Character(10) + "A path without a drive (C:\...) or a server (\\server\share) is resolved against whatever folder this program is running in, so the copy would land somewhere neither of us chose. Choose the destination again.") "Destination is not a full path"
+        Function_Return False
+    End
+
+    Get Create (RefClass(cWorkspaceCopyPlan)) to hoPlan
+    /* The home of the workspace BEING COPIED, derived from its own .sws - NOT
+       psHome of phoWorkspace(ghoApplication), which is the home of the workspace DFRefactor itself
+       is running in.
+
+       That mistake did not look like one: with a foreign old-home, _RelativeToHome returned "" for
+       every row, so every folder took the outside-home branch and was placed by LEAF name. For
+       AppSrc, Bitmaps and DdSrc - which sit directly under home - leaf placement is byte-identical
+       to the correct answer. Only the nested library paths gave it away, by flattening
+       Libraries\vWin32fh to vWin32fh and Libraries\DataFlex Reports 4.0\18.0 to 18.0, leaving every
+       [Libraries] entry pointing at a folder that no longer existed. Nils 2026-08-05. */
+    Get WorkspaceConfigFile of hoPlan sSws to sDestWs
+    If (sDestWs <> "") ;
+        Get WorkspaceHomeFromConfig of hoPlan sDestWs to sOldHome
+    If (sOldHome = "") Begin
+        // No .ws to ask: the .sws's own folder IS the home, which is what the library resolver
+        // assumes too.
+        Move (RightPos("\", sSws)) to iPos
+        If (iPos > 0) ;
+            Move (Left(sSws, iPos - 1)) to sOldHome
+    End
+    If (sOldHome = "") Begin
+        Send Destroy of hoPlan
+        Send FTStopBox "The workspace home could not be determined, so the copy would be laid out wrongly." "Copy failed"
+        Function_Return False
+    End
+
+    Get CopyFileList of hoPlan aChosen sOldHome sNewHome to aFiles
+    Get piCompilerOutputsSkipped of hoPlan to iOutputsSkipped     // read now - hoPlan is destroyed before the report
+
+    /* LIBRARIES THAT WILL NOT BE COPIED, asked BEFORE anything is written rather than reported
+       afterwards. A library folder that already exists beside the destination is left exactly as
+       it is - it can belong to other workspaces, and this workspace's copy of it is not
+       necessarily the newest, so writing into it would overwrite their files with ours.
+
+       The consequence is the user's to accept, not ours to assume: the copy will compile against
+       whatever version is already sitting there, which may not be the version the original was
+       built with. Defaults to No, because that is the answer that loses nothing. */
+    Get ExistingSiblingFolders of hoPlan aChosen sOldHome sNewHome to asReused
+    If (SizeOfArray(asReused) > 0) Begin
+        Move ("These libraries will NOT be copied - a folder of that name already exists beside the destination:" + Character(10)) to sMsg
+        Move (SizeOfArray(asReused) - 1) to iMax
+        For i from 0 to iMax
+            Move (sMsg + Character(10) + "   " + asReused[i]) to sMsg
+        Loop
+        Move (sMsg + Character(10) + Character(10) + "They are left untouched because other workspaces may be using them, and this workspace's copies are not necessarily newer. The copy will build against the version already there, which may differ from the one the original was built with." + Character(10) + Character(10) + "Continue?") to sMsg
+        Get FTYesNoBox sMsg "Libraries already at the destination" MB_DEFBUTTON2 to iRetval
+        If (iRetval <> MBR_Yes) Begin
+            Send Destroy of hoPlan
+            Function_Return False
+        End
+    End
+
+    /* LIBRARIES INSIDE THE HOME THAT ARE NOT TICKED (Nils 2026-09-03, LegacyApp -> E:\LegacyApp).
+       VDFQuery and vWin32fh lived under the workspace's own Libraries\ folder and were unticked.
+       Their [Libraries] entries went into the copy as written - right for a library BESIDE the
+       workspace, which the copy shares, wrong inside it: nothing is at that path in the copy.
+       df-cli read the dangling pair, refused to convert the workspace, and Add Package stayed dim
+       with no word about why. Asked BEFORE anything is written, default No; on Yes the entries are
+       left out of the copy's .sws (NewSwsLinesDropping) so the conversion runs, and the report
+       names them for the Libraries dialog to add back. */
+    Get UncopiedInsideHomeLibraries of hoPlan aChosen sSws sOldHome to aLeftOut
+    If (SizeOfArray(aLeftOut) > 0) Begin
+        Move ("These libraries live INSIDE this workspace and are not ticked, so they will NOT be copied:" + Character(10)) to sMsg
+        Move (SizeOfArray(aLeftOut) - 1) to iMax
+        For i from 0 to iMax
+            Move (sMsg + Character(10) + "   " + aLeftOut[i].sName + "   (" + aLeftOut[i].sRawEntry + ")") to sMsg
+            Move aLeftOut[i].sRawEntry to asDropRaw[i]
+        Loop
+        Move (sMsg + Character(10) + Character(10) + "In the copy their entries would point at folders that do not exist - df-cli then refuses to convert the workspace and no package can be added. If you continue, those entries are left out of the copy's workspace file. Add the libraries back afterwards from the Libraries dialog: Add Library... for a folder on disk, Add Package... for a DataFlex 26 package." + Character(10) + Character(10) + "Continue without them?") to sMsg
+        Get FTYesNoBox sMsg "Libraries inside the workspace are not ticked" MB_DEFBUTTON2 to iRetval
+        If (iRetval <> MBR_Yes) Begin
+            Send Destroy of hoPlan
+            Function_Return False
+        End
+    End
+
+    Move (rfDirectoryCreateEx(sNewHome, False)) to bOk
+    If (bOk = False) Begin
+        Send Destroy of hoPlan
+        Send FTStopBox ("The destination folder could not be created:" * sNewHome) "Copy failed"
+        Function_Return False
+    End
+
+    /* ---- 1. the files -------------------------------------------------------------------------
+       Driven through the STANDARD status panel, so the copy is visible and can actually be stopped.
+       A wait cursor alone was not enough: on a real workspace this is thousands of files, and the
+       cancel check had nothing to read because no window offered a Cancel button. Check_StatusPanel
+       is the panel's own cancel, and it pumps the queue as a side effect.
+
+       The count is throttled by ProgressTick rather than a fixed every-Nth-file: it repaints on a
+       time threshold, so a folder of tiny files does not spend its time redrawing and a folder of
+       large ones still updates. */
+    /* Initialize AFTER Start, not before. Start_StatusPanel activates the panel; text set while it
+       is still inactive does not reach the controls, which is why the message and action areas came
+       up blank. Every setter pumps once the panel is live.
+
+       Initialize_StatusPanel TAKES caption, title and message - the three Sets it performs
+       internally. Sending it bare raises error 57 at the panel, not at the call. */
+    /* StartStatusPanel is the panel's OWN entry point, and bypassing it was why nothing appeared.
+
+       Calling Initialize_StatusPanel and Start_StatusPanel by hand skips the visibility flags -
+       Progress_Bar_Visible_State, Progress_Bar_Overall_Visible_State, Cancel_Button_Visible_State -
+       which default off, so the bar and the Cancel button were never shown however carefully their
+       values were set. StartStatusPanel sets those, sizes the bar from its third argument, calls
+       EnableCancelButton, and only then Initializes and Starts (in THAT order - my earlier
+       "Initialize after Start" was a guess in the opposite direction).
+
+       Reset_StatusPanel first, so a panel left in some other run's state cannot leak into this one.
+       Nils 2026-08-06: two attempts at this from first principles produced nothing on screen; the
+       package had the answer the whole time. */
+    /* Driven exactly as cRefactorEngine drives it, which is the only pattern known to work here.
+
+       The bar is ghoProgressBar and it is made visible with Visible_State - NOT the panel's
+       Progress_Bar_Visible_State, which is what two earlier attempts set and why nothing ever
+       appeared. Range and step go on the bar object directly, the way the engine's per-file and
+       per-line loops do.
+
+       Field conventions follow the engine's: Caption = the run, Title = the phase, TableName = the
+       current file path, Action (Update_StatusPanel) = the fine-grained count. PanelPaintDue is the
+       engine's own throttle and it pumps the queue, so the panel keeps painting and its Cancel stays
+       live without a home-made tick. */
+    Move (SizeOfArray(aFiles)) to iTotal
+    Set Allow_Cancel_State of ghoStatusPanel to True
+    Send Start_StatusPanel of ghoStatusPanel
+    Set Caption_Text of ghoStatusPanel to ("Copying workspace -" * String(iTotal) * "files")
+    Set Title_Text   of ghoStatusPanel to ("To:" * String(sNewHome))
+    Set Message_Text of ghoStatusPanel to "Copying files"
+    Set piPosition    of ghoProgressBar to 0
+    Set piAdvanceBy   of ghoProgressBar to 1
+    Set piMaximum     of ghoProgressBar to iTotal
+    Set Visible_State of ghoProgressBar to True
+    Send ProgressTickStart of ghoApplication
+
+    Move False to bCancel
+    Move (iTotal - 1) to iMax
+    For i from 0 to iMax
+        // The containing folder is created per file - rfDirectoryCreateEx returns early when it
+        // already exists, so the tree needs no separate pre-pass.
+        /* NEVER overwrite a file that is NEWER than its source (Nils 2026-08-06).
+
+           An out-of-home folder - a shared library tree, typically, which is WHY it sits above the
+           workspace home - lands in the destination by leaf name. If the destination already holds
+           one of the same name, serving other workspaces, an unguarded copy would replace their
+           current library files with this workspace's older ones. Silent, and outside the copy.
+
+           Same-age or older is replaced, which is what makes a re-run into a half-finished copy do
+           the right thing. Newer is kept and COUNTED - a skip nobody is told about would read as a
+           successful copy. */
+        Move False to bSkip
+        If (vFilePathExists(aFiles[i].sDest) <> 0) Begin
+            If (rfFileDate(aFiles[i].sDest) > rfFileDate(aFiles[i].sSource)) Begin
+                Move True to bSkip
+                Increment iKept
+            End
+        End
+        If (bSkip = False) Begin
+            Move (rfDirectoryCreateEx(aFiles[i].sDest, True)) to bOk
+            Move (vCopyFile(aFiles[i].sSource, aFiles[i].sDest)) to bOk
+        End
+        Get PanelPaintDue of ghoStatusPanel to bTick
+        If (bTick = True) Begin
+            /* Field conventions, per the engine's own: Caption = "X - File n of m", TableName =
+               the full path (the multi-line box, and the setter that also ticks the elapsed clock),
+               Action = the fine-grained count. Putting a path in the Action area or the Title
+               breaks the convention every other panel user follows. */
+            Set TableName_Text of ghoStatusPanel to ("File:" * String(aFiles[i].sDest))
+            Set piPosition     of ghoProgressBar to (i + 1)
+            Send Update_StatusPanel of ghoStatusPanel (String(i + 1) * "of" * String(iTotal))
+            // Check_StatusPanel returns MSG_CANCEL (not a Boolean) and pumps events itself.
+            Get Check_StatusPanel of ghoStatusPanel to iCheck
+            If (iCheck = MSG_CANCEL) Begin
+                Move True to bCancel
+                Move iMax to i
+            End
+        End
+    Loop
+    If (bCancel = True) Begin
+        Send Stop_StatusPanel of ghoStatusPanel
+        Send Destroy of hoPlan
+        Send FTStopBox ("The copy was stopped. A PARTIAL workspace is left in" * sNewHome + ". Nothing in the original was touched - delete the partial copy and start again when ready.") "Copy cancelled"
+        Function_Return False
+    End
+
+    /* THE PANEL STAYS UP FOR THE DERIVATION (Nils 2026-08-14).
+
+       It used to stop here, and everything below - rewriting the .ws, writing the .sws, the df-cli
+       conversion, the synthesised headers - ran behind nothing but an hourglass. On a real workspace
+       that is a long, silent wait, and Nils read it as the hang we had just finished fixing: "I
+       thought the process had hung ... eventually the Libraries dialog came up. It was confusing."
+
+       A visible panel naming the current step is the whole fix. It does NOT animate through the
+       df-cli call - that call blocks the message pump by design - but a frozen panel that says
+       "Converting the workspace ... df-cli" is a different thing entirely from a bare wait cursor:
+       one tells you what is happening, the other leaves you guessing.
+
+       CANCEL COMES OFF. These steps derive one workspace from another and are not safely
+       interruptible half way; leaving a live Cancel that the code then ignores is worse than no
+       Cancel at all. The file loop above is where stopping is safe, and it keeps its own. */
+    Set Allow_Cancel_State of ghoStatusPanel to False
+    Set Visible_State of ghoProgressBar to False
+    Set Caption_Text of ghoStatusPanel to "Deriving the copy"
+    // The file loop left a path in TableName and an "n of m" in Action. Both are about files, and
+    // there are no more files - clearing them once is what leaves the phase line standing alone.
+    Set TableName_Text of ghoStatusPanel to ""
+    Send Update_StatusPanel of ghoStatusPanel ""
+    Send CopyPhase "Copied. Now deriving the new workspace..."
+
+    // ---- 2. the .ws (folder paths) ------------------------------------------------------------
+    Send CopyPhase "Writing the workspace configuration (.ws)"
+    Get WorkspaceConfigFile of hoPlan sSws to sDestWs
+    If (sDestWs <> "") Begin
+        Get RelativeInsideHome sDestWs sOldHome to sLeaf
+        If (sLeaf <> "") Begin
+            Get RewrittenWorkspaceLines of hoPlan sSws sNewHome aChosen to asLines
+            If (SizeOfArray(asLines) > 0) Begin
+                Move (vFolderFormat(sNewHome) + sLeaf) to sDestWs
+                Move (rfDirectoryCreateEx(sDestWs, True)) to bOk
+                Get rfWriteEncodedFileFromStringArray (&asLines) sDestWs C_NewLine False to bOk
+            End
+        End
+    End
+
+    // ---- 3. the .sws (target version + retargeted libraries) ----------------------------------
+    Send CopyPhase "Writing the workspace file (.sws)"
+    Move (RightPos("\", sSws)) to iPos
+    Move (Right(sSws, (Length(sSws) - iPos))) to sStem
+    Move (RightPos(".", sStem)) to iPos
+    If (iPos > 1) ;
+        Move (Left(sStem, iPos - 1)) to sStem
+    // asDropRaw: the unticked inside-home libraries the user agreed to leave behind (above).
+    Get NewSwsLinesDropping of hoPlan sSws sTargetVersion asDropRaw to asLines
+    If (SizeOfArray(asLines) > 0) Begin
+        // The programs the copy's .sws lists, kept for the check after the conversion in 4b -
+        // asLines is reused for the library headers before then.
+        Move (SwsIniProjectsFromLines(asLines)) to asListedPrograms
+        // Named for the version it is FOR - with the SOURCE version dropped and spaces removed, so
+        // it cannot end up stating two versions (see MigratedSwsFileName).
+        Get SwsDataFlexVersion of hoPlan sSws to sSrcVer
+        Get MigratedSwsFileName of hoPlan sSws sSrcVer sTargetVersion to sStem
+        Move (vFolderFormat(sNewHome) + sStem) to sNewSws
+        Get rfWriteEncodedFileFromStringArray (&asLines) sNewSws C_NewLine False to bOk
+    End
+
+    Send CopyPhase "Writing library headers for the target version"
+    /* ---- 4. synthesised library headers, WHEREVER THAT LIBRARY LANDED -------------------------
+
+       PLACED BY DestinationForFile, the same rule that placed the library's own files. It used to
+       be RelativeInsideHome, which answers only "is this inside the old home" - so a SIBLING
+       library got no header at all while step 3 had already retargeted the [Libraries] entry to
+       name one. The copy then pointed at a file nobody wrote, and df-cli called the workspace
+       BROKEN. Found on a real 19.1 -> 26.0 copy of a DataFlex example, 2026-08-12.
+
+       NEVER OVERWRITES. A sibling library may be one the copy did not write at all - Nils's rule is
+       that an existing sibling is left completely alone and used as it stands - so a header that is
+       already there belongs to whoever put it there. Additive only.
+
+       THE REPORT NAMES WHAT WAS WRITTEN, not what was wanted. asWritten is collected here and used
+       below instead of LibrariesWithoutTargetBuild, so the completion message can no longer claim a
+       header that never landed. That claim is what hid this bug: the report said the headers were
+       written, and they were not. */
+    Get LibrarySwsToAdd of hoPlan sSws sTargetVersion to aAdd
+    Move (SizeOfArray(aAdd) - 1) to iMax
+    For i from 0 to iMax
+        Get DestinationForFile of hoPlan aAdd[i].sNewFile sOldHome sNewHome to sNewLibSws
+        If (sNewLibSws <> "") Begin
+            If (vFilePathExists(sNewLibSws) = 0) Begin
+                Get NewLibrarySwsLines of hoPlan aAdd[i].sTemplateFile aAdd[i].sVersion to asLines
+                If (SizeOfArray(asLines) > 0) Begin
+                    Move (rfDirectoryCreateEx(sNewLibSws, True)) to bOk
+                    Get rfWriteEncodedFileFromStringArray (&asLines) sNewLibSws C_NewLine False to bOk
+                    If (bOk = True) ;
+                        Move (aAdd[i].sLibName * "-" * sNewLibSws) to asWritten[-1]
+                End
+            End
+        End
+    Loop
+
+    /* ---- 4b. a DataFlex 26 target gets the DataFlex 26 workspace FORMAT ------------------------
+
+       NewSwsLines writes an INI .sws, because that is the format it rewrites. For a DF26 target
+       that leaves the copy in the old shape wearing the new version number - and the old shape
+       cannot hold the thing DF26 workspaces are FOR: a package lives in the JSON "dependencies"
+       array, and [Libraries] has nowhere to put one. Converting is therefore not tidiness, it is
+       what makes the copy a DataFlex 26 workspace rather than a DataFlex 25 workspace that says 26.
+
+       ALWAYS, on a 26+ target (Nils 2026-08-12). The copy exists precisely to be the new-version
+       one; asking would be asking whether the user meant what they chose two dialogs ago.
+
+       THE WORKSPACE ONLY - no --recursive. DataFlex 26 itself converts the workspace it migrates
+       and leaves library .sws files alone (1 JSON against 103 INI, measured 2026-08-05), and a JSON
+       workspace referencing INI libraries is the normal arrangement, not a broken one. Converting
+       the copied libraries as well would rewrite files that are library artifacts.
+
+       AFTER the headers and BEFORE the Libraries dialog, so what the user then sees and edits is
+       the final format, and any change they make is written by the JSON writer rather than by the
+       INI one into a file that is about to be replaced.
+
+       NOT AVAILABLE IS NOT A FAILURE. df-cli ships with DataFlex 26; if the chosen compiler has
+       none beside it the copy stays INI and the report says so, rather than the step failing or -
+       worse - passing quietly. */
+    Move False to bConverted
+    Move "" to sConvertNote
+    Move "" to sLostNote
+    If (sNewSws <> "" and sTargetVersion <> "") Begin
+        Get IsVersionBelow of hoPlan sTargetVersion "26.0" to bSkip
+        If (bSkip = False) Begin
+            Get DfCliPath to sDfCli
+            If (sDfCli = "") Begin
+                Move ("The copy is in the older INI workspace format. DataFlex" * sTargetVersion * "workspaces use the JSON format, which df-cli converts - but no df-cli.exe was found beside the selected compiler, so the copy was left as it is. Run this to convert it by hand:" + Character(10) + "   df-cli convert --df" * sTargetVersion * '"' + sNewSws + '"') to sConvertNote
+            End
+            Else Begin
+                /* ALWAYS ATTEMPTED, and the chain check only EXPLAINS a failure (Nils 2026-08-14).
+
+                   It briefly did the opposite: check the chain first and skip the conversion when an
+                   entry did not resolve. That was wrong twice over.
+
+                   It broke the rule two dialogs up - "ALWAYS, on a 26+ target" - by quietly deciding
+                   for the user that the attempt was not worth making. And the test it decided on is
+                   not the test it looks like: for a PACKAGE dependency, bFound means "is that exact
+                   version installed in this cache", not "does a file exist" (see LibraryEntriesInfo).
+                   A nested JSON library naming a package that is not installed here would have made
+                   a perfectly convertible workspace refuse to convert.
+
+                   Attempting is safe for a reason MEASURED on 2026-09-14, and not the one written
+                   here before. Started with no console and nothing redirected, df-cli does NOT fail
+                   fast on "Failed to load workspace. Would you like to attempt a repair? (y/n):" -
+                   it waits until the deadline kills it (120 s of spinning cursor on a real copy,
+                   Nils's report). Started through the cmd.exe wrapper with its output to a log - the
+                   way the Convert dialog and every package call run it - the same failure exits in
+                   200 ms, and the log carries df-cli's own words for the report below. So:
+                   DfCliCaptureIn, never a bare run. Let df-cli decide - it is the one that knows -
+                   and use our chain walk for what it is good at, which is saying WHY afterwards. */
+                Send CopyPhase ("Converting to the DataFlex" * sTargetVersion * "JSON format - df-cli")
+                /* THE BAR COMES BACK for this one step, as a MARQUEE. df-cli reports no progress,
+                   so there is no percentage to show honestly; a bar that wraps says "still working"
+                   and claims nothing. RDCRunProgramBounded advances it on every poll - the range is
+                   set here because only the caller should decide how the bar is used. */
+                Set piPosition    of ghoProgressBar to 0
+                Set piMaximum     of ghoProgressBar to 30
+                Set Visible_State of ghoProgressBar to True
+                Send Cursor_Wait of Cursor_Control
+                // Working directory = the copy's own home. The .sws path is absolute so df-cli does
+                // not need it, but anything it writes relatively then lands in the copy rather than
+                // wherever this program happens to be pointed.
+                Move (DfCliCaptureIn(('convert --df' * sTargetVersion * '"' + sNewSws + '"'), sNewHome, CI_DfCliConvertTimeoutSecs)) to asCliLines
+                Move giLastDfCliExit to iRunResult
+                Send Cursor_Ready of Cursor_Control
+                Set Visible_State of ghoProgressBar to False
+                // ASKED OF THE FILE, not of the exit code: the only thing that matters is whether
+                // the copy is now JSON, and the file is the one witness that cannot be wrong.
+                Get SwsFormatOf of hoPlan sNewSws to iSwsFormat
+                Move (iSwsFormat = eSwsJson) to bConverted
+                /* EVERY PROGRAM MUST ARRIVE (Nils 2026-09-11), checked against the converted file
+                   the way the Compile program list reads it. NewSwsLinesDropping has already
+                   renumbered the section, so this should find nothing; it is here so that a program
+                   df-cli drops for any other reason is named in the report, not found missing
+                   later. */
+                If (bConverted = True) Begin
+                    Get GetWorkspaceProjects of ghoApplication sNewSws to asNowPrograms
+                    Move (SwsProgramsMissing(asListedPrograms, asNowPrograms)) to asLostPrograms
+                    Move (SwsProgramsMissingNote(asLostPrograms)) to sLostNote
+                End
+                If (bConverted = False) Begin
+                    Move ("The copy could NOT be converted to the DataFlex" * sTargetVersion * "JSON workspace format and is still in the older INI format. It will open, but it cannot hold DataFlex 26 packages.") to sConvertNote
+                    /* NAME THE REASON when we know it. "It did not convert" sends the user to a
+                       command line to find out why; naming the entries df-cli could not resolve
+                       points at the workspace itself, which is where the fix is. */
+                    If (iRunResult = CI_RDCRunToolTimedOut) ;
+                        Move (sConvertNote + Character(10) + Character(10) + "df-cli did not finish within" * String(CI_DfCliConvertTimeoutSecs) * "seconds and was stopped. It normally takes seconds.") to sConvertNote
+                    If (iRunResult = CI_RDCRunToolFailedToStart) ;
+                        Move (sConvertNote + Character(10) + Character(10) + "df-cli could not be started at all.") to sConvertNote
+                    // df-cli's own words - the last of them, where it states its decision (2026-09-14).
+                    Get DfCliOutputNote (&asCliLines) 12 to sCliSaid
+                    If (sCliSaid <> "") ;
+                        Move (sConvertNote + Character(10) + Character(10) + "df-cli said:" + sCliSaid) to sConvertNote
+                    Get UnresolvableLibraryRefs of hoPlan sNewSws sTargetVersion to asUnresolved
+                    Move (SizeOfArray(asUnresolved)) to iMax
+                    If (iMax > 0) Begin
+                        Move (sConvertNote + Character(10) + Character(10) + "df-cli reads the whole library chain before it converts, and" * String(iMax) * "reference(s) do not resolve:") to sConvertNote
+                        Decrement iMax
+                        For i from 0 to iMax
+                            Move (sConvertNote + Character(10) + "   " + asUnresolved[i]) to sConvertNote
+                        Loop
+                        Move (sConvertNote + Character(10) + Character(10) + "Each is declared by the workspace or by one of its libraries. Check whether the folder it names was part of the copy - a library reused from beside the new home is used AS IT STANDS and is never written to, so one that is incomplete will fail here.") to sConvertNote
+                    End
+                    Move (sConvertNote + Character(10) + Character(10) + "Try converting it by hand:" + Character(10) + "   df-cli convert --df" * sTargetVersion * '"' + sNewSws + '"') to sConvertNote
+                End
+            End
+        End
+    End
+
+    /* ---- 5. the copy's libraries - shown AFTER the "open it now?" answer, not before -----------
+
+       THE MOMENT THE LIST NEEDS A HAND. Steps 3 and 4 have just retargeted every [Libraries] entry
+       and synthesised a header for each library that ships no build for the target - decisions made
+       ON THE USER'S BEHALF, about the one part of the workspace this tool must never refactor.
+       Bringing a newer library across, and dropping one the old DataFlex version needed, is
+       hand-work the copy cannot do; offering it costs one dialog and saves a failed compile.
+
+       IT USED TO OPEN HERE, before the completion report and before the copy was loaded, on the
+       theory that editing the .sws of a LOADED workspace would leave the load disagreeing with the
+       file. Nils 2026-08-17, on a fresh copy: "I see on the top of the program Current workspace
+       WinservDf19.1 pointing to C:\...\ - was the Libraries dialog presented too early, before the
+       new workspace was open?" - the dialog was for the copy while the title still named the
+       original, and it read as the wrong workspace. And the theory does not hold: the ordinary
+       Libraries dialog edits the loaded workspace's .sws every day, and the app re-reads the
+       target's .sws when it changes. So the order is now: the report ends with "Open the copied
+       workspace now?"; YES loads the copy and THEN shows its Libraries (title and dialog agree - see
+       oCopyDeferTimer); NO shows the Libraries for the copy as before, then Explorer. */
+    Send CopyPhase "Reading the library chain"
+    Send Stop_StatusPanel of ghoStatusPanel
+
+    Get PathsSharedWithOriginal of hoPlan sSws aChosen to asShared
+    Get LibrariesWithoutTargetBuild of hoPlan sSws sTargetVersion to asMissing
+    // Read BEFORE the plan object goes: it is what lets the no-.sws report below name the actual
+    // reason instead of stating the bare fact. NewSwsLines refuses a JSON .sws by design.
+    Get SwsFormatOf of hoPlan sSws to iSwsFormat
+    /* The same gate _RetargetedLibraryEntry and LibrarySwsToAdd apply: from DataFlex 26 a
+       library's .sws filename is the author's, not ours to rewrite (Nils 2026-08-14), so no
+       entry is renamed and no header is synthesised - deliberately. The report below has to
+       branch on the SAME fact, because LibrariesWithoutTargetBuild does not: it kept counting
+       "needed" headers the writer was forbidden to write, and on every 26+ copy the completion
+       report warned that the workspace would not open when nothing was wrong (a
+       19.1 -> 26.0 copy, 2026-08-29 - the detector aimed at a population the writer excludes). */
+    Get IsVersionBelow of hoPlan sTargetVersion "26.0" to bVersionedLibNames
+    Send Destroy of hoPlan
+
+    /* REMEMBERED, so the Start Center does not offer to copy the copy and points the original at it
+       (Nils 2026-10-07: "It doesn't make much sense to copy a copy, does it?"). Only a copy with a .sws
+       of its own can be recognised - the record is keyed by it. A cancelled copy returned above. */
+    If (sNewSws <> "") ;
+        Send RecordWorkspaceCopy of ghoApplication sSws sNewSws
+
+    // ---- what the user still has to deal with -------------------------------------------------
+    Move ("Copied to" * sNewHome + "." + Character(10) + Character(10)) to sMsg
+    /* NO "open it in the Studio" (Nils 2026-08-06: "more confusing than helping").
+
+       This dialog ENDS by asking "Open the copied workspace now?", defaulting to Yes. So the line
+       here sent the user off to do, in another application, the very thing the last line offers to
+       do for them - two answers to one question inside one dialog, with the wrong one stated first.
+       The Studio is not where this migration continues either; DFRefactor is the tool that
+       refactors the copy, which is what it was copied FOR.
+
+       What survives is the half they cannot work out for themselves: the .sws name is DERIVED
+       (MigratedSwsFileName drops the source version and strips spaces), so a reader coming back to
+       this report later has no way to guess it. Guarded on sNewSws, because sStem still holds the
+       ORIGINAL workspace's stem when no new .sws was written - the old line named the original in
+       that case, and told you to go and open it. */
+    If (sNewSws <> "") ;
+        Move (sMsg + "Its workspace file is " + sStem + ". The original is untouched.") to sMsg
+    Else ;
+        Move (sMsg + "The original is untouched.") to sMsg
+    /* THE FORMAT IT ENDED UP IN, stated either way. A silent conversion is a change to the file the
+       user is about to open - the DataFlex 25 Studio cannot read a JSON .sws - and a silent
+       NON-conversion leaves them believing they have a DataFlex 26 workspace when they have a
+       DataFlex 25 one wearing the number. sConvertNote carries the reason when it did not happen. */
+    If (bConverted = True) ;
+        Move (sMsg + Character(10) + Character(10) + "CONVERTED to the DataFlex" * sTargetVersion * "workspace format (JSON) with df-cli, so it can use DataFlex" * sTargetVersion * "packages. Note that earlier DataFlex Studios cannot open this format - the original, in the old format, is untouched.") to sMsg
+    Else If (sConvertNote <> "") ;
+        Move (sMsg + Character(10) + Character(10) + sConvertNote) to sMsg
+    // A program the conversion lost is named whichever way the format question went.
+    If (sLostNote <> "") ;
+        Move (sMsg + Character(10) + Character(10) + sLostNote) to sMsg
+    /* COMPILER OUTPUT LEFT BEHIND, said in numbers (Nils 2026-08-17). The recopied WinServ arrived
+       with the original's WINSERV.prn and three .err files, and "Show last Check" read them as this
+       copy's compile. CopyFileList now skips .prn / .err / .dep; a leaner copy must not read as a
+       smaller one, so the count is stated and the reason with it. */
+    If (iOutputsSkipped > 0) Begin
+        Move (sMsg + Character(10) + Character(10) + "NOT COPIED - " + String(iOutputsSkipped) + " compiler output file(s) (.prn / .err / .dep). They belong to the ORIGINAL's last compile; carried across they would be read as this copy's, and the first Check here writes fresh ones.") to sMsg
+    End
+    If (iKept > 0) Begin
+        Move (sMsg + Character(10) + Character(10) + "KEPT " + String(iKept) + " file(s) that were already NEWER at the destination, rather than replacing them with this workspace's older copies. That normally means a folder there is shared with another workspace - check it before relying on this copy.") to sMsg
+    End
+    If (SizeOfArray(asReused) > 0) Begin
+        Move (sMsg + Character(10) + Character(10) + "NOT COPIED - these already existed beside the destination and were left untouched, so nothing another workspace put there was overwritten. The copy builds against the version that is there, which may not be the one the original used:" + Character(10)) to sMsg
+        Move (SizeOfArray(asReused) - 1) to iMax
+        For i from 0 to iMax
+            Move (sMsg + "   " + asReused[i] + Character(10)) to sMsg
+        Loop
+    End
+    If (SizeOfArray(asShared) > 0) Begin
+        Move (sMsg + Character(10) + Character(10) + "SHARED WITH THE ORIGINAL - left pointing where they pointed, because they sit outside the workspace and were not ticked:" + Character(10)) to sMsg
+        Move (SizeOfArray(asShared) - 1) to iMax
+        For i from 0 to iMax
+            Move (sMsg + "   " + asShared[i] + Character(10)) to sMsg
+        Loop
+    End
+    If (SizeOfArray(aLeftOut) > 0) Begin
+        Move (sMsg + Character(10) + Character(10) + "LEFT OUT - " + String(SizeOfArray(aLeftOut)) + " library(ies) inside the original were not ticked, so they were not copied and their entries were left out of the copy's workspace file (kept, they would have stopped the conversion). Add them back from the Libraries dialog - Add Library... for a folder on disk, Add Package... for a DataFlex 26 package:" + Character(10)) to sMsg
+        Move (SizeOfArray(aLeftOut) - 1) to iMax
+        For i from 0 to iMax
+            Move (sMsg + "   " + aLeftOut[i].sName + "   (" + aLeftOut[i].sRawEntry + ")" + Character(10)) to sMsg
+        Loop
+    End
+    /* WHAT WAS ACTUALLY WRITTEN, listed with its full path.
+
+       This used to list LibrariesWithoutTargetBuild - the libraries that NEEDED a header - and say
+       the headers "were written". For a sibling library none was, and the report said otherwise;
+       that sentence is what let a broken copy read as a finished one. Reporting the writes
+       themselves means the message cannot outrun the work again. */
+    If (SizeOfArray(asWritten) > 0) Begin
+        Move (sMsg + Character(10) + "LIBRARY HEADERS WERE WRITTEN for these, because they ship no .sws for DataFlex" * sTargetVersion + ". Right for a library whose code is version-independent; if one fails to compile, fetch a newer release of it:" + Character(10)) to sMsg
+        Move (SizeOfArray(asWritten) - 1) to iMax
+        For i from 0 to iMax
+            Move (sMsg + "   " + asWritten[i] + Character(10)) to sMsg
+        Loop
+    End
+    /* A LIBRARY THAT NEEDED A HEADER AND DID NOT GET ONE - a below-26 concern ONLY. Below 26 the
+       version lives in the library .sws FILENAME, so the copy renames each [Libraries] entry and
+       must write the header the renamed entry now names; one that did not land stops the workspace
+       opening, which is worth a sentence of its own rather than silence. The realistic cause is a
+       header that was already there (never overwritten) or a library whose folder the copy could
+       not place.
+
+       From 26 up NEITHER half runs - entries keep the filenames the library authors shipped and
+       still resolve - so this block said "will stop the workspace opening" about a workspace with
+       nothing wrong, on EVERY 26+ copy (8 needed / 0 written, 2026-08-29). The 26+
+       branch below states what is actually true instead: which libraries ship no 26.0 build, and
+       that bringing one forward is the Libraries dialog's or the package manager's decision. */
+    If (bVersionedLibNames = True and SizeOfArray(asMissing) > SizeOfArray(asWritten)) Begin
+        Move (sMsg + Character(10) + "CHECK THESE LIBRARIES - " + String(SizeOfArray(asMissing)) + " needed a DataFlex" * sTargetVersion + " header and " + String(SizeOfArray(asWritten)) + ;
+            " were written. Any entry in the copy's [Libraries] naming a file that is not there will stop the workspace opening; the Libraries dialog lists them:" + Character(10)) to sMsg
+        Move (SizeOfArray(asMissing) - 1) to iMax
+        For i from 0 to iMax
+            Move (sMsg + "   " + asMissing[i] + Character(10)) to sMsg
+        Loop
+    End
+    If (bVersionedLibNames = False and SizeOfArray(asMissing) > 0) Begin
+        Move (sMsg + Character(10) + "LIBRARIES WITHOUT A DATAFLEX" * sTargetVersion * ".SWS FILE - " + String(SizeOfArray(asMissing)) + ;
+            Character(10) + Character(10) + "Their entries still point at the .sws files they shipped with, unchanged - from DataFlex 26 a library's .sws filename and nothing was renamed." + ;
+            " Old libraries needs to be updated, Use the Libraries dialog. - Even better is to Add it as a package, if one exists:" + Character(10)) to sMsg
+        Move (SizeOfArray(asMissing) - 1) to iMax
+        For i from 0 to iMax
+            Move (sMsg + "   " + asMissing[i] + Character(10)) to sMsg
+        Loop
+    End
+    /* OFFER TO OPEN IT. Copying a workspace is not the goal - working on the copy is - so the
+       obvious next action belongs here rather than as a thing to go and do (Nils 2026-08-06).
+
+       ASKED, not done silently: loading a workspace clears every view and resets the refactoring
+       scope, which is too much to happen unannounced while the user is still reading a report that
+       may name libraries needing attention. Defaults to Yes - it is what you copied it FOR.
+
+       Explorer becomes the fallback rather than an extra: if the copy is being opened, a file
+       window over the top of it is noise; if it is not, "go and look at it" is exactly what was
+       wanted. */
+    /* GATED ON THERE BEING SOMETHING TO OPEN (Nils 2026-08-06).
+
+       The question used to be asked unconditionally, while the handler below required sNewSws - so
+       with no new .sws written, answering Yes silently did the No thing and opened Explorer. A
+       question whose Yes does not do what it says is the same defect as a button that looks live
+       and is not; it just hides one dialog further in.
+
+       When there is nothing to open the report SAYS SO, and says why. The realistic cause is not
+       exotic: the DF26 Studio stores a .sws as JSON, and NewSwsLines deliberately refuses to
+       rewrite that form because its INI surgery would append [Properties]/Version= to a JSON
+       document and produce a file neither tool can read. So a DF26 source workspace copies its
+       files perfectly and gets no derived .sws - exactly the case that would have offered to open
+       nothing. Explorer still follows, which is the useful thing left to do. */
+    If (sNewSws <> "") Begin
+        Move (sMsg + Character(10) + Character(10) + "Open the copied workspace now?") to sMsg
+        Get FTYesNoBox sMsg "Workspace copied" MB_DEFBUTTON1 to iRetval
+    End
+    Else Begin
+        If (iSwsFormat = eSwsJson) ;
+            Move (sMsg + Character(10) + Character(10) + "NO WORKSPACE FILE was written for the copy. This workspace's .sws is in the JSON format the DataFlex 26 Studio writes, and rewriting that form would corrupt it rather than retarget it, so it was left alone. Every copied file is in place - the copy needs a .sws of its own before it can be opened.") to sMsg
+        Else ;
+            Move (sMsg + Character(10) + Character(10) + "NO WORKSPACE FILE was written for the copy, so there is nothing to open yet. Every copied file is in place - the copy needs a .sws of its own before it can be opened.") to sMsg
+        Send FTInfoBox sMsg "Workspace copied"
+        Move MBR_No to iRetval
+    End
+    If (iRetval = MBR_Yes) Begin
+        // Armed, not called - see oCopyDeferTimer. The timer opens the copy and THEN shows its
+        // Libraries dialog, on what is by then the current workspace.
+        Set pbLibrariesAfterOpen of (oCopyDeferTimer(Self)) to True
+        Send ArmAction of (oCopyDeferTimer(Self)) 0 sNewSws
+    End
+    Else Begin
+        // Not opening it: the copy's libraries are still worth a look now - the .sws is just a file
+        // at this point and the next open picks up whatever is settled here.
+        If (sNewSws <> "") ;
+            Get MaintainWorkspaceLibraries sNewSws to bOk
+        // RDCRevealInExplorer, NOT RDCOpenUrl: RDCOpenUrl returns immediately unless the target starts
+        // http:// or https://, so it was a silent no-op on a folder path.
+        Send RDCRevealInExplorer sNewHome
+    End
+    Function_Return True
+End_Function
+
+/*  MAIN ACCESS METHOD - the one way to run the copy-scope step, following FillBackupFilesDialog.
+
+    Returns only the SELECTED rows, because "what should I copy" is the question the dialog exists to
+    answer; the caller has no use for the ones that were turned down. An EMPTY array means either
+    Cancel or nothing ticked - which call for the same thing, so they need no telling apart:
+
+        Get SelectMigrationCopyScope of (Client_Id(ghoCommandBars)) to aChosen
+        If (SizeOfArray(aChosen) = 0) Procedure_Return    // cancelled or nothing to do  */
+Function SelectMigrationCopyScope Returns tCopyItem[]
+    Handle ho hoFmt
+    tCopyItem[] aAll aChosen aNone
+    Boolean bOk
+    Integer i iMax iRetval iFormat
+    String sCompiler sAsk sWsPath
+
+    /* THE TARGET VERSION COMES FIRST (Nils 2026-08-05), and not merely for tidiness - three things
+       downstream cannot be decided without it:
+         - the new workspace's .sws is written FOR a version ([Properties] Version=);
+         - the library verdict is meaningless except against a target - "you are behind" is false for
+           a workspace whose target has no upstream build;
+         - the destination's default name is derived from it ("<name> DF26.0"), so asking for the
+           folder first would offer a name that cannot be right yet.
+
+       Gated on psCompiler, NOT psTargetDfVersion: ResolveTargetDataFlex falls back to DFRefactor's
+       OWN runtime, so the version is never blank and would silently pass a test it should fail. */
+    /* REFUSE a DF26 JSON workspace up front, before anything is asked or shown.
+
+       Not merely a courtesy. Every reader behind this step is INI-only, so a JSON workspace would
+       open a dialog with an empty grid (no declared paths resolve) and, if driven to OK, write a
+       .sws that NewSwsLines cannot produce - the guard there returns nothing rather than appending
+       INI lines to a JSON document. Saying so here means the user learns why, instead of meeting a
+       blank plan and guessing.
+
+       Checked on the FILE (SwsFormatOf reads its first non-blank character), never on the DataFlex
+       version: a DF26 workspace can still be INI, and the Studio only converts one when it
+       migrates it. */
+    Get psSWSFile of ghoApplication to sWsPath
+    If (sWsPath <> "") Begin
+        Get Create (RefClass(cWorkspaceFile)) to hoFmt
+        Get SwsFormatOf of hoFmt sWsPath to iFormat
+        Send Destroy of hoFmt
+        If (iFormat = eSwsJson) Begin
+            Move ("This workspace uses the DataFlex 26 JSON .sws format, which this step cannot read yet." + Character(10) + Character(10)) to sAsk
+            Move (sAsk + "Copying it would produce a workspace whose folders and libraries were never carried across, so the step stops here rather than making one." + Character(10) + Character(10)) to sAsk
+            Move (sAsk + "An INI-format .sws for the same workspace can be copied normally.") to sAsk
+            Send FTStopBox sAsk "JSON workspace not supported yet"
+            Function_Return aNone
+        End
+    End
+
+    Get psCompiler of ghoApplication to sCompiler
+    If (Trim(sCompiler) = "") Begin
+        // Character(10) for the line breaks - "\n" is NOT an escape in a DataFlex string literal, it
+        // is two characters, and FTYesNoBox (FTMessageBoxHtml) turns Character(10) into <br>.
+        Move ("Which DataFlex version are you migrating TO?" + Character(10) + Character(10)) to sAsk
+        Move (sAsk + "That choice comes from the compiler you select, and it decides three things: the version written into the new workspace's .sws, which build each shared library needs, and the name suggested for the copy." + Character(10) + Character(10)) to sAsk
+        Move (sAsk + "Choose a compiler now?") to sAsk
+        Get FTYesNoBox sAsk "Target DataFlex version not set" MB_DEFBUTTON1 to iRetval
+        If (iRetval <> MBR_Yes) ;
+            Function_Return aNone
+        Send Popup of (oCompilerSetup_dg(Client_Id(ghoCommandBars)))
+        Get psCompiler of ghoApplication to sCompiler
+        If (Trim(sCompiler) = "") ;
+            Function_Return aNone
+    End
+
+    Move (oSelectCopyScope_dg(Self)) to ho
+    Send Popup of ho
+    Get pbConfirmed of ho to bOk
+    If (bOk = False) ;
+        Function_Return aNone
+
+    Get paCopyItems of ho to aAll
+    Move (SizeOfArray(aAll) - 1) to iMax
+    For i from 0 to iMax
+        If (aAll[i].bSelected = True) ;
+            Move aAll[i] to aChosen[-1]
+    Loop
+    Function_Return aChosen
+End_Function

@@ -1,0 +1,1215 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cEditorColourScheme
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-27
+//
+// Description : An editor colour scheme as an object (Nils, 2026-07-27).
+//
+//               SEE ALSO: ScintillaApi.h.pkg for the original work done by Win van Antwerpen, Antwise Solutions.
+//
+//               WHAT THIS REPLACES. A scheme used to be one 504-character string of packed
+//               RRRGGGBBBAAA triples, and an element's identity was its POSITION in that string.
+//               gtColorer[] carried a hand-maintained offset per element - 5 and 6 for Text, 7 and 8
+//               for Numbers, and so on - assigned by hand in Register_Color_Elements. So the offset
+//               table and all seven built-in scheme strings had to stay in lockstep: one wrong number
+//               put a colour on the wrong element, silently, with nothing able to catch it. Nobody
+//               could see what a scheme looked like without counting characters. A quarter of the
+//               payload was an alpha byte that was always "000" - except when the whole triple was
+//               "255255255255", which was the magic sentinel for "no colour, use the default".
+//
+//               Here an element is an enum, a style is a struct with named fields, and a scheme is an
+//               object holding one style per element. Built-in schemes are declared a line at a time,
+//               so a scheme is reviewable in a diff. There are no offsets to keep in step.
+//
+//               WHAT WAS DROPPED. Tag Text, Tag Entities, Tag Element Names and Tag Attributes were
+//               HTML/XML colouring for the Hammer; the two divider-line entries were CodeMax's, and
+//               Scintilla has no equivalent. The "CodeMax supports this element" column went with the
+//               facade. Twenty-four elements became eighteen, all of which DFRefactor renders.
+//
+//               The legacy packed format is still READ, for one-time migration of saved schemes - see
+//               LoadLegacyPacked. It is never written. The seven built-in strings it used to hold now
+//               live in oEditorColourScheme-Tests.pkg as fixtures, where they prove the declarations
+//               below reproduce the original colours exactly.
+//
+//               A NOTE ON THE NAMES BELOW. gtColorer[] and Register_Color_Elements are referred to
+//               throughout this file and are no longer anywhere in DFRefactor - THColorer.pkg, which
+//               held them, stopped being compiled once the settings preview was rebuilt. They are
+//               named because they are what the offset table in LegacyOffsets is a transcription OF,
+//               and because a saved scheme in the packed format is only readable against them.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use Windows.pkg
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+
+// The colour elements, in the order the settings dialog lists them.
+#IFNDEF eEC_Window
+Enum_List
+    Define eEC_Window For 0
+    Define eEC_LeftMargin
+    Define eEC_Bookmark
+    Define eEC_Text
+    Define eEC_Numbers
+    Define eEC_Keywords
+    Define eEC_Operators
+    Define eEC_ScopeKeywords
+    Define eEC_Comments
+    Define eEC_Strings
+    Define eEC_LineNumbers
+    Define eEC_HighlightedLine
+    Define eEC_StringTyping
+    Define eEC_BraceHighlight
+    Define eEC_UnmatchedBrace
+    Define eEC_MetaTags
+    Define eEC_Selection
+    Define eEC_PreProcessor
+End_Enum_List
+Define CI_EditorElementCount for 18
+#ENDIF
+
+// A colour of -1 means "no colour of its own" - the consumer falls back to the window
+// colour. It replaces the old "255255255255" sentinel, which was indistinguishable from
+// opaque white at a glance.
+#IFNDEF CI_NoColour
+Define CI_NoColour for -1
+#ENDIF
+
+// The built-in theme names. A theme is referred to by name in the settings, the theme
+// combo and the stored file, so the name is a value the code passes around - not a
+// literal to retype at each site.
+#IFNDEF CS_ThemeWhite
+Define CS_ThemeWhite    for "White"
+Define CS_ThemeBlack    for "Black"
+Define CS_ThemeBlue     for "Blue"
+Define CS_ThemeLime     for "Lime"
+Define CS_ThemeSerene   for "Serene"
+Define CS_ThemeSahara   for "Sahara"
+Define CS_ThemeLucas    for "Lucas"
+Define CS_ThemeDataFlex for "DataFlex"
+#ENDIF
+
+/* What separates one element from the next in the serialized form. Deliberately the
+   literal two-character token backslash-n, NOT a real line break: the settings store
+   splits a value on exactly that sequence, so each element arrives in the JSON as its
+   own array entry instead of one long run. DeserializeScheme also accepts real line breaks,
+   for a file somebody has edited by hand. */
+#IFNDEF CS_SchemeLineBreak
+Define CS_SchemeLineBreak for "\n"
+#ENDIF
+
+// How translucent a selection is drawn on a dark scheme. Enough to read the selection as
+// a block, light enough that every token keeps its own colour.
+#IFNDEF CI_SelectionWash
+Define CI_SelectionWash for 110
+// "Work it out from the scheme" - the default, and distinct from SC_ALPHA_NOALPHA, which
+// is a scheme explicitly asking for a solid selection.
+Define CI_SelectionAlphaAuto for -1
+// Below this perceived luminance a scheme counts as dark. Mid-grey, on the usual
+// 0.299R + 0.587G + 0.114B weighting - the eye is far more sensitive to green than blue.
+Define CI_DarkSchemeLuminance for 128
+#ENDIF
+
+// How translucent the brace-match box is drawn. The fill is a wash - it has to read as a
+// box without dimming the character inside it - and the edge is firmer, because the
+// OUTLINE is what actually makes a one-character box locatable at a glance. The bad-brace
+// edge is firmer still: an unbalanced brace is a warning and should not be missable.
+#IFNDEF CI_BraceWashFill
+Define CI_BraceWashFill    for 80
+Define CI_BraceWashEdge    for 170
+Define CI_BraceBadWashEdge for 220
+#ENDIF
+
+Struct tEditorStyle
+    Integer iForeColor
+    Integer iBackColor
+    Boolean bBold
+    Boolean bItalic
+    Boolean bUnderline
+End_Struct
+
+/* One tokenset's DARK foreground, read from the target install's Lib\DataFlex.lng. The Studio keeps
+   a light and a dark colour per tokenset there (forecolor / darkforecolor), and the DataFlex built-in
+   scheme below is a hand-transcription of the dark half - the values matched the file exactly when
+   checked on 2026-08-01, which is what makes reading it a subtraction rather than a feature. */
+Struct tLngTokenColour
+    String  sTokenSet     // the tokenset name as the file spells it, e.g. "Line Comments"
+    Integer iDark         // the darkforecolor as a DataFlex colour
+End_Struct
+
+Class cEditorColourScheme is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Property String psSchemeName ""
+        Property tEditorStyle[] ptStyles
+        /* How translucent the selection is drawn: 0 invisible, 255 opaque,
+           SC_ALPHA_NOALPHA solid, CI_SelectionAlphaAuto (the default) work it out from
+           the scheme. Translucency lets every token keep its own colour while the ground
+           shifts underneath, which is what a dark scheme needs. */
+        Property Integer piSelectionAlpha CI_SelectionAlphaAuto
+        /* Parsed once per object: the target install's dark palette (see _LngDarkColours). Held per
+           OBJECT rather than globally because a scheme object outlives no more than the dialog that
+           made it, and the target install can change under a longer-lived cache - the settings
+           preview creates a fresh scheme each time it repaints, which is exactly when a changed
+           compiler should start showing through. */
+        Property tLngTokenColour[] paLngColours
+        Property Boolean           pbLngLoaded False
+        Send LoadBuiltIn CS_ThemeWhite
+    End_Procedure
+
+    /* The Selection element is the one entry whose two colour slots do not mean
+       fore/back in the usual way, and these two names exist so nobody has to remember
+       that. The packed format only ever had ONE selection colour, at offset 40, and it
+       was the BACKGROUND - so it lives in the fore slot. The back slot was unused, and
+       now carries the selection's TEXT colour. CI_NoColour there means "leave the
+       syntax colours alone", which is what you want with translucency on. */
+    Function SelectionBackColor Returns Integer
+        tEditorStyle Appearance
+        Get StyleFor eEC_Selection to Appearance
+        Function_Return Appearance.iForeColor
+    End_Function
+
+    Function SelectionTextColor Returns Integer
+        tEditorStyle Appearance
+        Get StyleFor eEC_Selection to Appearance
+        Function_Return Appearance.iBackColor
+    End_Function
+
+    Procedure SetSelectionColors Integer iBackColor Integer iTextColor
+        tEditorStyle Appearance
+        Get StyleFor eEC_Selection to Appearance
+        Move iBackColor to Appearance.iForeColor
+        Move iTextColor to Appearance.iBackColor
+        Send SetStyleFor eEC_Selection Appearance
+    End_Procedure
+
+    // The page colour. Worth a setter of its own because it is what decides whether a
+    // scheme reads as dark, and a caller may know the live colour when the scheme itself
+    // is a user's own rather than one of the built-ins.
+    Procedure SetWindowColor Integer iColor
+        tEditorStyle Appearance
+        Get StyleFor eEC_Window to Appearance
+        Move iColor to Appearance.iForeColor
+        Send SetStyleFor eEC_Window Appearance
+    End_Procedure
+
+    /* Is this a dark scheme? Perceived luminance of the page, weighted the way the eye
+       responds - green carries most of the brightness, blue almost none. A scheme that
+       names no window colour is taking the system default, which is light. */
+    Function IsDarkScheme Returns Boolean
+        Integer iRed iGreen iBlue iPageColor
+        tEditorStyle Appearance
+
+        Get StyleFor eEC_Window to Appearance
+        Move Appearance.iForeColor to iPageColor   // the window's "fore" IS the page colour
+        If (iPageColor = CI_NoColour) ;
+            Function_Return False
+        Send ColourParts iPageColor (&iRed) (&iGreen) (&iBlue)
+        Function_Return (((iRed * 299) + (iGreen * 587) + (iBlue * 114)) / 1000 < CI_DarkSchemeLuminance)
+    End_Function
+
+    /* What the selection should actually look like, once the scheme has had its say.
+
+       A scheme may name a selection colour, and then that is used. Most do not, and then
+       it is DERIVED from the page: a dark scheme selects with white drawn translucently,
+       so the block is obvious and every token underneath keeps its own colour; a light
+       scheme gets the pale blue it always had, solid.
+
+       Deriving rather than declaring means a scheme nobody wrote - one of yours, saved
+       from the dialog - gets a readable selection without anyone having thought about
+       it. That is the whole reason this is a rule and not eight copies of a colour. */
+    Function ResolvedSelectionBackColor Returns Integer
+        Integer iDeclared
+        Get SelectionBackColor to iDeclared
+        If (iDeclared <> CI_NoColour) ;
+            Function_Return iDeclared
+        If (IsDarkScheme(Self)) ;
+            Function_Return (RGB(255,255,255))
+        Function_Return (RGB(170,195,240))
+    End_Function
+
+    /* The ONE colour that represents an element drawn as a translucent overlay instead of
+       as a foreground/background pair.
+
+       Brace matching is the case in point. The Studio marks a matched pair with a
+       translucent box and leaves the brace characters their own syntax colour; that is one
+       colour, not two, so something has to decide WHICH of a scheme's two it means.
+
+       The background, normally - it is the colour behind the character, which is what an
+       overlay is. But a scheme is free to leave it unset, and several set it to the page
+       colour, which amounts to the same thing: no highlight was declared. Either way the
+       foreground is what carries the meaning, so that is what gets used.
+
+       Lime declared eEC_BraceHighlight as RGB(255,26,26) on RGB(49,60,83) - a red brace on
+       a background that IS the window colour. The pair rendered as "the brace turns red",
+       which is not what a highlight is for, and is what sent this file looking for a rule
+       rather than a ninth hand-picked colour. */
+    Function HighlightTintColor Integer eElement Returns Integer
+        Integer iPageColor
+        tEditorStyle Appearance PageStyle
+
+        Get StyleFor eElement   to Appearance
+        Get StyleFor eEC_Window to PageStyle
+        Move PageStyle.iForeColor to iPageColor   // the window's "fore" IS the page colour
+
+        If (Appearance.iBackColor <> CI_NoColour and Appearance.iBackColor <> iPageColor) ;
+            Function_Return Appearance.iBackColor
+        If (Appearance.iForeColor <> CI_NoColour) ;
+            Function_Return Appearance.iForeColor
+
+        // A scheme that declared neither still has to be visible: wash with whatever the
+        // page is not. Same reasoning as ResolvedSelectionBackColor above.
+        If (IsDarkScheme(Self)) ;
+            Function_Return (RGB(255,255,255))
+        Function_Return (RGB(0,0,0))
+    End_Function
+
+    Function ResolvedSelectionAlpha Returns Integer
+        If (piSelectionAlpha(Self) <> CI_SelectionAlphaAuto) ;
+            Function_Return (piSelectionAlpha(Self))
+        If (IsDarkScheme(Self)) ;
+            Function_Return CI_SelectionWash
+        Function_Return SC_ALPHA_NOALPHA
+    End_Function
+
+    Function ElementCount Returns Integer
+        Function_Return CI_EditorElementCount
+    End_Function
+
+    // The label the settings dialog shows for an element.
+    Function ElementName Integer eElement Returns String
+        Case Begin
+            Case (eElement = eEC_Window)
+                Function_Return "Window"
+            Case (eElement = eEC_LeftMargin)
+                Function_Return "Left Margin"
+            Case (eElement = eEC_Bookmark)
+                Function_Return "Bookmarks"
+            Case (eElement = eEC_Text)
+                Function_Return "Text"
+            Case (eElement = eEC_Numbers)
+                Function_Return "Numbers"
+            Case (eElement = eEC_Keywords)
+                Function_Return "Keywords"
+            Case (eElement = eEC_Operators)
+                Function_Return "Operators"
+            Case (eElement = eEC_ScopeKeywords)
+                Function_Return "Scope Keywords"
+            Case (eElement = eEC_Comments)
+                Function_Return "Comments"
+            Case (eElement = eEC_Strings)
+                Function_Return "Strings"
+            Case (eElement = eEC_LineNumbers)
+                Function_Return "Line Numbers"
+            Case (eElement = eEC_HighlightedLine)
+                Function_Return "Highlighted Line"
+            Case (eElement = eEC_StringTyping)
+                Function_Return "Unterminated String"
+            Case (eElement = eEC_BraceHighlight)
+                Function_Return "Brace Highlight"
+            Case (eElement = eEC_UnmatchedBrace)
+                Function_Return "Unmatched Brace"
+            Case (eElement = eEC_MetaTags)
+                Function_Return "Meta Tags"
+            Case (eElement = eEC_Selection)
+                Function_Return "Selection"
+            Case (eElement = eEC_PreProcessor)
+                Function_Return "Pre-processor (Macro)"
+        Case End
+        Function_Return ""
+    End_Function
+
+    /* Not every element has every field. The page has no background of its own - it IS
+       the background - and the margins and the selection carry a colour but no font.
+       The settings dialog asks these so it can hide the controls that would do nothing.
+       Answered from the same table the packed reader uses, so the two cannot disagree
+       about which fields an element has. */
+    Function ElementHasBackColor Integer eElement Returns Boolean
+        Integer iForeOff iBackOff iStyleSlot
+        Send LegacyOffsets eElement (&iForeOff) (&iBackOff) (&iStyleSlot)
+        Function_Return (iBackOff > 0)
+    End_Function
+
+    Function ElementHasFontStyle Integer eElement Returns Boolean
+        Integer iForeOff iBackOff iStyleSlot
+        Send LegacyOffsets eElement (&iForeOff) (&iBackOff) (&iStyleSlot)
+        Function_Return (iStyleSlot > 0)
+    End_Function
+
+    // The name used in the serialized form: the display name without its spaces, so the
+    // stored file stays one token per field.
+    Function ElementTag Integer eElement Returns String
+        Function_Return (Replaces(" ", ElementName(Self, eElement), ""))
+    End_Function
+
+    Function ElementFromTag String sTag Returns Integer
+        Integer eElement
+        Move (Lowercase(Trim(sTag))) to sTag
+        For eElement from 0 to (CI_EditorElementCount - 1)
+            If (Lowercase(ElementTag(Self, eElement)) = sTag) ;
+                Function_Return eElement
+        Loop
+        Function_Return -1
+    End_Function
+
+    // ==================================================================================
+    // The styles themselves
+    // ==================================================================================
+
+    Function StyleFor Integer eElement Returns tEditorStyle
+        tEditorStyle Empty
+        tEditorStyle[] Styles
+        If (eElement < 0 or eElement >= CI_EditorElementCount) ;
+            Function_Return Empty
+        Get ptStyles to Styles
+        Function_Return Styles[eElement]
+    End_Function
+
+    Procedure SetStyleFor Integer eElement tEditorStyle Appearance
+        tEditorStyle[] Styles
+        If (eElement < 0 or eElement >= CI_EditorElementCount) ;
+            Procedure_Return
+        Get ptStyles to Styles
+        Move Appearance to Styles[eElement]
+        Set ptStyles to Styles
+    End_Procedure
+
+    // One field at a time - what a settings dialog edits, where the user changes a
+    // single colour or ticks one box rather than replacing a whole style.
+    Procedure SetElementForeColor Integer eElement Integer iColor
+        tEditorStyle Appearance
+        Get StyleFor eElement to Appearance
+        Move iColor to Appearance.iForeColor
+        Send SetStyleFor eElement Appearance
+    End_Procedure
+
+    Procedure SetElementBackColor Integer eElement Integer iColor
+        tEditorStyle Appearance
+        Get StyleFor eElement to Appearance
+        Move iColor to Appearance.iBackColor
+        Send SetStyleFor eElement Appearance
+    End_Procedure
+
+    Procedure SetElementBold Integer eElement Boolean bOn
+        tEditorStyle Appearance
+        Get StyleFor eElement to Appearance
+        Move bOn to Appearance.bBold
+        Send SetStyleFor eElement Appearance
+    End_Procedure
+
+    Procedure SetElementItalic Integer eElement Boolean bOn
+        tEditorStyle Appearance
+        Get StyleFor eElement to Appearance
+        Move bOn to Appearance.bItalic
+        Send SetStyleFor eElement Appearance
+    End_Procedure
+
+    Procedure SetElementUnderline Integer eElement Boolean bOn
+        tEditorStyle Appearance
+        Get StyleFor eElement to Appearance
+        Move bOn to Appearance.bUnderline
+        Send SetStyleFor eElement Appearance
+    End_Procedure
+
+    // The declaration form the built-in schemes are written in. Underline is not offered
+    // - no scheme has ever used it, and an underlined keyword reads as a hyperlink.
+    Procedure DefineStyle Integer eElement Integer iFore Integer iBack Boolean bBold Boolean bItalic
+        tEditorStyle Appearance
+        Move iFore   to Appearance.iForeColor
+        Move iBack   to Appearance.iBackColor
+        Move bBold   to Appearance.bBold
+        Move bItalic to Appearance.bItalic
+        Send SetStyleFor eElement Appearance
+    End_Procedure
+
+    // Start a scheme from a clean slate, so a definition that omits an element gets
+    // "no colour" rather than whatever the previous scheme left behind.
+    Procedure BeginScheme String sName
+        Integer eElement
+        tEditorStyle Blank
+        tEditorStyle[] Styles
+        Move CI_NoColour to Blank.iForeColor
+        Move CI_NoColour to Blank.iBackColor
+        For eElement from 0 to (CI_EditorElementCount - 1)
+            Move Blank to Styles[eElement]
+        Loop
+        Set ptStyles to Styles
+        Set psSchemeName to sName
+        Set piSelectionAlpha to CI_SelectionAlphaAuto   // derived unless the scheme says
+    End_Procedure
+
+    // ==================================================================================
+    // Serialization. One line per element:  <Tag>=<fore>;<back>;<flags>
+    // where a colour is "R,G,B" or "default", and flags is any of B and I.
+    // Unknown tags are ignored and missing elements keep what they have, so a file
+    // written by a later version still loads.
+    // ==================================================================================
+
+    /* Split a colour into its three bytes. Written out with Mod rather than Low/Hi
+       because DataFlex's Low() takes the low SIXTEEN bits, not the low byte - so
+       Low(Low(x)) is a no-op and the red channel silently swallows the green one. It
+       round-trips through RGB() anyway, which is what hid it: the packed and readable
+       forms were both self-consistent and both wrong. */
+    Procedure ColourParts Integer iColor Integer ByRef iRed Integer ByRef iGreen Integer ByRef iBlue
+        Move (Mod(iColor, 256)) to iRed
+        Move (Mod(iColor / 256, 256)) to iGreen
+        Move (iColor / 65536) to iBlue
+    End_Procedure
+
+    Function ColourToText Integer iColor Returns String
+        Integer iRed iGreen iBlue
+        If (iColor = CI_NoColour) ;
+            Function_Return "default"
+        Send ColourParts iColor (&iRed) (&iGreen) (&iBlue)
+        Function_Return (String(iRed) + "," + String(iGreen) + "," + String(iBlue))
+    End_Function
+
+    Function ColourFromText String sText Returns Integer
+        Integer iRed iGreen iBlue iPos
+
+        Move (Trim(sText)) to sText
+        If (Lowercase(sText) = "default" or sText = "") ;
+            Function_Return CI_NoColour
+        Move (Pos(",", sText)) to iPos
+        If (iPos = 0) ;
+            Function_Return CI_NoColour
+        Move (Left(sText, iPos - 1)) to iRed
+        Move (Mid(sText, Length(sText), iPos + 1)) to sText
+        Move (Pos(",", sText)) to iPos
+        If (iPos = 0) ;
+            Function_Return CI_NoColour
+        Move (Left(sText, iPos - 1)) to iGreen
+        Move (Mid(sText, Length(sText), iPos + 1)) to iBlue
+        Function_Return (RGB(iRed, iGreen, iBlue))
+    End_Function
+
+    Function SerializeScheme Returns String
+        Integer eElement
+        String  sOut sFlags
+        tEditorStyle Appearance
+
+        Move ("Scheme=" + psSchemeName(Self)) to sOut
+        Move (sOut + CS_SchemeLineBreak + "SelectionAlpha=" + String(piSelectionAlpha(Self))) to sOut
+        For eElement from 0 to (CI_EditorElementCount - 1)
+            Get StyleFor eElement to Appearance
+            Move "" to sFlags
+            If (Appearance.bBold) ;
+                Move (sFlags + "B") to sFlags
+            If (Appearance.bItalic) ;
+                Move (sFlags + "I") to sFlags
+            Move (sOut + CS_SchemeLineBreak + ElementTag(Self, eElement) + "=" ;
+                       + ColourToText(Self, Appearance.iForeColor) + ";" ;
+                       + ColourToText(Self, Appearance.iBackColor) + ";" + sFlags) to sOut
+        Loop
+        Function_Return sOut
+    End_Function
+
+    // Read one "<fore>;<back>;<flags>" value onto an element.
+    Procedure ApplyStyleText Integer eElement String sValue
+        Integer iSplit
+        String  sFore sBack sFlags
+        tEditorStyle Appearance
+
+        Get StyleFor eElement to Appearance
+        Move (Pos(";", sValue)) to iSplit
+        If (iSplit = 0) ;
+            Procedure_Return
+        Move (Left(sValue, iSplit - 1)) to sFore
+        Move (Mid(sValue, Length(sValue), iSplit + 1)) to sValue
+        Move (Pos(";", sValue)) to iSplit
+        If (iSplit > 0) Begin
+            Move (Left(sValue, iSplit - 1)) to sBack
+            Move (Mid(sValue, Length(sValue), iSplit + 1)) to sFlags
+        End
+        Else Begin
+            Move sValue to sBack
+            Move "" to sFlags
+        End
+        Move (ColourFromText(Self, sFore)) to Appearance.iForeColor
+        Move (ColourFromText(Self, sBack)) to Appearance.iBackColor
+        Move (Pos("B", Uppercase(sFlags)) > 0) to Appearance.bBold
+        Move (Pos("I", Uppercase(sFlags)) > 0) to Appearance.bItalic
+        Send SetStyleFor eElement Appearance
+    End_Procedure
+
+    /* Accepts either separator. SerializeScheme joins with the literal two-character "\n"
+       token, because that is what the settings store splits a value on - so each element
+       arrives in the JSON as its own array entry rather than one long line. A file that
+       has been hand-edited will have real line breaks instead, and those work too. */
+    Procedure DeserializeScheme String sText
+        Integer iLine iEquals eElement
+        String  sLine sTag sValue
+        String[] asLines
+
+        Move (Replaces("\n", sText, Character(10))) to sText
+        Move (StrSplitToArray(Replaces(C_NewLine, sText, Character(10)), Character(10))) to asLines
+        For iLine from 0 to (SizeOfArray(asLines) - 1)
+            Move (Trim(asLines[iLine])) to sLine
+            Move (Pos("=", sLine)) to iEquals
+            If (iEquals > 1) Begin
+                Move (Left(sLine, iEquals - 1)) to sTag
+                Move (Mid(sLine, Length(sLine), iEquals + 1)) to sValue
+                Move (Lowercase(Trim(sTag))) to sTag
+                If (sTag = "scheme") ;
+                    Set psSchemeName to (Trim(sValue))
+                Else If (sTag = "selectionalpha") ;
+                    Set piSelectionAlpha to (Integer(Trim(sValue)))
+                Else Begin
+                    Get ElementFromTag sTag to eElement
+                    If (eElement >= 0) ;
+                        Send ApplyStyleText eElement sValue
+                End
+            End
+        Loop
+    End_Procedure
+
+    /* Does this settings value carry the old packed format? It is one long run of
+       digits - 42 colour slots of 12 characters plus three - so a single non-digit
+       settles it. The readable form always has an "=" in its first line. Sniffing the
+       content rather than versioning the setting means a scheme migrates the first time
+       it is loaded, with nothing to remember to run. */
+    Function LooksPacked String sValue Returns Boolean
+        Integer i iLen
+        String sChar
+
+        Move (Trim(sValue)) to sValue
+        Move (Length(sValue)) to iLen
+        If (iLen < 12) ;
+            Function_Return False
+        If (Pos("=", sValue) > 0) ;
+            Function_Return False
+        For i from 1 to iLen
+            Move (Mid(sValue, 1, i)) to sChar
+            If (sChar < "0" or sChar > "9") Begin
+                If (sChar <> ",") ;                 // two of the originals comma-joined
+                    Function_Return False
+            End
+        Loop
+        Function_Return True
+    End_Function
+
+    // Load a scheme from whatever the settings hold - readable, or the old packed pair
+    // being met for the first time.
+    Procedure LoadFromSettings String sName String sColors String sFontStyles
+        If (LooksPacked(Self, sColors)) Begin
+            Send LoadLegacyPacked sName sColors sFontStyles
+            Procedure_Return
+        End
+        Send BeginScheme sName
+        Send DeserializeScheme sColors
+    End_Procedure
+
+    /* MIGRATION ONLY. Reads the old packed pair - 12 characters per colour slot,
+       3 per font-style slot - using the offset table that used to live in
+       Register_Color_Elements. Never written back; once a scheme has been read here and
+       saved, it is in the readable form for good. The elements that were dropped are
+       simply not read. */
+    Function LegacyColourAt String sColors Integer iOffset Returns Integer
+        String sChunk
+        If (iOffset = 0) ;
+            Function_Return CI_NoColour
+        Move (Mid(sColors, 12, ((iOffset - 1) * 12) + 1)) to sChunk
+        If (Length(sChunk) <> 12) ;
+            Function_Return CI_NoColour
+        If (sChunk = "255255255255") ;          // the old "no colour" sentinel
+            Function_Return CI_NoColour
+        Function_Return (RGB(Integer(Left(sChunk, 3)), Integer(Mid(sChunk, 3, 4)), Integer(Mid(sChunk, 3, 7))))
+    End_Function
+
+    Function LegacyFontStyleAt String sFontStyles Integer iSlot Returns Integer
+        String sChunk
+        If (iSlot = 0 or sFontStyles = "") ;
+            Function_Return 0
+        Move (Mid(sFontStyles, 3, ((iSlot - 1) * 3) + 1)) to sChunk
+        If (Length(sChunk) <> 3) ;
+            Function_Return 0
+        Function_Return (Integer(sChunk))
+    End_Function
+
+    /* Where an element's colours and font style sit in the packed pair - the table that
+       used to be spread across Register_Color_Elements and every scheme string. It lives
+       in ONE place now, and both the reader and the writer below go through it, so they
+       cannot disagree. A zero means the packed format had no slot for it. (Offsets 19-26
+       were the HTML/XML tag elements, 29 and 30 the divider lines; nothing reads them.) */
+    Procedure LegacyOffsets Integer eElement Integer ByRef iForeOff Integer ByRef iBackOff Integer ByRef iStyleSlot
+        Move 0 to iForeOff
+        Move 0 to iBackOff
+        Move 0 to iStyleSlot
+        Case Begin
+            Case (eElement = eEC_Window)
+                Move 1 to iForeOff
+                Case Break
+            Case (eElement = eEC_LeftMargin)
+                Move 2 to iForeOff
+                Case Break
+            Case (eElement = eEC_Bookmark)
+                Move 3 to iForeOff
+                Move 4 to iBackOff
+                Case Break
+            Case (eElement = eEC_Text)
+                Move 5 to iForeOff
+                Move 6 to iBackOff
+                Move 1 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_Numbers)
+                Move 7 to iForeOff
+                Move 8 to iBackOff
+                Move 2 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_Keywords)
+                Move 9 to iForeOff
+                Move 10 to iBackOff
+                Move 3 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_Operators)
+                Move 11 to iForeOff
+                Move 12 to iBackOff
+                Move 4 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_ScopeKeywords)
+                Move 13 to iForeOff
+                Move 14 to iBackOff
+                Move 5 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_Comments)
+                Move 15 to iForeOff
+                Move 16 to iBackOff
+                Move 6 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_Strings)
+                Move 17 to iForeOff
+                Move 18 to iBackOff
+                Move 7 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_LineNumbers)
+                Move 27 to iForeOff
+                Move 28 to iBackOff
+                Move 12 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_HighlightedLine)
+                Move 31 to iForeOff
+                Case Break
+            Case (eElement = eEC_StringTyping)
+                Move 32 to iForeOff
+                Move 33 to iBackOff
+                Move 13 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_BraceHighlight)
+                Move 34 to iForeOff
+                Move 35 to iBackOff
+                Move 14 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_UnmatchedBrace)
+                Move 36 to iForeOff
+                Move 37 to iBackOff
+                Move 15 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_MetaTags)
+                Move 38 to iForeOff
+                Move 39 to iBackOff
+                Move 16 to iStyleSlot
+                Case Break
+            Case (eElement = eEC_Selection)
+                Move 40 to iForeOff
+                Case Break
+            Case (eElement = eEC_PreProcessor)
+                Move 41 to iForeOff
+                Move 42 to iBackOff
+                Move 17 to iStyleSlot
+                Case Break
+        Case End
+    End_Procedure
+
+    Procedure LoadLegacyPacked String sName String sColors String sFontStyles
+        Integer iPos eElement iForeOff iBackOff iStyleSlot iFontStyle
+        tEditorStyle Appearance
+
+        // Two of the seven built-in strings carried their font styles comma-appended to
+        // the colours and the other five did not.
+        Move (Pos(",", sColors)) to iPos
+        If (iPos > 0) Begin
+            If (sFontStyles = "") ;
+                Move (Mid(sColors, Length(sColors), iPos + 1)) to sFontStyles
+            Move (Left(sColors, iPos - 1)) to sColors
+        End
+        Send BeginScheme sName
+        For eElement from 0 to (CI_EditorElementCount - 1)
+            Send LegacyOffsets eElement (&iForeOff) (&iBackOff) (&iStyleSlot)
+            Move (LegacyColourAt(Self, sColors, iForeOff)) to Appearance.iForeColor
+            Move (LegacyColourAt(Self, sColors, iBackOff)) to Appearance.iBackColor
+            Move (LegacyFontStyleAt(Self, sFontStyles, iStyleSlot)) to iFontStyle
+            Move ((iFontStyle iAnd 1) <> 0) to Appearance.bBold
+            Move ((iFontStyle iAnd 2) <> 0) to Appearance.bItalic
+            Move ((iFontStyle iAnd 4) <> 0) to Appearance.bUnderline
+            Send SetStyleFor eElement Appearance
+        Loop
+    End_Procedure
+
+    /* TRANSITIONAL. The settings store and the colour dialog still speak the packed
+       format, so while they do, a scheme has to be able to hand itself over in it. This
+       is an ADAPTER to the old pipeline, not a storage format: when persistence and
+       rendering move onto the class, this pair goes. SerializeScheme is what gets written to
+       disk. */
+    Function PackedColourChunk Integer iColor Returns String
+        Integer iRed iGreen iBlue
+        If (iColor = CI_NoColour) ;
+            Function_Return "255255255255"          // the old "no colour" sentinel
+        Send ColourParts iColor (&iRed) (&iGreen) (&iBlue)
+        Function_Return (Right("000" + String(iRed),   3) ;
+                       + Right("000" + String(iGreen), 3) ;
+                       + Right("000" + String(iBlue),  3) + "000")
+    End_Function
+
+    Function LegacyPackedColors Returns String
+        Integer eElement iForeOff iBackOff iStyleSlot iSlot
+        String[] asSlots
+        String sOut
+        tEditorStyle Appearance
+
+        For iSlot from 0 to 41
+            Move "255255255255" to asSlots[iSlot]
+        Loop
+        For eElement from 0 to (CI_EditorElementCount - 1)
+            Send LegacyOffsets eElement (&iForeOff) (&iBackOff) (&iStyleSlot)
+            Get StyleFor eElement to Appearance
+            If (iForeOff > 0) ;
+                Move (PackedColourChunk(Self, Appearance.iForeColor)) to asSlots[iForeOff - 1]
+            If (iBackOff > 0) ;
+                Move (PackedColourChunk(Self, Appearance.iBackColor)) to asSlots[iBackOff - 1]
+        Loop
+        For iSlot from 0 to 41
+            Move (sOut + asSlots[iSlot]) to sOut
+        Loop
+        Function_Return (sOut + "000")
+    End_Function
+
+    Function LegacyPackedFontStyles Returns String
+        Integer eElement iForeOff iBackOff iStyleSlot iSlot iFontStyle
+        String[] asSlots
+        String sOut
+        tEditorStyle Appearance
+
+        For iSlot from 0 to 16
+            Move "000" to asSlots[iSlot]
+        Loop
+        For eElement from 0 to (CI_EditorElementCount - 1)
+            Send LegacyOffsets eElement (&iForeOff) (&iBackOff) (&iStyleSlot)
+            If (iStyleSlot > 0) Begin
+                Get StyleFor eElement to Appearance
+                Move 0 to iFontStyle
+                If (Appearance.bBold) ;
+                    Move (iFontStyle + 1) to iFontStyle
+                If (Appearance.bItalic) ;
+                    Move (iFontStyle + 2) to iFontStyle
+                If (Appearance.bUnderline) ;
+                    Move (iFontStyle + 4) to iFontStyle
+                Move (Right("000" + String(iFontStyle), 3)) to asSlots[iStyleSlot - 1]
+            End
+        Loop
+        For iSlot from 0 to 16
+            Move (sOut + asSlots[iSlot]) to sOut
+        Loop
+        Function_Return (sOut + "000")
+    End_Function
+
+    // ==================================================================================
+    // The built-in schemes, decoded from the packed originals and now readable.
+    // ==================================================================================
+
+    Function BuiltInNames Returns String[]
+        String[] asNames
+        Move CS_ThemeWhite    to asNames[0]
+        Move CS_ThemeBlack    to asNames[1]
+        Move CS_ThemeBlue     to asNames[2]
+        Move CS_ThemeLime     to asNames[3]
+        Move CS_ThemeSerene   to asNames[4]
+        Move CS_ThemeSahara   to asNames[5]
+        Move CS_ThemeLucas    to asNames[6]
+        Move CS_ThemeDataFlex to asNames[7]
+        Function_Return asNames
+    End_Function
+
+    Function IsBuiltIn String sName Returns Boolean
+        Integer i
+        String[] asNames
+        Get BuiltInNames to asNames
+        For i from 0 to (SizeOfArray(asNames) - 1)
+            If (Lowercase(asNames[i]) = Lowercase(Trim(sName))) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    Procedure LoadBuiltIn String sName
+        Move (Lowercase(Trim(sName))) to sName
+        Case Begin
+            Case (sName = Lowercase(CS_ThemeBlack))
+                Send LoadBuiltInBlack
+                Case Break
+            Case (sName = Lowercase(CS_ThemeBlue))
+                Send LoadBuiltInBlue
+                Case Break
+            Case (sName = Lowercase(CS_ThemeLime))
+                Send LoadBuiltInLime
+                Case Break
+            Case (sName = Lowercase(CS_ThemeSerene))
+                Send LoadBuiltInSerene
+                Case Break
+            Case (sName = Lowercase(CS_ThemeSahara))
+                Send LoadBuiltInSahara
+                Case Break
+            Case (sName = Lowercase(CS_ThemeLucas))
+                Send LoadBuiltInLucas
+                Case Break
+            Case (sName = Lowercase(CS_ThemeDataFlex))
+                Send LoadBuiltInDataFlex
+                Case Break
+            Case Else
+                Send LoadBuiltInWhite
+        Case End
+    End_Procedure
+
+    Procedure LoadBuiltInWhite
+        Send BeginScheme CS_ThemeWhite
+        Send DefineStyle eEC_Window           CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_LeftMargin       (RGB(220,225,240)) CI_NoColour        False False
+        Send DefineStyle eEC_Bookmark         CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_Text             (RGB(0,0,0))       (RGB(255,255,255)) False False
+        Send DefineStyle eEC_Numbers          (RGB(255,0,255))   (RGB(255,255,255)) False False
+        Send DefineStyle eEC_Keywords         (RGB(0,0,255))     (RGB(255,255,255)) False False
+        Send DefineStyle eEC_Operators        (RGB(255,0,0))     (RGB(255,255,255)) False False
+        Send DefineStyle eEC_ScopeKeywords    (RGB(0,0,255))     (RGB(255,255,255)) False False
+        Send DefineStyle eEC_Comments         (RGB(0,128,0))     (RGB(255,255,255)) False False
+        Send DefineStyle eEC_Strings          (RGB(128,128,128)) (RGB(255,255,255)) False False
+        Send DefineStyle eEC_LineNumbers      (RGB(105,105,105)) (RGB(190,200,225)) False False
+        Send DefineStyle eEC_HighlightedLine  (RGB(220,225,240)) CI_NoColour        False False
+        Send DefineStyle eEC_StringTyping     (RGB(128,128,128)) (RGB(255,215,215)) False False
+        Send DefineStyle eEC_BraceHighlight   (RGB(0,0,0))       (RGB(200,225,255)) False False
+        Send DefineStyle eEC_UnmatchedBrace   (RGB(255,255,0))   (RGB(255,35,35))   False False
+        Send DefineStyle eEC_MetaTags         (RGB(0,128,128))   (RGB(255,255,255)) False False
+        Send DefineStyle eEC_Selection        CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_PreProcessor     (RGB(215,107,0))   (RGB(255,255,255)) False False
+    End_Procedure
+
+    Procedure LoadBuiltInBlack
+        Send BeginScheme CS_ThemeBlack
+        Send DefineStyle eEC_Window           (RGB(25,25,25))    CI_NoColour        False False
+        Send DefineStyle eEC_LeftMargin       (RGB(120,120,120)) CI_NoColour        False False
+        Send DefineStyle eEC_Bookmark         CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_Text             (RGB(255,255,255)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Numbers          (RGB(255,185,255)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Keywords         (RGB(140,215,240)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Operators        (RGB(255,108,108)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_ScopeKeywords    (RGB(140,215,240)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Comments         (RGB(187,255,187)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Strings          (RGB(192,192,192)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_LineNumbers      (RGB(192,192,192)) (RGB(80,80,80))    False False
+        Send DefineStyle eEC_HighlightedLine  (RGB(105,105,105)) CI_NoColour        False False
+        Send DefineStyle eEC_StringTyping     (RGB(90,90,90))    (RGB(255,215,215)) False False
+        Send DefineStyle eEC_BraceHighlight   (RGB(0,0,0))       (RGB(200,225,255)) False False
+        Send DefineStyle eEC_UnmatchedBrace   (RGB(255,255,0))   (RGB(255,0,0))     False False
+        Send DefineStyle eEC_MetaTags         (RGB(202,255,255)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Selection        CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_PreProcessor     (RGB(255,190,120)) (RGB(25,25,25))    False False
+    End_Procedure
+
+    Procedure LoadBuiltInBlue
+        Send BeginScheme CS_ThemeBlue
+        Send DefineStyle eEC_Window           (RGB(0,0,128))     CI_NoColour        False False
+        Send DefineStyle eEC_LeftMargin       (RGB(0,0,128))     CI_NoColour        False False
+        Send DefineStyle eEC_Bookmark         CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_Text             (RGB(255,255,255)) (RGB(0,0,128))     False False
+        Send DefineStyle eEC_Numbers          (RGB(255,70,255))  (RGB(0,0,128))     False False
+        Send DefineStyle eEC_Keywords         (RGB(115,205,235)) (RGB(0,0,128))     False False
+        Send DefineStyle eEC_Operators        (RGB(255,66,66))   (RGB(0,0,128))     False False
+        Send DefineStyle eEC_ScopeKeywords    (RGB(115,205,235)) (RGB(0,0,128))     False False
+        Send DefineStyle eEC_Comments         (RGB(147,255,147)) (RGB(0,0,128))     False False
+        Send DefineStyle eEC_Strings          (RGB(190,190,190)) (RGB(0,0,128))     False False
+        Send DefineStyle eEC_LineNumbers      (RGB(255,255,255)) (RGB(0,0,128))     False False
+        Send DefineStyle eEC_HighlightedLine  (RGB(0,128,128))   CI_NoColour        False False
+        Send DefineStyle eEC_StringTyping     (RGB(90,90,90))    (RGB(255,215,215)) False False
+        Send DefineStyle eEC_BraceHighlight   (RGB(0,0,0))       (RGB(200,225,255)) False False
+        Send DefineStyle eEC_UnmatchedBrace   (RGB(255,255,0))   (RGB(255,35,35))   False False
+        Send DefineStyle eEC_MetaTags         (RGB(179,179,0))   (RGB(0,0,128))     False False
+        Send DefineStyle eEC_Selection        CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_PreProcessor     (RGB(255,190,120)) (RGB(0,0,128))     False False
+    End_Procedure
+
+    Procedure LoadBuiltInLime
+        Send BeginScheme CS_ThemeLime
+        Send DefineStyle eEC_Window           (RGB(49,60,83))    CI_NoColour        False False
+        Send DefineStyle eEC_LeftMargin       (RGB(69,82,104))   CI_NoColour        False False
+        Send DefineStyle eEC_Bookmark         CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_Text             (RGB(255,255,255)) (RGB(49,60,83))    False False
+        Send DefineStyle eEC_Numbers          (RGB(255,138,21))  (RGB(49,60,83))    False False
+        Send DefineStyle eEC_Keywords         (RGB(156,255,0))   (RGB(49,60,83))    False False
+        Send DefineStyle eEC_Operators        (RGB(249,255,13))  (RGB(49,60,83))    False False
+        Send DefineStyle eEC_ScopeKeywords    (RGB(156,255,0))   (RGB(49,60,83))    False False
+        Send DefineStyle eEC_Comments         (RGB(255,98,255))  (RGB(49,60,83))    False False
+        Send DefineStyle eEC_Strings          (RGB(180,180,180)) (RGB(49,60,83))    False False
+        Send DefineStyle eEC_LineNumbers      (RGB(96,114,145))  (RGB(28,38,60))    False False
+        Send DefineStyle eEC_HighlightedLine  (RGB(28,38,60))    CI_NoColour        False False
+        Send DefineStyle eEC_StringTyping     (RGB(70,70,70))    (RGB(253,193,220)) False False
+        /* Was RGB(255,26,26) on RGB(49,60,83) - a red brace on the page colour, i.e. a
+           foreground change wearing a highlight's name. Now a lighter slate than the page,
+           which washes visibly under the lime and yellow tokens without competing with
+           them. See HighlightTintColor for why the background is the one that matters. */
+        Send DefineStyle eEC_BraceHighlight   (RGB(200,225,255)) (RGB(120,145,190)) False False
+        Send DefineStyle eEC_UnmatchedBrace   (RGB(255,255,0))   (RGB(255,35,35))   False False
+        Send DefineStyle eEC_MetaTags         (RGB(0,240,240))   (RGB(49,60,83))    False False
+        Send DefineStyle eEC_Selection        CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_PreProcessor     (RGB(255,194,34))  (RGB(49,60,83))    False False
+    End_Procedure
+
+    // Black, but strings are yellow and scope keywords are bold.
+    Procedure LoadBuiltInSerene
+        Send BeginScheme CS_ThemeSerene
+        Send DefineStyle eEC_Window           (RGB(25,25,25))    CI_NoColour        False False
+        Send DefineStyle eEC_LeftMargin       (RGB(120,120,120)) CI_NoColour        False False
+        Send DefineStyle eEC_Bookmark         CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_Text             (RGB(255,255,255)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Numbers          (RGB(255,185,255)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Keywords         (RGB(140,215,240)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Operators        (RGB(255,108,108)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_ScopeKeywords    (RGB(140,215,240)) (RGB(25,25,25))    True  False
+        Send DefineStyle eEC_Comments         (RGB(187,255,187)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Strings          (RGB(255,255,0))   (RGB(25,25,25))    False False
+        Send DefineStyle eEC_LineNumbers      (RGB(192,192,192)) (RGB(80,80,80))    False False
+        Send DefineStyle eEC_HighlightedLine  (RGB(105,105,105)) CI_NoColour        False False
+        Send DefineStyle eEC_StringTyping     (RGB(90,90,90))    (RGB(255,215,215)) False False
+        Send DefineStyle eEC_BraceHighlight   (RGB(0,0,0))       (RGB(200,225,255)) False False
+        Send DefineStyle eEC_UnmatchedBrace   (RGB(255,255,0))   (RGB(255,0,0))     False False
+        Send DefineStyle eEC_MetaTags         (RGB(202,255,255)) (RGB(25,25,25))    False False
+        Send DefineStyle eEC_Selection        CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_PreProcessor     (RGB(255,190,120)) (RGB(25,25,25))    False False
+    End_Procedure
+
+    /* Black's palette on a teal ground. Lucas has been in the theme list for a while,
+       but only as a NAME: the string it pointed at was a byte-for-byte copy of Black
+       that nobody ever filled in, and because the save path refuses to store a scheme
+       whose name is already a built-in, it could not be given colours through the
+       dialog either. The colours below are the real ones, recovered from a saved
+       scheme and now declared like every other built-in. */
+    Procedure LoadBuiltInLucas
+        Send BeginScheme CS_ThemeLucas
+        Send DefineStyle eEC_Window           (RGB(25,110,130))  CI_NoColour        False False
+        Send DefineStyle eEC_LeftMargin       (RGB(25,110,130))  CI_NoColour        False False
+        Send DefineStyle eEC_Bookmark         CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_Text             (RGB(255,255,255)) (RGB(25,110,130))  False False
+        Send DefineStyle eEC_Numbers          (RGB(255,185,255)) (RGB(25,110,130))  False False
+        Send DefineStyle eEC_Keywords         (RGB(140,215,240)) (RGB(25,110,130))  False False
+        Send DefineStyle eEC_Operators        (RGB(255,108,108)) (RGB(25,110,130))  False False
+        Send DefineStyle eEC_ScopeKeywords    (RGB(140,215,240)) (RGB(25,110,130))  False False
+        Send DefineStyle eEC_Comments         (RGB(187,255,187)) (RGB(25,110,130))  False False
+        Send DefineStyle eEC_Strings          (RGB(192,192,192)) (RGB(25,110,130))  False False
+        Send DefineStyle eEC_LineNumbers      (RGB(192,192,192)) (RGB(25,110,130))  False False
+        Send DefineStyle eEC_HighlightedLine  (RGB(105,105,105)) CI_NoColour        False False
+        Send DefineStyle eEC_StringTyping     (RGB(90,90,90))    (RGB(255,215,215)) False False
+        Send DefineStyle eEC_BraceHighlight   (RGB(0,0,0))       (RGB(200,225,255)) False False
+        Send DefineStyle eEC_UnmatchedBrace   (RGB(255,255,0))   (RGB(255,0,0))     False False
+        Send DefineStyle eEC_MetaTags         (RGB(202,255,255)) (RGB(25,110,130))  False False
+        Send DefineStyle eEC_Selection        CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_PreProcessor     (RGB(255,190,120)) (RGB(25,110,130))  False False
+    End_Procedure
+
+    /* The DataFlex Studio 25 look, so the two editors match.
+       Read from Studio's own Dark scheme (its Code-Editor settings) and converted: its
+       colours are COLORREF values packed the same way DataFlex's RGB() packs them, and
+       its "use the default" marker is 0xFFFFFFFF, which becomes CI_NoColour here.
+
+       Six elements had no counterpart in Studio and were chosen rather than converted:
+         ScopeKeywords  Studio's DataFlex lexer does not separate scope keywords from
+                        keywords, so they share the keyword colour - faithful to Studio,
+                        even though this editor could tell them apart.
+         PreProcessor   likewise has no Studio entry of its own; keyword colour.
+         StringTyping   an unterminated string; Studio has no such state. Uses the same
+                        treatment as the other dark schemes so it still stands out.
+         UnmatchedBrace Studio highlights braces with one colour and has no "no partner"
+                        state. Yellow on red, as in the other schemes.
+         Selection      not stored with the scheme in Studio (it takes the system
+                        colour). The dark blue the other dark schemes use.
+         HighlightedLine Studio has no current-line colour; its left-margin grey reads as
+                        a subtle wash on this near-black ground. */
+    /* PURE parser for DataFlex.lng's dark palette: one entry per tokenset that declares a
+       darkforecolor, in file order. Kept apart from the file read so it is testable without an
+       install, the same split the Use-line and built-in-function parsers use.
+
+       ONLY the RGB(r,g,b) form is read. 24 of the 26 dark colours in DF 25 are written that way; the
+       two that are not ("purple", "red") name tokensets this scheme has no element for, so a colour
+       table would be dead weight bought at the price of guessing which "red" the Studio means. An
+       unparseable value is simply absent, and absent means the caller keeps its own literal.
+
+       The attributes are matched on the <tokenset ...> tag itself rather than by walking the XML: the
+       file is machine-generated and one attribute per tag is all this needs. If that ever stops being
+       true the parse returns fewer entries and every element falls back - it cannot return a WRONG
+       colour, which is the failure mode worth designing against. */
+    Function _LngDarkColoursFromLines String[] asLines Returns tLngTokenColour[]
+        tLngTokenColour[] aOut
+        tLngTokenColour C
+        String sLine sName sVal sNums
+        Integer i iMax iPos iEnd iR iG iB
+
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move asLines[i] to sLine
+            Move (Pos("<tokenset ", sLine)) to iPos
+            If (iPos > 0) Begin
+                Move "" to sName
+                Move "" to sVal
+                // name="..."
+                Move (Pos('name="', sLine)) to iPos
+                If (iPos > 0) Begin
+                    Move (Mid(sLine, (Length(sLine) - iPos - 5), (iPos + 6))) to sName
+                    Move (Pos('"', sName)) to iEnd
+                    If (iEnd > 1) ;
+                        Move (Left(sName, (iEnd - 1))) to sName
+                    Else ;
+                        Move "" to sName
+                End
+                // darkforecolor="RGB(r,g,b)"
+                Move (Pos('darkforecolor="RGB(', sLine)) to iPos
+                If (iPos > 0 and sName <> "") Begin
+                    // 19 = the length of 'darkforecolor="RGB(' - the value starts one PAST it, or the
+                    // opening paren rides along and the first component parses as "(60".
+                    Move (Mid(sLine, (Length(sLine) - iPos - 18), (iPos + 19))) to sVal
+                    Move (Pos(")", sVal)) to iEnd
+                    If (iEnd > 1) Begin
+                        Move (Left(sVal, (iEnd - 1))) to sNums
+                        Move 0 to iR
+                        Move 0 to iG
+                        Move 0 to iB
+                        Move (Pos(",", sNums)) to iPos
+                        If (iPos > 1) Begin
+                            Move (Left(sNums, (iPos - 1))) to iR
+                            Move (Mid(sNums, (Length(sNums) - iPos), (iPos + 1))) to sNums
+                            Move (Pos(",", sNums)) to iPos
+                            If (iPos > 1) Begin
+                                Move (Left(sNums, (iPos - 1))) to iG
+                                Move (Trim(Mid(sNums, (Length(sNums) - iPos), (iPos + 1)))) to iB
+                                Move sName to C.sTokenSet
+                                Move (RGB(iR, iG, iB)) to C.iDark
+                                Move C to aOut[SizeOfArray(aOut)]
+                            End
+                        End
+                    End
+                End
+            End
+        Loop
+        Function_Return aOut
+    End_Function
+
+    // <install root>\Lib\DataFlex.lng for the TARGET version - the Pkg folder the app already
+    // resolves, walked up one and across, so the bin->root derivation lives in exactly one place.
+    Function InstallLanguageFilePath Returns String
+        String sPkg sRoot
+        Integer iPos
+        Get psTargetPkgFolder of ghoApplication to sPkg
+        If (Trim(sPkg) = "") ;
+            Function_Return ""
+        If (Right(sPkg, 1) = "\") ;
+            Move (Left(sPkg, (Length(sPkg) - 1))) to sPkg
+        Move (RightPos("\", sPkg)) to iPos
+        If (iPos = 0) ;
+            Function_Return ""
+        Move (Left(sPkg, (iPos - 1))) to sRoot
+        Function_Return (vFolderFormat(sRoot) + "Lib\DataFlex.lng")
+    End_Function
+
+    // The install's dark palette, parsed once per object. Empty when there is no install to read -
+    // which every caller below treats as "keep the built-in literal".
+    Function _LngDarkColours Returns tLngTokenColour[]
+        tLngTokenColour[] aC
+        String[] asLines
+        String sFile
+        Boolean bExists
+
+        If (pbLngLoaded(Self) = True) ;
+            Function_Return (paLngColours(Self))
+        Set pbLngLoaded to True
+        Get InstallLanguageFilePath to sFile
+        If (sFile <> "") ;
+            Get vFilePathExists sFile to bExists
+        If (bExists = False) Begin
+            Set paLngColours to aC
+            Function_Return aC
+        End
+        Move (rfReadEncodedFileAsStringArray(sFile)) to asLines
+        Get _LngDarkColoursFromLines asLines to aC
+        Set paLngColours to aC
+        Function_Return aC
+    End_Function
+
+    /* One tokenset's dark colour, or iFallback when the install does not supply it.
+
+       The fallback is not a formality: "Scope Keywords" declares NO darkforecolor in DF 25 (it
+       inherits Keywords' colour in the Studio's own model), so that element reaches its literal on
+       every machine. Passing the literal in at the call site keeps the built-in scheme readable as a
+       complete scheme in its own right - it still says what every element is, and the install merely
+       gets first refusal. */
+    Function _LngDark String sTokenSet Integer iFallback Returns Integer
+        tLngTokenColour[] aC
+        Integer i iMax
+        Get _LngDarkColours to aC
+        Move (SizeOfArray(aC) - 1) to iMax
+        For i from 0 to iMax
+            If (Lowercase(aC[i].sTokenSet) = Lowercase(sTokenSet)) ;
+                Function_Return aC[i].iDark
+        Loop
+        Function_Return iFallback
+    End_Function
+
+    /* Studio 25's own Dark scheme, taken FROM THE INSTALL where it can be and falling back to the
+       transcribed literals otherwise (see _LngDark). The literals stay put deliberately: they are the
+       documented scheme, they keep this readable, and they are what a machine with no install shows.
+
+       Only the syntax colours come from the file. The ground, margin, selection, current-line and
+       brace states are not in it - the Studio takes some from the system and has no concept of the
+       rest - so those stay ours, which is also why they carry no tokenset name below. */
+    Procedure LoadBuiltInDataFlex
+        Send BeginScheme CS_ThemeDataFlex
+        Send DefineStyle eEC_Window           (RGB(16,16,16))    CI_NoColour        False False
+        Send DefineStyle eEC_LeftMargin       (RGB(45,45,45))    CI_NoColour        False False
+        Send DefineStyle eEC_Bookmark         CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_Text             (_LngDark(Self, "Text", (RGB(255,255,240)))) (RGB(16,16,16))    False False
+        Send DefineStyle eEC_Numbers          (_LngDark(Self, "Numbers", (RGB(255,255,128)))) (RGB(16,16,16))    False False
+        Send DefineStyle eEC_Keywords         (_LngDark(Self, "Keywords", (RGB(55,212,255))))  (RGB(16,16,16))    False False
+        Send DefineStyle eEC_Operators        (_LngDark(Self, "Operators", (RGB(255,255,128)))) (RGB(16,16,16))    False False
+        Send DefineStyle eEC_ScopeKeywords    (_LngDark(Self, "Scope Keywords", (RGB(55,212,255))))  (RGB(16,16,16))    False False
+        Send DefineStyle eEC_Comments         (_LngDark(Self, "Line Comments", (RGB(60,220,70))))   (RGB(16,16,16))    False False
+        Send DefineStyle eEC_Strings          (_LngDark(Self, "Strings", (RGB(255,190,154)))) (RGB(16,16,16))    False False
+        Send DefineStyle eEC_LineNumbers      (RGB(108,163,189)) (RGB(16,16,16))    False False
+        Send DefineStyle eEC_HighlightedLine  (RGB(45,45,45))    CI_NoColour        False False
+        Send DefineStyle eEC_StringTyping     (RGB(90,90,90))    (RGB(255,215,215)) False False
+        Send DefineStyle eEC_BraceHighlight   (RGB(128,128,128)) (RGB(192,192,192)) False False
+        Send DefineStyle eEC_UnmatchedBrace   (RGB(255,255,0))   (RGB(255,0,0))     False False
+        Send DefineStyle eEC_MetaTags         (_LngDark(Self, "Meta Data Tags", (RGB(255,120,180)))) (RGB(16,16,16))    False False
+        Send DefineStyle eEC_PreProcessor     (RGB(55,212,255))  (RGB(16,16,16))    False False
+    End_Procedure
+
+    // White on a cream page; meta tags are bold.
+    Procedure LoadBuiltInSahara
+        Send BeginScheme CS_ThemeSahara
+        Send DefineStyle eEC_Window           (RGB(255,255,187)) CI_NoColour        False False
+        Send DefineStyle eEC_LeftMargin       (RGB(220,225,240)) CI_NoColour        False False
+        Send DefineStyle eEC_Bookmark         CI_NoColour        (RGB(255,255,187)) False False
+        Send DefineStyle eEC_Text             (RGB(0,0,0))       (RGB(255,255,187)) False False
+        Send DefineStyle eEC_Numbers          (RGB(255,0,255))   (RGB(255,255,187)) False False
+        Send DefineStyle eEC_Keywords         (RGB(0,0,255))     (RGB(255,255,187)) False False
+        Send DefineStyle eEC_Operators        (RGB(255,0,0))     (RGB(255,255,187)) False False
+        Send DefineStyle eEC_ScopeKeywords    (RGB(0,0,255))     (RGB(255,255,187)) False False
+        Send DefineStyle eEC_Comments         (RGB(0,128,0))     (RGB(255,255,187)) False False
+        Send DefineStyle eEC_Strings          (RGB(255,0,128))   (RGB(255,255,187)) False False
+        Send DefineStyle eEC_LineNumbers      (RGB(105,105,105)) (RGB(190,200,225)) False False
+        Send DefineStyle eEC_HighlightedLine  (RGB(220,225,240)) CI_NoColour        False False
+        Send DefineStyle eEC_StringTyping     (RGB(128,128,128)) (RGB(255,215,215)) False False
+        Send DefineStyle eEC_BraceHighlight   (RGB(0,0,0))       (RGB(200,225,255)) False False
+        Send DefineStyle eEC_UnmatchedBrace   (RGB(255,255,0))   (RGB(255,35,35))   False False
+        Send DefineStyle eEC_MetaTags         (RGB(0,128,128))   (RGB(255,255,187)) True  False
+        Send DefineStyle eEC_Selection        CI_NoColour        CI_NoColour        False False
+        Send DefineStyle eEC_PreProcessor     (RGB(215,107,0))   (RGB(255,255,187)) False False
+    End_Procedure
+
+End_Class

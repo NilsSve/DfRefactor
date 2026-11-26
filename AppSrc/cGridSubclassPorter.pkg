@@ -1,0 +1,1361 @@
+﻿//****************************************************************************
+// $Module type: Package
+// $Module name: cGridSubclassPorter.pkg
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-10-04
+//
+// Description : ConvertGridSubclassToCodeJock's engine. A workspace's OWN subclass of a legacy grid is
+//               ported IN PLACE to the CodeJock grid it maps to - "Class X is a dbGrid" becomes "Class X
+//               is a cDbCJGrid", in its own package, keeping its name - and then every object of it is
+//               converted with it, all or nothing (design 2026-10-03, built 2026-10-04).
+//****************************************************************************
+Use cDbGridTocDbCJGrid.pkg
+Use cDbListTocDbCJGridPromptList.pkg
+Use cGridToCJGrid.pkg
+Use Seq_chnl.pkg                  // Seq_New_Channel - the DIR: listing of the run's folders
+
+/* WHY IN PLACE (Nils 2026-10-03: "a subclass can't be blindly swapped for a CodeJock grid class without
+   first have converted the cEntryGrid subclass"). An object converter re-based a subclass object on the
+   plain CodeJock class and lost what the subclass added - one workspace's dbGrid subclass anchors the
+   grid and translates every label and help text through its own language table. So the converters leave
+   such objects as they are (cGridToCJGridBase.SubclassToLeave), and this ports the CLASS first:
+
+     Class X is a dbGrid  -> Class X is a cDbCJGrid           Use Dftable.pkg  -> Use cDbCJGrid.pkg
+     Class X is a dbList  -> Class X is a cDbCJGridPromptList Use Dfsellst.pkg -> Use cDbCJGridPromptList.pkg
+     Class X is a Grid    -> Class X is a cCJGrid             (Windows.pkg stays; Use cCJGrid.pkg added)
+
+   A legacy grid sets its labels and help PER ITEM, a CodeJock grid per COLUMN, so the class's label and
+   help hooks move into a new column class in the same package, "XColumn", with only the message names
+   changed - their bodies carry over line for line:
+
+     Procedure Set Header_Label Integer iCol String s   -> Procedure Set psCaption String s
+     Procedure Set Status_Help Integer iItem String s   -> Procedure Set Status_Help String s
+     Function Status_Help Integer iItem Returns String  -> Function Status_Help Returns String
+       (its "which item" selection goes - a column IS the item)
+
+   Construct_Object's Set statements go through the object converter's own property mapping; a Set Label
+   override is dropped (a CodeJock grid shows no label); ANYTHING ELSE in the class makes it not portable,
+   and the run says what. Then the objects: the family's object converter runs with the parameter
+   "X,X,XColumn" - the in-place mode: the object keeps "is a X", its Begin_Row columns become XColumn
+   objects, and no "behaviour not inherited" TODO is written (cGridToCJGridBase.TransformSource).
+
+   ALL OR NOTHING PER CLASS, because a ported class with unconverted objects does not compile. Before
+   anything is written: the class must be portable, no other class may be built on it, no object may sit
+   outside the run's files, no object may set a Label, and a dry run of every object must convert it -
+   one declined object refuses the whole class. One class's refusal leaves the others alone.
+
+   THE PARAMETER names one class - or is EMPTY, and the run takes every grid subclass its files declare.
+   That is how a PLAN run reaches it (2026-10-04): the Check's rows name this function wherever
+   SubclassVerdict says the class converts - the class line, and every object of it - and the plan passes
+   their files and no class. A refusal whose cause is in the source leaves a marker above the class
+   (_WriteMarker), which the next Check reads, so the board says why instead of offering it again.
+
+   A List subclass is not ported yet: a List's objects commonly set Label, which no CodeJock grid shows. */
+Class cGridSubclassPorter is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        Property String   psClass        ""     // the class being ported, as written in its declaration
+        Property String   psSuperLc      ""     // its legacy superclass, lowercase: dbgrid / dblist / grid
+        Property String   psTargetGrid   ""
+        Property String  psObjectFn     ""    // the object converter of the family, by its function name - for the notes
+        Property String   psTargetColumn ""
+        Property String   psTargetUse    ""     // the package that defines the target grid class
+        Property String   psLegacyUse    ""     // the legacy package swapped out ("" for Grid: Windows.pkg stays)
+        Property String   psColumnClass  ""     // "XColumn" when hooks moved, else "" (the standard column)
+        Property String   psRefusal      ""     // why the class is not portable ("" = it is)
+        Property String[] pasRefusals           // every reason, psRefusal first - the run note counts them
+        Property String[] pasPortNotes          // what the port did, for the run notes
+        Property Handle   phoConverter   0      // the family's object converter (mapping + in-place objects)
+    End_Procedure
+
+    Procedure Destroy
+        Send _DropConverter
+        Forward Send Destroy
+    End_Procedure
+
+    Procedure _DropConverter
+        Handle ho
+        Get phoConverter to ho
+        If (ho <> 0) Begin
+            Send Destroy of ho
+            Set phoConverter to 0
+        End
+    End_Procedure
+
+    // *** Small text helpers ***
+
+    // The words of sText, split at spaces and tabs, no empty ones.
+    Function _Words String sText Returns String[]
+        String[] asRaw asOut
+        Integer  i iLast
+        Move (StrSplitToArray((Replaces(Character(9), sText, " ")), " ")) to asRaw
+        Move (SizeOfArray(asRaw) - 1) to iLast
+        For i from 0 to iLast
+            If (asRaw[i] <> "") ;
+                Move asRaw[i] to asOut[-1]
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // The code part of a trimmed line: everything before a "//" comment.
+    Function _CodePart String sTrim Returns String
+        Integer iPos
+        Move (Pos("//", sTrim)) to iPos
+        If (iPos > 0) ;
+            Move (Left(sTrim, (iPos - 1))) to sTrim
+        Function_Return (Trim(sTrim))
+    End_Function
+
+    // The lowercase tokens of a line's code, split at spaces and the expression punctuation - for "does this
+    // line still name X". A dotted Table.Field stays one token.
+    Function _CodeTokens String sTrim Returns String[]
+        String sT
+        Get _CodePart sTrim to sT
+        Move (Lowercase(sT)) to sT
+        Move (Replaces("(", sT, " ")) to sT
+        Move (Replaces(")", sT, " ")) to sT
+        Move (Replaces(",", sT, " ")) to sT
+        Move (Replaces("+", sT, " ")) to sT
+        Move (Replaces("=", sT, " ")) to sT
+        Move (Replaces("<", sT, " ")) to sT
+        Move (Replaces(">", sT, " ")) to sT
+        Move (Replaces("*", sT, " ")) to sT
+        Move (Replaces(";", sT, " ")) to sT
+        Function_Return (_Words(Self, sT))
+    End_Function
+
+    // Does the line's code name sWordLc (a lowercase token)?
+    Function _NamesWord String sTrim String sWordLc Returns Boolean
+        String[] asTok
+        Get _CodeTokens sTrim to asTok
+        Function_Return (SearchArray(sWordLc, asTok) <> -1)
+    End_Function
+
+    // The leading whitespace of sLine.
+    Function _Indent String sLine Returns String
+        Function_Return (Left(sLine, (Length(sLine) - Length(LTrim(sLine)))))
+    End_Function
+
+    /* sLine starts with exactly the words asHead (lowercase) and then "to": returns what follows that "to",
+       as written, with bOk True. Otherwise "" and bOk False. "Forward Set Header_Label Item Item# to x". */
+    Function _RestAfterWords String sLine String[] asHead Boolean ByRef bOk Returns String
+        String  sRest sWord
+        Integer i iLast iPos
+
+        Move False to bOk
+        Move (Trim(Replaces(Character(9), sLine, " "))) to sRest
+        Move (SizeOfArray(asHead) - 1) to iLast
+        For i from 0 to iLast
+            Move (Pos(" ", sRest)) to iPos
+            If (iPos = 0) ;
+                Function_Return ""
+            Move (Left(sRest, (iPos - 1))) to sWord
+            If (Lowercase(sWord) <> asHead[i]) ;
+                Function_Return ""
+            Move (Trim(Mid(sRest, Length(sRest), (iPos + 1)))) to sRest
+        Loop
+        If (Lowercase(Left(sRest, 3)) <> "to ") ;
+            Function_Return ""
+        Move True to bOk
+        Function_Return (Trim(Mid(sRest, Length(sRest), 4)))
+    End_Function
+
+    /* A per-item call rewritten to its per-column form. sLine is "<verb> <msg> [Item] <var> to <rest>" (verb
+       one or two words, e.g. "forward set", "get"); the result is "<indent><sNew> to <rest>", or "" when the
+       line is not that call. Tried with and without the "Item" keyword. */
+    Function _RewriteItemCall String sLine String sVerbLc String sMsgLc String sVarLc String sNew Returns String
+        String[] asHead asVerb
+        String   sRest
+        Boolean  bOk
+        Integer  i iLast
+
+        Get _Words sVerbLc to asVerb
+        Move (SizeOfArray(asVerb) - 1) to iLast
+        For i from 0 to iLast
+            Move asVerb[i] to asHead[-1]
+        Loop
+        Move sMsgLc to asHead[-1]
+        Move "item" to asHead[-1]
+        Move sVarLc to asHead[-1]
+        Get _RestAfterWords sLine asHead (&bOk) to sRest
+        If (bOk = False) Begin
+            Move (RemoveFromArray(asHead, (SizeOfArray(asHead) - 2))) to asHead
+            Get _RestAfterWords sLine asHead (&bOk) to sRest
+        End
+        If (bOk = False) ;
+            Function_Return ""
+        Function_Return ((_Indent(Self, sLine)) + sNew + " to " + sRest)
+    End_Function
+
+    // The declaration on sTrim, "Class <name> is a(n) <super>": True, with the name and the superclass as
+    // written. A commented-out declaration is not one.
+    Function _ClassDecl String sTrim String ByRef sName String ByRef sSuper Returns Boolean
+        String   sCode
+        String[] asW
+        Move "" to sName
+        Move "" to sSuper
+        Get _CodePart sTrim to sCode
+        Get _Words sCode to asW
+        If (SizeOfArray(asW) < 5) ;
+            Function_Return False
+        If (Lowercase(asW[0]) <> "class" or Lowercase(asW[2]) <> "is" or (Lowercase(asW[3]) <> "a" and Lowercase(asW[3]) <> "an")) ;
+            Function_Return False
+        Move asW[1] to sName
+        Move asW[4] to sSuper
+        Function_Return True
+    End_Function
+
+    // *** The family ***
+
+    // Sets the targets for a legacy superclass; False when it is not one this ports.
+    Function _SetFamily String sSuperLc Returns Boolean
+        Handle ho
+
+        Send _DropConverter
+        If (sSuperLc = "dbgrid") Begin
+            Set psObjectFn     to "RefactorDbGridTocDbCJGrid"
+            Set psTargetGrid   to "cDbCJGrid"
+            Set psTargetColumn to "cDbCJGridColumn"
+            Set psTargetUse    to "cDbCJGrid.pkg"
+            Set psLegacyUse    to "Dftable.pkg"
+            Get Create (RefClass(cDbGridTocDbCJGrid)) to ho
+        End
+        Else If (sSuperLc = "dblist") Begin
+            Set psObjectFn     to "RefactorDbListTocDbCJGridPromptList"
+            Set psTargetGrid   to "cDbCJGridPromptList"
+            Set psTargetColumn to "cDbCJGridColumn"
+            Set psTargetUse    to "cDbCJGridPromptList.pkg"
+            Set psLegacyUse    to "Dfsellst.pkg"
+            Get Create (RefClass(cDbListTocDbCJGridPromptList)) to ho
+        End
+        Else If (sSuperLc = "grid") Begin
+            Set psObjectFn     to "RefactorGridToCJGrid"
+            Set psTargetGrid   to "cCJGrid"
+            Set psTargetColumn to "cCJGridColumn"
+            Set psTargetUse    to "cCJGrid.pkg"
+            Set psLegacyUse    to ""
+            Get Create (RefClass(cGridToCJGrid)) to ho
+        End
+        Else ;
+            Function_Return False
+        Set psSuperLc    to sSuperLc
+        Set phoConverter to ho
+        Function_Return True
+    End_Function
+
+    Procedure _Refuse String sWhy
+        String[] asWhy
+        If (psRefusal(Self) = "") ;
+            Set psRefusal to sWhy
+        Get pasRefusals to asWhy
+        If (SearchArray(sWhy, asWhy) = -1) Begin
+            Move sWhy to asWhy[-1]
+            Set pasRefusals to asWhy
+        End
+    End_Procedure
+
+    /* psRefusal, and - when the class had more reasons not to port - how many and the first few (2026-11-01): one
+       workspace's dbList subclass overrode a dozen dbList internals, and the run note named only its first line, a
+       child Array object in Construct_Object, which read like a small thing to fix. */
+    Function _RefusalSummary Returns String
+        String[] asWhy
+        String   sOut
+        Integer  i iShown
+
+        Get pasRefusals to asWhy
+        Move (psRefusal(Self)) to sOut
+        If (SizeOfArray(asWhy) > 1) Begin
+            Move (SizeOfArray(asWhy) - 1) to iShown
+            If (iShown > 5) ;
+                Move 5 to iShown
+            Move (sOut + ". " + String(SizeOfArray(asWhy) - 1) + " more reason(s): ") to sOut
+            For i from 1 to iShown
+                If (i > 1) ;
+                    Move (sOut + "; ") to sOut
+                Move (sOut + asWhy[i]) to sOut
+            Loop
+            If ((SizeOfArray(asWhy) - 1) > iShown) ;
+                Move (sOut + "; ...") to sOut
+        End
+        Function_Return sOut
+    End_Function
+
+    Procedure _Note String sNote
+        String[] asNotes
+        Get pasPortNotes to asNotes
+        Move sNote to asNotes[-1]
+        Set pasPortNotes to asNotes
+    End_Procedure
+
+    // *** The class body's members ***
+
+    // Construct_Object / End_Construct_Object: kept, its Set statements through the object converter's own
+    // property mapping (translate, comment out with the closest equivalent, or drop - as an object's own Set
+    // lines go). Anything but a Forward, a Property, a Set, a comment or a blank line refuses the class.
+    Function _PortConstructor String[] asMember Returns String[]
+        String[] asOut asTr
+        String   sTrim sLow sHint sIndent sLine
+        Integer  i iLast j jLast
+        Boolean  bOk bRefused
+        Handle   hoConv
+
+        Get phoConverter to hoConv
+        Move asMember[0] to asOut[-1]
+        Move (SizeOfArray(asMember) - 2) to iLast
+        For i from 1 to iLast
+            Move asMember[i] to sLine
+            Move (Trim(sLine))      to sTrim
+            Move (Lowercase(sTrim)) to sLow
+            If (sLow = "" or Left(sLow, 2) = "//" or Left(sLow, 8) = "forward " or Left(sLow, 9) = "property ") Begin
+                Move sLine to asOut[-1]
+            End
+            Else If (Left(sLow, 4) = "set ") Begin
+                Get IsTranslatableGridProperty of hoConv sLow to bOk
+                If (bOk = True) Begin
+                    Get TranslateGridProperty of hoConv sLine sLow to asTr
+                    Move (SizeOfArray(asTr) - 1) to jLast
+                    For j from 0 to jLast
+                        Move asTr[j] to asOut[-1]
+                    Loop
+                    Send _Note ("'" + sTrim + "' translated for " + psTargetGrid(Self) + ".")
+                End
+                Else Begin
+                    Get IsCommentOutGridProperty of hoConv sLow to bOk
+                    If (bOk = True) Begin
+                        Get _Indent sLine to sIndent
+                        Move (sIndent + "// " + sTrim) to asOut[-1]
+                        Get LegacyOnlyGridPropertyHint of hoConv sLow to sHint
+                        If (sHint <> "") ;
+                            Move (sIndent + "// TODO: closest " + psTargetGrid(Self) + " equivalent is " + sHint) to asOut[-1]
+                        Send _Note ("'" + sTrim + "' commented out - " + psTargetGrid(Self) + " has no such property.")
+                    End
+                    Else Begin
+                        Get IsLegacyGridProperty of hoConv sLow to bOk
+                        If (bOk = True) ;
+                            Send _Note ("'" + sTrim + "' dropped - it means nothing to " + psTargetGrid(Self) + ".")
+                        Else ;
+                            Move sLine to asOut[-1]
+                    End
+                End
+            End
+            // One reason per member: a child object's every line is the same reason.
+            Else If (bRefused = False) Begin
+                Send _Refuse ("its " + Trim(asMember[0]) + " does more than set properties ('" + sTrim + "')")
+                Move True to bRefused
+            End
+        Loop
+        Move asMember[(SizeOfArray(asMember) - 1)] to asOut[-1]
+        Function_Return asOut
+    End_Function
+
+    // The label hook: Set Header_Label <col> <label> -> Set psCaption <label>, its body line for line.
+    Function _PortCaptionHook String[] asMember String sTypeLabel String sLabel String sColLc Returns String[]
+        String[] asOut
+        String   sLine sNew
+        Integer  i iLast
+
+        Move ((_Indent(Self, asMember[0])) + "Procedure Set psCaption " + sTypeLabel + " " + sLabel) to asOut[-1]
+        Move (SizeOfArray(asMember) - 2) to iLast
+        For i from 1 to iLast
+            Move asMember[i] to sLine
+            Get _RewriteItemCall sLine "forward set" "header_label" sColLc "Forward Set psCaption" to sNew
+            If (sNew = "") ;
+                Get _RewriteItemCall sLine "get" "header_label" sColLc "Get psCaption" to sNew
+            If (sNew <> "") ;
+                Move sNew to sLine
+            Else If (_NamesWord(Self, (Trim(sLine)), sColLc)) ;
+                Send _Refuse ("its Set Header_Label uses the column number for more than the label ('" + Trim(sLine) + "')")
+            Move sLine to asOut[-1]
+        Loop
+        Move asMember[(SizeOfArray(asMember) - 1)] to asOut[-1]
+        Function_Return asOut
+    End_Function
+
+    // Set Status_Help <item> <help> -> Set Status_Help <help>.
+    Function _PortSetHelpHook String[] asMember String sTypeHelp String sHelp String sItemLc Returns String[]
+        String[] asOut
+        String   sLine sNew
+        Integer  i iLast
+
+        Move ((_Indent(Self, asMember[0])) + "Procedure Set Status_Help " + sTypeHelp + " " + sHelp) to asOut[-1]
+        Move (SizeOfArray(asMember) - 2) to iLast
+        For i from 1 to iLast
+            Move asMember[i] to sLine
+            Get _RewriteItemCall sLine "forward set" "status_help" sItemLc "Forward Set Status_Help" to sNew
+            If (sNew <> "") ;
+                Move sNew to sLine
+            Else If (_NamesWord(Self, (Trim(sLine)), sItemLc)) ;
+                Send _Refuse ("its Set Status_Help uses the item number for more than the help ('" + Trim(sLine) + "')")
+            Move sLine to asOut[-1]
+        Loop
+        Move asMember[(SizeOfArray(asMember) - 1)] to asOut[-1]
+        Function_Return asOut
+    End_Function
+
+    // Is sLow (a lowercase trimmed line) a local declaration - a type, then names?
+    Function _IsLocalDecl String sLow Returns Boolean
+        String sW
+        Get _NthWord of ghoFuncLib sLow 1 to sW
+        Function_Return (sW = "integer" or sW = "string" or sW = "number" or sW = "boolean" or sW = "handle" or sW = "date" or sW = "real" or sW = "datetime" or sW = "variant")
+    End_Function
+
+    // The index of the End that closes the Begin on asLines[iFrom], -1 when there is none.
+    Function _BlockEnd String[] ByRef asLines Integer iFrom Returns Integer
+        String[] asW
+        Integer  i iLast iDepth
+        Move 0 to iDepth
+        Move (SizeOfArray(asLines) - 1) to iLast
+        For i from iFrom to iLast
+            Get _Words (Lowercase(_CodePart(Self, (Trim(asLines[i]))))) to asW
+            If (SizeOfArray(asW) > 0) Begin
+                If (asW[(SizeOfArray(asW) - 1)] = "begin") ;
+                    Increment iDepth
+                If (asW[0] = "end") Begin
+                    Decrement iDepth
+                    If (iDepth = 0) ;
+                        Function_Return i
+                End
+            End
+        Loop
+        Function_Return -1
+    End_Function
+
+    // Every line from iFrom to iTo (exclusive) is removed (abGone) or blank.
+    Function _AllGone String[] ByRef asLines Boolean[] ByRef abGone Integer iFrom Integer iTo Returns Boolean
+        Integer i
+        For i from iFrom to (iTo - 1)
+            If (abGone[i] = False and Trim(asLines[i]) <> "") ;
+                Function_Return False
+        Loop
+        Function_Return True
+    End_Function
+
+    /* Function Status_Help <item> Returns String -> Function Status_Help Returns String. A column IS the item,
+       so the body's "which item" selection goes: the locals it fills from the item parameter (Itm, from
+       "Move iItem to Itm"), every Move into them, their declarations, and the If / Else Begin..End shells
+       those Moves leave empty. "Forward Get Status_Help <item> to x" becomes "Forward Get Status_Help to x".
+       Anything still naming the item - or Num_Arguments - refuses the class. */
+    Function _PortGetHelpHook String[] asMember String sItemLc String sReturns Returns String[]
+        String[]  asBody asOut asW asSel
+        Integer[] aiKeep
+        Boolean[] abGone
+        String    sLine sLow sNew sIndent
+        Integer   i iLast j iEnd iNext k
+        Boolean   bChanged bBlank bGone bSeek
+
+        // the body alone, between the header and the end
+        Move (SizeOfArray(asMember) - 2) to iLast
+        For i from 1 to iLast
+            Move asMember[i] to asBody[-1]
+        Loop
+        Move (SizeOfArray(asBody) - 1) to iLast
+        // the selector locals
+        For i from 0 to iLast
+            Get _Words (Lowercase(_CodePart(Self, (Trim(asBody[i]))))) to asW
+            If (SizeOfArray(asW) = 4) Begin
+                If (asW[0] = "move" and asW[1] = sItemLc and asW[2] = "to" and SearchArray(asW[3], asSel) = -1) ;
+                    Move asW[3] to asSel[-1]
+            End
+        Loop
+        // mark: every Move into a selector, and a selector's declaration (the name taken out of a list)
+        For i from 0 to iLast
+            Move False to abGone[i]
+        Loop
+        For i from 0 to iLast
+            Move (Lowercase(_CodePart(Self, (Trim(asBody[i]))))) to sLow
+            Get _Words sLow to asW
+            If (SizeOfArray(asW) = 4) Begin
+                If (asW[0] = "move" and asW[2] = "to" and SearchArray(asW[3], asSel) <> -1) ;
+                    Move True to abGone[i]
+            End
+            If (abGone[i] = False and SizeOfArray(asW) > 1 and _IsLocalDecl(Self, sLow)) Begin
+                Move (ResizeArray(aiKeep, 0)) to aiKeep
+                For j from 1 to (SizeOfArray(asW) - 1)
+                    If (SearchArray(asW[j], asSel) = -1) ;
+                        Move j to aiKeep[-1]
+                Loop
+                If (SizeOfArray(aiKeep) = 0) Begin
+                    Move True to abGone[i]
+                End
+                Else If (SizeOfArray(aiKeep) < (SizeOfArray(asW) - 1)) Begin
+                    // keep the other names, in their own casing
+                    Get _Words (Trim(asBody[i])) to asW
+                    Get _Indent asBody[i] to sIndent
+                    Move (sIndent + asW[0]) to sNew
+                    For j from 0 to (SizeOfArray(aiKeep) - 1)
+                        Move (sNew + " " + asW[aiKeep[j]]) to sNew
+                    Loop
+                    Move sNew to asBody[i]
+                End
+            End
+        Loop
+        // the If / Else shells the removed Moves leave empty
+        Repeat
+            Move False to bChanged
+            For i from 0 to iLast
+                If (abGone[i] = False) Begin
+                    Get _Words (Lowercase(_CodePart(Self, (Trim(asBody[i]))))) to asW
+                    If (SizeOfArray(asW) > 1) Begin
+                        If (asW[0] = "if" and asW[(SizeOfArray(asW) - 1)] = "begin") Begin
+                            Get _BlockEnd (&asBody) i to iEnd
+                            Move False to bGone
+                            If (iEnd > i) ;
+                                Get _AllGone (&asBody) (&abGone) (i + 1) iEnd to bGone
+                            If (bGone = True) Begin
+                                // ...and its Else Begin..End, when that is empty too
+                                Move (iEnd + 1) to iNext
+                                Move True to bSeek
+                                While (bSeek = True)
+                                    If (iNext > iLast) ;
+                                        Move False to bSeek
+                                    Else If (Trim(asBody[iNext]) <> "") ;
+                                        Move False to bSeek
+                                    Else ;
+                                        Increment iNext
+                                Loop
+                                If (iNext <= iLast) Begin
+                                    Get _Words (Lowercase(_CodePart(Self, (Trim(asBody[iNext]))))) to asW
+                                    If (SizeOfArray(asW) = 2 and asW[0] = "else" and asW[1] = "begin") Begin
+                                        Get _BlockEnd (&asBody) iNext to k
+                                        Move False to bGone
+                                        If (k > iNext) ;
+                                            Get _AllGone (&asBody) (&abGone) (iNext + 1) k to bGone
+                                        If (bGone = True) Begin
+                                            For j from iNext to k
+                                                Move True to abGone[j]
+                                            Loop
+                                        End
+                                        Else ;
+                                            Move -1 to iEnd      // a live Else: the If shell must stay
+                                    End
+                                End
+                                If (iEnd > i) Begin
+                                    For j from i to iEnd
+                                        Move True to abGone[j]
+                                    Loop
+                                    Move True to bChanged
+                                End
+                            End
+                        End
+                    End
+                End
+            Loop
+        Until (bChanged = False)
+        // the header, the kept lines (the Forward Get rewritten), the end; one blank line where several meet
+        Move ((_Indent(Self, asMember[0])) + "Function Status_Help Returns " + sReturns) to asOut[-1]
+        Move False to bBlank
+        For i from 0 to iLast
+            If (abGone[i] = False) Begin
+                Move asBody[i] to sLine
+                If (Trim(sLine) = "") Begin
+                    If (bBlank = False) ;
+                        Move sLine to asOut[-1]
+                    Move True to bBlank
+                End
+                Else Begin
+                    Move False to bBlank
+                    Get _RewriteItemCall sLine "forward get" "status_help" sItemLc "Forward Get Status_Help" to sNew
+                    For j from 0 to (SizeOfArray(asSel) - 1)
+                        If (sNew = "") ;
+                            Get _RewriteItemCall sLine "forward get" "status_help" asSel[j] "Forward Get Status_Help" to sNew
+                    Loop
+                    If (sNew <> "") ;
+                        Move sNew to sLine
+                    Else Begin
+                        If (_NamesWord(Self, (Trim(sLine)), sItemLc) or _NamesWord(Self, (Trim(sLine)), "num_arguments")) ;
+                            Send _Refuse ("its Function Status_Help uses the item number for more than the help ('" + Trim(sLine) + "')")
+                        For j from 0 to (SizeOfArray(asSel) - 1)
+                            If (_NamesWord(Self, (Trim(sLine)), asSel[j])) ;
+                                Send _Refuse ("its Function Status_Help uses the item number for more than the help ('" + Trim(sLine) + "')")
+                        Loop
+                    End
+                    Move sLine to asOut[-1]
+                End
+            End
+        Loop
+        Move asMember[(SizeOfArray(asMember) - 1)] to asOut[-1]
+        Function_Return asOut
+    End_Function
+
+    /* One member of the class body, sorted: kept in the grid class (Construct_Object), moved into the column
+       class (a hook - returned in asHook), dropped (Set Label) or refused. Returns the lines the grid class
+       keeps; asHook comes back with the column class's version, or empty. */
+    Function _PortMember String[] asMember String[] ByRef asHook Returns String[]
+        String[] asW asNone
+        String   sHead sMethod
+        Integer  iW
+        Boolean  bSet
+
+        Move asNone to asHook
+        Get _Words (_CodePart(Self, (Trim(asMember[0])))) to asW
+        Move (SizeOfArray(asW)) to iW
+        Move (Trim(asMember[0])) to sHead
+        If (iW < 2) Begin
+            Send _Refuse ("'" + sHead + "' - a member this converter does not read")
+            Function_Return asNone
+        End
+        Move (Lowercase(asW[0]) = "procedure" and Lowercase(asW[1]) = "set") to bSet
+        If (bSet = True and iW >= 3) ;
+            Move (Lowercase(asW[2])) to sMethod
+        Else ;
+            Move (Lowercase(asW[1])) to sMethod
+        // Construct_Object / End_Construct_Object: kept, the Sets mapped
+        If (bSet = False and Lowercase(asW[0]) = "procedure" and (sMethod = "construct_object" or sMethod = "end_construct_object") and iW = 2) ;
+            Function_Return (_PortConstructor(Self, asMember))
+        // Procedure Set Header_Label <type> <col> <type> <label>
+        If (bSet = True and sMethod = "header_label" and iW = 7) Begin
+            Get _PortCaptionHook asMember asW[5] asW[6] (Lowercase(asW[4])) to asHook
+            Function_Return asNone
+        End
+        // Procedure Set Status_Help <type> <item> <type> <help>
+        If (bSet = True and sMethod = "status_help" and iW = 7) Begin
+            Get _PortSetHelpHook asMember asW[5] asW[6] (Lowercase(asW[4])) to asHook
+            Function_Return asNone
+        End
+        // Function Status_Help <type> <item> Returns <type>
+        If (bSet = False and Lowercase(asW[0]) = "function" and sMethod = "status_help" and iW = 6) Begin
+            If (Lowercase(asW[4]) = "returns") Begin
+                Get _PortGetHelpHook asMember (Lowercase(asW[3])) asW[5] to asHook
+                Function_Return asNone
+            End
+        End
+        // Procedure Set Label <type> <label>: a CodeJock grid shows no label
+        If (bSet = True and sMethod = "label" and iW = 5) Begin
+            Send _Note ("its Set Label override is dropped - a " + psTargetGrid(Self) + " shows no label.")
+            Function_Return asNone
+        End
+        Send _Refuse ("'" + sHead + "' - no " + psTargetGrid(Self) + " counterpart this converter knows")
+        Function_Return asNone
+    End_Function
+
+    // *** The class ***
+
+    /* _PortClassLines with the text masked (2026-10-30, cRefactorFuncLib's MaskForTransform): a block comment's, a
+       report image's and a string's text and the macro code are masked away while the class is ported and put back
+       after - a commented-out procedure is no code to port, and its text is never refactored. */
+    Function PortClassSource String[] asLines String sClass Returns String[]
+        String[] asOut
+        tWholeFileMask Mask
+        Integer iMacro iLost
+
+        Get MaskForTransform of ghoFuncLib (&asLines) (&Mask) to iMacro
+        Get _PortClassLines asLines sClass to asOut
+        If (SizeOfArray(asOut) > 0) Begin
+            Get UnmaskAfterTransform of ghoFuncLib (&asOut) (&Mask) to iLost
+            If (iLost > 0) ;
+                Send _Note (String(iLost) * "line(s) of comment, image or string text or macro code the conversion had removed were put back where they were - check the file.")
+        End
+        Function_Return asOut
+    End_Function
+
+    /* The file asLines with class sClass ported in place, or an EMPTY array with psRefusal saying why. Fills
+       psColumnClass ("" when no hook moved) and pasPortNotes. The file's other classes and code are untouched. */
+    Function _PortClassLines String[] asLines String sClass Returns String[]
+        String[] asOut asNone asKeep asHook asHooks asMember asNotes
+        String   sName sSuper sTrim sLow sIndent sMemberIndent sLine sUsed sLegacy sTargetUse sColumn sNote
+        Integer  i iLast iClass iEnd k kLast iUse iLastUse iFirstHook iUseDepth
+        Boolean  bUseInBlock
+        Boolean  bFound bStill bTargetUsed bGone
+        Handle   hoConv
+
+        Set psRefusal to ""
+        Set pasRefusals to asNone
+        Set psColumnClass to ""
+        Set pasPortNotes to asNotes
+        Move -1 to iClass
+        Move (SizeOfArray(asLines) - 1) to iLast
+        For i from 0 to iLast
+            If (iClass = -1) Begin
+                Get _ClassDecl (Trim(asLines[i])) (&sName) (&sSuper) to bFound
+                If (bFound = True and Lowercase(sName) = Lowercase(sClass)) Begin
+                    Move i to iClass
+                    Set psClass to sName
+                End
+            End
+        Loop
+        If (iClass = -1) Begin
+            Send _Refuse ("Class " + sClass + " is not declared in this file")
+            Function_Return asNone
+        End
+        Get _ClassDecl (Trim(asLines[iClass])) (&sName) (&sSuper) to bFound
+        If (_SetFamily(Self, (Lowercase(sSuper))) = False) Begin
+            If (Lowercase(sSuper) = "list") ;
+                Send _Refuse (sName + " is a List subclass - those are not converted yet: their objects commonly set a Label, which no CodeJock grid shows")
+            Else ;
+                Send _Refuse (sName + " is a " + sSuper + ", not a dbGrid, dbList or Grid")
+            Function_Return asNone
+        End
+        Get phoConverter to hoConv
+        Move -1 to iEnd
+        For i from (iClass + 1) to iLast
+            If (iEnd = -1 and Left(Lowercase(Trim(asLines[i])), 9) = "end_class") ;
+                Move i to iEnd
+        Loop
+        If (iEnd = -1) Begin
+            Send _Refuse ("Class " + sName + " has no End_Class")
+            Function_Return asNone
+        End
+
+        // The body: comments and blank lines kept, members sorted (_PortMember), anything else refused.
+        Move "" to sMemberIndent
+        Move -1 to iFirstHook
+        Move (iClass + 1) to i
+        While (i < iEnd)
+            Move asLines[i] to sLine
+            Move (Trim(sLine))      to sTrim
+            Move (Lowercase(sTrim)) to sLow
+            If (sLow = "" or Left(sLow, 2) = "//") Begin
+                Move sLine to asKeep[-1]
+                Increment i
+            End
+            Else If (Left(sLow, 2) = "/*") Begin
+                Repeat
+                    Move asLines[i] to asKeep[-1]
+                    Increment i
+                Until (i >= iEnd or (Lowercase(asLines[(i - 1)]) contains "*/"))
+            End
+            Else If (Left(sLow, 10) = "procedure " or Left(sLow, 9) = "function ") Begin
+                If (sMemberIndent = "") ;
+                    Get _Indent sLine to sMemberIndent
+                Move (ResizeArray(asMember, 0)) to asMember
+                Repeat
+                    Move asLines[i] to asMember[-1]
+                    Move (Lowercase(Trim(asLines[i]))) to sLow
+                    Increment i
+                Until (i >= iEnd or Left(sLow, 13) = "end_procedure" or Left(sLow, 12) = "end_function")
+                Get _PortMember asMember (&asHook) to asMember
+                Move (SizeOfArray(asMember) = 0) to bGone
+                Move (SizeOfArray(asMember) - 1) to kLast
+                For k from 0 to kLast
+                    Move asMember[k] to asKeep[-1]
+                Loop
+                If (SizeOfArray(asHook) > 0) Begin
+                    If (iFirstHook = -1) Begin
+                        Move (SizeOfArray(asKeep)) to iFirstHook
+                        Move "" to asKeep[-1]       // the place the note goes, filled in below
+                        Move False to bGone         // the note takes the member's place, its blank lines too
+                    End
+                    If (SizeOfArray(asHooks) > 0) ;
+                        Move "" to asHooks[-1]
+                    For k from 0 to (SizeOfArray(asHook) - 1)
+                        Move asHook[k] to asHooks[-1]
+                    Loop
+                End
+                /* A member that LEFT the class - moved to the column class, or dropped - takes the blank
+                   lines after it along: they only separated it from the next member, and kept, they piled
+                   up above End_Class (the first live run, 2026-10-04: four of them). */
+                If (bGone = True) Begin
+                    While (i < iEnd and Trim(asLines[i]) = "")
+                        Increment i
+                    Loop
+                End
+            End
+            Else Begin
+                Send _Refuse ("'" + sTrim + "' in its class body - not something this converter carries")
+                Increment i
+            End
+        Loop
+        If (psRefusal(Self) <> "") ;
+            Function_Return asNone
+
+        If (SizeOfArray(asHooks) > 0) Begin
+            Move (sName + "Column") to sColumn
+            Set psColumnClass to sColumn
+            Move (sMemberIndent + "// The label and help hooks are in " + sColumn + ", below: a CodeJock grid sets them per column.") to asKeep[iFirstHook]
+        End
+        Get psLegacyUse to sLegacy
+        Get psTargetUse to sTargetUse
+
+        // Assemble: the lines before the class, the class (its superclass swapped), the column class, the rest.
+        For i from 0 to (iClass - 1)
+            Move asLines[i] to asOut[-1]
+        Loop
+        Get _Indent asLines[iClass] to sIndent
+        Move (sIndent + "Class " + sName + " is a " + psTargetGrid(Self)) to sLine
+        Get _CodePart (Trim(asLines[iClass])) to sTrim
+        If (Length(sTrim) < Length(Trim(asLines[iClass]))) ;
+            Move (sLine + "  " + Trim(Right((Trim(asLines[iClass])), (Length(Trim(asLines[iClass])) - Length(sTrim))))) to sLine
+        Move sLine to asOut[-1]
+        For i from 0 to (SizeOfArray(asKeep) - 1)
+            Move asKeep[i] to asOut[-1]
+        Loop
+        Move asLines[iEnd] to asOut[-1]
+        If (SizeOfArray(asHooks) > 0) Begin
+            Move "" to asOut[-1]
+            Move (sIndent + "Class " + sColumn + " is a " + psTargetColumn(Self)) to asOut[-1]
+            For i from 0 to (SizeOfArray(asHooks) - 1)
+                Move asHooks[i] to asOut[-1]
+            Loop
+            Move (sIndent + "End_Class") to asOut[-1]
+        End
+        For i from (iEnd + 1) to iLast
+            Move asLines[i] to asOut[-1]
+        Loop
+
+        /* THE USE LINE. The legacy package the family names (Dftable.pkg / Dfsellst.pkg) is swapped in place
+           for the target's when nothing else in the file still needs it - the object converter's own test
+           (LegacyPackageStillUsed); otherwise it stays and the target joins it. Without a legacy Use - Grid,
+           whose class lives in Windows.pkg, or a class that relied on another file's Use - the target is
+           added after the last Use above the class, or right above the class when there is none. */
+        Move -1 to iUse
+        Move -1 to iLastUse
+        Move False to bTargetUsed
+        For i from 0 to (iClass - 1)
+            Send rfUseAnchorStep asOut[i] i (&iUseDepth) (&bUseInBlock) (&iLastUse)
+            Get UsePackageOnLine of hoConv asOut[i] to sUsed
+            If (sUsed <> "") Begin
+                If (Lowercase(sUsed) = Lowercase(sTargetUse)) ;
+                    Move True to bTargetUsed
+                If (sLegacy <> "" and (Lowercase(sUsed) = Lowercase(sLegacy) or Lowercase(sUsed + ".pkg") = Lowercase(sLegacy))) ;
+                    Move i to iUse
+            End
+        Loop
+        If (bTargetUsed = False) Begin
+            Move False to bStill
+            If (iUse <> -1) ;
+                Get LegacyPackageStillUsed of hoConv (&asOut) sLegacy to bStill
+            If (iUse <> -1 and bStill = False) Begin
+                Move ((_Indent(Self, asOut[iUse])) + "Use " + sTargetUse) to asOut[iUse]
+                Send _Note ("Use " + sLegacy + " -> Use " + sTargetUse + ".")
+            End
+            Else Begin
+                If (iUse <> -1) ;
+                    Move iUse to iLastUse
+                If (iLastUse <> -1) ;
+                    Move (InsertInArray(asOut, (iLastUse + 1), ((_Indent(Self, asOut[iLastUse])) + "Use " + sTargetUse))) to asOut
+                Else ;
+                    Move (InsertInArray(asOut, iClass, (sIndent + "Use " + sTargetUse))) to asOut
+                Send _Note ("Use " + sTargetUse + " added.")
+            End
+        End
+        Function_Return asOut
+    End_Function
+
+    // *** The run ***
+
+    // Is the trimmed line an object of sClassLc, as the in-place object converter will see it?
+    Function _IsObjectOfClass String sTrim String sClassLc Returns Boolean
+        String[] asW
+        Get _Words (_CodePart(Self, sTrim)) to asW
+        If (SizeOfArray(asW) < 5) ;
+            Function_Return False
+        Function_Return (Lowercase(asW[0]) = "object" and Lowercase(asW[2]) = "is" and (Lowercase(asW[3]) = "a" or Lowercase(asW[3]) = "an") and Lowercase(asW[4]) = sClassLc)
+    End_Function
+
+    /* The objects of sClassLc in asLines: their count, and (asLabelSites, "line N") each one that sets its own
+       Label - in its own body, not in a nested object's. */
+    Function _ScanObjects String[] ByRef asLines String sClassLc String[] ByRef asLabelSites Returns Integer
+        Integer i iLast iDepth iCount
+        String  sLow
+        Move 0 to iCount
+        Move 0 to iDepth
+        Move (SizeOfArray(asLines) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(Trim(asLines[i]))) to sLow
+            If (iDepth > 0) Begin
+                If (Left(sLow, 7) = "object ") ;
+                    Increment iDepth
+                Else If (Left(sLow, 10) = "end_object") ;
+                    Decrement iDepth
+                Else If (iDepth = 1 and Left(sLow, 10) = "set label ") ;
+                    Move ("line " + String(i + 1)) to asLabelSites[-1]
+            End
+            Else If (_IsObjectOfClass(Self, (Trim(asLines[i])), sClassLc)) Begin
+                Increment iCount
+                Move 1 to iDepth
+            End
+        Loop
+        Function_Return iCount
+    End_Function
+
+    /* _ScanObjects for SEVERAL classes in one walk over the lines (the run reads each file once, whatever the
+       number of classes): aiCount[k] objects of asCandLc[k] (lowercase names), and asSites[k] the "line N" of
+       each one that sets its own Label. Both come back sized to asCandLc. */
+    Procedure _ScanObjectsAll String[] ByRef asLines String[] ByRef asCandLc Integer[] ByRef aiCount String[][] ByRef asSites
+        String[] asW
+        String   sLow
+        Integer  i iLast iDepth iAt iCand
+
+        Move (SizeOfArray(asCandLc)) to iCand
+        Move (ResizeArray(aiCount, 0))     to aiCount
+        Move (ResizeArray(aiCount, iCand)) to aiCount
+        Move (ResizeArray(asSites, 0))     to asSites
+        Move (ResizeArray(asSites, iCand)) to asSites
+        Move 0  to iDepth
+        Move -1 to iAt
+        Move (SizeOfArray(asLines) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(Trim(Replaces(Character(9), asLines[i], " ")))) to sLow
+            If (iDepth > 0) Begin
+                If (Left(sLow, 7) = "object ") ;
+                    Increment iDepth
+                Else If (Left(sLow, 10) = "end_object") ;
+                    Decrement iDepth
+                Else If (iDepth = 1 and Left(sLow, 10) = "set label ") ;
+                    Move ("line " + String(i + 1)) to asSites[iAt][SizeOfArray(asSites[iAt])]
+            End
+            Else If (Left(sLow, 7) = "object ") Begin
+                Get _Words (_CodePart(Self, sLow)) to asW
+                If (SizeOfArray(asW) >= 5) Begin
+                    If (asW[2] = "is" and (asW[3] = "a" or asW[3] = "an")) Begin
+                        Move (SearchArray(asW[4], asCandLc)) to iAt
+                        If (iAt <> -1) Begin
+                            Move (aiCount[iAt] + 1) to aiCount[iAt]
+                            Move 1 to iDepth
+                        End
+                    End
+                End
+            End
+        Loop
+    End_Procedure
+
+    // The bare file names in sFolder (DIR: lists them one to a line; a missing folder lists nothing).
+    Function _FolderFileNames String sFolder Returns String[]
+        Integer  iCh
+        String   sLine
+        String[] asFiles
+        Move (Seq_New_Channel()) to iCh
+        If (iCh < 0) ;
+            Function_Return asFiles
+        Direct_Input channel iCh ("DIR:" + sFolder + "*.*")
+        If (not(SeqEof)) Begin
+            Readln channel iCh sLine
+            While (not(SeqEof))
+                If (Trim(sLine) <> "") ;
+                    Move (Trim(sLine)) to asFiles[-1]
+                Readln channel iCh sLine
+            Loop
+        End
+        Close_Input channel iCh
+        Send Seq_Release_Channel iCh
+        Function_Return asFiles
+    End_Function
+
+    /* Every "Class X is a Y" of asLines, appended to three parallel lists: the name and the superclass as
+       written, the file beside them. */
+    Procedure _CollectClassDecls String[] ByRef asLines String sFile String[] ByRef asNames String[] ByRef asSupers String[] ByRef asDeclFiles
+        String  sName sSuper
+        Integer i iLast
+        Boolean bFound
+
+        Move (SizeOfArray(asLines) - 1) to iLast
+        For i from 0 to iLast
+            If (Pos("class", Lowercase(asLines[i])) > 0) Begin
+                Get _ClassDecl (Trim(Replaces(Character(9), asLines[i], " "))) (&sName) (&sSuper) to bFound
+                If (bFound = True) Begin
+                    Move sName  to asNames[-1]
+                    Move sSuper to asSupers[-1]
+                    Move sFile  to asDeclFiles[-1]
+                End
+            End
+        Loop
+    End_Procedure
+
+    // The 0-based line that declares sClass in asLines; -1 when none does.
+    Function _ClassLine String[] ByRef asLines String sClass Returns Integer
+        String  sName sSuper sClassLc
+        Integer i iLast
+        Boolean bFound
+
+        Move (Lowercase(sClass)) to sClassLc
+        Move (SizeOfArray(asLines) - 1) to iLast
+        For i from 0 to iLast
+            If (Pos("class", Lowercase(asLines[i])) > 0) Begin
+                Get _ClassDecl (Trim(Replaces(Character(9), asLines[i], " "))) (&sName) (&sSuper) to bFound
+                If (bFound = True) Begin
+                    If (Lowercase(sName) = sClassLc) ;
+                        Function_Return i
+                End
+            End
+        Loop
+        Function_Return -1
+    End_Function
+
+    /* THE NOTE A REFUSED RUN LEAVES ABOVE THE CLASS. A refusal whose cause is in the source - an object that
+       sets its own Label, an object the converter declines - would otherwise come back on every Check as the
+       same offer and be refused again by every run. The marker is the standing one, '// TODO (DFRefactor):
+       NOT converted - <reason>' (cGridToCJGridBase.AppendDeclineMarker): the scan and the analyzer already
+       read it above a declaration, and SubclassVerdict reads it here, so the class's rows say why instead of
+       offering the run. Deleting the line is how the user asks again. */
+    Function _MarkerLead Returns String
+        Function_Return ("/" + "/ TODO (DFRefactor): NOT converted - ")
+    End_Function
+
+    // The reason on the marker line directly above sClass's declaration; "" when there is no marker.
+    Function _MarkerReason String[] ByRef asLines String sClass Returns String
+        String  sAbove sLead
+        Integer iClass
+
+        Get _ClassLine (&asLines) sClass to iClass
+        If (iClass < 1) ;
+            Function_Return ""
+        Move (Trim(Replaces(Character(9), asLines[iClass - 1], " "))) to sAbove
+        Get _MarkerLead to sLead
+        If (Lowercase(Left(sAbove, Length(sLead))) <> Lowercase(sLead)) ;
+            Function_Return ""
+        Function_Return (Trim(Right(sAbove, (Length(sAbove) - Length(sLead)))))
+    End_Function
+
+    // Writes the marker above sClass's declaration in sClassFile (replacing an earlier one). Never in a
+    // read-only run.
+    Procedure _WriteMarker String sClassFile String sClass String sReason
+        String[] asLines
+        String   sLine sOld
+        Integer  iClass
+        Boolean  bOk bUtf8
+
+        If (pbReadOnly(ghoFuncLib) = True) ;
+            Procedure_Return
+        Move (rfReadEncodedFileAsStringArray(sClassFile)) to asLines
+        Get _ClassLine (&asLines) sClass to iClass
+        If (iClass = -1) ;
+            Procedure_Return
+        Move ((_Indent(Self, asLines[iClass])) + (_MarkerLead(Self)) + sReason) to sLine
+        Get _MarkerReason (&asLines) sClass to sOld
+        If (sOld <> "") ;
+            Move sLine to asLines[iClass - 1]
+        Else ;
+            Move (InsertInArray(asLines, iClass, sLine)) to asLines
+        Move (rfFileHasBOM(sClassFile)) to bUtf8
+        Get _GuardedWriteEncodedFile of ghoFuncLib sClassFile (&asLines) bUtf8 to bOk
+    End_Procedure
+
+    /* CAN sClass BE CONVERTED IN PLACE? "" when it can; otherwise why not, worded to follow "... cannot be
+       converted in place: ". asLines is its file. Asked by the run before it touches anything, and by the
+       Check (cDeepScanner, through the function library), so a row offers the conversion only where the run
+       will make it. Four questions, none of which reads another file:
+         - does the class body port (PortClassSource)?
+         - did an earlier run leave its note above the class (_MarkerReason)?
+         - is another class built on it? Its objects would keep their old bodies under a converted base,
+           so a class with subclasses of its own is not converted yet;
+         - is the name of the column class the port would create already taken?
+       The last two are asked of the declarations the caller collected - asNames / asSupers / asDeclFiles,
+       parallel, any letter case. Leaves the family set for sClass. */
+    Function SubclassVerdict String[] ByRef asLines String sClass String[] ByRef asNames String[] ByRef asSupers String[] ByRef asDeclFiles Returns String
+        String[] asPorted
+        String   sClassLc sMarker
+        Integer  i iLast
+
+        Get PortClassSource asLines sClass to asPorted
+        If (SizeOfArray(asPorted) = 0) ;
+            Function_Return (psRefusal(Self))
+        Get _MarkerReason (&asLines) sClass to sMarker
+        If (sMarker <> "") ;
+            Function_Return ("an earlier run left it as it is, and the note it wrote above the class says why - " + sMarker)
+        Move (Lowercase(sClass)) to sClassLc
+        Move (SizeOfArray(asNames) - 1) to iLast
+        For i from 0 to iLast
+            If (Lowercase(asSupers[i]) = sClassLc) ;
+                Function_Return (asNames[i] + " (" + asDeclFiles[i] + ") is built on it, and a class with subclasses of its own is not converted yet")
+        Loop
+        If (psColumnClass(Self) <> "") Begin
+            For i from 0 to iLast
+                If (Lowercase(asNames[i]) = (sClassLc + "column")) ;
+                    Function_Return ("the class " + asNames[i] + " already exists (" + asDeclFiles[i] + "), and the port would create a column class of that name")
+            Loop
+        End
+        Function_Return ""
+    End_Function
+
+    /* The files of the run's folders that are NOT in the run, read once (only the extensions the run itself
+       carries): their class declarations join asNames / asSupers / asDeclFiles, and for each class in
+       asCandLc the files that hold an object of it join asOutside[k] - the reason a run must refuse that
+       class: those objects would keep their old bodies under a converted class. Nothing is read without a
+       run context (pasRunFolders). asOutside comes in sized to asCandLc. */
+    Procedure _ScanOutsideRun String[] asRunLc String[] ByRef asCandLc String[] ByRef asNames String[] ByRef asSupers String[] ByRef asDeclFiles String[][] ByRef asOutside
+        String[]   asFolders asFileNames asExts asLines
+        String[][] asNoSites
+        Integer[]  aiCount
+        String     sFolder sPath sExt
+        Integer    i j k iPos iCand
+        Boolean    bCancel
+
+        Move (SizeOfArray(asCandLc)) to iCand
+        Get pasRunFolders of ghoFuncLib to asFolders
+        For i from 0 to (SizeOfArray(asRunLc) - 1)
+            Move (RightPos(".", asRunLc[i])) to iPos
+            If (iPos > 0) Begin
+                Move (Mid(asRunLc[i], Length(asRunLc[i]), iPos)) to sExt
+                If (SearchArray(sExt, asExts) = -1) ;
+                    Move sExt to asExts[-1]
+            End
+        Loop
+        For i from 0 to (SizeOfArray(asFolders) - 1)
+            Move asFolders[i] to sFolder
+            If (Right(sFolder, 1) <> "\") ;
+                Move (sFolder + "\") to sFolder
+            Get _FolderFileNames sFolder to asFileNames
+            For j from 0 to (SizeOfArray(asFileNames) - 1)
+                Move (sFolder + asFileNames[j]) to sPath
+                Move (RightPos(".", asFileNames[j])) to iPos
+                Move "" to sExt
+                If (iPos > 0) ;
+                    Move (Lowercase(Mid(asFileNames[j], Length(asFileNames[j]), iPos))) to sExt
+                If (sExt <> "" and SearchArray(sExt, asExts) <> -1 and SearchArray((Lowercase(sPath)), asRunLc) = -1) Begin
+                    If (Mod(j, 20) = 0) ;
+                        Send _Panel "Looking at the files outside the run:" sPath (j + 1) (SizeOfArray(asFileNames))
+                    Move (rfReadEncodedFileAsStringArray(sPath)) to asLines
+                    Send _CollectClassDecls (&asLines) sPath (&asNames) (&asSupers) (&asDeclFiles)
+                    Send _ScanObjectsAll (&asLines) (&asCandLc) (&aiCount) (&asNoSites)
+                    For k from 0 to (iCand - 1)
+                        If (aiCount[k] > 0) ;
+                            Move sPath to asOutside[k][SizeOfArray(asOutside[k])]
+                    Loop
+                End
+                If (ghoEngine <> 0) Begin
+                    Get pbUserCancelRequested of ghoEngine to bCancel
+                    If (bCancel = True) ;
+                        Procedure_Return
+                End
+            Loop
+        Loop
+    End_Procedure
+
+    // A run note under the running function's name - outside a run there is nothing to note into.
+    Procedure _RunNote String sNote
+        String sFn
+        If (ghoFuncLib = 0) ;
+            Procedure_Return
+        Get psExecutionContext of ghoFuncLib to sFn
+        If (Trim(sFn) <> "") ;
+            Send AddRunNote of ghoFuncLib sFn sNote
+    End_Procedure
+
+    Procedure _Panel String sTitle String sFile Integer iAt Integer iOf
+        If (ghoStatusPanel = 0) ;
+            Procedure_Return
+        Set Caption_Text   of ghoStatusPanel to ("Grid subclass - File No:" * String(iAt) * "of:" * String(iOf))
+        Set Title_Text     of ghoStatusPanel to sTitle
+        Set TableName_Text of ghoStatusPanel to sFile
+    End_Procedure
+
+    // True when the user asked the engine to cancel (never Cancel_Check - that one is the engine's own).
+    Function _CancelAsked Returns Boolean
+        Boolean bCancel
+        Move False to bCancel
+        If (ghoEngine <> 0) ;
+            Get pbUserCancelRequested of ghoEngine to bCancel
+        Function_Return bCancel
+    End_Function
+
+    /* ONE CLASS, once the run's passes have found its objects: the last checks, then the write. Returns the
+       number of objects converted. 0 on a refusal, which converts nothing: the run notes say why, and for a
+       cause that sits in the source a marker above the class says it to the next Check as well.
+         asObjFiles    the run's files that hold objects of it
+         asLabelSites  "<file> line N" of each object that sets its own Label
+         asOutside     files outside the run that hold objects of it */
+    Function _ConvertOneClass String sClass String sClassFile String[] asObjFiles String[] asLabelSites String[] asOutside Returns Integer
+        String[] asLines asPorted asNotes
+        String   sColumn sParam sDeclined sWhy
+        Integer  i iObjects iFileObjects iDeclined iConverted
+        Boolean  bOk bUtf8
+        Handle   hoConv
+
+        // Read HERE, not earlier: an earlier class of this run may have been written into the same file.
+        Move (rfReadEncodedFileAsStringArray(sClassFile)) to asLines
+        Get PortClassSource asLines sClass to asPorted
+        If (SizeOfArray(asPorted) = 0) Begin
+            Send _RunNote ("NOT CONVERTED - " + sClass + " (" + sClassFile + "): " + _RefusalSummary(Self) + ".")
+            Function_Return 0
+        End
+        Get psColumnClass to sColumn
+        If (sColumn = "") ;
+            Get psTargetColumn to sColumn
+        Get phoConverter to hoConv
+
+        // Objects that set their own Label: a CodeJock grid shows none.
+        If (SizeOfArray(asLabelSites) > 0) Begin
+            Move (String(SizeOfArray(asLabelSites)) + " object(s) of " + sClass + " set their own Label, which a " + psTargetGrid(Self) + " does not show - the first at " + asLabelSites[0] + ". Settle those, then remove this line and run Check again.") to sWhy
+            Send _RunNote ("NOT CONVERTED - " + sClass + ": " + sWhy + " The class converts with all of its objects or not at all.")
+            Send _WriteMarker sClassFile sClass sWhy
+            Function_Return 0
+        End
+        // Objects outside the run: the run's own selection, so nothing is written into the source for it.
+        If (SizeOfArray(asOutside) > 0) Begin
+            Send _RunNote ("NOT CONVERTED - " + sClass + ": " + String(SizeOfArray(asOutside)) + " file(s) with objects of it are outside this run, the first " + asOutside[0] + ". They would keep their old bodies under the converted class - include every file that holds its objects, and run again.")
+            Function_Return 0
+        End
+
+        // The dry run: every object must convert - one declined object refuses the whole class.
+        Move (sClass + "," + sClass + "," + sColumn) to sParam
+        Get ParseAndSetParameter of hoConv sParam to bOk
+        If (bOk = False) ;
+            Function_Return 0
+        Move 0 to iObjects
+        Move 0 to iDeclined
+        Move "" to sDeclined
+        For i from 0 to (SizeOfArray(asObjFiles) - 1)
+            Send _Panel ("Trying the conversion of " + sClass + " objects in:") asObjFiles[i] (i + 1) (SizeOfArray(asObjFiles))
+            Send ReadFile of hoConv asObjFiles[i]
+            Get TransformSource of hoConv to iFileObjects
+            Add iFileObjects to iObjects
+            If (piDeclineMarkers(hoConv) > 0) Begin
+                Add (piDeclineMarkers(hoConv)) to iDeclined
+                If (sDeclined = "") ;
+                    Move asObjFiles[i] to sDeclined
+            End
+            If (_CancelAsked(Self) = True) ;
+                Function_Return 0
+        Loop
+        If (iDeclined > 0) Begin
+            Move (String(iDeclined) + " object(s) of " + sClass + " cannot be converted, the first in " + sDeclined + ". Settle those (the run notes of the run that wrote this say why), then remove this line and run Check again.") to sWhy
+            Send _RunNote ("NOT CONVERTED - " + sClass + ": " + String(iDeclined) + " object(s) of it cannot be converted (the notes above say why), the first in " + sDeclined + ". The class converts with all of its objects or not at all.")
+            Send _WriteMarker sClassFile sClass sWhy
+            Function_Return 0
+        End
+
+        // The write: the class, then every object. A read-only run stops here - its dry run was the answer.
+        If (pbReadOnly(ghoFuncLib) = False) Begin
+            Move (rfFileHasBOM(sClassFile)) to bUtf8
+            Get _GuardedWriteEncodedFile of ghoFuncLib sClassFile (&asPorted) bUtf8 to bOk
+            If (bOk = False) Begin
+                Send _RunNote ("NOT CONVERTED - " + sClassFile + " could not be written. " + sClass + " was left as it is.")
+                Function_Return 0
+            End
+            Move 0 to iConverted
+            If (SizeOfArray(asObjFiles) > 0) ;
+                Get TransformFiles of hoConv asObjFiles sParam to iConverted
+        End
+        Else ;
+            Move iObjects to iConverted
+        Send _RunNote (sClass + " is a " + psTargetGrid(Self) + " now, in " + sClassFile + If((psColumnClass(Self) <> ""), (", its label and help hooks in the new " + psColumnClass(Self)), "") + ". " + String(iConverted) + " object(s) of it converted by " + psObjectFn(Self) + ", in " + String(SizeOfArray(asObjFiles)) + " file(s).")
+        Get pasPortNotes to asNotes
+        For i from 0 to (SizeOfArray(asNotes) - 1)
+            Send _RunNote (sClass + ": " + asNotes[i])
+        Loop
+        Function_Return iConverted
+    End_Function
+
+    /* THE RUN: ConvertGridSubclassToCodeJock. sParameter names ONE class - or is EMPTY, and the run takes every
+       grid subclass its files declare (how a plan run reaches it: the plan passes the files its rows name
+       and no class). Each class converts with all of its objects or not at all, and one class's refusal
+       leaves the others alone. Returns the number of objects converted.
+
+       The files are read a fixed number of times, whatever the number of classes: once for the class
+       declarations, once for the objects of every class together, and the files outside the run once. */
+    Function ConvertSubclass String[] asFiles String sParameter Returns Integer
+        String[]   asLines asRunLc asNames asSupers asDeclFiles asCand asCandLc asCandFile asCandWhy
+        String[][] asObjFiles      // a jagged array is declared one to a line (error 4391 otherwise)
+        String[][] asLabelSites
+        String[][] asOutside
+        String[][] asSites
+        Integer[]  aiCount
+        String     sClass sClassLc sFn sSuperLc sWhy
+        Integer    i j k iLast iCand iTotal iDone
+        Boolean    bDeclared
+
+        Move (Trim(sParameter)) to sClass
+        Move (Pos(",", sClass)) to i
+        If (i > 0) ;
+            Move (Trim(Left(sClass, (i - 1)))) to sClass
+        Move (Lowercase(sClass)) to sClassLc
+        If (ghoFuncLib <> 0) Begin
+            Get psExecutionContext of ghoFuncLib to sFn
+            If (sFn <> "") ;
+                Send SetSummaryUnit of ghoFuncLib sFn "object(s)"
+        End
+
+        // PASS 1: the class declarations of the run's files.
+        Move (SizeOfArray(asFiles) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(asFiles[i])) to asRunLc[-1]
+        Loop
+        For i from 0 to iLast
+            If (Mod(i, 20) = 0) ;
+                Send _Panel "Looking for grid subclasses in:" asFiles[i] (i + 1) (iLast + 1)
+            Move (rfReadEncodedFileAsStringArray(asFiles[i])) to asLines
+            Send _CollectClassDecls (&asLines) asFiles[i] (&asNames) (&asSupers) (&asDeclFiles)
+            If (_CancelAsked(Self) = True) ;
+                Function_Return 0
+        Loop
+
+        // The classes to convert: the one named, or every grid subclass declared.
+        Move False to bDeclared
+        For i from 0 to (SizeOfArray(asNames) - 1)
+            Move (Lowercase(asSupers[i])) to sSuperLc
+            If (sClass <> "") Begin
+                If (Lowercase(asNames[i]) = sClassLc) Begin
+                    Move True to bDeclared
+                    Move asNames[i]     to asCand[-1]
+                    Move asDeclFiles[i] to asCandFile[-1]
+                End
+            End
+            Else If (sSuperLc = "dbgrid" or sSuperLc = "dblist" or sSuperLc = "grid" or sSuperLc = "list") Begin
+                Move asNames[i]     to asCand[-1]
+                Move asDeclFiles[i] to asCandFile[-1]
+            End
+        Loop
+        If (sClass <> "" and bDeclared = False) Begin
+            Send _RunNote ("NOT CONVERTED - Class " + sClass + " is not declared in the selected files. Select the folder of its package as well, and run again.")
+            Function_Return 0
+        End
+        Move (SizeOfArray(asCand)) to iCand
+        If (iCand = 0) Begin
+            Send _RunNote "No grid subclass is declared in the selected files - nothing to convert."
+            Function_Return 0
+        End
+        For k from 0 to (iCand - 1)
+            Move (Lowercase(asCand[k])) to asCandLc[k]
+        Loop
+
+        // PASS 2: the files outside the run - classes built on a candidate, objects of one.
+        Move (ResizeArray(asOutside, iCand)) to asOutside
+        Send _ScanOutsideRun asRunLc (&asCandLc) (&asNames) (&asSupers) (&asDeclFiles) (&asOutside)
+        If (_CancelAsked(Self) = True) ;
+            Function_Return 0
+
+        // Which of them can be converted at all (SubclassVerdict - the Check asks the same question).
+        For k from 0 to (iCand - 1)
+            Move (rfReadEncodedFileAsStringArray(asCandFile[k])) to asLines
+            Get SubclassVerdict (&asLines) asCand[k] (&asNames) (&asSupers) (&asDeclFiles) to sWhy
+            Move sWhy to asCandWhy[k]
+            // The port's refusal is counted in full in the note; the verdict - what the Check shows - stays its first reason.
+            If (sWhy <> "" and sWhy = psRefusal(Self)) ;
+                Move (_RefusalSummary(Self)) to sWhy
+            If (sWhy <> "") ;
+                Send _RunNote ("NOT CONVERTED - " + asCand[k] + " (" + asCandFile[k] + "): " + sWhy + ".")
+        Loop
+
+        // PASS 3: the objects of every candidate, one walk per file.
+        Move (ResizeArray(asObjFiles, iCand))   to asObjFiles
+        Move (ResizeArray(asLabelSites, iCand)) to asLabelSites
+        For i from 0 to iLast
+            If (Mod(i, 20) = 0) ;
+                Send _Panel "Looking for their objects in:" asFiles[i] (i + 1) (iLast + 1)
+            Move (rfReadEncodedFileAsStringArray(asFiles[i])) to asLines
+            Send _ScanObjectsAll (&asLines) (&asCandLc) (&aiCount) (&asSites)
+            For k from 0 to (iCand - 1)
+                If (aiCount[k] > 0) Begin
+                    Move asFiles[i] to asObjFiles[k][SizeOfArray(asObjFiles[k])]
+                    For j from 0 to (SizeOfArray(asSites[k]) - 1)
+                        Move (asFiles[i] + " " + asSites[k][j]) to asLabelSites[k][SizeOfArray(asLabelSites[k])]
+                    Loop
+                End
+            Loop
+            If (_CancelAsked(Self) = True) ;
+                Function_Return 0
+        Loop
+
+        // Said once per run, because the run's function list names only this one (Nils 2026-10-05).
+        Send _RunNote "This function runs RefactorDbGridTocDbCJGrid, RefactorDbListTocDbCJGridPromptList and RefactorGridToCJGrid itself, on the objects of each class it converts. Their own parameters are not used."
+
+        // Each class in turn. The next one reads what this one wrote.
+        Move 0 to iTotal
+        For k from 0 to (iCand - 1)
+            If (asCandWhy[k] = "") Begin
+                Get _ConvertOneClass asCand[k] asCandFile[k] asObjFiles[k] asLabelSites[k] asOutside[k] to iDone
+                Add iDone to iTotal
+                If (_CancelAsked(Self) = True) ;
+                    Function_Return iTotal
+            End
+        Loop
+        If (ghoStatusPanel <> 0) Begin
+            Set Title_Text     of ghoStatusPanel to ""
+            Set TableName_Text of ghoStatusPanel to ""
+        End
+        Function_Return iTotal
+    End_Function
+
+End_Class

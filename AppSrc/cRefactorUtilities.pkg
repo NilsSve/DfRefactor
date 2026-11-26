@@ -186,6 +186,65 @@ Class cRefactorUtilities is a cObject
         Function_Return 0
     End_Function
 
+    // Trim TRAILING ")" characters beyond paren balance from a captured command-argument
+    // expression. The legacy command parser IGNORED junk after its arguments, so customer code
+    // carries typo'd extra ")"s - 'Indicate Select as (Uppercase(A)) Eq (Uppercase(B)))' was legal
+    // to DF 19.1's Indicate and produced 30 unbalanced Move expressions on the LegacyApp replay's
+    // plan run (Nils 2026-07-24). Counting runs on sMaskedForCount (pass a string-masked twin when
+    // the raw text can hold literals; pass the expression itself when it is already masked); the
+    // trim applies to sExpr. Anything that is not a pure trailing-excess case returns unchanged -
+    // the converter then emits it as-is and the compiler flags it, exactly as before.
+    Function _TrimTrailingExcessParens String sExpr String sMaskedForCount Returns String
+        Integer i iLen iOpen iClose
+        String sCh
+
+        Move (Length(sMaskedForCount)) to iLen
+        Move 0 to iOpen
+        Move 0 to iClose
+        For i from 1 to iLen
+            Move (Mid(sMaskedForCount, 1, i)) to sCh
+            If (sCh = "(") ;
+                Increment iOpen
+            If (sCh = ")") ;
+                Increment iClose
+        Loop
+        Move (Trim(sExpr)) to sExpr
+        While (iClose > iOpen and Right(sExpr, 1) = ")")
+            Move (Trim(Left(sExpr, (Length(sExpr) - 1)))) to sExpr
+            Decrement iClose
+        Loop
+        Function_Return sExpr
+    End_Function
+
+    // True when sText is ONE balanced parenthesised group - the first "(" closes at the LAST
+    // character. The one correct "is it already wrapped?" test before embedding an expression in a
+    // Move/If: naive first/last-char or contains-parens checks read '(A) = (B)' as wrapped and skip
+    // the outer pair, emitting the illegal 'Move (A) = (B) to X' (LegacyApp replay 2026-07-24, the
+    // plan's operators row running before the indicators row). Lives here in the Utilities base so
+    // the expression parser and every composer up the chain can share it.
+    Function _IsSingleParenGroup String sText Returns Boolean
+        Integer i iLen iDepth
+        String sCh
+
+        Move (Trim(sText)) to sText
+        Move (Length(sText)) to iLen
+        If (iLen < 2 or Left(sText, 1) <> "(" or Right(sText, 1) <> ")") ;
+            Function_Return False
+        Move 0 to iDepth
+        For i from 1 to iLen
+            Move (Mid(sText, 1, i)) to sCh
+            If (sCh = "(") Begin
+                Increment iDepth
+            End
+            Else If (sCh = ")") Begin
+                Decrement iDepth
+                If (iDepth = 0 and i < iLen) ;
+                    Function_Return False
+            End
+        Loop
+        Function_Return (iDepth = 0)
+    End_Function
+
     // Rename function CALLS on one line: for each asFrom[i], every occurrence of
     // asFrom[i] that is a whole word - preceded by a non-identifier char (or the
     // start of line) and followed by "(" - is replaced with asTo[i]. Whitespace
@@ -257,6 +316,82 @@ Class cRefactorUtilities is a cObject
         Move (Mid(sLine, CI_EOL, iCopyFrom)) to sSeg                        // [iCopyFrom .. end]
         Move (sOut + sSeg) to sOut
         Function_Return sOut
+    End_Function
+
+    /* Split a line into WORDS - no empty entries.
+
+       StrSplitToArray on a single space yields an empty entry for every REPEATED space, and real
+       source aligns its columns:
+
+           Get Parse_Path sFilename    to sPath
+
+       splits into eight entries, not five. Anything reasoning about token POSITIONS ("the second
+       word is the function name") has to skip the gaps first, or it only ever matches code that
+       happens to be single-spaced.
+
+       Written after that cost a converter which matched nothing on the very files it was built
+       for (Nils 2026-07-29) - the unit test caught it only because the fixture was copied from his
+       real lines rather than typed out tidily. */
+    Function _SplitWords String sText Returns String[]
+        String[] asIn asOut
+        Integer i iMax iOut
+
+        Move (StrSplitToArray(Trim(sText), CS_S)) to asIn
+        Move ((SizeOfArray(asIn)) - 1) to iMax
+        Move 0 to iOut
+        For i from 0 to iMax
+            If (Trim(asIn[i]) <> "") Begin
+                Move (Trim(asIn[i])) to asOut[iOut]
+                Increment iOut
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* THE OTHER CALL SHAPE: "Get <FunctionName> <args> to <dest>".
+
+       _RenameMaskedCalls above requires a "(" after the name - deliberately, since that is what
+       makes a bare identifier unambiguously a CALL. But DataFlex also lets a global function be
+       invoked as a command, with no parentheses at all, and that form is invisible to it:
+
+           Get Parse_File  sFilename   to sFilename
+
+       Found the hard way (Nils 2026-07-29): the analyzer correctly listed five files needing
+       ChangeParseFileToExtractFileName, the plan ran, and the log said "0 lines". Every call site
+       in that workspace used the command form, so the converter could not see a single one. A
+       converter that silently finds nothing is worse than one that is absent - the run reports
+       success and the work is still there.
+
+       Renames ONLY when the name sits in the second token of a Get statement, which is the one
+       position where a bare identifier must be the function being called. Anything else - a
+       variable of the same name, an argument, the destination - is left alone. Returns sLine
+       unchanged when the shape does not match, so callers can try this after the paren form. */
+    Function _RenameMaskedGetCall String sLine String sOver String sFrom String sTo Returns String
+        String[] asTokens
+        String   sTrimmed
+        Integer  iPos iFromLen iTailLen
+
+        Move (Trim(sFrom)) to sFrom
+        If (sFrom = "" or Trim(sOver) = "") ;
+            Function_Return sLine
+        Move (Trim(sOver)) to sTrimmed
+        Get _SplitWords sTrimmed to asTokens
+        If ((SizeOfArray(asTokens)) < 2) ;
+            Function_Return sLine
+        If (Lowercase(Trim(asTokens[0])) <> "get") ;
+            Function_Return sLine
+        If (Lowercase(Trim(asTokens[1])) <> Lowercase(sFrom)) ;
+            Function_Return sLine
+        // Position comes from the MASKED line, which the caller has re-indented so it aligns with
+        // sLine character for character (see feedback on the overstrike line's stripped indent).
+        Get _FindKeywordPos sOver sFrom True 1 to iPos
+        If (iPos < 1) ;
+            Function_Return sLine
+        Move (Length(sFrom)) to iFromLen
+        Move ((Length(sLine)) - iPos - iFromLen + 1) to iTailLen
+        If (iTailLen < 0) ;
+            Move 0 to iTailLen
+        Function_Return (Left(sLine, (iPos - 1)) + sTo + Mid(sLine, iTailLen, (iPos + iFromLen)))
     End_Function
 
     // Renames a leading TYPE keyword in a declaration: if the first token of the (masked,
@@ -435,6 +570,609 @@ Class cRefactorUtilities is a cObject
         Function_Return iCount
     End_Function
 
+    /* ===== C PROTOTYPE -> External_Function ==========================================
+
+       Maps ONE C / Win32 type to the DataFlex type an External_Function should declare.
+       iPtr = how many levels of indirection the C type carries (the * count PLUS any
+       implied by the typedef itself - LPWSTR is already a pointer), bConst = the C
+       declaration said const, which is what separates an INPUT string from a caller-
+       allocated OUTPUT buffer.
+
+       THE EMITTED SET IS DELIBERATELY SMALL: Integer, DWord, Handle, Pointer, Longptr,
+       ULongptr, String, WString, BigInt, UBigInt, Number. That is not a preference - it
+       is every type DataFlex 25's own Pkg folder uses in an External_Function, counted.
+       Word, Short, Real and friends never appear there, so this never emits one; a width
+       narrower than Integer is widened to Integer, which is how the install declares them
+       too.
+
+       Pointer-sized types are the reason this exists at all: WPARAM / LPARAM / LRESULT /
+       INT_PTR are 4 bytes on x86 and 8 on x64, so declaring them Integer is the classic
+       truncation bug this application spends its life finding. They map to Longptr, and
+       the unsigned family to ULongptr, matching _SuggestPointerType above - which the
+       generated declaration is then checked against by _AuditApiDeclaration. */
+    Function _CTypeToDataFlex String sCType Integer iPtr Boolean bConst Returns String
+        String sLC sSecond
+
+        Move (Trim(sCType)) to sCType
+        Move (Lowercase(sCType)) to sLC
+
+        // Pointer-sized integers FIRST: they are typedefs that look like plain ints.
+        If (sLC = "wparam" or sLC = "lparam" or sLC = "lresult" or sLC = "int_ptr" or sLC = "long_ptr" or sLC = "ssize_t") ;
+            Function_Return "Longptr"
+        If (sLC = "uint_ptr" or sLC = "ulong_ptr" or sLC = "dword_ptr" or sLC = "size_t") ;
+            Function_Return "ULongptr"
+
+        // Anything that is already a handle typedef. A delimited-list "contains" rather
+        // than a chain of "or"s: one line, and a new typedef is a one-word edit.
+        If (CS_CDeclHandleTypes contains ("|" + sLC + "|")) ;
+            Function_Return "Handle"
+
+        // The string typedefs carry their own indirection and constness in the NAME.
+        // const => an input the caller supplies => String / WString (DataFlex marshals it).
+        // non-const => a buffer the API writes into => Pointer (the caller allocates).
+        If (sLC = "lpcwstr" or sLC = "pcwstr") ;
+            Function_Return "WString"
+        If (sLC = "lpcstr" or sLC = "pcstr" or sLC = "lpctstr") ;
+            Function_Return "String"
+        If (sLC = "lpwstr" or sLC = "pwstr" or sLC = "lpstr" or sLC = "pstr" or sLC = "lptstr") ;
+            Function_Return "Pointer"
+        If (sLC = "lpvoid" or sLC = "pvoid" or sLC = "lpcvoid") ;
+            Function_Return "Pointer"
+
+        /* THE REST OF THE LP.../P... FAMILY - LPDWORD, LPRECT, LPBYTE, PINT, PHANDLE.
+           Convention, not guesswork: in Win32 an LP or P prefix on a typedef IS the
+           indirection, so the type is a pointer even though no "*" appears in the text.
+           Missing this is what made LPDWORD come out as Integer - a silent 4-vs-8 byte
+           lie on x64, which is precisely the class of bug this application hunts.
+           The single-P form is case-aware (uppercase second character) for the same
+           reason _SuggestPointerType is: "pos" and "params" are not pointers. The
+           specific LPCSTR/LPCWSTR/LPWSTR/LPVOID typedefs are all matched above, so they
+           never reach this. */
+        If (Left(sLC, 2) = "lp") ;
+            Function_Return "Pointer"
+        If (Left(sLC, 1) = "p" and Length(sCType) >= 2) Begin
+            Move (Mid(sCType, 1, 2)) to sSecond
+            If (sSecond = Uppercase(sSecond) and sSecond <> Lowercase(sSecond)) ;
+                Function_Return "Pointer"
+        End
+
+        // A raw char pointer: const decides input-vs-buffer, width decides which string.
+        If (iPtr > 0 and (sLC = "wchar_t" or sLC = "wchar")) Begin
+            If (bConst) ;
+                Function_Return "WString"
+            Function_Return "Pointer"
+        End
+        If (iPtr > 0 and (sLC = "char" or sLC = "tchar")) Begin
+            If (bConst) ;
+                Function_Return "String"
+            Function_Return "Pointer"
+        End
+        // Every other pointer is an address; DataFlex has one type for that.
+        If (iPtr > 0) ;
+            Function_Return "Pointer"
+
+        // 64-bit integers.
+        If (sLC = "__int64" or sLC = "int64" or sLC = "longlong" or sLC = "long long") ;
+            Function_Return "BigInt"
+        If (sLC = "unsigned __int64" or sLC = "uint64" or sLC = "ulonglong" or sLC = "dwordlong" or sLC = "ulong64") ;
+            Function_Return "UBigInt"
+
+        // Unsigned 32-bit reads as DWord, which is how the install declares flags/counts.
+        If (sLC = "dword" or sLC = "ulong" or sLC = "uint" or sLC = "unsigned long" or sLC = "unsigned int" or sLC = "colorref") ;
+            Function_Return "DWord"
+
+        // Floating point. The install only ever uses Number for these.
+        If (sLC = "float" or sLC = "double") ;
+            Function_Return "Number"
+
+        // Everything left that is a known width narrower than or equal to Integer widens
+        // to Integer - BOOL included, which is a 32-bit int in Win32 whatever its name says.
+        Function_Return "Integer"
+    End_Function
+
+    /* Splits a C parameter list on its TOP-LEVEL commas. A comma inside parentheses
+       belongs to a function-pointer parameter or a SAL annotation like
+       _Out_writes_(cchBuffer), never to the list, so depth is tracked rather than a
+       plain split. Returns the parameter count. PURE -> testable. */
+    Function _SplitCParams String sParams String[] ByRef asOut Returns Integer
+        Integer i iLen iDepth iStart
+        String  sChar sPiece
+
+        Move (ResizeArray(asOut, 0)) to asOut
+        Move (Length(sParams)) to iLen
+        Move 0 to iDepth
+        Move 1 to iStart
+        For i from 1 to iLen
+            Move (Mid(sParams, 1, i)) to sChar
+            If (sChar = "(") ;
+                Increment iDepth
+            If (sChar = ")") ;
+                Decrement iDepth
+            If (sChar = "," and iDepth = 0) Begin
+                Move (Trim(Mid(sParams, i - iStart, iStart))) to sPiece
+                If (sPiece <> "") ;
+                    Move sPiece to asOut[SizeOfArray(asOut)]
+                Move (i + 1) to iStart
+            End
+        Loop
+        Move (Trim(Mid(sParams, iLen - iStart + 1, iStart))) to sPiece
+        If (sPiece <> "") ;
+            Move sPiece to asOut[SizeOfArray(asOut)]
+        Function_Return (SizeOfArray(asOut))
+    End_Function
+
+    /* Strips the noise a pasted prototype carries but a declaration does not: SAL
+       annotations (_In_, _Out_opt_, and the _Out_writes_(n) family, whose parenthesised
+       argument goes with them), calling conventions, and struct/enum/class tags. Returns
+       the cleaned token list. Anything beginning with an underscore AND ending with one is
+       treated as SAL - that is the whole convention, and it is safer than a fixed list
+       that a new Windows SDK would outgrow. */
+    Function _StripCNoise String[] asTok Returns String[]
+        String[] asOut
+        String  sT sLC
+        Integer i iMax iDepth
+        Boolean bDrop bDone
+
+        Move (SizeOfArray(asTok) - 1) to iMax
+        Move 0 to i
+        While (i <= iMax)
+            Move (Trim(asTok[i])) to sT
+            Move (Lowercase(sT)) to sLC
+            Move False to bDrop
+            // SAL is "an underscore at both ends" - _In_, _Out_opt_, _Inout_updates_ - which
+            // is the whole convention and outlives any fixed list a new SDK would extend.
+            If (Left(sT, 1) = "_" and Right(sT, 1) = "_") ;
+                Move True to bDrop
+            /* ...AND THE ANNOTATION THAT HAS NO TRAILING UNDERSCORE - __out_data_source(FILE),
+               __drv_preferredFunction(...). Recognised by a "__" prefix IMMEDIATELY followed by a
+               paren group, which no type ever is: __int64 and __stdcall are bare tokens and survive
+               untouched.
+
+               Found 2026-08-09 by the Win32 catalogue's audit test. ReadFile's lpBuffer carries a
+               SAL annotation AND this one; the leftover made the parameter scan mis-read the type,
+               so LPVOID came out Integer while the sibling lp* parameters correctly came out
+               Pointer. A 4-vs-8-byte lie on x64 - the precise defect this converter exists to
+               prevent, hiding behind a second annotation on the same parameter. */
+            Else If (Left(sT, 2) = "__" and i < iMax and asTok[i + 1] = "(") ;
+                Move True to bDrop
+            Else If (CS_CDeclNoiseWords contains ("|" + sLC + "|")) ;
+                Move True to bDrop
+            If (bDrop = True) Begin
+                /* THE ARGUMENT GOES WITH IT. The caller has already split "(" and ")" into
+                   their own tokens, so _Out_writes_(cchBuffer) arrives as four tokens and
+                   dropping only the first would leave "( cchBuffer )" behind - which the
+                   parameter-list scan would then take for the parameter list itself, on the
+                   first paste of any modern annotated prototype. Same for __declspec(x). */
+                /* extern "C" - the LINKAGE TAG goes with the keyword. It is a quoted
+                   token, so leaving it behind would put a stray "C" in the return type,
+                   and `extern "C" BOOL Foo(int);` is one of the commonest header forms
+                   there is. */
+                If (sLC = "extern" and i < iMax and Left(asTok[i + 1], 1) = '"') ;
+                    Increment i
+                If (i < iMax and asTok[i + 1] = "(") Begin
+                    Move (i + 1) to i
+                    Move 0 to iDepth
+                    Move False to bDone
+                    While (i <= iMax and bDone = False)
+                        If (asTok[i] = "(") ;
+                            Increment iDepth
+                        If (asTok[i] = ")") Begin
+                            Decrement iDepth
+                            If (iDepth = 0) ;
+                                Move True to bDone
+                        End
+                        Increment i
+                    Loop
+                End
+                Else ;
+                    Increment i
+            End
+            Else Begin
+                If (sT <> "") ;
+                    Move sT to asOut[SizeOfArray(asOut)]
+                Increment i
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* Removes C comments before anything else looks at the text. Both forms, because a
+       prototype copied out of a header carries them freely - and a multi-line CALL carries
+       one per argument, which is how "// Window text" turned into a parameter the first
+       time this met real code (Nils 2026-08-03). Runs BEFORE newlines are flattened to
+       spaces: "//" ends at the line break, so flattening first would eat the rest of the
+       declaration. PURE -> testable. */
+    Function _StripCComments String sText Returns String
+        String  sOut sChar sNext
+        Integer i iLen
+        Boolean bInLine bInBlock
+
+        Move (Length(sText)) to iLen
+        Move "" to sOut
+        Move False to bInLine
+        Move False to bInBlock
+        Move 1 to i
+        While (i <= iLen)
+            Move (Mid(sText, 1, i)) to sChar
+            Move (Mid(sText, 1, i + 1)) to sNext
+            If (bInBlock = True) Begin
+                If (sChar = "*" and sNext = "/") Begin
+                    Move False to bInBlock
+                    Move (i + 1) to i
+                End
+            End
+            Else If (bInLine = True) Begin
+                // A line comment ends at the break - and the break is KEPT, so the
+                // remaining text still has its line structure.
+                If (sChar = (Character(13)) or sChar = (Character(10))) Begin
+                    Move False to bInLine
+                    Move (sOut + sChar) to sOut
+                End
+            End
+            Else Begin
+                If (sChar = "/" and sNext = "*") Begin
+                    Move True to bInBlock
+                    Move (i + 1) to i
+                End
+                Else If (sChar = "/" and sNext = "/") Begin
+                    Move True to bInLine
+                    Move (i + 1) to i
+                End
+                Else ;
+                    Move (sOut + sChar) to sOut
+            End
+            Increment i
+        Loop
+        Function_Return sOut
+    End_Function
+
+    /* Is this MANAGED C++ (C++/CLI) rather than C? Refuse it, because there is nothing
+       honest to emit: `String ^` is a .NET tracking handle and `[MarshalAs(...)]` a .NET
+       marshalling attribute, and DataFlex's External_Function is a C FFI - a managed type
+       cannot cross it at all. A declaration like
+           extern "C" int puts([MarshalAs(UnmanagedType::LPWStr)] String ^);
+       is in fact the .NET ANALOGUE of what this converter produces, not an input to it
+       (Nils 2026-08-03, where it emitted "Pointer ^" - the handle marker taken for a
+       parameter name, and the attribute mangled by the array-bracket rule).
+
+       BRACKETS ARE TOLD APART BY THEIR CONTENT, which is what keeps `char buf[16]` and
+       `char buf[]` working: an array bound is empty or numeric, an attribute is not.
+       Returns the reason, or "". PURE. */
+    Function _LooksLikeManagedCpp String sText Returns String
+        String  sLC sInner sChar
+        Integer i iLen iOpen
+        Boolean bNum
+
+        Move (Lowercase(sText)) to sLC
+        If (sText contains "^") ;
+            Function_Return "a C++/CLI managed handle (^) cannot cross a C FFI"
+        If (sLC contains "gcnew" or sLC contains "ref class" or sLC contains "value class") ;
+            Function_Return "this is C++/CLI, not C"
+        // A bracket group whose content is neither empty nor a plain number is an
+        // attribute, not an array bound.
+        Move (Length(sText)) to iLen
+        Move 0 to iOpen
+        For i from 1 to iLen
+            Move (Mid(sText, 1, i)) to sChar
+            If (sChar = "[") ;
+                Move i to iOpen
+            If (sChar = "]" and iOpen > 0) Begin
+                Move (Trim(Mid(sText, i - iOpen - 1, iOpen + 1))) to sInner
+                If (sInner <> "") Begin
+                    Get _IsNumeric sInner to bNum
+                    If (bNum = False) ;
+                        Function_Return "a bracketed attribute is a .NET/C++ annotation, not a C parameter"
+                End
+                Move 0 to iOpen
+            End
+        Loop
+        Function_Return ""
+    End_Function
+
+    /* Is this text a CALL rather than a declaration? Worth its own function because
+       getting it wrong is the expensive direction: a call converted anyway produces a
+       confident, plausible, WRONG declaration, which is exactly what happened the first
+       time this met real Windows sample code (Nils 2026-08-03, CreateWindowEx(...) with
+       arguments and comments - it emitted "Integer Windows"", the tail of a string
+       literal, as a parameter).
+
+       The signals are things a DECLARATION can never contain, so a valid prototype is
+       never rejected by them:
+         - "=" in the head          an assignment: HWND hwnd = CreateWindowEx(
+         - a quote in an argument   a string literal: L"Learn to Program Windows"
+         - an argument that is a bare number, or NULL
+       A declaration's parameters are TYPE + name; none of those four can appear in one.
+       Returns the reason, or "" when the text does not look like a call. PURE. */
+    Function _LooksLikeCCall String sHead String[] asParams Returns String
+        String  sP sLC
+        Integer i iMax
+        Boolean bNum
+
+        If (sHead contains "=") ;
+            Function_Return "it reads as an assignment from a call, not a declaration"
+        Move (SizeOfArray(asParams) - 1) to iMax
+        For i from 0 to iMax
+            Move (Trim(asParams[i])) to sP
+            Move (Lowercase(sP)) to sLC
+            If (sP contains '"') ;
+                Function_Return "an argument is a string literal, so this is a call"
+            If (sLC = "null" or sLC = "nullptr") ;
+                Function_Return "an argument is NULL, so this is a call"
+            // Get form, not (_IsNumeric(Self, ...)): that helper is defined LOWER in this
+            // class, so the expression form would not resolve at compile time.
+            Get _IsNumeric sP to bNum
+            If (sP <> "" and bNum = True) ;
+                Function_Return "an argument is a literal number, so this is a call"
+        Loop
+        Function_Return ""
+    End_Function
+
+    /* ONE C/C++ prototype -> the External_Function (or External_Procedure) that declares it.
+       Returns "" when the text is not a recognisable prototype, so the caller can say so
+       rather than replacing the user's selection with nonsense. asNotes comes back with
+       one line per assumption worth stating out loud - they are emitted as // comments
+       under the declaration, because the two things a prototype genuinely cannot tell us
+       are which DLL exports the function and whether a non-const pointer is an input or an
+       output buffer.
+
+       THE DLL IS A PLACEHOLDER ON PURPOSE. A prototype does not carry it, and guessing
+       kernel32 would produce a declaration that compiles and fails at run time - the worst
+       possible outcome. CS_CDeclDllPlaceholder does not compile, so it cannot be missed.
+
+       The output is built to satisfy _AuditApiDeclaration: run the audit on what this
+       returns and it finds nothing. That is the contract the tests assert, and it is why
+       the pointer-sized and Unicode rules live in ONE place rather than two. PURE -> the
+       whole thing is testable without an editor. */
+    Function CDeclarationToDataFlex String sDecl String[] ByRef asNotes Returns String
+        String[] asRaw asTok asPieces asPTok
+        String  sWork sChar sParams sName sRet sType sDfType sPName sOut sLine sPiece sHead sWhy
+        Integer i iMax iTok iOpen iClose iDepth iNum iNum2 iPtr iRetPtr iP iPMax iTokMax
+        Boolean bConst bVoidRet bNum
+
+        Move (ResizeArray(asNotes, 0)) to asNotes
+
+        // Normalise: tabs/newlines to spaces, and detach the punctuation we tokenise on
+        // so "GetFoo(LPWSTR a,int b);" splits the same as a spaced-out prototype.
+        // Comments FIRST - before newlines become spaces, or "//" would never end.
+        Get _StripCComments sDecl to sWork
+        // Then managed C++, while the brackets are still intact - the array-bracket rule
+        // below rewrites "[" and would destroy the evidence.
+        Get _LooksLikeManagedCpp sWork to sWhy
+        If (sWhy <> "") Begin
+            Move sWhy to asNotes[0]
+            Function_Return ""
+        End
+        Move (Replaces((Character(9)),  sWork, " ")) to sWork
+        Move (Replaces((Character(13)), sWork, " ")) to sWork
+        Move (Replaces((Character(10)), sWork, " ")) to sWork
+        Move (Replaces(";", sWork, " "))  to sWork
+        Move (Replaces("(", sWork, " ( ")) to sWork
+        Move (Replaces(")", sWork, " ) ")) to sWork
+        Move (Replaces(",", sWork, " , ")) to sWork
+        Move (Replaces("*", sWork, " * ")) to sWork
+        Move (Replaces("[", sWork, " * ")) to sWork      // an array parameter IS a pointer
+        Move (Replaces("]", sWork, " "))   to sWork
+        Move (Trim(sWork)) to sWork
+        If (sWork = "") ;
+            Function_Return ""
+
+        // Tokenise, drop empties, then drop SAL / calling conventions.
+        Move (StrSplitToArray(sWork, CS_S)) to asRaw
+        Move (SizeOfArray(asRaw) - 1) to iMax
+        Move 0 to iNum
+        For i from 0 to iMax
+            If (Trim(asRaw[i]) <> "") Begin
+                Move (Trim(asRaw[i])) to asPieces[iNum]
+                Increment iNum
+            End
+        Loop
+        Get _StripCNoise asPieces to asTok
+        Move (SizeOfArray(asTok)) to iNum
+        If (iNum < 3) ;
+            Function_Return ""
+
+        // The parameter list runs from the FIRST "(" to its matching ")".
+        Move -1 to iOpen
+        Move -1 to iClose
+        Move (iNum - 1) to iTokMax
+        For i from 0 to iTokMax
+            If (asTok[i] = "(" and iOpen = -1) ;
+                Move i to iOpen
+        Loop
+        If (iOpen < 2) ;
+            Function_Return ""                      // no parameter list, or no room for a name
+        Move 0 to iDepth
+        For i from iOpen to iTokMax
+            If (asTok[i] = "(") ;
+                Increment iDepth
+            If (asTok[i] = ")") Begin
+                Decrement iDepth
+                If (iDepth = 0 and iClose = -1) ;
+                    Move i to iClose
+            End
+        Loop
+        If (iClose = -1) ;
+            Function_Return ""
+
+        // Head = return type + name. The name is the last token before "(".
+        Move asTok[iOpen - 1] to sName
+        If (sName = "*") ;
+            Function_Return ""                      // a function-pointer typedef, not a prototype
+        Move "" to sRet
+        Move 0 to iRetPtr
+        For i from 0 to (iOpen - 2)
+            If (asTok[i] = "*") ;
+                Increment iRetPtr
+            Else If (Lowercase(asTok[i]) <> "const") ;
+                Move (Trim(sRet * asTok[i])) to sRet
+        Loop
+        // iRetPtr is kept SEPARATE from the per-parameter iPtr below on purpose: the
+        // parameter loop overwrites iPtr, so reusing it here would type the return from
+        // whatever the last parameter happened to be.
+        Move (Lowercase(sRet) = "void" and iRetPtr = 0) to bVoidRet
+
+        // Rebuild the parameter text and split it on top-level commas.
+        Move "" to sParams
+        For i from (iOpen + 1) to (iClose - 1)
+            Move (Trim(sParams * asTok[i])) to sParams
+        Loop
+        Get _SplitCParams sParams (&asPieces) to iP
+
+        /* REFUSE A CALL. Everything below assumes TYPE + name pairs, and fed a call it
+           produces a confident, wrong declaration rather than nothing - so the check goes
+           here, after the pieces exist and before a single one is typed. The reason goes
+           back in asNotes so the caller can say WHICH thing was wrong instead of the
+           useless "not a prototype". */
+        Move "" to sHead
+        For i from 0 to (iOpen - 1)
+            Move (Trim(sHead * asTok[i])) to sHead
+        Loop
+        Get _LooksLikeCCall sHead asPieces to sWhy
+        If (sWhy <> "") Begin
+            Move sWhy to asNotes[0]
+            Function_Return ""
+        End
+        Move ""  to sLine
+        Move (iP - 1) to iPMax
+        For i from 0 to iPMax
+            Move asPieces[i] to sPiece
+            Move (StrSplitToArray(Trim(sPiece), CS_S)) to asPTok
+            Move (SizeOfArray(asPTok) - 1) to iMax
+            Move ""    to sType
+            Move ""    to sPName
+            Move 0     to iPtr
+            Move False to bConst
+            Move 0     to iNum
+            For iTok from 0 to iMax
+                Move (Trim(asPTok[iTok])) to sChar
+                If (sChar <> "") Begin
+                    Get _IsNumeric sChar to bNum
+                    If (sChar = "*") ;
+                        Increment iPtr
+                    Else If (Lowercase(sChar) = "const") ;
+                        Move True to bConst
+                    // An array BOUND, left behind by the "[" -> "*" rewrite: char buf[16]
+                    // arrives as "char buf * 16", and without this the 16 becomes the
+                    // parameter NAME (it is the last token).
+                    Else If (bNum = True) ;
+                        Move 0 to iNum2
+                    Else Begin
+                        // Last non-star token is the name, everything before it the type.
+                        If (sType <> "" or iNum > 0) ;
+                            Move (Trim(sType * sPName)) to sType
+                        Move sChar to sPName
+                        Increment iNum
+                    End
+                End
+            Loop
+            // "void" alone means an EMPTY parameter list, not a parameter.
+            If (Lowercase(sPName) = "void" and sType = "" and iPtr = 0) ;
+                Move iPMax to i
+            Else Begin
+                // A type with no parameter name (legal in C) - name it so the
+                // declaration is readable and _SuggestPointerType has something to read.
+                If (sType = "") Begin
+                    Move sPName to sType
+                    Move ("param" + String(i + 1)) to sPName
+                End
+                Get _CTypeToDataFlex sType iPtr bConst to sDfType
+                Move (Trim(sLine * sDfType * sPName)) to sLine
+                /* Note every non-const Pointer, NOT just the ones written with a "*".
+                   LPWSTR carries its indirection in the typedef, so keying this on the
+                   star count stayed silent on exactly the parameters that most need
+                   saying out loud - the output buffers. */
+                If (sDfType = "Pointer" and bConst = False) ;
+                    Move (sPName + ": caller-allocated buffer assumed (non-const pointer)") to asNotes[SizeOfArray(asNotes)]
+            End
+        Loop
+
+        // Assemble. External_Procedure for a void return - a discarded Returns Integer
+        // would be a lie about the API.
+        If (bVoidRet) ;
+            Move "External_Procedure " to sOut
+        Else ;
+            Move "External_Function " to sOut
+        Move (sOut + sName + ' "' + sName + '" ' + CS_CDeclDllPlaceholder) to sOut
+        If (bVoidRet = False) Begin
+            Get _CTypeToDataFlex sRet iRetPtr False to sDfType
+            If (Lowercase(sName) contains "create" or Lowercase(sName) contains "open") Begin
+                If (sDfType = "Integer" or sDfType = "DWord") ;
+                    Move "Handle" to sDfType
+            End
+            Move (Trim(sLine * "Returns" * sDfType)) to sLine
+        End
+        If (sLine <> "") ;
+            Move (sOut + " ;" + (Character(13)) + (Character(10)) + "    " + sLine) to sOut
+        Move ("set the exporting DLL - a prototype does not carry it") to asNotes[SizeOfArray(asNotes)]
+        Function_Return sOut
+    End_Function
+
+    // The DataFlex-side NAME of an ANSI ("...A" entry point) External_Function / External_Procedure
+    // declaration - "" when the line is not such a declaration. sEntry/sDll come back ByRef for
+    // display. Uses the SAME tokenize + Right(entry,1)="A" rule as _AuditApiDeclaration, so the
+    // audit findings and the call-site section of the report can never disagree. PURE -> testable.
+    Function _AnsiExternalName String sDecl String ByRef sEntry String ByRef sDll Returns String
+        String[] asRaw asTok
+        String sFirst
+        Integer iRaw iR iNum
+
+        Move "" to sEntry
+        Move "" to sDll
+        Move (Replaces((Character(9)), sDecl, " ")) to sDecl
+        Move (StrSplitToArray(Trim(sDecl), CS_S)) to asRaw
+        Move (SizeOfArray(asRaw)) to iRaw
+        Move 0 to iNum
+        Decrement iRaw
+        For iR from 0 to iRaw
+            If (Trim(asRaw[iR]) <> "") Begin
+                Move (Trim(asRaw[iR])) to asTok[iNum]
+                Increment iNum
+            End
+        Loop
+        If (iNum < 4) ;
+            Function_Return ""
+        Move (Lowercase(asTok[0])) to sFirst
+        If (sFirst <> "external_function" and sFirst <> "external_procedure") ;
+            Function_Return ""
+        Move (Replaces('"', asTok[2], "")) to sEntry
+        Move asTok[3] to sDll
+        If (Right(sEntry, 1) <> "A") ;
+            Function_Return ""
+        Function_Return asTok[1]
+    End_Function
+
+    // Position of a CALL to sNameLC in sLineLC (both pre-lowercased): the name at a left
+    // identifier boundary, followed (after optional spaces) by "(" - matches "rfFoo(x)" AND
+    // DataFlex's optional-space "rfFoo (x)" form, and can NOT match the name inside a longer
+    // identifier ("rfFooBar(") or on its own External_Function declaration line (the name is
+    // followed by the quoted entry point there, never "("). 0 = no call. PURE -> testable.
+    Function _AnsiCallSitePos String sLineLC String sNameLC Returns Integer
+        Integer iPos iAfter iLen iLineLen
+        Boolean bIdent
+
+        Move (Length(sNameLC)) to iLen
+        Move (Length(sLineLC)) to iLineLen
+        If (iLen = 0 or iLineLen = 0) ;
+            Function_Return 0
+        Move (Pos(sNameLC, sLineLC)) to iPos
+        While (iPos > 0)
+            Move False to bIdent
+            If (iPos > 1) Begin
+                Get _IsIdentifierChar (Mid(sLineLC, 1, iPos - 1)) to bIdent
+            End
+            If (bIdent = False) Begin
+                Move (iPos + iLen) to iAfter
+                While (iAfter <= iLineLen and Mid(sLineLC, 1, iAfter) = " ")
+                    Increment iAfter
+                Loop
+                If (iAfter <= iLineLen and Mid(sLineLC, 1, iAfter) = "(") ;
+                    Function_Return iPos
+            End
+            Move (Pos(sNameLC, sLineLC, (iPos + 1))) to iPos
+        Loop
+        Function_Return 0
+    End_Function
+
     // Helper message for _ClearFirstCompoundBeforeMethod
     // Overwrites the string content with blanks up to the iPos position.
     Procedure _WipeUntilPosition String ByRef sLine Integer iPos
@@ -473,33 +1211,115 @@ Class cRefactorUtilities is a cObject
 
     // Is it a Class declaration?
     // Pass a source line param with overstriked string literals.
+    // FIRST-TOKEN check (2026-07-12, same family as the _IsStructDeclaration phantom-scope fix):
+    // the old Pos("class ", anywhere) also matched the word inside an inline trailing COMMENT
+    // ('Move x to y // base class for grids' - comments are NOT masked in the overstrike line),
+    // wrongly opening a class scope that an object file never closes (no End_Class to EOF).
     Function _IsClassDeclaration String sOverstrikeLine Returns Boolean
-        Function_Return (Pos(Lowercase("class "), Lowercase(sOverstrikeLine)) <> 0)
+        Function_Return (Left(Trim(Lowercase(sOverstrikeLine)), 6) = "class ")
     End_Function
 
+    /* Does sEnd close sStart, according to the install's own scope-keyword PAIRS?
+
+       The pairs come from Lib\DataFlex.lng, where the Studio stores scope keywords as two parallel
+       token groups - openers and their partners - so the vendor states that Begin closes with End,
+       Loop OR Until, and that Class closes only with End_Class. pasScopeStart / pasScopeEnd cannot
+       carry that: they are sorted lookup SETS, and a set can say "End is a closer" but never "of
+       what". See _AddAllKeyWords.
+
+       FALSE WHEN THERE ARE NO PAIRS, and that is deliberate. With no install to read, this knows
+       nothing - and returning False means every caller falls back to the hardcoded keyword it used
+       before. It can only ever ADD knowledge, never contradict what already worked. Callers must
+       therefore use it as an extra acceptance, not as a veto: a False here means "not known to
+       close", never "known not to close".
+
+       One opener legitimately has SEVERAL partners, so this asks "is this pair listed" rather than
+       "what closes this opener" - the second question has no single answer for Begin, the most
+       common keyword in the language. */
+    Function _ScopeEndClosesStart String sStart String sEnd Returns Boolean
+        String[] asStart asEnd
+        Integer i iMax
+
+        Get pasScopePairStart to asStart
+        Get pasScopePairEnd   to asEnd
+        Move (SizeOfArray(asStart) - 1) to iMax
+        If (iMax < 0) ;
+            Function_Return False
+        // The two arrays are written in step and _AddAllKeyWords drops both if they ever disagree;
+        // this guard is the belt to that braces - an index walk must never read past the shorter one.
+        If ((SizeOfArray(asEnd)) <> (SizeOfArray(asStart))) ;
+            Function_Return False
+        Move (Lowercase(Trim(sStart))) to sStart
+        Move (Lowercase(Trim(sEnd)))   to sEnd
+        For i from 0 to iMax
+            If (asStart[i] = sStart and asEnd[i] = sEnd) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    // The first token of a line, lowercased - what the scope predicates below actually test.
+    Function _FirstTokenLower String sLine Returns String
+        Integer iPos
+        Move (Trim(sLine)) to sLine
+        Move (Pos(" ", sLine)) to iPos
+        If (iPos > 1) ;
+            Move (Left(sLine, (iPos - 1))) to sLine
+        Move (Pos((Character(9)), sLine)) to iPos
+        If (iPos > 1) ;
+            Move (Left(sLine, (iPos - 1))) to sLine
+        Function_Return (Lowercase(Trim(sLine)))
+    End_Function
+
+    /* The hardcoded constant FIRST, then the vendor's pair table.
+
+       The literal stays because it is what this has always answered and what a machine with no
+       install still answers; the table is consulted after it, so the install can recognise a closer
+       nobody hardcoded but can never take one away. Today the two agree for Class - which is worth
+       knowing, because their agreeing is the evidence that the table describes the same language the
+       constants were written from. */
     Function _IsClassEnd String sOverstrikeLine Returns Boolean
         Boolean bClassEnd
 
         Move (Lowercase(Trim(sOverstrikeLine))) to sOverstrikeLine
         Move (Left(sOverstrikeLine, 9) = Lowercase(CS_EndClass)) to bClassEnd
+        If (bClassEnd = False) ;
+            Get _ScopeEndClosesStart "class" (_FirstTokenLower(Self, sOverstrikeLine)) to bClassEnd
 
         Function_Return bClassEnd
     End_Function
 
-    // Is the line a struct declaration?
+    // Is the line a struct declaration? FIRST-TOKEN check. The old Pos("struct ", anywhere)
+    // matched variable NAMES ending in "...Struct" followed by another token - 'Local Pointer
+    // lpsStruct pszValue pVoid' (Dftreevw.pkg, Nils 2026-07-11) opened a PHANTOM struct scope
+    // that a legacy file never closes (no End_Struct anywhere), and inside struct scope
+    // IsVariableDeclarationLine returns False - so RemoveLocalKeyWord and every other
+    // declaration-aware converter went dead for the REST OF THE FILE.
     Function _IsStructDeclaration String sOverstrikeLine Returns Boolean
         Move (Trim(Lowercase(sOverstrikeLine))) to sOverstrikeLine
-        Function_Return (Pos(Lowercase("Struct "), sOverstrikeLine) <> 0)
+        Function_Return (Left(sOverstrikeLine, 7) = "struct ")
     End_Function
 
     Function _IsStructEnd String sOverstrikeLine Returns Boolean
-        Function_Return (Left(Uppercase(sOverstrikeLine), Length("END_STRUCT")) = "END_STRUCT")
+        Boolean bEnd
+        // Trim first (2026-07-12): the lexer passes the RAW line here (TokenizerData.sLine,
+        // indent intact), so an INDENTED End_Struct was missed and the struct scope stuck on.
+        Move (Left(Uppercase(Trim(sOverstrikeLine)), Length("END_STRUCT")) = "END_STRUCT") to bEnd
+        // ...then the install's pair table, which can add a closer but never remove this one.
+        If (bEnd = False) ;
+            Get _ScopeEndClosesStart "struct" (_FirstTokenLower(Self, sOverstrikeLine)) to bEnd
+        Function_Return bEnd
     End_Function
 
     // Is the line an Object declaration? (e.g. "Object oMyObject is a cSomeClass")
     // Pass a source line with overstriked string literals.
+    // FIRST-TOKEN check (2026-07-12, same family as the _IsStructDeclaration phantom-scope fix):
+    // the old Pos("object ", anywhere) also matched every identifier ENDING in "object" followed
+    // by an argument - real legacy shapes like 'Set Timer_object to ...', 'Register_Object oX',
+    // 'Set Main_Object to ...' - plus the word in inline trailing comments, wrongly flipping the
+    // lexer's object scope mid-file.
     Function _IsObjectDeclaration String sOverstrikeLine Returns Boolean
-        Function_Return (Pos(Lowercase("Object "), Lowercase(sOverstrikeLine)) <> 0)
+        Function_Return (Left(Trim(Lowercase(sOverstrikeLine)), 7) = "object ")
     End_Function
 
     Function _IsObjectEnd String sOverstrikeLine Returns Boolean
@@ -529,11 +1349,11 @@ Class cRefactorUtilities is a cObject
 
     // Is it a Procedure declaration?
     // Pass a source line param with overstriked string literals.
+    // Trim first (2026-07-12): the position-1 anchor was correct, but an indented line from a
+    // caller that does not pre-trim silently missed. ("Procedure_Return" stays excluded - the
+    // underscore means it never contains "procedure ".)
     Function _IsProcedureDeclaration String sOverstrikeLine Returns Boolean
-        Integer iPos
-        Boolean bFound
-        Move (Pos("procedure ", Lowercase(sOverstrikeLine))) to iPos
-        Function_Return (iPos = 1)
+        Function_Return (Left(Trim(Lowercase(sOverstrikeLine)), 10) = "procedure ")
     End_Function
 
     // Returns True if the sOverStrikeLine is the start of a Function *or* a Procedure.
@@ -556,54 +1376,6 @@ Class cRefactorUtilities is a cObject
         Function_Return bMethodEnd
     End_Function
 
-    // Returns sLine with the CONTENT of single/double-quoted string literals replaced by "_"
-    // (length and positions preserved; the quote chars themselves kept). Lets marker checks
-    // ignore "/*", "*/", "//" etc. that sit INSIDE a string literal - e.g. an HTTP "*/*" accept
-    // header or a "http://" URL. Per-line only (does not track old-school ';'-continued multi-
-    // line strings). Mirrors RemoveStringsFromLine (cRefactorFuncLib) but lives here at the
-    // lexer/utilities level so the Tokenizer's PRE-overstrike comment checks can use it - and is
-    // length-preserving so position comparisons stay valid (Nils 2026-06-11).
-    Function _MaskQuotedContent String sLine Returns String
-        Integer iLength iPos
-        Boolean bSep1 bSep2
-        String  sChar sSep1 sSep2 sReturn
-
-        Move False to bSep1
-        Move False to bSep2
-        Move "'" to sSep1
-        Move '"' to sSep2
-        Move ""  to sReturn
-        Move (Length(sLine)) to iLength
-        For iPos from 1 to iLength
-            Move (Mid(sLine, 1, iPos)) to sChar
-            If (bSep1 = False and bSep2 = False) Begin
-                // Outside any string: keep the char (an opening quote also opens a string).
-                If (sChar = sSep1) Begin
-                    Move True to bSep1
-                End
-                Else If (sChar = sSep2) Begin
-                    Move True to bSep2
-                End
-                Move (sReturn + sChar) to sReturn
-            End
-            Else Begin
-                // Inside a string: keep the matching closing quote, mask everything else.
-                If (bSep1 and sChar = sSep1) Begin
-                    Move False to bSep1
-                    Move (sReturn + sChar) to sReturn
-                End
-                Else If (bSep2 and sChar = sSep2) Begin
-                    Move False to bSep2
-                    Move (sReturn + sChar) to sReturn
-                End
-                Else Begin
-                    Move (sReturn + "_") to sReturn
-                End
-            End
-        Loop
-        Function_Return sReturn
-    End_Function
-
     // Is the line a "#Command" declaration? Start-anchored on the trimmed line so a real
     // (possibly indented) directive matches but a stray "#command" inside masked text/a later
     // token cannot falsely turn pbInCommand ON (which would then never clear). Symmetric with
@@ -621,6 +1393,28 @@ Class cRefactorUtilities is a cObject
     // flag could never be cleared (Nils 2026-06-11).
     Function _IsCommandEnd String sOverstrikeLine Returns Boolean
         Function_Return (Left(Uppercase(Trim(sOverstrikeLine)), Length("#ENDCOMMAND")) = "#ENDCOMMAND")
+    End_Function
+
+    /* Is the line a "#Header" directive? A #HEADER ... #ENDHEADER region is the PRECOMPILED
+       part of a program: the compiler builds <program>.pkd out of it and trusts that .pkd on
+       later builds. Rewriting anything inside the region invalidates it silently - the
+       compiler only WARNS ("precompiled header may be out of date") and then compiles against
+       the stale symbol table, so every error it reports describes code that is not there.
+       That is what produced 389 phantom errors on LegacyApp's main .src after a refactoring
+       run (Nils 2026-07-26). The region is also where #COMMAND macro bodies live, and a macro
+       body carries !1..!9 argument tokens no converter can reason about. Nothing in a #HEADER
+       is ours to touch. Start-anchored on the trimmed line, symmetric with
+       _IsCommandDeclaration above ("#ENDHEADER" cannot false-match "#HEADER"). The lexer's file walk
+       (ScanSourceFile) reads it too. */
+    Function _IsHeaderDeclaration String sOverstrikeLine Returns Boolean
+        Function_Return (Left(Uppercase(Trim(sOverstrikeLine)), Length("#HEADER")) = "#HEADER")
+    End_Function
+
+    // Is the line a "#EndHeader"? Trimmed for the same reason as _IsCommandEnd above: an
+    // indented directive must still close the region, or the flag sticks ON for the rest
+    // of the file and nothing after it would ever be refactored.
+    Function _IsHeaderEnd String sOverstrikeLine Returns Boolean
+        Function_Return (Left(Uppercase(Trim(sOverstrikeLine)), Length("#ENDHEADER")) = "#ENDHEADER")
     End_Function
 
     Function _IsRegisterObjectLine String sLine Returns Boolean
@@ -769,6 +1563,7 @@ Class cRefactorUtilities is a cObject
     {Visibility = Private}
     Function HasBracketNotOperator String sToken Returns Boolean
         Boolean bHasNot bHasBracket
+
         Move False to bHasNot
         Get _HasTokenLeftBracket sToken to bHasBracket
         If (bHasBracket = False) Begin
@@ -903,8 +1698,13 @@ Class cRefactorUtilities is a cObject
         Move False to bIsDFCOMProxyClasses
         Get vFilePathExists sFileName to bExists
         If (bExists = False) Begin
-            Error DfErr_Program ("The file doesn't exist:" * String(sFileName))
-            Function_Return False
+            /* A name with nothing behind it is "do not process", not an error (2026-09-05, LegacyApp):
+               the engine's list can be older than the disk - [Rename them] retired FlexCOM20.pkg
+               between the Check and the run - and this gate raised DfErr_Program once per file and
+               per pass. The engine now drops such names at InitializeEngine and NAMES them
+               (DropMissingFiles); this stays quiet so a file that vanishes mid-run is skipped
+               rather than announced four times. */
+            Function_Return True
         End
         Get rfOpenInput sFileName to iCh
         If (iCh < 0) Begin
@@ -947,6 +1747,24 @@ Class cRefactorUtilities is a cObject
             Move (iItem <> -1) to bFound
         End
         Function_Return bFound
+    End_Function
+
+    /* The leading whitespace of a RAW line - the tokenizer-free twin of _Indentation below, for the
+       many callers that hold a plain String and no tTokenizer.
+
+       LTrim, never Trim: the difference is only visible on a line with TRAILING whitespace, and then
+       Trim gets it wrong. "    If (cond) cmd    " is 57 chars and trims to 49, so a
+       length-difference of 8 yields Left(sLine, 8) = "    If (" - four characters of real content
+       smuggled in as indent. cGridToCJGridBase.GetIndent carries that warning and the same LTrim
+       body; this is the copy the funclib chain can reach.
+
+       WHY IT EXISTS (Nils 2026-07-28): _EnsureUsePackage called `Get GetIndent`, which lives on
+       cGridToCJGridBase - a DIFFERENT class family the funclib does not descend from - so the
+       message went unanswered, delegated funclib -> ClientArea -> Main -> Desktop, and died as a
+       runtime Error 98. The compiler cannot see that; only a live run on a qualifying file can.
+       Twenty lines further on, the same function was open-coded a third way. One home now. */
+    Function _LineIndent String sLine Returns String
+        Function_Return (Left(sLine, (Length(sLine) - Length(LTrim(sLine)))))
     End_Function
 
     Function _Indentation tTokenizer ByRef TokenizerData Returns String
@@ -1028,9 +1846,7 @@ Class cRefactorUtilities is a cObject
         Function_Return (sLine <> sOrgLine)
     End_Function
 
-    // NOTE: This is a unit-testable copy of cRefactorApplication IsFileInFilter.
-    // The two implementations must be kept identical. If you change the logic here,
-    // you MUST apply the same change to cRefactorApplication.IsFileInFilter, and vice versa.
+    // The one IsFileInFilter (cRefactorApplication's forwards here); unit-tested via oIsFileInFilter-Tests.
     Function IsFileInFilter String sFileName String sFileFilter Returns Boolean
         Integer iSearchIndex
         String sExtension sChar
@@ -1053,6 +1869,36 @@ Class cRefactorUtilities is a cObject
     End_Function
 
     // It is assumed that the sToken is neither blank or part of a comment or text constant.
+    /* Is sToken a DataFlex RESERVED word - keyword, scope opener, or scope closer?
+
+       _IsKeyWord below checks only pasKeyWords, which is one of THREE buckets _AddAllKeyWords fills
+       from the Scintilla language definition (saKeywords / saScopeStart / saScopeStop). That makes
+       it too narrow to answer "may an identifier be named this": End_Procedure is a scope CLOSER,
+       so _IsKeyWord says False for it (Nils 2026-07-28, via '#REPLACE End_Procedure
+       End_Procedure_Profiler' - the keyword guard let that macro through as if it were a constant).
+
+       Callers asking "is this name the language's, not the user's" want this one. Callers asking
+       specifically about the keyword bucket keep _IsKeyWord. */
+    Function _IsReservedWord String sToken Returns Boolean
+        Integer iItem
+        String[] asWords
+
+        Move (Trim(Lowercase(sToken))) to sToken
+        If (sToken = "") ;
+            Function_Return False
+        Get pasKeyWords to asWords
+        Move (SearchArray(sToken, asWords)) to iItem
+        If (iItem <> -1) ;
+            Function_Return True
+        Get pasScopeStart to asWords
+        Move (SearchArray(sToken, asWords)) to iItem
+        If (iItem <> -1) ;
+            Function_Return True
+        Get pasScopeEnd to asWords
+        Move (SearchArray(sToken, asWords)) to iItem
+        Function_Return (iItem <> -1)
+    End_Function
+
     Function _IsKeyWord String sToken Returns Boolean
         Integer iItem
         String[] asKeyWords
@@ -1075,6 +1921,16 @@ Class cRefactorUtilities is a cObject
         Function_Return (iItem <> -1)
     End_Function
 
+    // The six legacy comparison words this tool exists to modernise - answered from the language,
+    // never from a list: the operator list is seeded from the target install's DataFlex.lng, and
+    // DataFlex 26's carries none of them (see _EnsureLegacyOperatorWords). Case-insensitive, trimmed.
+    Function _IsLegacyOperatorWord String sToken Returns Boolean
+        String sLow
+
+        Move (Lowercase(Trim(sToken))) to sLow
+        Function_Return (sLow = "eq" or sLow = "ne" or sLow = "gt" or sLow = "ge" or sLow = "lt" or sLow = "le")
+    End_Function
+
     Function _IsListedWord String sToken Returns Boolean
         Integer iItem
         String[] asKeyWords asScopeStart asScopeEnd asCommands
@@ -1091,22 +1947,56 @@ Class cRefactorUtilities is a cObject
         Function_Return (iItem <> -1)
     End_Function
 
+    /* The first keyword token AT PAREN DEPTH ZERO - a keyword inside parentheses is part of an
+       expression, not the boundary of one.
+
+       DEPTH ADDED 2026-08-30, for a defect that had been recorded as "mangled elsewhere in the
+       extractor" since 08-18. "If sX eq ( Trim (sY) ) Begin" came out as
+       "If (sX = ()) ( Trim (sY) ) Begin" - the operand replaced by an empty pair and then left
+       dangling after it, which does not compile.
+
+       WHY THE SPACES ARE WHAT BREAK IT: the glued form "eq (Trim(sY)) Begin" splits on spaces into
+       one token "(Trim(sY))", and a token is only tested whole, so the inner Trim is never seen as a
+       keyword. Put spaces inside the parens and "Trim" becomes a token of its own - _ExpressionTail
+       (this functions only caller) cut the tail there, at depth 1, leaving "eq (" for the caller to
+       close into "()". Same class as the note already above _CutBeforeCommandFunctionWord, which was
+       taught depth for the same reason: the pair of them now agree.
+
+       Depth is read BEFORE the token is judged, so the "(" that opens a group is itself at depth 0
+       and its contents are not. */
     Function _FirstKeyWordInArray String sOverstrike String[] asArray Returns String
         tToken TokenData
-        Integer iSize iCount
+        Integer iSize iCount j iDepth
         Boolean bFound
+        String sTok sCh
 
         Move (SizeOfArray(asArray)) to iSize
         If (iSize = 0) Begin
             Function_Return TokenData
         End
         Decrement iSize
+        Move 0 to iDepth
         For iCount from 0 to iSize
-            Get _IsKeyWord asArray[iCount] to bFound
-            If (bFound = True) Begin
-                Move asArray[iCount] to TokenData.sCode
-                Move (Pos(TokenData.sCode, sOverstrike)) to TokenData.iStartPos
-                Move iSize to iCount
+            Move asArray[iCount] to sTok
+            If (iDepth = 0) Begin
+                Get _IsKeyWord sTok to bFound
+                If (bFound = True) Begin
+                    Move sTok to TokenData.sCode
+                    Move (Pos(TokenData.sCode, sOverstrike)) to TokenData.iStartPos
+                    Move iSize to iCount
+                End
+            End
+            // carry the depth this token leaves behind into the next one
+            If (bFound = False) Begin
+                For j from 1 to (Length(sTok))
+                    Move (Mid(sTok, 1, j)) to sCh
+                    If (sCh = "(") ;
+                        Increment iDepth
+                    Else If (sCh = ")") Begin
+                        If (iDepth > 0) ;
+                            Decrement iDepth
+                    End
+                Loop
             End
         Loop
 
@@ -1125,63 +2015,40 @@ Class cRefactorUtilities is a cObject
         Function_Return (iItem <> -1)
     End_Function
 
-    // Helper function for the BreakupCompoundStatement function.
-    {Visibility = Private}
-    Function _TestCommands String sTest Returns Integer
+    // The position of the first of asCommands in sTest - each must carry a space before it (after it not
+    // always), and the earliest position wins when several occur; 0 when none does.
+    Function _FirstCommandPos String sTest String[] asCommands Returns Integer
         Integer iCount iSize iPos iTest
-        String  sCommand
-        String[] asCommands
 
         Move 0 to iPos
-        Get pasCommands to asCommands
         Move (SizeOfArray(asCommands)) to iSize
         Decrement iSize
         For iCount from 0 to iSize
-            Move asCommands[iCount] to sCommand
-            Move (Pos(" " + sCommand, sTest)) to iTest // The command MUST have a space before it, after it not always
+            Move (Pos(" " + asCommands[iCount], sTest)) to iTest
             If (iTest <> 0) Begin
-                If (iPos = 0) Begin
+                If (iPos = 0 or iTest < iPos) ;
                     Move iTest to iPos
-                End
-                Else Begin
-                    If (iTest < iPos) Begin
-                        Move iTest to iPos
-                    End
-                End
             End
         Loop
-
         Function_Return iPos
+    End_Function
+
+    // Helper function for the BreakupCompoundStatement function.
+    {Visibility = Private}
+    Function _TestCommands String sTest Returns Integer
+        String[] asCommands
+
+        Get pasCommands to asCommands
+        Function_Return (_FirstCommandPos(Self, sTest, asCommands))
     End_Function
 
     // Helper function. This is a list of commands that also exists as DataFlex string functions.
     Function _TestCommandFunctions String sTest Returns Integer
-        Boolean bRemoved
-        Integer iCount iSize iPos iTest
-        String  sCommand
         String[] asCommandFunctions
 
-        Move 0 to iPos
         Get _RemoveEndComment sTest to sTest
         Get pasCommandFunctions to asCommandFunctions
-        Move (SizeOfArray(asCommandFunctions)) to iSize
-        Decrement iSize
-        For iCount from 0 to iSize
-            Move asCommandFunctions[iCount] to sCommand
-            Move (Pos(" " + sCommand, sTest)) to iTest // The command MUST have a space before it.
-            If (iTest <> 0) Begin
-                If (iPos = 0) Begin
-                    Move iTest to iPos
-                End
-                Else Begin
-                    If (iTest < iPos) Begin
-                        Move iTest to iPos
-                    End
-                End
-            End
-        Loop
-
-        Function_Return iPos
+        Function_Return (_FirstCommandPos(Self, sTest, asCommandFunctions))
     End_Function
 
     // Counts total number of source lines for the passed file name.
@@ -1203,7 +2070,7 @@ Class cRefactorUtilities is a cObject
             Function_Return 0
         End
 
-        Move (RFReadEncodedFileAsStringArray(sFullSourceFileName)) to asSource
+        Move (rfReadEncodedFileAsStringArray(sFullSourceFileName)) to asSource
         Move 0 to iLines
         For iCount from 0 to (SizeOfArray(asSource) - 1)
             Get IsCommentLineOrBlank asSource[iCount] to bBlank
@@ -1378,6 +2245,27 @@ Class cRefactorUtilities is a cObject
         Function_Return sFirstWord
     End_Function
 
+    // Returns sLine without a leading 'Local' keyword (any case), indentation kept:
+    // "  Local Integer iA" -> "  Integer iA". Any other line comes back unchanged.
+    // There is no tokenizer check here; the caller knows the line is a declaration.
+    // RemoveLocalKeyWord adds that check. cRemoveUnusedLocals calls this directly,
+    // because by the time it edits a line pTokenizer describes a different line.
+    Function _RemoveLocalKeyWord String sLine Returns String
+        String sText
+        Integer iPos
+
+        // Local must be the first word on the line.
+        Move (Lowercase(Left(LTrim(sLine), 6))) to sText
+        If (sText <> (Lowercase(CS_Local) + CS_S)) Begin
+            Function_Return sLine
+        End
+        Move (Pos((Lowercase(CS_Local) + CS_S), Lowercase(sLine))) to iPos
+        If (iPos > 0) Begin
+            Move (Remove(sLine, iPos, 6)) to sLine
+        End
+        Function_Return sLine
+    End_Function
+
     // Parses the method name from the string
     Function _MethodName String sOverstrikeLine Returns String
         Integer iPos
@@ -1404,6 +2292,7 @@ Class cRefactorUtilities is a cObject
 
     Function _IsOverwriteValue String sOverwrite Returns Boolean
         Boolean bFound
+
         // Single-quoted strings: content is masked with CS_E (~)
         // Single-quoted strings: content may also be masked with CS_U (^)
         Move (sOverwrite contains ("'" + CS_E + CS_E) or sOverwrite contains ("'" + CS_E + "'") or ;
@@ -1477,6 +2366,116 @@ Class cRefactorUtilities is a cObject
         End
 
         Function_Return bIsUseLine
+    End_Function
+
+    /* How many lines differ between two versions of a file.
+
+       Written for the editor pass, which had no honest measure of its own work. The two
+       eEditorFunction refactorings reported Changed_State - "is the document different from its
+       last save point" - which after loading a file into the control is ALWAYS true, so the engine
+       counted one per FILE and printed it as "lines". Nils, 2026-08-03, isolated it exactly: he ran
+       the same workspace twice, un-indenting ten lines in between and changing nothing else, and
+       got "25 lines Reindented code" both times. 25 was the file count.
+
+       COMPARISON IS CASE-SENSITIVE, which matters here rather than being incidental:
+       EditorNormalizeCase changes nothing BUT casing, and DataFlex "=" on strings is
+       case-sensitive, so a case-only edit is correctly counted as a change.
+
+       Added and removed lines count too - the size difference is added on top of the differing
+       lines in the overlap, so a converter that splits one line into two reports both. */
+    Function ChangedLineCount String[] asBefore String[] asAfter Returns Integer
+        Integer iBefore iAfter iOverlap i iCount
+
+        Move (SizeOfArray(asBefore)) to iBefore
+        Move (SizeOfArray(asAfter))  to iAfter
+        Move 0 to iCount
+
+        Move iBefore to iOverlap
+        If (iAfter < iOverlap) ;
+            Move iAfter to iOverlap
+        If (iOverlap > 0) Begin
+            For i from 0 to (iOverlap - 1)
+                If (asBefore[i] <> asAfter[i]) ;
+                    Increment iCount
+            Loop
+        End
+
+        If (iAfter > iBefore) ;
+            Move (iCount + (iAfter - iBefore)) to iCount
+        If (iBefore > iAfter) ;
+            Move (iCount + (iBefore - iAfter)) to iCount
+
+        Function_Return iCount
+    End_Function
+
+    /* The DF23 name for a CodeJock "Report" symbol, or "" if this is not one.
+
+       DataFlex followed CodeJock's own control rename at DF 23.0: cCJReportControl.pkg became
+       cCJGridControl.pkg, and every symbol in it went Report -> Grid. The old package survives as
+       OldcCJReportControl.pkg carrying a 4536 obsolete warning - and it is the ONLY place in a
+       DF23+ install where any cCJReport or xtpReport name is still defined. So this is one atomic
+       migration: swap the Use and rename everything, or keep the obsolete package. There is no
+       half-way state where some names resolve and others do not.
+
+       MATCHED BY VENDOR PREFIX, NEVER BY THE WORD "REPORT". DataFlex's own reporting stack is
+       full of it - Report.pkg, CrystalReport.pkg, Dfreport.pkg, cBasicReport, cAutoWebReport,
+       WinReport/cWinReport2 - as is ordinary application code (psReportName, oReport_btn). Most
+       sharply, the ComReport* COM properties (ComReportTitle, ComReportSource, ComReportTemplate
+       and eight more) belong to DataFlex/Crystal Reports, are byte-identical in 20.1 and 26.0, and
+       have no ComGrid* counterpart at all: a substitution on the word would rename them out of
+       existence. Requiring one of the four CodeJock prefixes excludes every one of those by
+       construction.
+
+       TWO EXCEPTIONS, both verified against the 20.1 and 23.0 installs. Rule + exceptions maps
+       all 214 prefixed symbols in cCJReportControl.pkg onto symbols that exist in
+       cCJGridControl.pkg - 214 of 214, nothing left over:
+
+       1. cCJReportColumn -> cCJGridColumnXTP, NOT cCJGridColumn. This is the one that has to be
+          hard-coded, because getting it wrong COMPILES: cCJGridColumn exists in cCJGridColumn.pkg,
+          declared "Class cCJGridColumn is a cCJGridColumnXTP", so the obvious substitution binds
+          silently to a different, derived class. DataFlex says so itself at the declaration -
+          "renamed because there already is a cCJGridColumn in cCJGridColumn.pkg".
+       2. xtpReportElementRectReportArea -> xtpGridElementRectGridArea. The word appears TWICE and
+          BOTH change; replacing only the leading one names a constant that does not exist. It is
+          the single symbol of 214 where that happens. */
+    Function CodeJockGridNameFor String sName Returns String
+        String  sLC
+        Integer iPos
+
+        Move (Trim(sName)) to sName
+        Move (Lowercase(sName)) to sLC
+
+        If (sLC = "ccjreportcolumn") ;
+            Function_Return "cCJGridColumnXTP"
+        If (sLC = "xtpreportelementrectreportarea") ;
+            Function_Return "xtpGridElementRectGridArea"
+
+        If (Left(sLC, 9) <> "ccjreport" and Left(sLC, 10) <> "ccjireport" ;
+            and Left(sLC, 11) <> "ccj_dreport" and Left(sLC, 9) <> "xtpreport") ;
+            Function_Return ""
+
+        Move (Pos("report", sLC)) to iPos
+        If (iPos = 0) ;
+            Function_Return ""
+        // Casing of the ORIGINAL is preserved either side of the replaced word - these names are
+        // emitted into source, and only the "Grid" itself is ours to spell.
+        Function_Return (Left(sName, (iPos - 1)) + "Grid" + Mid(sName, (Length(sName) - (iPos + 5)), (iPos + 6)))
+    End_Function
+
+    // The index of the first token EQUAL to sWord (case-blind) AFTER token iFrom, or -1. A command's
+    // clause words (In / At / With / To) are looked up from the command token, never from the start
+    // of the line - a guarding condition can carry the same word ('If x In "A|B" Insert "+" In s At 1').
+    Function _TokenIndexAfter tTokenizer TokenizerData Integer iFrom String sWord Returns Integer
+        Integer i iLast
+
+        Move (SizeOfArray(TokenizerData.asLineTokens) - 1) to iLast
+        If (iFrom < -1) ;
+            Move -1 to iFrom
+        For i from (iFrom + 1) to iLast
+            If (Lowercase(TokenizerData.asLineTokens[i]) = Lowercase(sWord)) ;
+                Function_Return i
+        Loop
+        Function_Return -1
     End_Function
 
 End_Class

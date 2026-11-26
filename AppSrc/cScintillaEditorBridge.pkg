@@ -1,0 +1,1320 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cScintillaEditorBridge
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-27
+//
+// Description : PHASE 1, the rebase layer (Nils 2026-07-27). Sits between the clean
+//               cScintillaControl (pure Scintilla API, probe-proven) and DFRefactor's
+//               cRefactorScintillaEditor, and supplies everything the editor + the Find/Replace
+//               dialogs + the hotkey mixin need beyond raw control primitives.
+//
+//               APP-SIDE BY DECISION: DFRefactor owns its adapters; the SciControlLib fork stays
+//               untouched for the Hammer heritage and the other pool apps
+//               NO CM_ NAMES ANYWHERE - the CodeMax vocabulary is retired, not
+//               re-exported, so cRefactorScintillaEditor's call
+//               sites move to the new vocabulary in the same commit that swaps its base class.
+//
+//               What lives here, by bucket (from the 2026-07-27 consumption census):
+//                 B  selection state mirror       - piSelStart/EndLine/Col + RefreshSelectionState
+//                 D  hotkey action verbs          - the ~15 verbs cEditorHotKey_Mixin dispatches
+//                 F  plumbing                     - line numbering, scrollbars, indent mode, toggles
+//               Search (C) and the interactive services (E: auto-indent, brace match, folding,
+//               style map) land in the next pass.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use cScintillaControl.pkg
+
+// The right-click menu object is told which control invoked it. That object belongs to
+// the consumer, so the message is registered rather than defined here.
+Register_Procedure Set phoServedObject Handle hoServedObject
+
+// The bookmark MARKER NUMBER. SC_MASK_BOOKMARK (cScintilla.h) is 0x00000800 - the
+// mask with bit 11 set - and the marker-set messages want the number, not the mask.
+// Named here so the two can never drift apart silently.
+#IFNDEF CI_BookmarkMarker
+Define CI_BookmarkMarker for 11
+#ENDIF
+
+// The Quick Mark MARKER NUMBER and its mask bit, kept together for the same reason. 12 is free:
+// 10 is the current-line highlight (SC_MARKNUM_LINEHIGHLIGHT), 11 the bookmark, 25-31 folding.
+#IFNDEF CI_QuickMarkMarker
+Define CI_QuickMarkMarker for 12
+Define CI_QuickMarkMask   for |CI$00001000
+#ENDIF
+
+/* The margin layout. Scintilla gives a control five margins and no opinion about what
+   goes in them, so the assignment is ours to make - and it must be made in ONE place,
+   because a margin set up as a symbol margin here and sized as a number margin there
+   silently shows nothing. The old chain spread four margin indices across three files;
+   this is the whole layout, left to right. (These deliberately do NOT reuse the old
+   chain's MARGIN_* names, which carry a different order and are still in scope via
+   cSciLexer.h.) */
+#IFNDEF CI_MarginLineNumbers
+Define CI_MarginLineNumbers for 0
+Define CI_MarginMarkers     for 1    // bookmarks
+Define CI_MarginFolding     for 2
+#ENDIF
+
+// "No colour of its own" - the caller wants whatever the control would use anyway.
+// Guarded and defined identically in cEditorColourScheme.pkg, because either file can
+// be the first one a program pulls in and neither should have to depend on the other.
+#IFNDEF CI_NoColour
+Define CI_NoColour for -1
+#ENDIF
+
+Class cScintillaEditorBridge is a cScintillaControl
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+
+        // ---- B: the selection mirror. The old chain filled these as a SIDE EFFECT of
+        // CM_GetSel; here RefreshSelectionState fills them explicitly and the callers
+        // ask for what they want. Columns are CHARACTER columns (SCI_GETCOLUMN), which
+        // is what every consumer of these means.
+        Property Integer piSelStartLine 0
+        Property Integer piSelStartCol  0
+        Property Integer piSelEndLine   0
+        Property Integer piSelEndCol    0
+
+        // ---- F: editor options the settings dialog drives. Held here because the
+        // control is stateless about them; each setter pushes to Scintilla at once.
+        Property Integer peAutoIndentMode CI_AutoIndentPrevLine
+        Property Boolean pbShowMatchingBraces True
+        Property Boolean pbNormalizeCase True
+        Property Boolean pbFindDocumentStart False
+        Property String  psSearchText ""
+
+        // ---- J: shortcuts Scintilla owns that the app has claimed, collected while the
+        // view is built and cleared from the control once it exists.
+        Property String[] psClearKeyBindings
+
+        // The scheme's text and window colours, remembered so a style that says "use the
+        // window background" has something to resolve to.
+        Property Integer piTextColor   clBlack
+        Property Integer piWindowColor clWhite
+
+        /* The right-click menu. DataFlex's standard controls answer this property from
+           their own base class; cWinControl does not, so the control owns it and pops
+           the menu itself. Scintilla is told never to show its own built-in popup, and
+           the right mouse button is routed to OnWmContextMenu below. */
+        Property Integer Floating_Menu_Object 0
+        Set External_Message WM_RBUTTONUP to msg_OnWmContextMenu
+
+        // Dropping a file from Explorer onto the editor opens it.
+        Property Integer piDragAcceptFilesState True
+        Set External_Message WM_DROPFILES to msg_DoFileDropping
+
+        // Keep the DataFlex focus with whatever holds the Windows focus.
+        Set External_Message WM_SETFOCUS  to msg_OnWmSetFocus
+        Set External_Message WM_KILLFOCUS to msg_OnWmKillFocus
+
+        /* DataFlex's control host eats these four before the control ever sees them -
+           Tab and Shift+Tab as focus movement, Enter as "next field", Insert as nothing
+           at all. Claiming them here hands them back to the editor, which is why they
+           have to be bound even though Scintilla would handle them perfectly well on
+           its own. Enter in particular: without this line the key does nothing. */
+        On_Key key_Tab           Send Default_Key
+        On_Key Key_Shift+key_Tab Send Default_Key
+        On_Key kEnter            Send HandleReturnKey
+        On_Key KEY_INSERT        Send ToggleOvertype
+    End_Procedure
+
+    Procedure OnWmSetFocus
+        Send Activate
+    End_Procedure
+
+    Procedure OnWmKillFocus
+    End_Procedure
+
+    Procedure ToggleOvertype
+        Send EditorMessage SCI_EDITTOGGLEOVERTYPE
+        Send OnOvertypeChange
+    End_Procedure
+
+    /* Windows hands over a drop as a handle to a list of paths, which has to be asked
+       for its count, then for each path's length, then for the path itself - and then
+       released, or the drop leaks. One OnFileDropped per file. */
+    Procedure DoFileDropping Longptr wParam Longptr lParam
+        Handle  hDrop
+        Integer iCount iSize iFile iRet
+        String  sFile
+
+        Move wParam to hDrop
+        Move (DragQueryFile(hDrop, |CI$FFFFFFFF, 0, 0)) to iCount
+        For iFile from 0 to (iCount - 1)
+            Move (DragQueryFile(hDrop, iFile, 0, 0)) to iSize
+            Move (Repeat(Character(0), iSize + 1)) to sFile
+            Move (DragQueryFile(hDrop, iFile, AddressOf(sFile), iSize + 1)) to iRet
+            If (iRet) ;
+                Send OnFileDropped (CString(sFile))
+        Loop
+        Move (DragFinish(hDrop)) to iRet
+    End_Procedure
+
+    Procedure OnFileDropped String sFilePath
+    End_Procedure
+
+    /* Raised on every document change. OnDocumentModified carries Scintilla's
+       modification-type flags; OnModified is the older no-argument form that consumers
+       (the test bench) override to refresh a line count. Both fire, one source. */
+    Procedure OnDocumentModified Integer iModificationType
+        Forward Send OnDocumentModified iModificationType
+        Send OnModified
+    End_Procedure
+
+    Procedure OnModified
+    End_Procedure
+
+    // The editor settings dialog. Empty here - and it was empty in the old chain too,
+    // where the body had been commented out; the hotkey layer still sends it.
+    Procedure Properties
+    End_Procedure
+
+    /* The post-page setup hooks. A Scintilla control can only be configured once its
+       window exists, so everything that talks to the control waits for this moment -
+       and consumers hang their own setup off these three overridables. The order
+       mirrors the old chain's exactly, because cRefactorScintillaEditor's overrides
+       depend on it: settings first, then the language, then anything else.
+
+       Losing this hook is not a subtle failure. SetLexer is what loads the language
+       definition, and that definition seeds ghoFuncLib's keyword arrays - so without
+       it the whole refactoring engine stops recognising DataFlex keywords. */
+    Procedure Page_Object Integer bState
+        Integer iVoid
+        Forward Send Page_Object bState
+        If (bState = False or Window_Handle(Self) = 0) ;
+            Procedure_Return
+        If (piDragAcceptFilesState(Self)) ;
+            Move (DragAcceptFiles(Window_Handle(Self), True)) to iVoid
+        Send SetAdjustments True
+        Send ApplyEditorOptions
+        Send OnPaged
+    End_Procedure
+
+    // For overriding: settings, language, appearance - anything the consumer needs
+    // after paging. Empty here because the colour scheme belongs to the application,
+    // not to the control.
+    Procedure SetAdjustments Boolean bIsPaged
+    End_Procedure
+
+    Procedure SetLexer
+    End_Procedure
+
+    Procedure ApplyColourScheme
+    End_Procedure
+
+    Procedure ApplyFoldingStyle
+    End_Procedure
+
+    Procedure OnPaged
+    End_Procedure
+
+    /* The order matters and is the old chain's: the lexer first, because the colour
+       scheme maps styles the lexer defines; then the scheme; then the fold markers,
+       which take their colours from the scheme. Leave any of them out and the editor
+       comes up as black text on white with no fold markers. */
+    Procedure ApplyEditorOptions
+        Send SetLexer
+        Send ApplyColourScheme
+        Send ApplyFoldingStyle
+        // Default word/whitespace character classes: word characters are alphanumeric
+        // and underscore, which is what every word-boundary member here assumes.
+        Send EditorMessage SCI_SETCHARSDEFAULT
+        // Scintilla has a built-in right-click menu; turn it off or it appears instead
+        // of the application's.
+        Send EditorMessage SCI_USEPOPUP SC_POPUP_NEVER
+        // Report every kind of change through SCN_MODIFIED.
+        Send EditorMessage SCI_SETMODEVENTMASK SC_MODEVENTMASKALL
+        // Now that the control exists, drop the built-in shortcuts the app has claimed.
+        Send ClearRegisteredKeyBindings
+    End_Procedure
+
+    Procedure OnBeforeFloatingMenu
+    End_Procedure
+
+    Procedure OnAfterFloatingMenu
+    End_Procedure
+
+    Procedure OnWmContextMenu Longptr wParam Longptr lParam
+        If (Floating_Menu_Object(Self) = 0) ;
+            Procedure_Return
+        Set phoServedObject of (Floating_Menu_Object(Self)) to Self
+        Send OnBeforeFloatingMenu
+        Send Popup to (Floating_Menu_Object(Self))
+        Send OnAfterFloatingMenu
+    End_Procedure
+
+    // *** B - selection state
+
+    // Refresh the four line/col properties from the control's live selection.
+    // Returns True when the selection is non-empty.
+    Function RefreshSelectionState Returns Boolean
+        Integer iStartPos iEndPos iLine iCol
+
+        Get EditorMessage SCI_GETSELECTIONSTART to iStartPos
+        Get EditorMessage SCI_GETSELECTIONEND   to iEndPos
+        Get EditorMessage SCI_LINEFROMPOSITION iStartPos to iLine
+        Get EditorMessage SCI_GETCOLUMN        iStartPos to iCol
+        Set piSelStartLine to iLine
+        Set piSelStartCol  to iCol
+        If (iStartPos <> iEndPos) Begin
+            Get EditorMessage SCI_LINEFROMPOSITION iEndPos to iLine
+            Get EditorMessage SCI_GETCOLUMN        iEndPos to iCol
+        End
+        Set piSelEndLine to iLine
+        Set piSelEndCol  to iCol
+        Function_Return (iStartPos <> iEndPos)
+    End_Function
+
+    Function HasSelection Returns Boolean
+        Longptr iEmpty
+        Get EditorMessage SCI_GETSELECTIONEMPTY to iEmpty
+        Function_Return (iEmpty = 0)
+    End_Function
+
+    // The word at the caret INCLUDING dotted parts (Table.Field, Object.Property) -
+    // what the open-file-under-cursor and help lookups want. Scintilla's word
+    // boundaries stop at '.', so extend across dots by hand.
+    Function WordAtCaretIncludingDots Returns String
+        Integer iPos iStartPos iEndPos iChar iLen iNew
+        Boolean bMore
+
+        Get EditorMessage SCI_GETCURRENTPOS to iPos
+        Get EditorMessage SCI_WORDSTARTPOSITION iPos True to iStartPos
+        Get EditorMessage SCI_WORDENDPOSITION   iPos True to iEndPos
+        Get ByteLength to iLen
+
+        // Walk LEFT over ".<word>" groups. Each pass must make real progress, or the
+        // loop stops - a dot with no word before it is a boundary, not an invitation
+        // to keep walking (the first cut collapsed onto the whole line).
+        Move True to bMore
+        While (bMore = True)
+            Move False to bMore
+            If (iStartPos > 0) Begin
+                Get EditorMessage SCI_GETCHARAT (iStartPos - 1) to iChar
+                If (iChar = 46) Begin
+                    Get EditorMessage SCI_WORDSTARTPOSITION (iStartPos - 1) True to iNew
+                    If (iNew < (iStartPos - 1)) Begin
+                        Move iNew to iStartPos
+                        Move True to bMore
+                    End
+                End
+            End
+        Loop
+
+        // Walk RIGHT over "<word>." groups, same progress rule.
+        Move True to bMore
+        While (bMore = True)
+            Move False to bMore
+            If (iEndPos < iLen) Begin
+                Get EditorMessage SCI_GETCHARAT iEndPos to iChar
+                If (iChar = 46) Begin
+                    Get EditorMessage SCI_WORDENDPOSITION (iEndPos + 1) True to iNew
+                    If (iNew > (iEndPos + 1)) Begin
+                        Move iNew to iEndPos
+                        Move True to bMore
+                    End
+                End
+            End
+        Loop
+        Function_Return (TextRange(Self, iStartPos, iEndPos))
+    End_Function
+
+    // *** D - the hotkey action verbs (what cEditorHotKey_Mixin dispatches). Nearly all
+    // are single Scintilla commands; the old chain wrapped them the same way.
+
+    Procedure MoveLineUp
+        Send EditorMessage SCI_MOVESELECTEDLINESUP
+    End_Procedure
+
+    Procedure MoveLineDown
+        Send EditorMessage SCI_MOVESELECTEDLINESDOWN
+    End_Procedure
+
+    Procedure DuplicateSelection
+        Send EditorMessage SCI_SELECTIONDUPLICATE
+    End_Procedure
+
+    Procedure CutLine
+        Send EditorMessage SCI_LINECUT
+    End_Procedure
+
+    Procedure UpperCaseSelection
+        Send EditorMessage SCI_UPPERCASE
+    End_Procedure
+
+    Procedure LowerCaseSelection
+        Send EditorMessage SCI_LOWERCASE
+    End_Procedure
+
+    Procedure SelectAllText
+        Send EditorMessage SCI_SELECTALL
+    End_Procedure
+
+    Procedure SelectToLineEnd
+        Send EditorMessage SCI_LINEENDEXTEND
+    End_Procedure
+
+    Procedure ClearDocument
+        Send EditorMessage SCI_CLEARALL
+    End_Procedure
+
+    /* Jump to the brace matching the one at/just before the caret. REWRITTEN on
+       SCI_BRACEMATCH - the old chain hand-parsed the document counting nesting
+       (~60 lines); Scintilla does it correctly, including inside the lexer's own
+       notion of code vs string. -1 = no match, leave the caret alone. */
+    Procedure GotoMatchingBrace
+        Integer iPos iMatch iChar
+
+        Get EditorMessage SCI_GETCURRENTPOS to iPos
+        Move -1 to iMatch
+        If (iPos > 0) Begin
+            Get EditorMessage SCI_GETCHARAT (iPos - 1) to iChar
+            If (iChar = 40 or iChar = 41 or iChar = 91 or iChar = 93 or iChar = 123 or iChar = 125) ;
+                Get EditorMessage SCI_BRACEMATCH (iPos - 1) 0 to iMatch
+        End
+        If (iMatch < 0) Begin
+            Get EditorMessage SCI_GETCHARAT iPos to iChar
+            If (iChar = 40 or iChar = 41 or iChar = 91 or iChar = 93 or iChar = 123 or iChar = 125) ;
+                Get EditorMessage SCI_BRACEMATCH iPos 0 to iMatch
+        End
+        If (iMatch >= 0) ;
+            Send EditorMessage SCI_GOTOPOS iMatch
+    End_Procedure
+
+    // ---- Bookmarks (marker 11 - SC_MASK_BOOKMARK is that marker's bit mask).
+    Function LineHasBookmark Integer iLine Returns Boolean
+        Longptr iMarkers
+        Get EditorMessage SCI_MARKERGET iLine to iMarkers
+        Function_Return ((iMarkers iAnd SC_MASK_BOOKMARK) <> 0)
+    End_Function
+
+    Procedure ToggleBookmark
+        Boolean bHas
+        Integer iLine
+        Get CurrentLine to iLine
+        If (iLine < 0) ;
+            Procedure_Return
+        Get LineHasBookmark iLine to bHas
+        If (bHas = True) ;
+            Send EditorMessage SCI_MARKERDELETE iLine CI_BookmarkMarker
+        Else ;
+            Send EditorMessage SCI_MARKERADD iLine CI_BookmarkMarker
+    End_Procedure
+
+    Procedure NextBookmark
+        Integer iLine iFound
+        Get CurrentLine to iLine
+        Get EditorMessage SCI_MARKERNEXT (iLine + 1) SC_MASK_BOOKMARK to iFound
+        If (iFound >= 0) ;
+            Send EditorMessage SCI_GOTOLINE iFound
+    End_Procedure
+
+    Procedure PreviousBookmark
+        Integer iLine iFound
+        Get CurrentLine to iLine
+        Get EditorMessage SCI_MARKERPREVIOUS (iLine - 1) SC_MASK_BOOKMARK to iFound
+        If (iFound >= 0) ;
+            Send EditorMessage SCI_GOTOLINE iFound
+    End_Procedure
+
+    Procedure FirstBookmark
+        Integer iFound
+        Get EditorMessage SCI_MARKERNEXT 0 SC_MASK_BOOKMARK to iFound
+        If (iFound >= 0) ;
+            Send EditorMessage SCI_GOTOLINE iFound
+    End_Procedure
+
+    Procedure LastBookmark
+        Integer iFound iLines
+        Get DocumentLineCount to iLines
+        Get EditorMessage SCI_MARKERPREVIOUS iLines SC_MASK_BOOKMARK to iFound
+        If (iFound >= 0) ;
+            Send EditorMessage SCI_GOTOLINE iFound
+    End_Procedure
+
+    Procedure ClearAllBookmarks
+        Send EditorMessage SCI_MARKERDELETEALL CI_BookmarkMarker
+    End_Procedure
+
+    // *** F - plumbing / editor options
+
+    Procedure ShowHorizontalScrollBar Boolean bShow
+        Send EditorMessage SCI_SETHSCROLLBAR bShow
+    End_Procedure
+
+    Procedure ShowVerticalScrollBar Boolean bShow
+        Send EditorMessage SCI_SETVSCROLLBAR bShow
+    End_Procedure
+
+    /* The line-number margin, width computed from the document's digit count (the
+       old CM_SetLineNumbering did the same, minimum 3 digits). */
+    Procedure ShowLineNumbers Boolean bShow
+        Integer iLines iDigits iWidth
+        String sSample
+
+        If (bShow = False) Begin
+            Send EditorMessage SCI_SETMARGINWIDTHN CI_MarginLineNumbers 0
+            Procedure_Return
+        End
+        Get DocumentLineCount to iLines
+        Move 3 to iDigits
+        If (iLines > 999) ;
+            Move (Length(Trim(String(iLines)))) to iDigits
+        Move ("_" + Repeat("9", iDigits) + Character(0)) to sSample
+        Send EditorMessage SCI_SETMARGINTYPEN CI_MarginLineNumbers SC_MARGIN_NUMBER
+        Get EditorMessage SCI_TEXTWIDTH STYLE_LINENUMBER (AddressOf(sSample)) to iWidth
+        Send EditorMessage SCI_SETMARGINWIDTHN CI_MarginLineNumbers iWidth
+    End_Procedure
+
+    Procedure SetUseTabs Boolean bUseTabs
+        Send EditorMessage SCI_SETUSETABS bUseTabs
+    End_Procedure
+
+    /* The old ShowIndentationGuides took no argument and was only called when the
+       setting was on - so turning it OFF in the settings dialog did nothing until the
+       next restart. Taking the boolean means the setting is always pushed. */
+    Procedure SetIndentationGuides Boolean bShow
+        Send EditorMessage SCI_SETINDENTATIONGUIDES (If(bShow, SC_IV_LOOKBOTH, SC_IV_NONE))
+    End_Procedure
+
+    Procedure ToggleIndentationGuides
+        Longptr eStyle
+        Get EditorMessage SCI_GETINDENTATIONGUIDES to eStyle
+        Send SetIndentationGuides (eStyle = SC_IV_NONE)
+    End_Procedure
+
+    // Show spaces and tabs as dots and arrows. (The old pair also wrote a
+    // DisplayEOLCharacters property nothing ever read.)
+    Procedure ShowWhitespace Boolean bShow
+        Send EditorMessage SCI_SETVIEWWS (If(bShow, SCWS_VISIBLEALWAYS, SCWS_INVISIBLE))
+        Send EditorMessage SCI_SETVIEWEOL bShow // show end of line characters
+    End_Procedure
+
+    Function IsWhitespaceVisible Returns Boolean
+        Longptr eStyle
+        Get EditorMessage SCI_GETVIEWWS to eStyle
+        Function_Return (eStyle <> SCWS_INVISIBLE)
+    End_Function
+
+    /* How a selection is drawn. Scintilla changes only the BACKGROUND by default, so on
+       a dark scheme a light selection leaves light-blue keywords on a light ground -
+       readable in theory, horrible in practice.
+
+       Two ways out, and they are alternatives:
+
+       A TEXT COLOUR forces every selected character to one colour, so white-on-black
+       becomes black-on-white and stays legible - at the cost of the syntax colouring
+       for as long as the selection lasts. This is the closest Scintilla gets to what
+       the DataFlex Studio does; Studio computes a reciprocal colour PER TOKEN, which
+       has no Scintilla equivalent - styling is the lexer's business and the selection
+       is not an input to it.
+
+       TRANSLUCENCY draws the selection background over the text instead of behind it,
+       so every token keeps its own colour and the ground shifts underneath. Nothing is
+       lost, which is why most modern editors settled on it.
+
+       Pass CI_NoColour as the text colour to leave the syntax colours alone. */
+    Procedure SetSelectionColours Integer iBackColor Integer iTextColor
+        If (iBackColor <> CI_NoColour) ;
+            Send EditorMessage SCI_SETSELBACK True iBackColor
+        Else ;
+            Send EditorMessage SCI_SETSELBACK False 0
+        If (iTextColor <> CI_NoColour) ;
+            Send EditorMessage SCI_SETSELFORE True iTextColor
+        Else ;
+            Send EditorMessage SCI_SETSELFORE False 0
+    End_Procedure
+
+    // 0 is invisible, 255 opaque, SC_ALPHA_NOALPHA turns translucency off entirely and
+    // goes back to a solid background.
+    Procedure SetSelectionTranslucency Integer iAlpha
+        Send EditorMessage SCI_SETSELALPHA iAlpha
+    End_Procedure
+
+    Function SelectionTranslucency Returns Integer
+        Longptr iRet
+        Get EditorMessage SCI_GETSELALPHA to iRet
+        Function_Return iRet
+    End_Function
+
+    /* "Selecting a line selects to the end of it": the selection is drawn filled past
+       the last character, and virtual space becomes reachable so a rectangular
+       selection can extend beyond the line ends. Was SelectTillEndOfLine, a name that
+       reads like an action - this is a mode. */
+    Procedure SetSelectionFillsLineEnd Boolean bFilled
+        Send EditorMessage SCI_SETSELEOLFILLED bFilled
+        Send EditorMessage SCI_SETVIRTUALSPACEOPTIONS ;
+            (If(bFilled, SCVS_RECTANGULARSELECTION + SCVS_USERACCESSIBLE, SCVS_NONE))
+    End_Procedure
+
+    Procedure SetOvertypeState Boolean bOvertype
+        Send EditorMessage SCI_SETOVERTYPE bOvertype
+    End_Procedure
+
+    Procedure SetWrapState Boolean bWrap
+        Send EditorMessage SCI_SETWRAPMODE (If(bWrap, SC_WRAP_WORD, SC_WRAP_NONE))
+    End_Procedure
+
+    // Auto-indent mode is OUR behavior (applied when Enter is pressed), so it is
+    // held here rather than pushed into Scintilla. CI_AutoIndentScope collapsed onto
+    // PREVLINE in the old chain - keep that, it is the behavior users have.
+    Procedure SetAutoIndentMode Integer eMode
+        If (eMode = CI_AutoIndentScope) ;
+            Move CI_AutoIndentPrevLine to eMode
+        Set peAutoIndentMode to eMode
+    End_Procedure
+
+    // *** C - the SEARCH ENGINE. A PORT of the old chain's ~330 lines, which were already
+    // near-pure Scintilla target-range code; what changes is the shape, not the method:
+    //
+    //   * the encoding dance that repeated VERBATIM in six members
+    //         If (pbUtf8Mode) SizeOfString(...) Else Length(...) + Utf8ToEditorFormat
+    //     is now ONE call to the control's TextToBytes codec (SearchNeedle below) -
+    //     mode-correct by construction, byte length free
+    //   * its five CM_ references (CM_GetCurrentWord / CM_GetSel / CM_SetBookmark)
+    //     become the new vocabulary
+    //   * every operation returns a POSITION or a Boolean instead of steering the UI,
+    //     so the engine is probe-testable and the dialogs stay a separate concern
+    //
+    // Positions are BYTES (as everywhere), and the needle's byte length is what
+    // SCI_SEARCHINTARGET wants - the old code's two-branch length was computing
+    // exactly that.
+
+    // The needle as buffer bytes, NUL-terminated. Returns 0 length for an empty needle.
+    Function SearchNeedle String sText Integer ByRef iByteLen Returns UChar[]
+        UChar[] ucaBytes
+        Get TextToBytes sText to ucaBytes
+        Move (SizeOfArray(ucaBytes)) to iByteLen
+        Move 0 to ucaBytes[iByteLen]   // SCI_SEARCHINTARGET reads a NUL-terminated buffer
+        Function_Return ucaBytes
+    End_Function
+
+    Function SearchFlags Returns Integer
+        Longptr iFlags
+        Get EditorMessage SCI_GETSEARCHFLAGS to iFlags
+        Function_Return iFlags
+    End_Function
+
+    /* Search options as PLAIN BOOLEANS, deliberately not tFindReplaceOptions: that
+       struct lives in THDialog.pkg, and Using it here would pull the fork's CYCLIC
+       dialog graph into the bridge - the exact dependency this rewrite exists to
+       shed (and the graph whose entry order caused the Error-98 episode). The
+       dialogs keep their struct; cRefactorScintillaEditor, which already includes
+       them, translates struct -> these four booleans at the call site. */
+    Function ApplySearchOptions Boolean bWordMatch Boolean bMatchCase Boolean bRegExp Boolean bFromDocumentStart Returns Integer
+        Integer iFlags
+        Move 0 to iFlags
+        Move (If(bWordMatch, iFlags iOr SCFIND_WHOLEWORD, iFlags)) to iFlags
+        Move (If(bMatchCase, iFlags iOr SCFIND_MATCHCASE, iFlags)) to iFlags
+        Move (If(bRegExp,    iFlags iOr SCFIND_REGEXP,    iFlags)) to iFlags
+        Set pbFindDocumentStart to bFromDocumentStart
+        Send EditorMessage SCI_SETSEARCHFLAGS iFlags
+        Function_Return iFlags
+    End_Function
+
+    Function SearchMatchesCase Returns Boolean
+        Function_Return ((SearchFlags(Self) iAnd SCFIND_MATCHCASE) <> 0)
+    End_Function
+
+    Function SearchMatchesWholeWord Returns Boolean
+        Function_Return ((SearchFlags(Self) iAnd SCFIND_WHOLEWORD) <> 0)
+    End_Function
+
+    Function SearchUsesRegExp Returns Boolean
+        Function_Return ((SearchFlags(Self) iAnd SCFIND_REGEXP) <> 0)
+    End_Function
+
+    /* THE one search primitive: find sText within [iFrom, iTo) under the current
+       flags. Returns the match's start position, or -1. A backwards range (iFrom >
+       iTo) searches backwards - Scintilla's own convention for the target range,
+       which is how FindPrevious works. Leaves the target set to the match, so a
+       caller can SCI_REPLACETARGET immediately. */
+    Function FindInRange String sText Integer iFrom Integer iTo Returns Integer
+        Integer iByteLen
+        Longptr iPos
+        UChar[] ucaNeedle
+        Get SearchNeedle sText (&iByteLen) to ucaNeedle
+        If (iByteLen = 0) ;
+            Function_Return -1
+        Send EditorMessage SCI_SETTARGETSTART iFrom
+        Send EditorMessage SCI_SETTARGETEND   iTo
+        Get EditorMessage SCI_SEARCHINTARGET iByteLen (AddressOf(ucaNeedle)) to iPos
+        Function_Return iPos
+    End_Function
+
+    // Select a found match and scroll it into view. Anchor AFTER the match so the
+    // caret lands at its start - the old chain's SETSEL (pos+len) pos.
+    Procedure SelectMatchAt Integer iPos Integer iByteLen
+        Send EditorMessage SCI_SETSEL (iPos + iByteLen) iPos
+        Send EditorMessage SCI_SCROLLCARET
+    End_Procedure
+
+    // Search forward from the caret (wrapping to the top once). True when found.
+    Function FindNextOccurrence String sText Returns Boolean
+        Integer iByteLen iCaret iPos iLen
+        UChar[] ucaNeedle
+
+        Get SearchNeedle sText (&iByteLen) to ucaNeedle
+        If (iByteLen = 0) ;
+            Function_Return False
+        Set psSearchText to sText
+        Get ByteLength to iLen
+        Get EditorMessage SCI_GETSELECTIONEND to iCaret
+        Get FindInRange sText iCaret iLen to iPos
+        If (iPos < 0) ;
+            Get FindInRange sText 0 iLen to iPos     // wrap
+        If (iPos < 0) ;
+            Function_Return False
+        Send SelectMatchAt iPos iByteLen
+        Function_Return True
+    End_Function
+
+    // Search backward from the selection start (wrapping to the bottom once).
+    Function FindPreviousOccurrence String sText Returns Boolean
+        Integer iByteLen iCaret iPos iLen
+        UChar[] ucaNeedle
+
+        Get SearchNeedle sText (&iByteLen) to ucaNeedle
+        If (iByteLen = 0) ;
+            Function_Return False
+        Set psSearchText to sText
+        Get ByteLength to iLen
+        Get EditorMessage SCI_GETSELECTIONSTART to iCaret
+        Get FindInRange sText iCaret 0 to iPos       // backwards range
+        If (iPos < 0) ;
+            Get FindInRange sText iLen 0 to iPos     // wrap
+        If (iPos < 0) ;
+            Function_Return False
+        Send SelectMatchAt iPos iByteLen
+        Function_Return True
+    End_Function
+
+    // Search from the very top - "Find First".
+    Function FindFirstOccurrence String sText Returns Boolean
+        Integer iByteLen iPos iLen
+        UChar[] ucaNeedle
+        Get SearchNeedle sText (&iByteLen) to ucaNeedle
+        If (iByteLen = 0) ;
+            Function_Return False
+        Set psSearchText to sText
+        Get ByteLength to iLen
+        Get FindInRange sText 0 iLen to iPos
+        If (iPos < 0) ;
+            Function_Return False
+        Send SelectMatchAt iPos iByteLen
+        Function_Return True
+    End_Function
+
+    // Replace the CURRENT selection (i.e. the last match) and leave the caret after
+    // the replacement. The target is already the match after a find, but set it
+    // explicitly from the selection so a hand-made selection replaces too.
+    Function ReplaceSelectionWith String sReplaceText Returns Boolean
+        Integer iByteLen iStartPos iEndPos
+        UChar[] ucaBytes
+        Get EditorMessage SCI_GETSELECTIONSTART to iStartPos
+        Get EditorMessage SCI_GETSELECTIONEND   to iEndPos
+        If (iEndPos <= iStartPos) ;
+            Function_Return False
+        Get SearchNeedle sReplaceText (&iByteLen) to ucaBytes
+        Send EditorMessage SCI_SETTARGETSTART iStartPos
+        Send EditorMessage SCI_SETTARGETEND   iEndPos
+        Send EditorMessage SCI_REPLACETARGET iByteLen (AddressOf(ucaBytes))
+        Send EditorMessage SCI_SETSEL (iStartPos + iByteLen) (iStartPos + iByteLen)
+        Function_Return True
+    End_Function
+
+    /* Replace every occurrence, as ONE undo unit (the old chain wrapped the loop the
+       same way). Walks forward from the top; the scan position advances past each
+       replacement, so a replacement containing the needle cannot loop for ever.
+       Returns the number replaced. */
+    Function ReplaceAllOccurrences String sFindText String sReplaceText Returns Integer
+        Integer iFindLen iReplaceLen iPos iScan iLen iCount
+        UChar[] ucaNeedle ucaReplace
+
+        Get SearchNeedle sFindText (&iFindLen) to ucaNeedle
+        If (iFindLen = 0) ;
+            Function_Return 0
+        Get SearchNeedle sReplaceText (&iReplaceLen) to ucaReplace
+        Move 0 to iCount
+        Move 0 to iScan
+        Send BeginUndoGroup
+        Get ByteLength to iLen
+        Get FindInRange sFindText iScan iLen to iPos
+        While (iPos >= 0)
+            Send EditorMessage SCI_SETTARGETSTART iPos
+            Send EditorMessage SCI_SETTARGETEND   (iPos + iFindLen)
+            Send EditorMessage SCI_REPLACETARGET iReplaceLen (AddressOf(ucaReplace))
+            Move (iCount + 1) to iCount
+            Move (iPos + iReplaceLen) to iScan    // past the replacement, never re-scan it
+            Get ByteLength to iLen                // the document just changed size
+            Move -1 to iPos
+            If (iScan < iLen) ;
+                Get FindInRange sFindText iScan iLen to iPos
+        Loop
+        Send EndUndoGroup
+        Function_Return iCount
+    End_Function
+
+    // *** E - the interactive services: indentation, auto-indent on Enter, brace
+    // highlighting, folding. These are what make the control feel like an EDITOR
+    // rather than a text box, and they are the behaviours users would notice
+    // instantly if the rebase changed them - so they follow the old chain's rules
+    // exactly, with the mechanics modernised where Scintilla offers a better tool.
+
+    Function LineIndentation Integer iLine Returns Integer
+        Longptr iRet
+        Get EditorMessage SCI_GETLINEINDENTATION iLine to iRet
+        Function_Return iRet
+    End_Function
+
+    /* Set a line's indentation. Uses SCI_SETLINEINDENTATION rather than the old
+       chain's build-an-indent-string-and-splice-it: Scintilla honours the tabs/spaces
+       setting itself, so this cannot disagree with SetUseTabs the way a hand-built
+       string can. */
+    Procedure SetLineIndentation Integer iLine Integer iColumns
+        Send EditorMessage SCI_SETLINEINDENTATION iLine iColumns
+    End_Procedure
+
+    // The position of the first non-indent character - where the caret belongs after
+    // an auto-indent.
+    Function LineIndentPosition Integer iLine Returns Integer
+        Longptr iRet
+        Get EditorMessage SCI_GETLINEINDENTPOSITION iLine to iRet
+        Function_Return iRet
+    End_Function
+
+    // Fold level as a plain depth number (0 = outermost), the lexer's own view of
+    // scope nesting - which is what makes the auto-indent below scope-aware.
+    Function LineFoldLevel Integer iLine Returns Integer
+        Longptr iRaw
+        Get EditorMessage SCI_GETFOLDLEVEL iLine to iRaw
+        Function_Return ((iRaw iAnd SC_FOLDLEVELNUMBERMASK) - SC_FOLDLEVELBASE)
+    End_Function
+
+    // True when this line OPENS a fold - the lexer's own answer to "does the next
+    // line belong to a new, deeper scope?".
+    Function LineOpensScope Integer iLine Returns Boolean
+        Longptr iRaw
+        Get EditorMessage SCI_GETFOLDLEVEL iLine to iRaw
+        Function_Return ((iRaw iAnd SC_FOLDLEVELHEADERFLAG) <> 0)
+    End_Function
+
+    Function FoldParentLine Integer iLine Returns Integer
+        Longptr iRet
+        Get EditorMessage SCI_GETFOLDPARENT iLine to iRet
+        Function_Return iRet
+    End_Function
+
+    Procedure ToggleFoldAtLine Integer iLine
+        Send EditorMessage SCI_TOGGLEFOLD iLine
+    End_Procedure
+
+    // Fold or unfold every scope in the document at once (SC_FOLDACTION_*).
+    Procedure FoldAllScopes Integer eMode
+        Send EditorMessage SCI_FOLDALL eMode
+    End_Procedure
+
+    /* Turn folding on: the lexer must be told to compute fold levels (a lexer
+       PROPERTY, not a message), and margin 2 becomes the sensitive symbol margin
+       carrying the folder markers. Off = fold levels stop being computed and the
+       margin collapses to nothing. */
+    Procedure EnableFolding Boolean bEnable
+        String sName sValue
+
+        // The NUL terminators are load-bearing: Scintilla reads these as C strings,
+        // and a DataFlex string is length-counted, not NUL-terminated. Without them
+        // the property name is garbage and folding silently never turns on.
+        Move ("fold" + Character(0)) to sName
+        Move (If(bEnable, "1", "0") + Character(0)) to sValue
+        Send EditorMessage SCI_SETPROPERTY (AddressOf(sName)) (AddressOf(sValue))
+        If (bEnable = False) Begin
+            Send EditorMessage SCI_SETMARGINWIDTHN CI_MarginFolding 0
+            Procedure_Return
+        End
+        Send EditorMessage SCI_SETMARGINTYPEN      CI_MarginFolding SC_MARGIN_SYMBOL
+        Send EditorMessage SCI_SETMARGINMASKN      CI_MarginFolding SC_MASK_FOLDERS
+        Send EditorMessage SCI_SETMARGINSENSITIVEN CI_MarginFolding True
+        Send EditorMessage SCI_SETMARGINWIDTHN     CI_MarginFolding 14
+    End_Procedure
+
+    /* The bookmark margin. Bookmarks are stored as marker 11 on a line (bucket D), but
+       a marker only DRAWS if some margin's mask claims its bit - which is why toggling
+       a bookmark can look like it did nothing until this has run. Quick Marks share the
+       margin as marker 12, so the mask claims that bit too. */
+    Procedure EnableBookmarkMargin Boolean bEnable
+        If (bEnable = False) Begin
+            Send EditorMessage SCI_SETMARGINWIDTHN CI_MarginMarkers 0
+            Procedure_Return
+        End
+        Send EditorMessage SCI_MARKERDEFINE    CI_BookmarkMarker  SC_MARK_BOOKMARK
+        Send EditorMessage SCI_MARKERDEFINE    CI_QuickMarkMarker SC_MARK_ARROW
+        Send EditorMessage SCI_SETMARGINTYPEN  CI_MarginMarkers SC_MARGIN_SYMBOL
+        Send EditorMessage SCI_SETMARGINMASKN  CI_MarginMarkers (SC_MASK_BOOKMARK ior CI_QuickMarkMask)
+        Send EditorMessage SCI_SETMARGINWIDTHN CI_MarginMarkers 16
+    End_Procedure
+
+    /* CLICKING THE FOLD MARGIN. EnableFolding marks margin 2 sensitive, which makes
+       Scintilla REPORT a click there - it does not act on one. Toggling the fold is the
+       application's job, and without this the +/- markers were decorative.
+
+       Only lines that actually open a scope respond, so a click on a blank stretch of
+       margin does nothing rather than toggling some enclosing fold the user cannot see.
+       The bookmark margin is deliberately inert: bookmarks are set from the menu and the
+       keyboard, and a stray click in a narrow margin should not silently add one. */
+    Procedure OnMarginClicked Integer iMargin Integer iLine
+        Boolean bOpensScope
+        Forward Send OnMarginClicked iMargin iLine
+        If (iMargin <> CI_MarginFolding) ;
+            Procedure_Return
+        Get LineOpensScope iLine to bOpensScope
+        If (bOpensScope) ;
+            Send ToggleFoldAtLine iLine
+    End_Procedure
+
+    /* DOUBLE-CLICKING A BRACE selects everything it encloses, the brace pair included.
+       Double-clicking anything else keeps Scintilla's own behaviour, which is to select
+       the word - so this adds to the default rather than replacing it.
+
+       A brace inside a COMMENT is ignored: SCI_BRACEMATCH is happy to pair a "(" in prose
+       with a real one in code, and selecting from the middle of a comment to somewhere in
+       the following statement is never what was meant. */
+    Procedure OnDoubleClickAt Integer iPos Integer iLine
+        Integer iChar iMatch iStyle
+
+        Forward Send OnDoubleClickAt iPos iLine
+
+        Get EditorMessage SCI_GETCHARAT iPos to iChar
+        If (iChar <> 40 and iChar <> 41 and iChar <> 91 ;
+            and iChar <> 93 and iChar <> 123 and iChar <> 125) ;
+            Procedure_Return
+
+        Get EditorMessage SCI_GETSTYLEAT iPos to iStyle
+        If (iStyle = SCE_DF_COMMENTLINE or iStyle = SCE_DF_STRING) ;
+            Procedure_Return
+
+        Get EditorMessage SCI_BRACEMATCH iPos 0 to iMatch
+        If (iMatch < 0) ;
+            Procedure_Return
+        // BRACEMATCH answers in either direction; select from whichever comes first.
+        If (iMatch < iPos) Begin
+            Send EditorMessage SCI_SETSELECTIONSTART iMatch
+            Send EditorMessage SCI_SETSELECTIONEND   (iPos + 1)
+        End
+        Else Begin
+            Send EditorMessage SCI_SETSELECTIONSTART iPos
+            Send EditorMessage SCI_SETSELECTIONEND   (iMatch + 1)
+        End
+    End_Procedure
+
+    /* WHAT DRIVES THE BRACE HIGHLIGHT. Scintilla reports "something about the view
+       changed" as SCN_UPDATEUI, which cScintillaControl turns into OnEditorUpdateUI.
+       That is the one place the caret can have moved, so it is where the matcher runs.
+
+       This was MISSING between the base-class switch and 2026-07-28: ShowMatchingBraces
+       came across from the old facade intact, and nothing called it. The facade drove it
+       from two places - onNavigate for caret movement, and a separate
+       BraceMatchingCharAdded because CodeMax's navigate event did not fire on typing.
+       Scintilla needs only one hook: SCN_UPDATEUI reports a content change and a
+       selection change, and typing is both.
+
+       Nothing in the compiler or the headless suite could have caught the omission - a
+       missing OVERRIDE of an empty overridable is invisible to both. It took Nils
+       putting the caret next to a parenthesis. That is now four silent losses from the
+       same switch (the post-page hook, Floating_Menu_Object, the four On_Key claims, and
+       this); the pattern is always a capability that survived without its invocation.
+
+       Scroll-only updates are ignored: re-matching on every scrolled line is work for a
+       highlight that cannot have changed. */
+    Procedure OnEditorUpdateUI Integer iUpdatedFlags
+        Integer iPos
+        Forward Send OnEditorUpdateUI iUpdatedFlags
+        If (pbShowMatchingBraces(Self) = False) ;
+            Procedure_Return
+        If ((iUpdatedFlags iAnd (SC_UPDATE_CONTENT ior SC_UPDATE_SELECTION)) = 0) ;
+            Procedure_Return
+        Get EditorMessage SCI_GETCURRENTPOS to iPos
+        Send ShowMatchingBraces iPos
+    End_Procedure
+
+    /* Highlight (or un-highlight) the brace pair around a position. Scintilla draws
+       the pair itself once told which two positions they are; an unmatched brace gets
+       the BAD highlight, which is the visual cue that something is unbalanced. */
+    Procedure ShowMatchingBraces Integer iPos
+        Integer iChar iBrace iMatch
+
+        Move -1 to iBrace
+        Move -1 to iMatch
+        If (iPos > 0) Begin
+            Get EditorMessage SCI_GETCHARAT (iPos - 1) to iChar
+            If (iChar = 40 or iChar = 41 or iChar = 91 or iChar = 93 or iChar = 123 or iChar = 125) ;
+                Move (iPos - 1) to iBrace
+        End
+        If (iBrace < 0) Begin
+            Get EditorMessage SCI_GETCHARAT iPos to iChar
+            If (iChar = 40 or iChar = 41 or iChar = 91 or iChar = 93 or iChar = 123 or iChar = 125) ;
+                Move iPos to iBrace
+        End
+        If (iBrace < 0) Begin
+            Send EditorMessage SCI_BRACEHIGHLIGHT -1 -1    // nothing to show
+            Procedure_Return
+        End
+        Get EditorMessage SCI_BRACEMATCH iBrace 0 to iMatch
+        If (iMatch >= 0) ;
+            Send EditorMessage SCI_BRACEHIGHLIGHT iBrace iMatch
+        Else ;
+            Send EditorMessage SCI_BRACEBADLIGHT iBrace
+    End_Procedure
+
+    /* ENTER with auto-indent - the behaviour users feel on every single line, so the
+       old chain's rules are kept exactly: indent to match the current line, and when
+       the new line opens a deeper SCOPE (the lexer's fold level rose), add one more
+       tab width. The whole thing is ONE undo unit, so a single Ctrl+Z takes back the
+       newline AND its indentation rather than leaving a stranded blank.
+       pbNormalizeCase is honoured by the consumer BEFORE calling this (it needs the
+       funclib), which is why there is no hook here. */
+    Procedure HandleReturnKey
+        Integer iLine iIndent iTabWidth iCol iCaretPos
+        Boolean bOpensScope
+
+        If (peAutoIndentMode(Self) <> CI_AutoIndentPrevLine) Begin
+            Send EditorMessage SCI_NEWLINE
+            Procedure_Return
+        End
+        Get CurrentLine to iLine
+        Get LineIndentation iLine to iIndent
+        Get CaretColumn to iCol
+        /* Ask the line we are LEAVING whether it opens a scope, rather than asking the
+           line that does not exist yet. The old chain compared fold levels across the
+           newline, which only worked when the lexer happened to have already styled
+           the new line - so the extra indent after "Procedure Foo" came and went.
+           Known limit, inherited from the lexer: a scope opener typed as the LAST line
+           of a file is not yet a fold header (nothing closes it), so that one case
+           indents flat. Adding the closing line fixes it on the next keystroke. */
+        Get LineOpensScope iLine to bOpensScope
+        Send BeginUndoGroup
+        Send EditorMessage SCI_NEWLINE
+        If (bOpensScope) Begin
+            Get TabWidth to iTabWidth
+            Move (iIndent + iTabWidth) to iIndent
+        End
+        // Pressing Enter from INSIDE the leading whitespace splits the line there and
+        // must not then push the tail further right.
+        If (iIndent > 0 and iCol >= iIndent) Begin
+            Send SetLineIndentation (iLine + 1) iIndent
+            Get LineIndentPosition (iLine + 1) to iCaretPos
+            Send EditorMessage SCI_GOTOPOS iCaretPos
+        End
+        Send EndUndoGroup
+    End_Procedure
+
+    // *** H - what a line IS. Re-indent and normalize-case both have to know whether a line
+    // is code, a comment, part of a multi-line string, or a label before they touch it,
+    // and every answer here comes from the LEXER's style bytes rather than a second
+    // parse of the text - so the classification always agrees with what the user sees
+    // coloured on screen. (The old chain took the line text as a second argument on
+    // every one of these and used it only to count leading blanks; that is derivable,
+    // so it is gone.)
+
+    Function StyleIsString Integer iPos Returns Boolean
+        Function_Return ((StyleAt(Self, iPos)) = SCE_DF_STRING)
+    End_Function
+
+    // A report image counts as a comment here - it is prose in the source, and both
+    // callers want to leave it exactly where the author put it.
+    Function StyleIsComment Integer iPos Returns Boolean
+        Integer eStyle
+        Get StyleAt iPos to eStyle
+        Function_Return (eStyle = SCE_DF_COMMENTLINE or eStyle = SCE_DF_IMAGE)
+    End_Function
+
+    Function StyleIsReportImage Integer iPos Returns Boolean
+        Function_Return ((StyleAt(Self, iPos)) = SCE_DF_IMAGE)
+    End_Function
+
+    // Byte position of a line's first non-blank character - where every classifier
+    // below asks its question.
+    Function LineFirstNonBlankPosition Integer iLine Returns Integer
+        Integer iPos
+        String sLine
+        Get LineText iLine to sLine
+        Get EditorMessage SCI_POSITIONFROMLINE iLine to iPos
+        Function_Return (iPos + Length(sLine) - Length(LTrim(sLine)))
+    End_Function
+
+    Function LineIsComment Integer iLine Returns Boolean
+        Function_Return (StyleIsComment(Self, LineFirstNonBlankPosition(Self, iLine)))
+    End_Function
+
+    Function LineIsReportImage Integer iLine Returns Boolean
+        Function_Return (StyleIsReportImage(Self, LineFirstNonBlankPosition(Self, iLine)))
+    End_Function
+
+    /* A line inside a multi-line string: either it OPENS as string text, or it ENDS as
+       string text (the opening quote sits mid-line). Re-indent must leave these alone -
+       moving them changes the string's contents. */
+    Function LineIsMultiLineString Integer iLine Returns Boolean
+        Integer iPos
+        String sLine
+        If (StyleIsString(Self, LineFirstNonBlankPosition(Self, iLine))) ;
+            Function_Return True
+        Get LineText iLine to sLine
+        Get EditorMessage SCI_POSITIONFROMLINE iLine to iPos
+        Function_Return (StyleIsString(Self, iPos + Length(sLine)))
+    End_Function
+
+    // A goto label: a trailing colon with no blank before it. Read from the blanked
+    // line so a colon inside a string or comment cannot fake one.
+    Function LineIsGotoLabel Integer iLine Returns Boolean
+        Integer iPos iColonPos
+        String sLine
+        Get LineWithoutStringsAndComments iLine to sLine
+        If (Right(sLine, 1) <> ":") ;
+            Function_Return False
+        Move (Trim(sLine)) to sLine
+        Move (Pos(":", sLine) - 1) to iColonPos
+        For iPos from 1 to iColonPos
+            If (Mid(sLine, 1, iPos) = " ") ;
+                Function_Return False
+        Loop
+        Function_Return True
+    End_Function
+
+    /* The line with string contents overwritten and any comment tail dropped, POSITIONS
+       PRESERVED - callers splice by column, so the blanked line has to line up with the
+       real one character for character. Quoted text becomes underscores (double quotes)
+       or plus signs (single quotes) and a tab becomes one space, all of which keeps the
+       column count honest. Was PreParsedLine. */
+    Function LineWithoutStringsAndComments Integer iLine Returns String
+        Boolean bInDoubleQuote bInSingleQuote
+        Integer iChar iLength
+        String sLine sChar
+
+        Get LineText iLine to sLine
+        Move (Length(sLine)) to iLength
+        For iChar from 1 to iLength
+            Move (Mid(sLine, 1, iChar)) to sChar
+            If (sChar = Character(9)) Begin
+                Move (Overstrike(" ", sLine, iChar)) to sLine
+                Move " " to sChar
+            End
+            If (bInDoubleQuote and sChar = '"') Begin
+                Move (Overstrike("_", sLine, iChar)) to sLine
+                Move "" to sChar
+                Move False to bInDoubleQuote
+            End
+            If (bInSingleQuote and sChar = "'") Begin
+                Move (Overstrike("+", sLine, iChar)) to sLine
+                Move "" to sChar
+                Move False to bInSingleQuote
+            End
+            If (sChar = '"') ;
+                Move True to bInDoubleQuote
+            If (sChar = "'") ;
+                Move True to bInSingleQuote
+            If (bInDoubleQuote) Begin
+                Move (Overstrike("_", sLine, iChar)) to sLine
+            End
+            Else If (bInSingleQuote) Begin
+                Move (Overstrike("+", sLine, iChar)) to sLine
+            End
+            Else If (sChar = "/" and Mid(sLine, 2, iChar) = "//") Begin
+                Move (Left(sLine, iChar - 1)) to sLine
+                Move iLength to iChar          // stop
+            End
+        Loop
+        Function_Return (RTrim(sLine))
+    End_Function
+
+    // Replace one line's text, leaving its line ending - and every other line - alone.
+    // Was the Value Item array accessor, whose name said nothing about lines.
+    Procedure SetLineText Integer iLine String sText
+        Integer iStart iEnd
+        UChar[] ucaBytes
+        Get TextToBytes sText to ucaBytes
+        Get EditorMessage SCI_POSITIONFROMLINE   iLine to iStart
+        Get EditorMessage SCI_GETLINEENDPOSITION iLine to iEnd
+        Send EditorMessage SCI_SETTARGETRANGE iStart iEnd
+        Send EditorMessage SCI_REPLACETARGET (SizeOfArray(ucaBytes)) (AddressOf(ucaBytes))
+    End_Procedure
+
+    // Leading whitespace for a given column width, honouring the tabs/spaces setting.
+    Function IndentationText Integer iColumns Returns String
+        Boolean bUseTabs
+        Integer iTabWidth
+        String sIndent
+        Get EditorMessage SCI_GETUSETABS to bUseTabs
+        If (bUseTabs = False) ;
+            Function_Return (Repeat(" ", iColumns))
+        Get TabWidth to iTabWidth
+        While (iColumns >= iTabWidth and iTabWidth > 0)
+            Move (sIndent + Character(9)) to sIndent
+            Move (iColumns - iTabWidth) to iColumns
+        Loop
+        Function_Return (sIndent + Repeat(" ", iColumns))
+    End_Function
+
+    // *** J - key bindings. Scintilla ships its own built-in shortcuts, so when the user
+    // binds Ctrl+D (say) to a DFRefactor command, Scintilla's own Ctrl+D still fires
+    // too and you get BOTH actions. The hotkey layer registers each shortcut it claims
+    // while the view is being built, and this clears them from the control in one pass
+    // once the control exists.
+
+    /* Map a shortcut's key NAME to the code Scintilla knows it by. Table-driven on
+       purpose: the old chain used a fifteen-branch Case in which the ENTER, DOWN and UP
+       branches were missing their Case Break, so asking to clear Enter silently cleared
+       Up instead - which matters here, because Enter is the auto-indent key. */
+    Function ScintillaKeyCode String sKeyName Returns Integer
+        Integer iIndex
+        String[] asNames
+        Integer[] aiCodes
+
+        If (Length(sKeyName) = 1) ;
+            Function_Return (Ascii(sKeyName))
+        Move "F1"       to asNames[0]
+        Move "F2"       to asNames[1]
+        Move "F3"       to asNames[2]
+        Move "F4"       to asNames[3]
+        Move "F5"       to asNames[4]
+        Move "F6"       to asNames[5]
+        Move "F7"       to asNames[6]
+        Move "F8"       to asNames[7]
+        Move "F9"       to asNames[8]
+        Move "F10"      to asNames[9]
+        Move "F11"      to asNames[10]
+        Move "F12"      to asNames[11]
+        Move "ENTER"    to asNames[12]
+        Move "DOWN"     to asNames[13]
+        Move "UP"       to asNames[14]
+        Move "LEFT"     to asNames[15]
+        Move "RIGHT"    to asNames[16]
+        Move "HOME"     to asNames[17]
+        Move "END"      to asNames[18]
+        Move "DELETE"   to asNames[19]
+        Move "INSERT"   to asNames[20]
+        Move "TAB"      to asNames[21]
+        Move "ESCAPE"   to asNames[22]
+        Move "PAGEUP"   to asNames[23]
+        Move "PAGEDOWN" to asNames[24]
+        Move VK_F1      to aiCodes[0]
+        Move VK_F2      to aiCodes[1]
+        Move VK_F3      to aiCodes[2]
+        Move VK_F4      to aiCodes[3]
+        Move VK_F5      to aiCodes[4]
+        Move VK_F6      to aiCodes[5]
+        Move VK_F7      to aiCodes[6]
+        Move VK_F8      to aiCodes[7]
+        Move VK_F9      to aiCodes[8]
+        Move VK_F10     to aiCodes[9]
+        Move VK_F11     to aiCodes[10]
+        Move VK_F12     to aiCodes[11]
+        Move SCK_RETURN to aiCodes[12]
+        Move SCK_DOWN   to aiCodes[13]
+        Move SCK_UP     to aiCodes[14]
+        Move SCK_LEFT   to aiCodes[15]
+        Move SCK_RIGHT  to aiCodes[16]
+        Move SCK_HOME   to aiCodes[17]
+        Move SCK_END    to aiCodes[18]
+        Move SCK_DELETE to aiCodes[19]
+        Move SCK_INSERT to aiCodes[20]
+        Move SCK_TAB    to aiCodes[21]
+        Move SCK_ESCAPE to aiCodes[22]
+        Move SCK_PRIOR  to aiCodes[23]
+        Move SCK_NEXT   to aiCodes[24]
+        Move (SearchArray(sKeyName, asNames)) to iIndex
+        If (iIndex < 0) ;
+            Function_Return 0
+        Function_Return aiCodes[iIndex]
+    End_Function
+
+    // Clear one of Scintilla's built-in shortcuts, named the way the settings dialog
+    // writes them ("Ctrl + Shift + H").
+    Procedure RemoveKeyBinding String sKey
+        Integer iModKeys iKey
+
+        Move 0 to iModKeys
+        Move (Uppercase(Replaces(" ", sKey, ""))) to sKey
+        If (Pos("CTRL+", sKey) <> 0) Begin
+            Move (iModKeys ior SCMOD_CTRL) to iModKeys
+            Move (Replace("CTRL+", sKey, "")) to sKey
+        End
+        If (Pos("ALT+", sKey) <> 0) Begin
+            Move (iModKeys ior SCMOD_ALT) to iModKeys
+            Move (Replace("ALT+", sKey, "")) to sKey
+        End
+        If (Pos("SHIFT+", sKey) <> 0) Begin
+            Move (iModKeys ior SCMOD_SHIFT) to iModKeys
+            Move (Replace("SHIFT+", sKey, "")) to sKey
+        End
+        Get ScintillaKeyCode sKey to iKey
+        If (iKey = 0) ;                       // a name we do not know: leave it alone
+            Procedure_Return
+        Send EditorMessage SCI_CLEARCMDKEY ((65536 * iModKeys) + iKey)
+    End_Procedure
+
+    // Collected while the view is built (the control may not exist yet), applied once.
+    Procedure RegisterKeyBindingToClear String sKey
+        String[] asKeys
+        Get psClearKeyBindings to asKeys
+        Move sKey to asKeys[SizeOfArray(asKeys)]
+        Set psClearKeyBindings to asKeys
+    End_Procedure
+
+    Procedure ClearRegisteredKeyBindings
+        Integer iKey iCount
+        String[] asKeys
+        Get psClearKeyBindings to asKeys
+        Move (SizeOfArray(asKeys)) to iCount
+        For iKey from 0 to (iCount - 1)
+            Send RemoveKeyBinding asKeys[iKey]
+        Loop
+        Move (ResizeArray(asKeys, 0)) to asKeys    // each control clears its list once
+        Set psClearKeyBindings to asKeys
+    End_Procedure
+
+    // DataFlex's convention for "empty this control" - the old chain answered it and
+    // callers outside the editor still send it.
+    Procedure Delete_Data
+        Send ClearDocument
+    End_Procedure
+
+    // Overridable notifications the editor raises after it changes state. Empty here;
+    // consumers (the status bar, the settings dialog) override them.
+    Procedure OnSelChange
+    End_Procedure
+
+    Procedure OnOvertypeChange
+    End_Procedure
+
+    Procedure OnPropsChange
+    End_Procedure
+
+    // Bookmark every occurrence - the Find dialog's "Mark All".
+    Function MarkAllOccurrences String sFindText Returns Integer
+        Integer iFindLen iPos iScan iLen iCount iLine
+        UChar[] ucaNeedle
+
+        Get SearchNeedle sFindText (&iFindLen) to ucaNeedle
+        If (iFindLen = 0) ;
+            Function_Return 0
+        Move 0 to iCount
+        Move 0 to iScan
+        Get ByteLength to iLen
+        Get FindInRange sFindText iScan iLen to iPos
+        While (iPos >= 0)
+            Get EditorMessage SCI_LINEFROMPOSITION iPos to iLine
+            Send EditorMessage SCI_MARKERADD iLine CI_BookmarkMarker
+            Move (iCount + 1) to iCount
+            Move (iPos + iFindLen) to iScan
+            Move -1 to iPos
+            If (iScan < iLen) ;
+                Get FindInRange sFindText iScan iLen to iPos
+        Loop
+        Function_Return iCount
+    End_Function
+
+End_Class

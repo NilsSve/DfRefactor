@@ -158,7 +158,7 @@
             String sLine sExpected
             Boolean bChanged
             tTokenizer TokenizerData
-            Move CS_CRLF to sLine
+            Move C_NewLine to sLine
             Get Tokenizer of ghoFuncLib sLine to TokenizerData
             Send Assert (TokenizerData.bIsBlank = True)
         End_Procedure
@@ -803,6 +803,70 @@
             Send Assert (TokenizerData.bLineIsReady = True)
         End_Procedure
 
+        // The Pos-anywhere family audit (2026-07-12) - object/class scope must NOT open from
+        // identifiers ending in "object" ('Set Timer_object to ...', 'Register_Object oX') or
+        // from the words inside inline trailing comments; real declarations still detect; an
+        // INDENTED End_Struct still closes struct scope (the lexer passes the RAW line there).
+        {Published = True}
+        Procedure Tokenizer_ScopeDetectorsFirstTokenOnly
+            tTokenizer TokenizerData
+
+            // Real declarations still open their scopes (controls).
+            Get Tokenizer of ghoFuncLib 'Object oFoo is a cBar' to TokenizerData
+            Send Assert (TokenizerData.bIsInObject = True)
+            Send _InitializeFuncLib of ghoFuncLib
+            Get Tokenizer of ghoFuncLib 'Class cFoo is a cBar' to TokenizerData
+            Send Assert (TokenizerData.bIsInClass = True)
+            // The real-world false triggers (the DfTimer dispatch shape, registration, comments).
+            Send _InitializeFuncLib of ghoFuncLib
+            Get Tokenizer of ghoFuncLib '    Set Timer_object to (RefProc(msg_OnTick))' to TokenizerData
+            Send Assert (TokenizerData.bIsInObject = False)
+            Get Tokenizer of ghoFuncLib 'Register_Object oMain' to TokenizerData
+            Send Assert (TokenizerData.bIsInObject = False)
+            Get Tokenizer of ghoFuncLib 'Move iX to iY // the object is cached' to TokenizerData
+            Send Assert (TokenizerData.bIsInObject = False)
+            Get Tokenizer of ghoFuncLib 'Move iX to iY // base class for grids' to TokenizerData
+            Send Assert (TokenizerData.bIsInClass = False)
+            // An INDENTED End_Struct closes struct scope (the raw line carries the indent).
+            Send _InitializeFuncLib of ghoFuncLib
+            Set pbInStruct of ghoFuncLib to True
+            Get Tokenizer of ghoFuncLib '    End_Struct' to TokenizerData
+            Send Assert (TokenizerData.bIsInStruct = False)
+        End_Procedure
+
+        // A variable NAME ending in "...Struct" followed by another token must NOT open a struct
+        // scope. _IsStructDeclaration used to match "struct " ANYWHERE, so Dftreevw.pkg's
+        // 'Local Pointer lpsStruct pszValue pVoid' (Nils's LegacyApp3 residue 2026-07-11) opened a
+        // PHANTOM struct that no legacy file ever closes (no End_Struct) - variable-declaration
+        // detection, and with it RemoveLocalKeyWord, went dead to EOF. First-token check now.
+        {Published = True}
+        Procedure Tokenizer_StructNameSubstringNoPhantomScope
+            String sLine
+            Boolean bChanged
+            tTokenizer TokenizerData
+
+            // The real file shape: a Function opens, then the two Local declarations.
+            Get Tokenizer of ghoFuncLib 'Function AddTreeItem String sValue Returns Handle' to TokenizerData
+            Move '        Local Pointer lpsStruct pszValue pVoid' to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Send Assert (TokenizerData.bIsInStruct = False)
+            Send Assert (TokenizerData.bIsVariableDeclaration = True)
+            Get RemoveLocalKeyWord of ghoFuncLib (&sLine) '' to bChanged
+            Send Assert (bChanged = True)
+            Send AssertSAreEqual '        Pointer lpsStruct pszValue pVoid' sLine
+            // The line AFTER the poison line used to be dead too - now converts.
+            Move '        Local String sStruct' to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Send Assert (TokenizerData.bIsInStruct = False)
+            Send Assert (TokenizerData.bIsVariableDeclaration = True)
+            Get RemoveLocalKeyWord of ghoFuncLib (&sLine) '' to bChanged
+            Send Assert (bChanged = True)
+            // And a REAL struct declaration still opens the scope (first-token match).
+            Send _InitializeFuncLib of ghoFuncLib
+            Get Tokenizer of ghoFuncLib 'Struct tMyPoint' to TokenizerData
+            Send Assert (TokenizerData.bIsInStruct = True)
+        End_Procedure
+
         // #ENDCOMMAND when inside a command block resets bIsInCommand and sets bLineIsReady.
         {Published = True}
         Procedure Tokenizer_74
@@ -933,12 +997,13 @@
         End_Procedure
 
         // Multi-line SQL string continuation with "//" in SQL content: line must be flagged
-        // as bLineIsReady so refactoring functions never process it.
+        // as bLineIsReady so refactoring functions never process it. The SQL literal is single-quoted: a
+        // double quote would END an @SQL" string - its text holds none (measured on DataFlex 26, 2026-10-29).
         {Published = True}
         Procedure Tokenizer_86
             String sLine
             tTokenizer TokenizerData
-            Move '    WHERE url = "http://example.com" AND active = 1' to sLine
+            Move "    WHERE url = 'http://example.com' AND active = 1" to sLine
             Set piMultiLineStringType of ghoFuncLib to MLS_SQLDoubleQuote
             Get Tokenizer of ghoFuncLib sLine to TokenizerData
             Send Assert (TokenizerData.bIsInDF23MultiLineString = True)
@@ -987,6 +1052,7 @@
         Procedure Tokenizer_89
             String sLine
             tTokenizer TokenizerData
+
             Set piMultiLineStringType of ghoFuncLib to MLS_None
 
             Move 'Move "This is a test string on multiple lines;' to sLine
@@ -1005,6 +1071,231 @@
             Get Tokenizer of ghoFuncLib sLine to TokenizerData
             Send Assert (Pos('semicolon', TokenizerData.sOverstrikeLine) = 0)
             Send Assert (Pos('to sTest', TokenizerData.sOverstrikeLine) > 0)
+        End_Procedure
+
+        // 'If (paren-cond) Indicate X as <expr>' (Nils 2026-07-08): the expression extractor
+        // swallows the WHOLE tail after 'If' into one pseudo-expression token
+        // ('((MORE_ROWS) indicate MORE_ROWS as ...)'), so bHasIndicateCommand - which keys
+        // off a clean Indicate token in asLineTokens - reads FALSE for a line that plainly
+        // carries the command. ChangeLegacyIndicators' composed-path detection depends on this:
+        // it must find the Indicate WORD on the masked overstrike line instead. If this test
+        // ever flips (a tokenizer rework producing a clean Indicate token), revisit that hook.
+        {Published = True}
+        Procedure Tokenizer_90
+            String sLine
+            tTokenizer TokenizerData
+            Move 'If (MORE_ROWS) indicate MORE_ROWS as Orders.Due_Date LE dCutOff' to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Send AssertFalse (TokenizerData.BooleanIndicator.bHasIndicateCommand)
+            Send Assert (TokenizerData.bHasIfCommand = True)
+            // the masked overstrike line still shows the real command word:
+            Send Assert (Lowercase(TokenizerData.sOverstrikeLine) contains "indicate ")
+        End_Procedure
+
+        // INDENTED report-image markers are recognised (Nils 2026-07-11). '/PageName' and its
+        // '/*' terminator sit indented inside the report object; the old column-1-only test
+        // missed them, so the '/*' became a fake block-comment start that poisoned the rest of
+        // the file. A '/'+letter is an image start; '//' and '/*' are not.
+        {Published = True}
+        Procedure Tokenizer_IndentedImageMarkers
+            Boolean bStart bEnd
+
+            Get IsImageStart of ghoFuncLib "    /BodyTi1"    to bStart
+            Send Assert (bStart = True)
+            Get IsImageStart of ghoFuncLib "/PageTitle"      to bStart
+            Send Assert (bStart = True)
+            Get IsImageStart of ghoFuncLib "        //a note" to bStart
+            Send Assert (bStart = False)
+            Get IsImageStart of ghoFuncLib "    /* block"     to bStart
+            Send Assert (bStart = False)
+            Get IsImageEnd of ghoFuncLib "    /*"             to bEnd
+            Send Assert (bEnd = True)
+            Get IsImageEnd of ghoFuncLib "/*"                 to bEnd
+            Send Assert (bEnd = True)
+        End_Procedure
+
+        // The whole point, end to end: an indented image page ('/name' .. '/*') must OPEN and
+        // CLOSE so a code line BELOW it is live again - not stuck in the image or a fake block
+        // comment. Feed the lines in sequence (the page state is sticky on ghoFuncLib).
+        {Published = True}
+        Procedure Tokenizer_CodeBelowIndentedImageIsLive
+            tTokenizer TokenizerData
+            Get Tokenizer of ghoFuncLib "    /BodyTi1"      to TokenizerData
+            Send Assert (TokenizerData.bIsInImage = True)
+            Get Tokenizer of ghoFuncLib "    ___  __/__"    to TokenizerData
+            Send Assert (TokenizerData.bIsInImage = True)
+            Get Tokenizer of ghoFuncLib "    /*"            to TokenizerData
+            // The '/*' ended the page; the NEXT real line must be live code.
+            Get Tokenizer of ghoFuncLib "    Sysdate4 dDatum" to TokenizerData
+            Send Assert (TokenizerData.bIsInImage = False)
+            Send Assert (TokenizerData.bLineIsReady = False)
+        End_Procedure
+
+        // A SINGLE-LINE '/* ... */' block comment - the ubiquitous VDF IDE marker - opens AND
+        // closes on the same line: the sticky DF23 flag must NOT carry over, or every converter
+        // below the marker goes silently dead to end-of-file (WinServ GBE.dg: 'Character (9)'
+        // flagged by the scan, never converted by the run). The marker line itself still reads
+        // as a comment; the genuinely multi-line form must keep tracking.
+        {Published = True}
+        Procedure Tokenizer_SingleLineBlockCommentNoCarryOver
+            tTokenizer TokenizerData
+            String sLine
+            Boolean bChanged
+
+            Get Tokenizer of ghoFuncLib "        /* Do NOT REMOVE THIS LINE: IDE GENERATED CODE WILL GO HERE */" to TokenizerData
+            Send Assert (TokenizerData.bIsComment = True)
+            Move "            Character (9) to inter // Tab" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Send Assert (TokenizerData.bIsInDF23MultiLineComment = False)
+            Get ChangeCharacterCommandToFunction of ghoFuncLib (&sLine) to bChanged
+            Send Assert bChanged
+            // The multi-line form still tracks: bare '/*' opens, '*/' closes, code after is live.
+            Get Tokenizer of ghoFuncLib "/*"                   to TokenizerData
+            Send Assert (TokenizerData.bIsInDF23MultiLineComment = True)
+            Get Tokenizer of ghoFuncLib "commented out code"   to TokenizerData
+            Send Assert (TokenizerData.bIsInDF23MultiLineComment = True)
+            Get Tokenizer of ghoFuncLib "*/"                   to TokenizerData
+            Get Tokenizer of ghoFuncLib "Move 1 to iX"         to TokenizerData
+            Send Assert (TokenizerData.bIsInDF23MultiLineComment = False)
+            Send Assert (TokenizerData.bLineIsReady = False)
+        End_Procedure
+
+        /* Every line of a #HEADER ... #ENDHEADER region reports bLineIsReady - the universal
+           "hands off" signal - and #ENDHEADER closes the region so the REST of the file stays
+           refactorable. A stuck pbInHeader would silently kill every remaining line in the
+           program, which is the failure mode _IsCommandEnd already had once (2026-06-11). */
+        {Published = True}
+        Procedure Tokenizer_HeaderRegionIsHandsOffAndCloses
+            tTokenizer TokenizerData
+
+            Get Tokenizer of ghoFuncLib '#HEADER' to TokenizerData
+            Send Assert (TokenizerData.bLineIsReady = True)
+            Get Tokenizer of ghoFuncLib '    Use DfAllEnt.pkg' to TokenizerData
+            Send Assert (TokenizerData.bLineIsReady = True)
+            Get Tokenizer of ghoFuncLib '    Move 1 to iX' to TokenizerData
+            Send Assert (TokenizerData.bLineIsReady = True)
+            Get Tokenizer of ghoFuncLib '#ENDHEADER' to TokenizerData
+            Send Assert (TokenizerData.bLineIsReady = True)
+            // Region closed: ordinary code is refactorable again.
+            Get Tokenizer of ghoFuncLib 'Move 1 to iX' to TokenizerData
+            Send Assert (TokenizerData.bLineIsReady = False)
+        End_Procedure
+
+        // An INDENTED #EndHeader must still close the region - same asymmetry that once left
+        // pbInCommand stuck ON (see _IsCommandEnd in cRefactorUtilities.pkg).
+        {Published = True}
+        Procedure Tokenizer_IndentedHeaderEndClosesRegion
+            tTokenizer TokenizerData
+
+            Get Tokenizer of ghoFuncLib '    #Header' to TokenizerData
+            Send Assert (TokenizerData.bLineIsReady = True)
+            Get Tokenizer of ghoFuncLib '        #EndHeader' to TokenizerData
+            Get Tokenizer of ghoFuncLib 'Move 1 to iX' to TokenizerData
+            Send Assert (TokenizerData.bLineIsReady = False)
+        End_Procedure
+
+        /* A method end inside a #COMMAND must not drop the enclosing macro scope. The lexer
+           tolerates a Function closed by End_Procedure, and both branches used to call the
+           blanket _ClearRefactoringProperties - wiping pbInCommand along with the method
+           flags, so a macro body went unprotected after its first method. */
+        {Published = True}
+        Procedure Tokenizer_MethodEndKeepsEnclosingCommandScope
+            tTokenizer TokenizerData
+
+            Get Tokenizer of ghoFuncLib '#COMMAND Deferred_Panel R' to TokenizerData
+            Send Assert (TokenizerData.bIsInCommand = True)
+            // A Function closed by End_Procedure - the tolerated mismatch.
+            Get Tokenizer of ghoFuncLib '    Function !1_Handle Returns Handle' to TokenizerData
+            Get Tokenizer of ghoFuncLib '    End_Procedure' to TokenizerData
+            Get Tokenizer of ghoFuncLib '        Move 1 to iX' to TokenizerData
+            Send Assert (TokenizerData.bIsInCommand = True)
+            // A matched Procedure/End_Procedure pair likewise.
+            Get Tokenizer of ghoFuncLib '    Procedure !1' to TokenizerData
+            Get Tokenizer of ghoFuncLib '    End_Procedure' to TokenizerData
+            Get Tokenizer of ghoFuncLib '        Move 1 to iX' to TokenizerData
+            Send Assert (TokenizerData.bIsInCommand = True)
+            // #ENDCOMMAND still closes it.
+            Get Tokenizer of ghoFuncLib '#ENDCOMMAND' to TokenizerData
+            Send Assert (TokenizerData.bIsInCommand = False)
+        End_Procedure
+
+        /* EVERY STRING LITERAL GOES BACK TO ITS OWN TOKEN, UNCHANGED (Nils 2026-09-23). The tokenizer
+           masks the literals, splits the line, then hands them back in order: the ones INSIDE an
+           expression go back with it, the rest to the masked tokens outside. Every way this broke
+           wrote a different value into the program, and it compiled:
+             - only ONE inside literal was skipped, so with two in the condition the token after it
+               got the second: 'if ((P eq "TP") or (P eq "WA")) move "C" to P' stored "WA";
+             - an empty "" is never masked, so its token takes nothing back - and the literal
+               after it got the "";
+             - a literal BEFORE an expression was taken for the expression's own: pasted into it
+               when as long, and when not, nothing went back and the mask "^^^" was written out;
+             - a TAB inside a literal came back as a space;
+             - a ';' glued to a literal was dropped with the mask;
+             - of two literals glued in one token, "a""b", only the first came back;
+             - an expression took a literal from OUTSIDE its span when the line's indent made two
+               positions agree: 20 spaces, and '(not(Found))' came back '(not(Found)) "AB"';
+             - an expression glued behind a literal or a name, '"logo"('"1"')', kept its placeholder
+               '|||||||' - or, behind a literal, was dropped from the line. */
+        {Published = True}
+        Procedure Tokenizer_StringLiteralsGoBackToTheirOwnTokens
+            tTokenizer TokenizerData
+            Get Tokenizer of ghoFuncLib 'if ((Functions.Parameter eq "TP") or (Functions.Parameter eq "WA")) move "C" to Functions.Parameter' to TokenizerData
+            Send AssertSAreEqual '"C"' TokenizerData.asLineTokens[3]
+            Send Assert (Pos('"TP"', TokenizerData.asLineTokens[1]) > 0)
+            Send Assert (Pos('"WA"', TokenizerData.asLineTokens[1]) > 0)
+            // the empty literal first
+            Get Tokenizer of ghoFuncLib 'Showln "" "Hello"' to TokenizerData
+            Send AssertSAreEqual '""' TokenizerData.asLineTokens[1]
+            Send AssertSAreEqual '"Hello"' TokenizerData.asLineTokens[2]
+            // a literal before an expression holding one of the same length
+            Get Tokenizer of ghoFuncLib 'Send Info_Box "AB" (sA eq "CD")' to TokenizerData
+            Send AssertSAreEqual '"AB"' TokenizerData.asLineTokens[2]
+            Send Assert (Pos('"CD"', TokenizerData.asLineTokens[3]) > 0)
+            Send Assert (Pos('"AB"', TokenizerData.asLineTokens[3]) = 0)
+            // ... and of a different length, where nothing was put back at all
+            Get Tokenizer of ghoFuncLib 'Send Info_Box "AB" (sA eq "CDE")' to TokenizerData
+            Send AssertSAreEqual '"AB"' TokenizerData.asLineTokens[2]
+            Send Assert (Pos('"CDE"', TokenizerData.asLineTokens[3]) > 0)
+            // positive control: one literal inside, one after - this always worked
+            Get Tokenizer of ghoFuncLib 'If sOne eq "A" Insert "B" in sOne At 2' to TokenizerData
+            Send Assert (SearchArray('"B"', TokenizerData.asLineTokens) <> -1)
+            // a TAB inside a literal is the literal's own text - the scan's tab-to-space is for the mask only
+            Get Tokenizer of ghoFuncLib ('Move "a' + Character(9) + 'b" to sX') to TokenizerData
+            Send AssertSAreEqual ('"a' + Character(9) + 'b"') TokenizerData.asLineTokens[1]
+            // two literals glued in one token both come back
+            Get Tokenizer of ghoFuncLib 'Move "ab ""cd" to sX' to TokenizerData
+            Send AssertSAreEqual '"ab ""cd"' TokenizerData.asLineTokens[1]
+            // the indent coincidence: the expression's place in the INDENTED line equals the literal's
+            // place in the trimmed one (24) - the literal is not the expression's, it lies after it
+            Get Tokenizer of ghoFuncLib (Repeat(' ', 20) + 'If (not(Found)) If not "AB" in sList Insert "CD" in sList at 1') to TokenizerData
+            Send AssertSAreEqual '(not(Found))' TokenizerData.asLineTokens[1]
+            Send AssertSAreEqual '"AB"' TokenizerData.asLineTokens[4]
+            // an expression glued behind a literal, and behind a name
+            Get Tokenizer of ghoFuncLib ('Send AssignFormula of hoReport "logo"(' + "'" + '"1"' + "'" + ')') to TokenizerData
+            Send AssertSAreEqual ('"logo"(' + "'" + '"1"' + "'" + ')') TokenizerData.asLineTokens[4]
+            Get Tokenizer of ghoFuncLib "#REPLACE C_SND_ASTERISK sndAlias('S', '*')" to TokenizerData
+            Send AssertSAreEqual "sndAlias('S', '*')" TokenizerData.asLineTokens[2]
+            // a ';' glued to a literal stays glued (LAST: the ';' leaves the next line a continuation)
+            Get Tokenizer of ghoFuncLib 'Send Stop_Box "Hello";' to TokenizerData
+            Send AssertSAreEqual '"Hello";' TokenizerData.asLineTokens[2]
+        End_Procedure
+
+        // A block comment inside a method is no end of it (2026-10-30): after a comment over two lines and after a
+        // one-line comment, the next code line is still in the procedure; End_Procedure ends it.
+        {Published = True}
+        Procedure Tokenizer_ScopeKeptAcrossBlockComment
+            tTokenizer TokenizerData
+            Send ClearFuncLibProperties of ghoFuncLib
+            Get Tokenizer of ghoFuncLib 'Procedure MyProc' to TokenizerData
+            Get Tokenizer of ghoFuncLib '    /* a comment' to TokenizerData
+            Get Tokenizer of ghoFuncLib '       inside the method */' to TokenizerData
+            Get Tokenizer of ghoFuncLib '    Move 1 to iX' to TokenizerData
+            Send Assert (TokenizerData.bIsInProcedure = True) "after a comment over two lines"
+            Get Tokenizer of ghoFuncLib '    /* one line */' to TokenizerData
+            Get Tokenizer of ghoFuncLib '    Move 2 to iX' to TokenizerData
+            Send Assert (TokenizerData.bIsInProcedure = True) "after a one-line comment"
+            Get Tokenizer of ghoFuncLib 'End_Procedure' to TokenizerData
+            Send Assert (TokenizerData.bIsInProcedure = False) "End_Procedure ends it"
         End_Procedure
 
     End_Object

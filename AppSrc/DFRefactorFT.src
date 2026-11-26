@@ -1,0 +1,2719 @@
+﻿//****************************************************************************
+// $Module type: Program
+// $Module name: DFRefactor
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2018-08-05 @ 09:50 (Military date format: YY-MM-DD)
+//
+// Description : Code Refactor functions for DataFlex.
+//
+// The code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//
+//****************************************************************************
+Use DFAllEnt.pkg
+Use cRDCCJCommandBarSystem.pkg
+Use File_dlg.pkg
+Use gFormatNumbers.pkg
+Use vWin32fh.pkg
+Use RefactorConstants.h.pkg
+Use FTConstants.h.pkg      // the FlexTron theme values and where the theme choice is saved
+Use FTThemeColors.pkg      // FTWebBg/FTViewBg/FTThemeInk - the native side of the light theme
+
+/* DARK MESSAGE BOXES (FT only, Nils 2026-07-30). Info_Box / Stop_Box / YesNo_Box end up in the
+   Win32 MessageBox API, which Windows draws itself - no colour hook, no dark mode - so a message box
+   in the theme has to be a dialog of its own. Since 2026-09-29 that is the RDCFlexTron library's
+   (FTMessageBox.pkg, shown in FTMessageBox.dg): FTInfoBox / FTStopBox / FTYesNoBox as drop-in
+   equivalents (same call shapes, same MBR_Yes/MBR_No return, same Num_Arguments handling), and
+   FTHtmlMessage for a formatted body with verb buttons. DFRefactor's own RefactorInfoBox /
+   RefactorStopBox / RefactorYesNoBox, in MessageBoxFT.dg, did this until then.
+
+   #REPLACE WAS THE PLAN AND IT DOES NOT WORK - measured, not assumed. The idea was three
+   #REPLACE lines here redirecting all 195 call sites without editing any file. Three probes
+   settled it: pointing the replacement at a nonexistent procedure compiled clean (DataFlex
+   tolerates unknown message names in Send), and so did pointing it at the KEYWORD End_Procedure -
+   including for a "Get FTYesNoBox ... to iRetval" later in THIS very file, so no ordering doubt.
+   #REPLACE substitutes in command, type and expression positions (which is how the runtime uses
+   it for CP_UTF8, OLE_Handle and the rest) but NOT in the message-name slot after Send / Get.
+   Since these three are only ever reached that way, the whole approach is dead.
+
+   So the conversion is per-call-site, and only in FT-ONLY files - 68 of them across 17 files,
+   which is every message box on the FlexTron-specific surface. The other ~127 live in engine and
+   funclib code SHARED with the two light builds, where a swap would darken their boxes too; those
+   keep the system box until each gets an FT variant for other reasons. */
+Use FTMessageBox.pkg            // FTInfoBox / FTStopBox / FTYesNoBox / FTHtmlMessage (RDCFlexTron)
+Use FTRefactorMessageBox.pkg    // ghoBrowsePackages + ShowPicker - declared early
+
+Use cWorkspaceMenuItem.pkg
+Use cEncodingHelpers.pkg
+Use FTMarkupBuilders.pkg     // ElemHtml / ChipHtml / BarButtonHtml - global, so every
+                             // dialog can build a chip whatever the include order.
+
+// clDarkViewBg / clDarkWebBg moved to RefactorConstants.h.pkg (Used at the top of this file), so the
+// ~28 FT files that reference them no longer depend on being Used below this point.
+
+// FT: last Modernize/analyze outcome, cached so the dashboard's "Last analyze" tile can show it on return.
+// ModAnalyzerFT.dg writes these when the analyze summary is built; DashboardFT.vw reads them in
+// RefreshAnalyze. Kept as FT-only globals - no change to the shared cRefactorApplication.
+Global_Variable Integer ghiLastAnalyzeAuto      // auto-fixable rows
+Global_Variable Integer ghiLastAnalyzeSuggest   // rows to review
+Global_Variable Integer ghiLastAnalyzeWarn      // compiler warning messages
+Global_Variable Integer ghiLastAnalyzeErr       // compiler error messages
+Global_Variable Integer ghiLastAnalyzeDone      // 0 = not analyzed for the current workspace, 1 = have a result
+Global_Variable String  ghsLastAnalyzeDate      // ISO yyyy-mm-dd of the cached counts above ("" = none); shown as "last run <date>"
+Global_Variable String  ghsLastAnalyzeProgram   // the program (.src) the cached counts are for - labels the Modernize tile so a many-program workspace is not ambiguous ("" = unknown/old snapshot)
+Global_Variable String  ghsLastAnalyzeWS        // the .sws path the cached counts/date describe; RefreshAnalyze re-seeds from the registry snapshot when this <> psSWSFile (robust to any workspace-load path)
+
+// FT: the CURRENT saved LastPlan file's profile - drives the SHARED "View/Run last plan" link + the guided
+// "Run Plan" button, which BOTH a compile+analyze cycle AND a Deep Scan can produce (the plan JSON is shared,
+// latest writer wins). Set at every plan write (ModAnalyzerFT.dg LoadData) and restored from the file header on
+// workspace load (DashboardFT.RestoreAnalyzeSnapshot). Deliberately SEPARATE from ghiLastAnalyze* above (which
+// stay the COMPILE stat readout / burn-down cue) so a Deep Scan plan resumes like an analyze plan without ever
+// polluting the compile counts. "" / 0 => no resumable plan for this workspace.
+Global_Variable Integer ghiLastPlanAuto         // auto-fix rows in the saved LastPlan (either source)
+Global_Variable Integer ghiLastPlanSuggest      // review rows in the saved LastPlan (either source)
+Global_Variable Integer ghiLastPlanIsDeepScan   // 1 = the saved LastPlan was written by a Deep Scan (labels the foot); 0 = compile+analyze
+Global_Variable String  ghsLastPlanDate         // ISO yyyy-mm-dd of the saved LastPlan ("" = none)
+Global_Variable Handle  ghoTabWorkspace         // FT EXPERIMENT: CodeJock MDI tab-workspace (cCJTabWorkspace) handle, captured in oCJCommandBarSystem.OnCreateTabbedWorkspace; the docked OutputDockFT re-asserts ComEnableGroups on it to try to revive drag-to-split view grouping after a tool panel docks
+
+// FT: declared HERE (before the views are Used) so ModAnalyzerFT.dg can Broadcast it to oDashboard_vw when
+// an analyze finishes - the dashboard view may not re-activate after the (docked) analyze, so its Activating
+// hook alone is unreliable. The procedure is DEFINED in DashboardFT.vw; the Broadcast no-ops on any view
+// that does not handle it.
+Register_Procedure RefreshAnalyze
+Register_Procedure SourceReverted
+Register_Procedure AnalysisCleared    // broadcast by the Test Compile bar's Clear (TestCompileFT.dg)
+
+// FT: declared HERE (before the views are Used) so the Select Folders / Select Functions views can Broadcast
+// it to oDashboard_vw whenever the user changes the selection (a tick, or Select All/None/Invert). In the
+// side-by-side Split View the dashboard stays visible beside those grids, so it never re-Activates and its
+// "Selected" tile would otherwise go stale. The procedure is DEFINED in DashboardFT.vw, where it just arms
+// the existing coalescing refresh timer; the Broadcast no-ops on any view that does not handle it.
+Register_Procedure RequestTileRefresh
+
+/* ORPHANED BY THE 2026-08-10 DASHBOARD SWAP - registered here so the Broadcasts still COMPILE.
+
+   TestCompileFT.dg broadcasts RunDeepScan (the bar's own scan chip) and RunDeepScanVerify (the
+   post-plan automatic verify re-scan). Both workers lived on the old split cockpit board, which is
+   no longer in the build, and the guided board that replaced it does not answer either message -
+   it drives its scans through ghoDeepScanDriver from its own Check flow instead.
+
+   Without these two registrations the .src does not compile at all (4306 on the Broadcast). WITH
+   them it compiles and the two broadcasts reach nobody: the Test Compile bar's Deep Scan chip and
+   the auto verify re-scan are INERT until the guided board answers them. Deliberate and visible
+   rather than silent - see the swap's commit message for the full orphan list. */
+Register_Procedure RunDeepScan
+Register_Procedure RunDeepScanVerify
+
+// Not sure why we need this, but it somehow is linked to the "OnIdle events"
+Procedure Exit_Application for cDesktop
+    // Arm pbAppExiting BEFORE Exit_System_Confirmation/Abort. A committed exit TERMINATES inside the
+    // Abort below, so anything after it never runs on a real exit - which is exactly why this flag
+    // stayed False during teardown and the Modernize dock's restore-on-return re-showed against
+    // half-destroyed CodeJock COM objects -> error 4399 (pvComObject NULL in ComEnableGroups). It
+    // only bites when exiting from a NON-editor view with the Modernize pane open: the CJ MDI
+    // activates the editor view as it tears the views down, and that view's Activate handler
+    // re-shows the dock unless this flag is already set (ShowTestCompileDockOnly checks it). Set it
+    // up front so the guard is armed no matter which branch runs. One-way latch by design (see
+    // pbAppExiting in cRefactorApplication.pkg) - never reset; a cancelled exit merely leaves the
+    // dock not auto-restoring until the next launch. (Nils 2026-07-06.)
+    Set pbAppExiting of ghoApplication to True
+    Send SuspendGUI of Desktop True
+    If (Exit_System_Confirmation(Self)) ;
+        Abort
+End_Procedure
+
+Object oHtmlHelp is a cHtmlHelp
+    Set pbAlwaysOnTop to False
+End_Object
+
+// Dummy messages that are called from the toolbars; in case they
+// doesn't exist in a view. This avoids runtime errors.
+Function Can_UndoAction Desktop Returns Boolean
+    Function_Return False
+End_Function
+
+Function Can_RedoAction Desktop Returns Boolean
+    Function_Return False
+End_Function
+
+Function pbShouldSave Desktop Returns Boolean
+    Function_Return False
+End_Function
+
+Function BackupFile Desktop Returns String
+    Function_Return ""
+End_Function
+
+Procedure OpenSourceFile Desktop
+End_Procedure
+
+Procedure Compare Desktop String sCompareApp
+End_Procedure
+
+Procedure OnWorkspaceLoaded Desktop
+End_Procedure
+
+Procedure LoadFile Desktop String sFileName
+End_Procedure
+
+Procedure Set pbEnabled Desktop Boolean bState
+End_Procedure
+
+External_Function GetACP "GetACP" kernel32.dll Returns Integer
+Register_Procedure DoChangeFontSize
+// Modernize dock entry points (defined in TestCompileFT.dg, which is Used AFTER the views) - registered here
+// so EditorViewFT.vw can Send them for the toggle button / Ctrl+M / view-switch restore.
+Register_Procedure ShowTestCompilePanel
+Register_Procedure ShowTestCompileDockOnly
+// guided-flow-redesign: StartAnalyze (TestCompileFT.dg) Broadcasts this to hand a guided compile+analyze
+// to the Check Workspace view's findings list; handled by oDashboard_vw (Used after this .src).
+Register_Procedure RenderGuidedFindings
+// Close the loop back to the guided trail after a run it sent the user off to make.
+Register_Procedure StartGuidedCheckFromRun
+/* The trail's own activation message, registered so views Use'd BEFORE CheckWorkspaceFT.vw can
+   reach it - SelectFunctionsFT.vw is Use'd two lines earlier and has to land a guided run on the
+   trail instead of the dashboard. Same reason OutputDockFT registers Activate_oEditorView_vw. */
+Register_Procedure Activate_oDashboard_vw
+// Same reason: the toolbar item above is declared before ManualDashboardFT.vw is Used.
+Register_Procedure Activate_oManualDashboard_vw
+/* Same reason again, twice over: the toolbar item is declared before StartCenterFT.vw is Used,
+   AND both boards' workspace crumbs send this to get back to it - and both of those views are
+   Used before it as well. */
+Register_Procedure Activate_oStartCenter_vw
+/* The migration copy-scope dialog, defined on oMain far below the views. The Start Center's
+   "Make a workspace copy" card is its first real entry point - until now it was reachable only
+   by the Alt+P development shortcut. */
+Register_Procedure ActivateCopyScopeDialog
+/* Library Maintenance on the LOADED workspace. The migration copy calls the dialog directly for the
+   copy it has just written; this is the same list for the workspace already open, which is where a
+   library gets brought forward outside a migration. */
+Register_Procedure ActivateLibraryMaintenance
+// ...and the plain return, for a run that changed nothing (nothing to verify, but still come back).
+Register_Procedure ActivateGuidedTrail
+// Broadcast target on the Check Workspace view: the post-analyze name-collision nudge hands the report
+// over instead of routing the user through Select Folders -> Select Functions to hunt for one function.
+Register_Procedure RunReturnMismatchReport
+Register_Procedure CloseTestCompileDialog
+Register_Procedure StopBuildFeedback
+// Build the "Dashboard left / other views right" tab-group layout on demand (sidesteps CodeJock's fiddly
+// drag-to-split). Defined on oMain near StartRefactoreCode; called by the Main toolbar's "Split View" button.
+Register_Procedure SplitViewWorkspace
+/* The menu bar's commands (2026-11-19): oMain's, defined far below it, and the editor's, which come with
+   EditorViewFT.vw. The menu bar is declared before both. */
+Register_Procedure ActivateWorkspaceDialog
+Register_Procedure ActivateBrowseDialog
+Register_Procedure ActivateUndoRefactoringDialog
+Register_Procedure ActivateCompare
+Register_Procedure CME_Find
+Register_Procedure CME_FindNext
+Register_Procedure CME_FindPrevious
+Register_Procedure CME_FindReplace
+Register_Procedure CME_GotoLine
+Register_Procedure HKSC_GotoDefinition
+
+// CI_CleanupSource / CI_CodeIndenter: RefactorConstants.h.pkg
+
+Declare_Datafile FolderSelHea
+Use cFunctionsDataDictionary.dd
+
+Use cRefactorApplication.pkg
+
+Use FTThemeSeed.pkg   // SeedFTTheme (DFRefactor's own) - oApplication's End_Construct_Object sends it
+
+Object oApplication is a cRefactorApplication
+    Set psProduct to "DFRefactor"
+    Set psCompany to "RDC Tools International"
+    Set peHelpType to htHtmlHelp
+    Set psHelpFile to "DFRefactor.chm"
+
+    Property String psCmdLineIniFile ""  
+    /* THE CI SCAN (/scan <ini> [/baseline], 2026-11-20 - cCIScan.pkg, RunCIScanAndExit): the switches, and what
+       ReadScanIniFile read from the INI. psScanError keeps a fault for the run to report with exit code 2. */
+    Property Boolean  pbScanMode False
+    Property Boolean  pbScanBaseline False
+    Property String   psScanIniFile ""
+    Property String[] pasScanFolders
+    Property String   psScanFilter ""
+    Property String   psScanBaselineFile ""
+    Property String   psScanJsonFile ""
+    Property String   psScanSarifFile ""
+    Property String   psScanError ""
+    Property Handle phoTestCompileFT
+    // FT: does the user want the Modernize dock (Test Compile + Compiler Output + ModAnalyzer) shown while on
+    // the Refactoring Editor view? Set True by every show path (ShowTestCompileDockOnly); set False ONLY by an
+    // explicit user close (Close button / Esc / the editor toggle) - never by the view-switch auto-hide. The
+    // editor view's Activate restores the dock when this is True; the editor's toggle button + Ctrl+M flip it.
+    Property Boolean pbModernizePanelWanted False
+
+//    Procedure OnWorkspaceOpened
+//        String sProduct
+//        Integer iRetval
+//        
+//        Forward Send OnWorkspaceOpened  
+//        /* Check that the 'correct' collating.cfg is used when the program is
+//           started. The data in the database was entered with an english (standard)
+//           collating sequence. If another df_collate.cfg is encountered at runtime,
+//           all data tables will automatically be reindexed, prior to running the program.
+//           Note: We cannot use the event OnCreate for this, because the psDataPath
+//           et. al. is set after that event.
+//        */
+//        Open Functions
+//        Send CheckCollatingSequence of ghoDatabaseFunctions File_Field Functions.Function_Name
+//    End_Procedure
+
+    Procedure OnFileNameUpdate String sFileName
+        Set psCurrentSourceFileName to sFileName
+    End_Procedure
+
+    Procedure SelectSourceFile
+        Boolean bOpen bReadOnly bExists
+        String  sFileName sHomePath sAppSrcPath sInitialFolder
+        Handle ho
+
+        Move (phoOpenSourceFileDialog(Self)) to ho
+        Get Initial_Folder of ho to sInitialFolder
+        If (sInitialFolder = "") Begin
+            Get psHomeTarget to sHomePath
+            // If an "AppSrc" folder exists we want to display those source files.
+            Move (vFolderFormat(sHomePath)) to sAppSrcPath
+            Move (sAppSrcPath + "AppSrc") to sAppSrcPath
+            Move (vFolderExists(sAppSrcPath)) to bExists
+            If (bExists = True) Begin
+                Move sAppSrcPath to sHomePath
+            End
+
+            Set Initial_Folder of ho to sHomePath
+        End
+        Get Show_Dialog of ho to bOpen
+        If (bOpen = True) Begin
+            Get File_Name of ho to sFileName
+            // Check if user is opening file as read_only
+            Get TickReadOnly_State of ho to bReadOnly
+            If (bReadOnly = True) Begin
+                Send FTInfoBox ("Files should not be opened as ReadOnly.") "Warning!"
+            End
+            Else Begin
+                Set pbWorkspaceMode to False
+                Send OnFileNameUpdate sFileName
+                Send LoadFile of (phoEditor(Self)) sFileName
+                Send Activate_oEditorView_vw of (Client_Id(phoMainPanel(Self)))
+            End
+        End
+    End_Procedure     
+    
+    /* THE ICON SET FOLLOWS THE THEME. The DK icons are drawn for a dark ground and vanish on a
+       light one (Nils 2026-08-13). They used to be bound by an [Icons] remap in DFRefactorFT.cfg -
+       name = DK\name - which the compiler EMBEDS, so it could not vary at runtime; that list has
+       been removed, and the icons now load from the bitmap path instead.
+
+       THREE FOLDERS in the dark theme (2026-11-14): this program's own Bitmaps\DK, then
+       Bitmaps\RDCFlexTron\Dk - the dark icons RDCFlexTron 0.9.31 and later installs into every workspace
+       that uses it (Save outlined blue, Delete Record red, the common toolbar and menu icons; the 28
+       identical copies Bitmaps\DK had are gone) - then Bitmaps, so an icon with no dark version shows
+       its light one. The library's FTSeedThemeIcons builds the same list after the workspace opens; it
+       is not used here because Programs\Config.ws's BitmapPath is switched by hand per build, and the
+       list below must not depend on it.
+
+       A LIST, not a swap, and that is the whole point: the two folders are not parallel sets.
+       113 names exist in both, but 117 live only in Bitmaps and 72 only in Bitmaps\DK. Pointing
+       dark at Bitmaps\DK alone would lose the 117. Dark therefore prefers DK and falls back to
+       Bitmaps for everything DK does not carry; light just uses Bitmaps.
+
+       Here rather than earlier because the workspace object is what owns psBitmapPath, and it
+       only exists once a workspace is open. Anything whose icon was already loaded keeps it -
+       if a toolbar comes up with the wrong set, that is the reason, and the fix is a reload
+       rather than an earlier Set (there is no earlier - the property has no owner yet). */
+    Procedure OnCreate
+        Integer iMode
+        Get ReadInteger CS_FTThemeSection CS_FTTheme CI_FTThemeDark to iMode
+        If (iMode = CI_FTThemeLight) ;
+            Set psBitmapPath of (phoWorkspace(Self)) to "Bitmaps"
+        Else ;
+            Set psBitmapPath of (phoWorkspace(Self)) to "Bitmaps\DK;Bitmaps\RDCFlexTron\Dk;Bitmaps"
+    End_Procedure
+
+    /* THE FT THEME, read as soon as this object is built: its psCompany and psProduct - the registry key -
+       are set by then, and it is well before line ~1350, where the FT dialogs are Used; they colour
+       themselves as they are built. Not a line earlier: the setting is read through ghoApplication, which
+       is assigned when this object is BUILT (2026-08-13: sent before it, SeedFTTheme took its guard and did
+       nothing at all, silently). The library's cFTApplication does the same for its programs; this object
+       is a cRefactorApplication, shared with the light builds, so it sends DFRefactor's own SeedFTTheme
+       (FTThemeSeed.pkg). */
+    Procedure End_Construct_Object
+        Forward Send End_Construct_Object
+        Send SeedFTTheme
+        Send SeedFTAppGlyphs    // DFRefactor's own glyphs, AppHtml\FTGlyphs - from pOrgWS (FTThemeSeed.pkg)
+    End_Procedure
+
+    /* Command Line Interface:
+       "/h" "/help" or "/?" - Show command line parameters help
+    
+      Enables the ability to pass, on the command line;
+      - The path and name of a *.sws file
+      - And path to a source -folder or -filename
+      
+      Command line samples:
+      /sws "C:\DataFlex 24.0 Examples\Order Entry\Order Entry.sws" /d AppSrc;AppHtml;DDSrc
+      /c "C:\DataFlex 24.0 Examples\DFRefactorCmdLineOE.ini"
+      
+      This command line sample would tell the DFRefactor program to run automatically, 
+      applying all previously selected refactoring functions and apply them to all source
+      files for the AppSrc, AppHtml and DDSrc folders, that matches the file extensions previously
+      setup in the DFRefactor program. Then exit the program when done.   
+      Note: The program's UI will be visible while the program runs. However, no UI
+            interaction is needed while it is run. All actions as well as possible errors,
+            will be automatically registered, but not shown on screen.
+    */
+    Procedure OnWorkspaceOpened
+        Handle hoCmdLine
+        String sSourceFile sSWSFile sChar sArgument sParamText sFolders sPath sCmdLineIniFile sProduct sScanIniFile
+        Integer iWin10BetaSetting iNumArgs iCount iMode iRetval
+        Boolean bShowParamHelp bDebugMode bBatch bConfigFile bScan bScanBaseline
+        String[] asFolders
+        
+        Forward Send OnWorkspaceOpened  
+        // Test for serious Windows 10 "bug": "https://support.dataaccess.com/Forums/showthread.php?64797-Recent-Microsoft-Changes-to-Windows-10-May-Impact-Functionality-and-or-Data-Integrity"
+        Move (GetACP()) to iWin10BetaSetting
+        If (iWin10BetaSetting = 65001) Begin
+            Send FTInfoBox ("Windows 10 ouch! This workstation has its BETA option set to TRUE. This means that the normal codepage that DataFlex relies on does not work. This also means that some refactoring functions will fail. Program will now exit!")
+            Send vShellExecute "Open" "https://support.dataaccess.com/Forums/showthread.php?64797-Recent-Microsoft-Changes-to-Windows-10-May-Impact-Functionality-and-or-Data-Integrity" "" ""
+            Send Exit_Application
+        End
+
+        /* Check that the 'correct' collating.cfg is used when the program is
+           started. The data in the database was entered with an english (standard)
+           collating sequence. If another df_collate.cfg is encountered at runtime,
+           all data tables will automatically be reindexed, prior to running the program.
+           Note: We cannot use the event OnCreate for this, because the psDataPath
+           et. al. is set after that event.
+        */
+        Open Functions
+        Send CheckCollatingSequence of ghoDatabaseFunctions File_Field Functions.Function_Name
+
+        Get phoCommandLine to hoCmdLine
+        Get CountOfArgs of hoCmdLine to iNumArgs
+
+        For iCount from 1 to iNumArgs
+            Get Argument of hoCmdLine iCount to sArgument   
+            Move (Left(sArgument, 1)) to sChar
+            If (sChar = "-") Begin
+                Move (Replace("-", sArgument, "/")) to sArgument
+            End
+            Move (Lowercase(sArgument)) to sArgument
+
+            Case Begin
+                Case (sArgument = CS_CmdLineDebug)
+                    Move True to bDebugMode
+                    Case Break
+
+                Case (sArgument = CS_CmdLineHelp1 or sArgument = CS_CmdLineHelp2 or sArgument = CS_CmdLineHelp3 or sArgument = CS_CmdLineHelp4)
+                    Move True to bShowParamHelp
+                    Case Break
+
+                Case (sArgument = CS_CmdLineSWSFile)
+                    Get Argument of hoCmdLine (iCount + 1) to sSWSFile
+                    Move (Trim(sSWSFile)) to sSWSFile
+                    Case Break
+                                    
+                Case (sArgument = CS_CmdLineFileName1 or sArgument = CS_CmdLineFileName2)
+                    Get Argument of hoCmdLine (iCount + 1) to sSourceFile
+                    Case Break
+                
+                Case (sArgument = CS_CmdLineFolders1 or sArgument = CS_CmdLineFolders2 or sArgument = CS_CmdLineFolders3)
+                    Get Argument of hoCmdLine (iCount + 1) to sFolders
+                    Case Break
+
+                Case (sArgument = CS_CmdLineBatch1 or sArgument = CS_CmdLineBatch2)
+                    Move True to bBatch
+                    Case Break
+                
+                /* /bm is THE documented switch now; /c, -c and --console still work but are no
+                   longer advertised (Nils 2026-08-03: two flags that both meant batch mode was
+                   the confusion). Keeping them costs one line and breaks nobody's script - and
+                   it also revives every Run-...ps1 generated before today, which emitted /bm
+                   against a parser that did not accept it. */
+                Case (sArgument = CS_BatchModeShort or sArgument = CS_BatchModeLong or ;
+                      sArgument = CS_CmdConfigFile1 or sArgument = CS_CmdConfigFile2 or sArgument = CS_CmdConfigFile3)
+                    Get Argument of hoCmdLine (iCount +1) to sCmdLineIniFile
+                    Get ParseFolderName sCmdLineIniFile to sPath
+                    If (sPath = "") Begin
+                        Get psProgramPath of (phoWorkspace(ghoApplication)) to sPath
+                        Move (vFolderFormat(sPath)) to sPath
+                        Move (sPath + sCmdLineIniFile) to sCmdLineIniFile
+                    End
+                    Set psCmdLineIniFile to sCmdLineIniFile
+                    Move True to bConfigFile
+                    Move True to bBatch
+                    Case Break
+
+                /* THE CI SCAN (2026-11-20): Analyze Source for a build, read-only - see cCIScan.pkg. Its INI is
+                   found the way /bm finds its own. */
+                Case (sArgument = CS_CmdLineScan)
+                    Get Argument of hoCmdLine (iCount + 1) to sScanIniFile
+                    Get ParseFolderName sScanIniFile to sPath
+                    If (sPath = "") Begin
+                        Get psProgramPath of (phoWorkspace(ghoApplication)) to sPath
+                        Move (vFolderFormat(sPath)) to sPath
+                        Move (sPath + sScanIniFile) to sScanIniFile
+                    End
+                    Move True to bScan
+                    Case Break
+
+                Case (sArgument = CS_CmdLineScanBaseline)
+                    Move True to bScanBaseline
+                    Case Break
+            Case End
+        Loop
+        
+        If (bShowParamHelp = True) Begin
+            Move "" to sParamText
+            Append sParamText "PARAMETER SYNTAX:"
+            Append sParamText "\n=============="
+
+            Append sParamText "\n\n/h or /help or /? - Displays *this* help text. Then exits the program."
+            Append sParamText "\n\n/debug - displays all passed parameters. Then exits the program."
+            Append sParamText " The /h takes precedence over the /debug flag."
+            Append sParamText "\nIf the /batch flag is omitted, the program will wait for the user to start the process."
+            Append sParamText "\n\nNote: Parameters and its value(s) must all be passed as a pair separated by a SPACE, when applicable."
+            Append sParamText "\nParameters can be passed in any order."
+            Append sParamText "\n\nPaths should be surrounded by single- or double-quotes('""')"
+            Append sParamText "\nOnly parameters that are necessary needs to be passed."
+            Append sParamText "\nUppercase/Lowercase doesn't matter when spelling flags."
+            Append sParamText "\nEach flag must be preceeded by a '/' (forward slash) or a '-' (dash) character."
+                              
+            Append sParamText "\n\nFLAGS AND SAMPLE USAGE:"
+            Append sParamText "\n========================"
+
+            Append sParamText "\n *.sws workspace file:"
+            Append sParamText '\n/sws "C:\Projects\DF20\My_Folder\MySWSFile.sws"'
+            Append sParamText "\nMandatory, unless /bm supplies an ini-file that names the workspace."
+            
+            Append sParamText "\n\nSingle Source File:"
+            Append sParamText "\n/f or /file - A single file name with full path."
+            Append sParamText '\n/f "C:\Projects\DF20\My_Folder\AppSrc\MySourceFile.vw"' 
+            Append sParamText "A Single Source File takes precedence over a *.sws workspace file."
+            
+            Append sParamText "\n\nFolder Names Selections:"
+            Append sParamText "\n/d or /dirs or /folders - followed by a semi-comma separated list with folder names to be selected."
+            Append sParamText "\nThe semi-comma separated list with folders will be added to those previously saved for the workspace."
+            Append sParamText "\n/d AppSrc;DDSrc;AppHtml;Libraries (only together with the /sws param)"
+
+            Append sParamText "\n\nBATCH MODE - start and run a refactoring with no user interaction."
+            Append sParamText "\nThe program's UI is shown while it runs, but nothing is asked of the user."
+
+            Append sParamText "\n\n/bm <ini file> - run the settings held in an ini-file. This is the usual way."
+            Append sParamText "\n/bm " CS_CmdIniFileName
+            Append sParamText "\nA bare file name is looked for in the program's Programs folder; otherwise pass a full path."
+            Append sParamText "\nAn ini-file already names the workspace, folders, filters and functions, so /sws is not needed with it."
+            Append sParamText "\nThe run writes STATUS=SUCCESS or STATUS=FAILED to the result file the ini-file names,"
+            Append sParamText "\nand exits with code 0 on success, 1 on failure - so a build can check either."
+
+            Append sParamText "\n\n/b or /batch - run the settings already stored for the workspace, with no ini-file."
+            Append sParamText "\nIf neither flag is given, the program starts, shows the parameters it was passed, and waits."
+
+            Append sParamText "\n\nCI SCAN - Analyze Source for a build. It reads the source and changes nothing."
+            Append sParamText "\n/scan <ini file> - the ini-file /bm takes: the workspace, folders, file filter and result file."
+            Append sParamText "\nThe findings go to <ini>.findings.json and <ini>.findings.sarif (SARIF 2.1.0, which GitHub shows on a pull request)."
+            Append sParamText "\nExit code 0 = no new findings, 1 = findings the baseline does not have, 2 = the scan could not run."
+            Append sParamText "\n/scan <ini file> /baseline - accepts today's findings: writes <ini>.baseline.json, exit code 0."
+            Append sParamText "\nThe ini-file's [Scan Section] can name the three files: Baseline File, Json File and Sarif File."
+
+            Append sParamText "\n\nTop Tip: the main toolbar's Export dialog writes an ini-file for the current workspace,"
+            Append sParamText "\ntogether with a ready-to-run <ini name>_RUN.ps1 beside it - no need to write one from scratch."
+            Append sParamText "\nFor /scan it writes <ini name>_SCAN.ps1 too (-Baseline, and -WorkspaceRoot for a build server's checkout),"
+            Append sParamText "\nand <ini name>_CI-SAMPLE.yml, a starter GitHub Actions workflow: build, DFUnit tests, the scan, SARIF upload."
+
+            Send FTInfoBox sParamText
+            Abort 
+        End 
+        
+        If (bDebugMode = True) Begin
+            Move "Parameters passed on the command line:" to sParamText
+            Append sParamText "\n\nDebug mode:"
+            Append sParamText "\n/debug = TRUE"
+
+            Append sParamText "\n\n *.sws param and file:"
+            If (sSWSFile <> "") Begin
+                Append sParamText "\n/sws " sSWSFile
+            End
+            Else Begin
+                Append sParamText "\n/sws " "None specified"
+            End
+                    
+            Append sParamText "\n\nSingle Source File:"
+            If (sSourceFile <> "") Begin
+                Append sParamText "\n/f " sSourceFile
+            End
+            Else Begin
+                Append sParamText "\n/f " "None specified"
+            End
+            
+            Append sParamText "\n\n Folder Names:"
+            If (sFolders <> "") Begin
+                Append sParamText "\n/f " sFolders
+            End
+            Else Begin
+                Append sParamText "\n/f " "None specified"
+            End
+                
+            Append sParamText "\n\nBatch mode:"
+            Append sParamText "\n/batch = " (If(bBatch = True, "TRUE", "FALSE"))
+            Append sParamText "\nIf omitted, program will start, display the passed parameters, but *will not* start automatically."
+            
+            Append sParamText "\n\nIni-file:"
+            If (sCmdLineIniFile <> "") Begin
+                Append sParamText "\n" sCmdLineIniFile
+                Append sParamText "\n/batch = TRUE"
+            End
+            Else Begin
+                Append sParamText "\n" "None specified"
+            End
+                    
+            Send FTInfoBox sParamText
+            Abort 
+        End
+
+        // We need to send messages in this order:
+        If (sSWSFile <> "") Begin
+            If (bConfigFile = False) Begin
+                Set pbWorkspaceMode to True
+                Send UpdateWorkspaceSelectorDisplay sSWSFile
+            End
+            Else Begin
+                /* /sws TOGETHER WITH /bm IS LEGAL - it names the workspace the INI does not.
+                   This used to Abort with "You need to specify an .sws file on the command line!",
+                   which is the opposite of what had just happened: we are inside If (sSWSFile <> "")
+                   and the user HAD passed one. The feature was built and then walled off - the INI
+                   read below takes (psSWSFile(Self)) as its DEFAULT, which is only meaningful if the
+                   command line could have supplied it, and the abort made that unreachable.
+
+                   Recorded, not displayed: ReadCmdLineIniFile does the workspace switch once, with
+                   the INI's own [SWS File Section] winning when it has one and this as the fallback.
+                   Doing the switch here as well would load a workspace twice per run. */
+                Set psSWSFile to sSWSFile
+            End
+        End
+        Else If (sSourceFile <> "") Begin
+            Set pbWorkspaceMode to False
+            Send OnFileNameUpdate sSourceFile
+        End
+        If (sFolders <> "") Begin
+            Move (StrSplitToArray(sFolders, ";")) to asFolders
+            Set pasSelectedFolders to asFolders
+            Set pasCmdLineFolders  to asFolders
+        End
+        /* /scan TAKES OVER (2026-11-20): nothing of a refactoring run - the scan reads its own INI, and OnStartup
+           runs it before the batch branch, which it never reaches (RunCIScanAndExit ends the program). pbBatchMode
+           keeps every error dialog away, as it does for /bm: a CI run must never wait for a click. */
+        If (bScan = True) Begin
+            Set pbScanMode     to True
+            Set pbScanBaseline to bScanBaseline
+            Set pbBatchMode    to True
+            Send ReadScanIniFile sScanIniFile
+        End
+        Else Begin
+            If (bBatch = True) Begin
+                Set pbBatchMode to True
+            End
+            If (bConfigFile = True) Begin
+                Set pbBatchMode to True
+                Send ReadCmdLineIniFile sCmdLineIniFile
+            End
+        End
+    End_Procedure
+    
+    // Helper message for: Command Line Interface:
+    Procedure ReadCmdLineIniFile String sCmdLineIniFile
+        Handle hoIni hoDD
+        String sSWSFile sUserName sFolder sFilters sFunction sFileName sText sProgramPath sResultFile sSingleFile
+        String[] asFolders asFunctions
+        Boolean bFolders bExists
+        Integer iCount iSize
+        
+        Get vFilePathExists sCmdLineIniFile to bExists
+        If (bExists = False) Begin
+            Send FTStopBox ("The CmdLineIniFile can't be found:" * String(sCmdLineIniFile) + "\nThe program will now close.")
+            Abort
+        End
+            
+        Get Create (RefClass(cIniFile)) to hoIni
+        Set psFileName of hoIni to sCmdLineIniFile
+        
+        // SWS-File:
+        Get ReadString of hoIni CS_CmdIniSWSFileSection CS_CmdIniSWSFile (psSWSFile(Self)) to sSWSFile
+        If (sSWSFile <> "") Begin
+            Set pbWorkspaceMode to True
+            Send UpdateWorkspaceSelectorDisplay sSWSFile
+        End
+        Else Begin           
+            Get psSWSFile to sFileName
+            If (sFileName = "") Begin 
+                // Begin/End on purpose: this used to be a bare "If (sCmdLineIniFile <> "")" with no
+                // block, so it guarded only the message and the Abort ran unconditionally. Harmless
+                // while sCmdLineIniFile is always set here, but it reads as - and would behave as -
+                // a silent exit the moment that stops being true.
+                If (sCmdLineIniFile <> "") Begin
+                    Send FTStopBox ("The .sws file is missing from the ini-file and has not been specified on the command line. Cannot continue. Program will now close.")
+                    Abort
+                End
+            End
+        End
+
+        // User Name:
+        Get ReadString of hoIni CS_CmdIniUserSection CS_CmdIniUserName "" to sUserName
+        If (sUserName <> "") Begin
+            Set psUserName to sUserName
+        End
+                
+        // Folders:
+        Move 1000 to iSize // Just an arbitrarly large integer.
+        For iCount from 1 to iSize
+            Get ReadString of hoIni CS_CmdIniFoldersSection (CS_CmdIniFolderName + String(iCount)) "" to sFolder
+            If (sFolder = "") Begin
+                Move iSize to iCount
+            End
+            Else Begin
+                Move sFolder to asFolders[-1]
+            End
+        Loop
+        // Update Folders table selections
+        Set pasSelectedFolders to asFolders
+        Set pasCmdLineFolders  to asFolders
+            
+        // Filters:
+        Get ReadString of hoIni CS_CmdIniFileFilterSection CS_CmdIniFileFilters "" to sFilters
+        // Kept, not written: ApplyCmdLineSelections puts it into SysFile from the batch block, just before the run,
+        // and RestoreCmdLineSelections puts the user's own back after it (2026-11-20).
+        Set psCmdLineFilter to (Trim(sFilters))
+        
+        // Functions:
+        For iCount from 1 to iSize
+            Get ReadString of hoIni CS_CmdIniFunctionSection (CS_CmdInitFunction + String(iCount)) "" to sFunction
+            If (sFunction = "") Begin
+                Move iSize to iCount
+            End
+            Else Begin
+                Move sFunction to asFunctions[-1]
+            End
+        Loop
+
+        // The specs, kept whole: ApplyCmdLineSelections ticks the names, and the parameter half has to reach the
+        // table before the run too (ApplyCmdLineFunctionParameters) - both driven from the batch block.
+        Set pasCmdLineFunctionSpecs to asFunctions
+        Get Create (RefClass(cFunctionsDataDictionary)) to hoDD
+        /* The ticks are NOT changed here (2026-11-20): ApplyCmdLineSelections ticks the INI's functions from the
+           batch block, just before the run, and RestoreCmdLineSelections puts the user's own back after it. This
+           ran while the command line was parsed, and a run that stopped before the batch block left the user's
+           ticks replaced for good. */
+        // Say what the INI asked for that is not there - a moved folder and a name this build no
+        // longer has both make an unattended run quietly do LESS than asked, and every readout
+        // afterwards reads as an honest success. Surfaced in the run summary by CollectSummary.
+        Send ValidateCmdLineIniSelections asFolders asFunctions hoDD
+
+        Send Destroy of hoDD
+        // Result file: optional path where this run records its outcome (STATUS=SUCCESS/FAILED) so a
+        // build / toolchain can check it alongside the process exit code. "" = don't write one.
+        Get ReadString of hoIni CS_CmdIniResultSection CS_CmdIniResultFile "" to sResultFile
+        Set psBatchResultFile to sResultFile
+
+        /* [Single File Section] - OPTIONAL, and it takes precedence over the .sws, exactly as the
+           constant's own comment has always claimed. It was never written by an exporter nor read
+           by either reader, so the header promised a feature that did not exist (Nils 2026-08-03).
+
+           Read LAST, because it OVERRIDES: the .sws block above has already set pbWorkspaceMode
+           True and the folders are already loaded, and naming one file narrows the run to it. The
+           workspace still matters - it supplies the backup folder and the paths - so this replaces
+           the SCOPE of the run, not its context. That is also how the program behaves interactively.
+
+           A named file that is not there FAILS the run rather than quietly falling back to scanning
+           the whole workspace: doing a different job from the one the INI asked for, and reporting
+           SUCCESS, is the worst of the options. ExitBatchWithCode (not a Stop_Box) because a
+           headless run must never wait for a click - it writes STATUS=FAILED and exits non-zero. */
+        Get ReadString of hoIni CS_CmdIniSingleFileSection CS_CmdIniSingleFileName "" to sSingleFile
+        Move (Trim(sSingleFile)) to sSingleFile
+        Send Destroy of hoIni
+        If (sSingleFile <> "") Begin
+            Get vFilePathExists sSingleFile to bExists
+            If (bExists = False) ;
+                Send ExitBatchWithCode eEngineError ("INI [Single File Section]: the file named there does not exist, so there was nothing to refactor -" * sSingleFile)
+            Set pbWorkspaceMode to False
+            Send OnFileNameUpdate sSingleFile
+        End
+    End_Procedure
+
+    /* THE CI SCAN'S INI (2026-11-20): the /bm INI, read for a scan - the workspace, the folders, the file filter,
+       the result file, and [Scan Section]'s three file names. Nothing else, and nothing saved: a scan must not
+       change the function selection, the folder ticks or the stored file filter that a refactoring run uses, all
+       three of which ReadCmdLineIniFile sets for /bm. A fault is kept in psScanError for RunCIScanAndExit, which
+       ends the run with exit code 2. */
+    Procedure ReadScanIniFile String sIniFile
+        Handle hoIni
+        String sSWSFile sFolder sFilters sResultFile sBase sFile
+        String[] asFolders
+        Integer iCount iSize
+        Boolean bExists
+
+        Set psScanIniFile to sIniFile
+        Get vFilePathExists sIniFile to bExists
+        If (bExists = False) Begin
+            Set psScanError to ("the INI file is not there: " + sIniFile)
+            Procedure_Return
+        End
+        Get Create (RefClass(cIniFile)) to hoIni
+        Set psFileName of hoIni to sIniFile
+
+        /* The result file FIRST: every fault below still has to be written there. With the workspace check ahead of it,
+           a missing workspace ended the run with exit code 2 and no result file, and the CI log could only say the scan
+           "crashed, hung, or never finished" (found by the live test of the exported _SCAN.ps1, 2026-11-21). */
+        Get ReadString of hoIni CS_CmdIniResultSection CS_CmdIniResultFile "" to sResultFile
+        Set psBatchResultFile to (Trim(sResultFile))
+
+        // The workspace: the INI's, else the one /sws named.
+        Get ReadString of hoIni CS_CmdIniSWSFileSection CS_CmdIniSWSFile (psSWSFile(Self)) to sSWSFile
+        Move (Trim(sSWSFile)) to sSWSFile
+        Move False to bExists
+        If (sSWSFile <> "") ;
+            Get vFilePathExists sSWSFile to bExists
+        If (bExists = False) Begin
+            Send Destroy of hoIni
+            If (sSWSFile = "") ;
+                Set psScanError to ("the INI names no workspace in [" + CS_CmdIniSWSFileSection + "], and /sws named none: " + sIniFile)
+            Else ;
+                Set psScanError to ("the workspace the INI names is not there: " + sSWSFile)
+            Procedure_Return
+        End
+        Set pbWorkspaceMode to True
+        Send UpdateWorkspaceSelectorDisplay sSWSFile
+
+        // The folders; none = the workspace's source folders (RunCIScanAndExit).
+        Move 1000 to iSize
+        For iCount from 1 to iSize
+            Get ReadString of hoIni CS_CmdIniFoldersSection (CS_CmdIniFolderName + String(iCount)) "" to sFolder
+            Move (Trim(sFolder)) to sFolder
+            If (sFolder = "") ;
+                Move iSize to iCount
+            Else ;
+                Move sFolder to asFolders[SizeOfArray(asFolders)]
+        Loop
+        Set pasScanFolders to asFolders
+
+        // The file filter, for this run only: RunCIScanAndExit puts it in the SysFile buffer and never saves it.
+        Get ReadString of hoIni CS_CmdIniFileFilterSection CS_CmdIniFileFilters "" to sFilters
+        Set psScanFilter to (Trim(sFilters))
+
+        /* The three files, each beside the INI under its name unless [Scan Section] names it. "findings" for what every
+           run writes anew, "baseline" for what only /baseline writes - names that cannot be taken for each other (Nils
+           2026-11-20 edited the findings for the baseline, when they were .scan.json and .scan-baseline.json). */
+        Get BatchArtifactBase sIniFile to sBase
+        Get ReadString of hoIni CS_CmdIniScanSection CS_CmdIniScanBaselineFile (sBase + ".baseline.json") to sFile
+        Set psScanBaselineFile to (Trim(sFile))
+        Get ReadString of hoIni CS_CmdIniScanSection CS_CmdIniScanJsonFile (sBase + ".findings.json") to sFile
+        Set psScanJsonFile to (Trim(sFile))
+        Get ReadString of hoIni CS_CmdIniScanSection CS_CmdIniScanSarifFile (sBase + ".findings.sarif") to sFile
+        Set psScanSarifFile to (Trim(sFile))
+        Send Destroy of hoIni
+    End_Procedure
+
+End_Object
+
+// Includes automatic database update logic:
+Use DoDatabaseUpdateStuff.pkg
+                                
+Use cRDCTooltipController.pkg
+Object oToolTipController is a cRDCTooltipController
+End_Object
+
+Declare_Datafile SysFile
+Declare_Datafile StatLog
+Register_Object oSysfile_DD
+
+Use ScintillaLexerApi.h.pkg
+Use cRefactorEditorSettings.pkg   // JSON-backed settings: repoints ghoEditorProperties (must follow oEditorProperties.pkg)
+Use oEditContextMenu.pkg
+Use oDEOEditContextMenu.pkg
+
+Object oMain is a Panel
+    Set Label to (psProduct(ghoApplication) * "- Refactors Legacy Source Code")
+    Set Size to 310 610
+    Set piMinSize to 294 610
+    Set Icon to "DFRefactor.ico"
+
+    // One-shot latch for the startup view below.
+    Property Boolean pbStartViewChosen False
+
+    /* THE STARTUP VIEW IS NAMED HERE, ONCE - deliberately not via pbAutoActivate.
+
+       pbAutoActivate reads like "activate me at startup", but AppPanel.Add_Focus (Dfpanel.pkg) replays
+       the ENTIRE phoAutoActivateViews list on every Add_Focus - and this panel gets focus back every
+       time a modal dialog closes. With the guided trail marked auto-activate, picking a .sws from the
+       Dashboard (SelectWorkspaceFile pops a modal Open dialog) silently handed the screen to the trail
+       on the way back: the user asked for one board and ended up reading another, mid-load, before
+       psSWSFile was set. Every modal in the app did the same thing. (Nils 2026-07-31.)
+
+       So no view auto-activates now; this fires once, on the first focus the panel takes, and after
+       that a view is on screen only because something asked for it by name.
+
+       THE STARTUP VIEW IS THE START CENTER (Nils 2026-08-06). It was the guided trail, which meant
+       the first thing anyone saw with no workspace loaded was a board whose builders all
+       short-circuit to an empty wrap - one workspace card, and a line telling them to run a Check
+       they had no way to reach. The Start Center is the screen for that state; a board is what you
+       get once a workspace is open, reached through one of its two lanes or its own toolbar item.
+       To fall back, send Activate_oDashboard_vw (the trail) or Activate_oDashboard_vw (the
+       old cockpit) here instead. */
+    Procedure Add_Focus Handle hoParent Returns Integer
+        Integer iError
+        Boolean bChosen
+        Forward Get msg_Add_Focus hoParent to iError
+        If (iError = 0) Begin
+            Get pbStartViewChosen to bChosen
+            If (bChosen = False) Begin
+                Set pbStartViewChosen to True
+                Send Activate_oStartCenter_vw of (Client_Id(Self))
+            End
+        End
+        Procedure_Return iError
+    End_Procedure
+
+    Object oCJCommandBarSystem is a cRDCCJCommandBarSystem
+        Set peRestoreLayout to rlSaveRestoreLayout
+        Set peVisualTheme to (FTCJTheme())
+        // 18 (2026-11-19): the menu bar, and the Tools and Settings toolbars gone - a layout saved by build 17
+        // would bring the old toolbars back and leave the menu bar out.
+        Set piLayoutBuild to 18    
+        Set pbLargeIcons to False
+        Set pbShowExpandButtonAlways to False
+
+        // EXPERIMENT (revive view tab-grouping after a tool panel docks): capture the CodeJock MDI
+        // tab-workspace handle from the base cRDCCJCommandBarSystem's DisplayTabWorkspace hook. A docked
+        // tool panel (a CommandBars dialog-bar) appears to disable the workspace's drag-to-split;
+        // the dock re-asserts ComEnableGroups on this handle after each dock (see OutputDockFT.dg's Activate)
+        // to test whether interactive grouping can be revived.
+        Procedure OnCreateTabbedWorkspace Handle hoTabWorkspace Handle hoTabPaintManager
+            Forward Send OnCreateTabbedWorkspace hoTabWorkspace hoTabPaintManager
+            Move hoTabWorkspace to ghoTabWorkspace
+        End_Procedure
+
+        /* SHOW OR HIDE THE TOOLBAR TEXT (Nils 2026-10-04: the toolbar takes a lot of horizontal space). A
+           toolbar item declared with a caption - peControlStyle xtpButtonIconAndCaption - takes the style the
+           Program Settings dialog saved (peToolbarButtonStyle of ghoApplication): its text beside the icon, or
+           the icon alone. An icon-only item is left as it is, and so is every menu: a menu bar or a popup draws
+           its items its own way.
+
+           The style belongs to each toolbar CONTROL, and CodeJock reads it only when it creates one, so it is
+           set on the controls themselves. A control's action carries its DataFlex menu item in ComTag - the
+           back pointer cCJAction sets, which OnComExecute follows the same way - and that item's own
+           peControlStyle, never changed at run time, says whether it is one of the captioned ones. So a new
+           item with a caption follows the setting with nothing to add here. */
+        Procedure ApplyToolbarButtonStyle
+            Handle hoBar hoControls hoControl hoAction hoItem
+            Variant vBar vControls vControl vAction
+            Integer eStyle eItemStyle eBarType iBars iBar iCount i
+
+            If (not(IsComObjectCreated(Self))) ;
+                Procedure_Return
+            Get peToolbarButtonStyle of ghoApplication to eStyle
+            Get Create U_cCJCommandBar         to hoBar
+            Get Create U_cCJCommandBarControls to hoControls
+            Get Create U_cCJCommandBarControl  to hoControl
+            Get Create U_cCJCommandBarAction   to hoAction
+            Get ComCount to iBars
+            For iBar from 1 to iBars
+                Get ComItem iBar to vBar
+                Set pvComObject of hoBar to vBar
+                Get ComType of hoBar to eBarType
+                If (eBarType = xtpBarTypeNormal) Begin
+                    Get ComControls of hoBar to vControls
+                    Set pvComObject of hoControls to vControls
+                    Get ComCount of hoControls to iCount
+                    For i from 1 to iCount
+                        Get ComItem of hoControls i to vControl
+                        Set pvComObject of hoControl to vControl
+                        Get ComAction of hoControl to vAction
+                        If (not(IsNullComObject(vAction))) Begin
+                            Set pvComObject of hoAction to vAction
+                            Get ComTag of hoAction to hoItem
+                            If (hoItem <> 0) Begin
+                                If (IsObjectOfClass(hoItem, RefClass(cCJMenuItem))) Begin
+                                    Get peControlStyle of hoItem to eItemStyle
+                                    If (eItemStyle = xtpButtonIconAndCaption) ;
+                                        Set ComStyle of hoControl to eStyle
+                                End
+                            End
+                        End
+                    Loop
+                End
+            Loop
+            Send Destroy of hoAction
+            Send Destroy of hoControl
+            Send Destroy of hoControls
+            Send Destroy of hoBar
+            Send ComRecalcLayout
+        End_Procedure
+
+        // The saved layout brings the toolbar controls back with the style they were saved in, so the setting is
+        // applied after it: CreateCommandBars loads the environment once every item exists.
+        Procedure LoadEnvironment
+            Forward Send LoadEnvironment
+            Send ApplyToolbarButtonStyle
+        End_Procedure
+
+        /* THE MENU BAR (Nils 2026-11-19: "adding a menu-system - just as we did for CMS"). Every command has a
+           named place here, with its key: a dozen toolbar buttons were icons only, and several dialogs could be
+           reached only from a dashboard tile or from a key nothing showed. The main toolbar keeps the views,
+           Compile pane, Split View, Clear, Save, Undo, Redo and Source Explorer; the help bar stays as it was;
+           the Tools and Settings toolbars and the clipboard buttons are in the menus now.
+
+           Alt plus a letter opens a menu, so the four Alt keys that used a menu's letter are gone: Alt+F (the
+           workspace/file switch), Alt+E (Source Explorer), Alt+W (Open Workspace) and Alt+T (Settings). Each
+           keeps its Ctrl key. The keys themselves are the On_Key lines at the end of oMain.
+
+           Check and the refactoring plan stay on the dashboards: their steps decide when each one is ready.
+           An item that repeats a toolbar button asks that button (Execute, IsEnabled), so the two cannot
+           disagree. A menu item is updated as its menu opens, so none needs pbActiveUpdate. */
+        Object oMenuBar is a cCJMenuBar
+
+            Object oFile_Menu is a cCJMenuItem
+                Set peControlType to xtpControlPopup
+                Set psCaption to "&File"
+                Set psDescription to "Open a workspace or a source file, clear, save, or quit the program."
+
+                Object oOpenWorkspace_MenuItem is a cCJMenuItem
+                    Set psCaption to "&Open Workspace..."
+                    Set psDescription to "Choose the workspace (.sws) to work on"
+                    Set psImage to "ActionOpenWorkspace.ico"
+                    Set psShortcut to "Ctrl+W"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send ActivateWorkspaceDialog of (phoMainPanel(ghoApplication))
+                    End_Procedure
+                End_Object
+
+                Object oOpenSourceFile_MenuItem is a cCJMenuItem
+                    Set psCaption to "Open a Source &File..."
+                    Set psDescription to "Choose one source file to refactor on its own"
+                    Set psImage to "ActionOpen.ico"
+                    Set psShortcut to "Ctrl+O"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send ActivateBrowseDialog of (phoMainPanel(ghoApplication))
+                    End_Procedure
+                End_Object
+
+                Object oClear_FileMenuItem is a cCJMenuItem
+                    Set psCaption to "&Clear"
+                    Set psDescription to "Close the workspace or the file, and go back to the Start Center"
+                    Set psImage to "ActionClear.ico"
+                    Set pbControlBeginGroup to True
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Execute of (oClear_MenuItem(ghoCommandBars))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Function_Return (IsEnabled(oClear_MenuItem(ghoCommandBars)))
+                    End_Function
+                End_Object
+
+                Object oSave_FileMenuItem is a cCJMenuItem
+                    Set psCaption to "&Save"
+                    Set psDescription to "Save the changes in the editor"
+                    Set psImage to "ActionSave.ico"
+                    Set psShortcut to "Ctrl+S"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Execute of (oSave_ToolItem(ghoCommandBars))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Function_Return (IsEnabled(oSave_ToolItem(ghoCommandBars)))
+                    End_Function
+                End_Object
+
+                Object oExit_FileMenuItem is a cCJExitMenuItem
+                    Set psImage to "ActionExit.ico"
+                    Set pbControlBeginGroup to True
+                End_Object
+            End_Object
+
+            Object oEdit_Menu is a cCJMenuItem
+                Set peControlType to xtpControlPopup
+                Set psCaption to "&Edit"
+                Set psDescription to "Undo, the clipboard, and find and go to in the editor."
+
+                // The editor's own commands apply while the editor has the focus.
+                Function EditorHasFocus Returns Boolean
+                    Handle hoEditor
+                    Get phoEditor of ghoApplication to hoEditor
+                    Function_Return (hoEditor <> 0 and Focus(Desktop) = hoEditor)
+                End_Function
+
+                Object oUndo_EditMenuItem is a cCJMenuItem
+                    Set psCaption to "&Undo"
+                    Set psDescription to "Undo the last editor action"
+                    Set psImage to "ActionUndo.ico"
+                    Set psShortcut to "Ctrl+Z"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Execute of (oUndo_MenuItem(ghoCommandBars))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Function_Return (IsEnabled(oUndo_MenuItem(ghoCommandBars)))
+                    End_Function
+                End_Object
+
+                Object oRedo_EditMenuItem is a cCJMenuItem
+                    Set psCaption to "&Redo"
+                    Set psDescription to "Redo the last editor action"
+                    Set psImage to "ActionRedo.ico"
+                    Set psShortcut to "Ctrl+Y"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Execute of (oRedo_MenuItem(ghoCommandBars))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Function_Return (IsEnabled(oRedo_MenuItem(ghoCommandBars)))
+                    End_Function
+                End_Object
+
+                Object oCut_EditMenuItem is a cCJCutMenuItem
+                    Set pbControlBeginGroup to True
+                End_Object
+
+                Object oCopy_EditMenuItem is a cCJCopyMenuItem
+                End_Object
+
+                Object oPaste_EditMenuItem is a cCJPasteMenuItem
+                End_Object
+
+                Object oDelete_EditMenuItem is a cCJDeleteEditMenuItem
+                End_Object
+
+                Object oFind_EditMenuItem is a cCJMenuItem
+                    Set psCaption to "&Find..."
+                    Set psDescription to "Find text in the editor"
+                    Set psImage to "ActionFind.ico"
+                    Set psShortcut to "Ctrl+F"
+                    Set pbControlBeginGroup to True
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send CME_Find of (phoEditor(ghoApplication))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Boolean bOK
+                        Get EditorHasFocus to bOK
+                        Function_Return bOK
+                    End_Function
+                End_Object
+
+                Object oFindNext_EditMenuItem is a cCJMenuItem
+                    Set psCaption to "Find &Next"
+                    Set psDescription to "Find the next place the text is"
+                    Set psImage to "ActionFindnext.ico"
+                    Set psShortcut to "F3"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send CME_FindNext of (phoEditor(ghoApplication))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Boolean bOK
+                        Get EditorHasFocus to bOK
+                        Function_Return bOK
+                    End_Function
+                End_Object
+
+                Object oFindPrevious_EditMenuItem is a cCJMenuItem
+                    Set psCaption to "Find &Previous"
+                    Set psDescription to "Find the previous place the text is"
+                    Set psImage to "ActionFindPrevious.ico"
+                    Set psShortcut to "Shift+F3"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send CME_FindPrevious of (phoEditor(ghoApplication))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Boolean bOK
+                        Get EditorHasFocus to bOK
+                        Function_Return bOK
+                    End_Function
+                End_Object
+
+                Object oReplace_EditMenuItem is a cCJMenuItem
+                    Set psCaption to "R&eplace..."
+                    Set psDescription to "Find text in the editor and replace it"
+                    Set psImage to "ActionFindAndReplace.ico"
+                    Set psShortcut to "Ctrl+Alt+F3"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send CME_FindReplace of (phoEditor(ghoApplication))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Boolean bOK
+                        Get EditorHasFocus to bOK
+                        Function_Return bOK
+                    End_Function
+                End_Object
+
+                Object oGotoLine_EditMenuItem is a cCJMenuItem
+                    Set psCaption to "&Go to Line..."
+                    Set psDescription to "Go to a line number in the editor"
+                    Set psShortcut to "Ctrl+G"
+                    Set pbControlBeginGroup to True
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send CME_GotoLine of (phoEditor(ghoApplication))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Boolean bOK
+                        Get EditorHasFocus to bOK
+                        Function_Return bOK
+                    End_Function
+                End_Object
+
+                Object oGotoDefinition_EditMenuItem is a cCJMenuItem
+                    Set psCaption to "Go to &Definition"
+                    Set psDescription to "Go to where the word at the caret is declared"
+                    Set psShortcut to "F12"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send HKSC_GotoDefinition of (phoEditor(ghoApplication))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Boolean bOK
+                        Get EditorHasFocus to bOK
+                        Function_Return bOK
+                    End_Function
+                End_Object
+            End_Object
+
+            Object oView_Menu is a cCJMenuItem
+                Set peControlType to xtpControlPopup
+                Set psCaption to "&View"
+                Set psDescription to "The Start Center, the dashboards and the editor; the Compile pane, and the split view."
+
+                Object oStartCenter_ViewMenuItem is a cCJMenuItem
+                    Set psCaption to "Start &Center"
+                    Set psDescription to "Open a workspace, or pick the guided or the manual flow"
+                    Set psImage to "StartCenter.ico"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Activate_oStartCenter_vw of (Client_Id(ghoCommandBars))
+                    End_Procedure
+                End_Object
+
+                Object oGuidedDashboard_ViewMenuItem is a cCJMenuItem
+                    Set psCaption to "&Guided Dashboard"
+                    Set psDescription to "The guided flow, one step at a time"
+                    Set psImage to "GuidedDashboard.ico"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Activate_oDashboard_vw of (Client_Id(ghoCommandBars))
+                    End_Procedure
+                End_Object
+
+                Object oManualDashboard_ViewMenuItem is a cCJMenuItem
+                    Set psCaption to "&Manual Dashboard"
+                    Set psDescription to "Pick the folders and the functions yourself"
+                    Set psImage to "Manual.ico"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Activate_oManualDashboard_vw of (Client_Id(ghoCommandBars))
+                    End_Procedure
+                End_Object
+
+                Object oEditor_ViewMenuItem is a cCJMenuItem
+                    Set psCaption to "&Editor"
+                    Set psDescription to "The source file you are working on"
+                    Set psImage to "Editor.ico"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Activate_oEditorView_vw of (Client_Id(ghoCommandBars))
+                    End_Procedure
+                End_Object
+
+                // Ticked while the pane shows - the same flag the toolbar button reads.
+                Object oCompilePane_ViewMenuItem is a cCJMenuItem
+                    Set psCaption to "Compile &Pane"
+                    Set psDescription to "Show or hide the Compile pane"
+                    Set psImage to "CompilePane.ico"
+                    Set pbControlBeginGroup to True
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Execute of (oShowCompilePane_MenuItem(ghoCommandBars))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Function_Return (IsEnabled(oShowCompilePane_MenuItem(ghoCommandBars)))
+                    End_Function
+
+                    Function IsChecked Returns Boolean
+                        Function_Return (pbModernizePanelWanted(ghoApplication))
+                    End_Function
+                End_Object
+
+                // Ticked while the view is split - as the toolbar button is pressed.
+                Object oSplitView_ViewMenuItem is a cCJMenuItem
+                    Set psCaption to "&Split View"
+                    Set psDescription to "The Dashboard on the left, the other views on the right; again to merge them"
+                    Set psImage to "SplitVertical.ico"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Execute of (oSplitView_MenuItem(ghoCommandBars))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Function_Return (IsEnabled(oSplitView_MenuItem(ghoCommandBars)))
+                    End_Function
+
+                    Function IsChecked Returns Boolean
+                        Function_Return (pbChecked(oSplitView_MenuItem(ghoCommandBars)))
+                    End_Function
+                End_Object
+            End_Object
+
+            Object oWorkspace_Menu is a cCJMenuItem
+                Set peControlType to xtpControlPopup
+                Set psCaption to "&Workspace"
+                Set psDescription to "The workspace's libraries, the backups the refactoring runs made, and its folder."
+
+                // A workspace is open, or in single-file mode a file - what Compare and Undo Refactoring work on.
+                Function SourceIsOpen Returns Boolean
+                    Boolean bWorkspaceMode
+                    String sSWSFile sFileName
+                    Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
+                    Get psSWSFile               of ghoApplication to sSWSFile
+                    Get psCurrentSourceFileName of ghoApplication to sFileName
+                    If (bWorkspaceMode = True) ;
+                        Function_Return (sSWSFile <> "")
+                    Function_Return (sFileName <> "")
+                End_Function
+
+                Object oLibraries_MenuItem is a cCJMenuItem
+                    Set psCaption to "&Libraries..."
+                    Set psDescription to "The libraries the workspace uses, their versions, and adding or removing one"
+                    Set psShortcut to "Alt+B"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send ActivateLibraryMaintenance of (phoMainPanel(ghoApplication))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Function_Return (psSWSFile(ghoApplication) <> "")
+                    End_Function
+                End_Object
+
+                Object oUndoRefactoring_MenuItem is a cCJMenuItem
+                    Set psCaption to "&Undo Refactoring..."
+                    Set psDescription to "The backups the refactoring runs made: put files back as they were"
+                    Set psImage to "UndoRefactoring.ico"
+                    Set psShortcut to "Alt+U"
+                    Set pbControlBeginGroup to True
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send ActivateUndoRefactoringDialog of (phoMainPanel(ghoApplication))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Boolean bOK
+                        Get SourceIsOpen to bOK
+                        Function_Return bOK
+                    End_Function
+                End_Object
+
+                Object oCompare_MenuItem is a cCJMenuItem
+                    Set psCaption to "&Compare with the Backups..."
+                    Set psDescription to "Open the compare program on the source and its backups (Settings names the program)"
+                    Set psImage to "Compare.ico"
+                    Set psShortcut to "Alt+M"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send ActivateCompare of (phoMainPanel(ghoApplication))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Boolean bOK
+                        Get SourceIsOpen to bOK
+                        Function_Return bOK
+                    End_Function
+                End_Object
+
+                Object oOpenContainingFolder_MenuItem is a cCJMenuItem
+                    Set psCaption to "Open the Containing &Folder"
+                    Set psDescription to "Open the workspace's folder in Windows Explorer, with the open file selected"
+                    Set psImage to "ActionOpenContainingFolder.ico"
+                    Set pbControlBeginGroup to True
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        String sPath sFile
+                        Get psWorkspaceHomePath of ghoApplication to sPath
+                        Get psCurrentSourceFileName of ghoApplication to sFile
+
+                        // We want to have that file to be selected in Windows Explorer
+                        If (sFile <> "") Begin
+                            Move ("/select," * String(sFile)) to sPath
+                        End
+                        Send vShellExecute "open" "explorer.exe" sPath ""
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        String sPath
+                        Get psWorkspaceHomePath of ghoApplication to sPath
+                        Function_Return (sPath <> "")
+                    End_Function
+                End_Object
+            End_Object
+
+            Object oTools_Menu is a cCJMenuItem
+                Set peControlType to xtpControlPopup
+                Set psCaption to "&Tools"
+                Set psDescription to "Analyze Source rules, the logs, the batch-mode export, Source Explorer, and the settings."
+
+                // Analyze Source rules: which obsolete symbols the scan searches for. HIDDEN - not just
+                // disabled - while the Deep Scan alpha gate is off (CB_DeepScanEnabled: nothing of Deep Scan
+                // may show in a gated build).
+                Object oDeepScanRules_MenuItem is a cCJMenuItem
+                    Set psCaption to "Analyze Source &Rules..."
+                    Set psDescription to "Choose which obsolete symbols Analyze Source searches for"
+                    Set psImage to "DeepScanGear.ico"
+                    Set pbVisible to (CB_DeepScanEnabled = True)
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send ActivateDeepScanRulesDialog of (Client_Id(ghoCommandBars))
+                    End_Procedure
+                End_Object
+
+                Object oLogs_Menu is a cCJMenuItem
+                    Set peControlType to xtpControlPopup
+                    Set psCaption to "&Logs"
+                    Set psDescription to "The engine's error log, and the logs in the workspace's backup folder"
+
+                    Object oShowErrorLog_MenuItem is a cCJMenuItem
+                        Set psCaption to "&Error Log..."
+                        Set psDescription to "The refactor engine's error log (only when it has errors)"
+                        Set psImage to "ErrorLog.ico"
+
+                        Procedure OnExecute Variant vCommandBarControl
+                            Send Popup of (oEngineErrorLog_dg(Client_Id(ghoCommandBars)))
+                        End_Procedure
+
+                        Function IsEnabled Returns Boolean
+                            Integer iErrors
+                            Get_Attribute DF_FILE_RECORDS_USED of StatLog.File_Number to iErrors
+                            Function_Return (iErrors > 0)
+                        End_Function
+                    End_Object
+
+                    Object oRefactoringLog_MenuItem is a cCJMenuItem
+                        Set psCaption to "The &Refactoring Log..."
+                        Set psDescription to "The refactoring runs' log, in the workspace's backup folder"
+                        Set psImage to "OpenLogFile.ico"
+                        Set psShortcut to "Alt+L"
+
+                        Procedure OnExecute Variant vCommandBarControl
+                            Send ShowLogFile of ghoApplication
+                        End_Procedure
+
+                        Function IsEnabled Returns Boolean
+                            Function_Return (psSWSFile(ghoApplication) <> "")
+                        End_Function
+                    End_Object
+
+                    Object oOtherLogFiles_MenuItem is a cCJMenuItem
+                        Set psCaption to "&Other Log Files..."
+                        Set psDescription to "The reports' logs in the workspace's backup folder"
+                        Set psImage to "OtherLogFiles.ico"
+
+                        Procedure OnExecute Variant vCommandBarControl
+                            Send ShowOtherLogFiles of ghoApplication
+                        End_Procedure
+
+                        Function IsEnabled Returns Boolean
+                            Function_Return (psSWSFile(ghoApplication) <> "")
+                        End_Function
+                    End_Object
+                End_Object
+
+                Object oExportToIniFile_MenuItem is a cCJMenuItem
+                    Set psCaption to "E&xport to a Batch-mode INI File..."
+                    Set psDescription to "Export the refactoring settings to an INI file, for a batch-mode run"
+                    Set psImage to "Export.ico"
+                    Set pbControlBeginGroup to True
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Forward Send OnExecute vCommandBarControl
+                        Send Popup of (oCmdLineIniFileExporter(Client_Id(ghoCommandBars)))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Boolean bEnabled bWorkspaceMode
+                        String sFileName sSWSFile
+
+                        Get pbWorkspaceMode         of ghoApplication to bWorkspaceMode
+                        Get psSWSFile               of ghoApplication to sSWSFile
+                        Get psCurrentSourceFileName of ghoApplication to sFileName
+                        If (bWorkspaceMode = True) Begin
+                            Move (sSWSFile <> "") to bEnabled
+                        End
+                        Else Begin
+                            Move (sFileName <> "") to bEnabled
+                        End
+                        Function_Return bEnabled
+                    End_Function
+                End_Object
+
+                Object oSourceExplorer_ToolsMenuItem is a cCJMenuItem
+                    Set psCaption to "StarZen's Source &Explorer"
+                    Set psDescription to "Run StarZen's DataFlex Source Code Explorer on the workspace"
+                    Set psImage to "DataFlexSourceExplorer.ico"
+                    Set psShortcut to "Ctrl+E"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Execute of (oCodeExplorer_ToolbarButton(ghoCommandBars))
+                    End_Procedure
+
+                    Function IsEnabled Returns Boolean
+                        Function_Return (IsEnabled(oCodeExplorer_ToolbarButton(ghoCommandBars)))
+                    End_Function
+                End_Object
+
+                Object oSettings_MenuItem is a cCJMenuItem
+                    Set psCaption to "&Settings..."
+                    Set psDescription to "The program's settings"
+                    Set psImage to "Settings.ico"
+                    Set psShortcut to "Ctrl+T"
+                    Set pbControlBeginGroup to True
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Popup of (oProgramSetup_dg(Client_Id(ghoCommandBars)))
+                    End_Procedure
+                End_Object
+
+                Object oCompilerSetup_MenuItem is a cCJMenuItem
+                    Set psCaption to "&Compiler Setup..."
+                    Set psDescription to "The DataFlex compiler the workspace's programs are compiled with"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Popup of (oCompilerSetup_dg(Client_Id(ghoCommandBars)))
+                    End_Procedure
+                End_Object
+
+                Object oEditorSettings_MenuItem is a cCJMenuItem
+                    Set psCaption to "E&ditor Settings..."
+                    Set psDescription to "Configure the editor"
+                    Set psImage to "EditorSettings.ico"
+                    Set psShortcut to "Alt+D"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Send Popup of (oScintillaParameters_dg(Client_Id(ghoCommandBars)))
+                    End_Procedure
+                End_Object
+            End_Object
+
+            Object oHelp_Menu is a cCJMenuItem
+                Set peControlType to xtpControlPopup
+                Set psCaption to "&Help"
+                Set psDescription to "The help, the source code, a suggestion or a bug report, and About."
+
+                Object oHelpLocal_MenuItem is a cCJHelpMenuItem
+                    Set psCaption to "&Local HTML Help"
+                End_Object
+
+                Object oHelpOnline_MenuItem is a cCJMenuItem
+                    Set psCaption to "&Online HTML Help"
+                    Set psDescription to "The help on the web"
+                    Set psImage to "ActionHelpInternet.ico"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Runprogram Shell Background "https://nilssve.github.io/DfRefactor/"
+                    End_Procedure
+                End_Object
+
+                Object oHelpSource_MenuItem is a cCJMenuItem
+                    Set psCaption to "The &Source Code on GitHub"
+                    Set psDescription to "DFRefactor's source code repository on GitHub"
+                    Set psImage to "GitHub.ico"
+                    Set pbControlBeginGroup to True
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Runprogram Shell Background "https://github.com/NilsSve/DFRefactor.git"
+                    End_Procedure
+                End_Object
+
+                Object oHelpSuggest_MenuItem is a cCJMenuItem
+                    Set psCaption to "Suggest a Feature or Report a &Bug..."
+                    Set psDescription to "Suggest a feature, or report a bug, on DFRefactor's GitHub page"
+                    Set psImage to "Suggestion.ico"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Runprogram Shell Background "https://github.com/NilsSve/DfRefactor-FlexTron-Issues/issues/new/choose"
+                    End_Procedure
+                End_Object
+
+                Object oHelpKoFi_MenuItem is a cCJMenuItem
+                    Set psCaption to "Buy Me a &Coffee (Ko-fi)"
+                    Set psDescription to "Buy me a coffee, to support me"
+                    Set psImage to "Ko-fi.ico"
+
+                    Procedure OnExecute Variant vCommandBarControl
+                        Runprogram Shell Background "https://ko-fi.com/nilss"
+                    End_Procedure
+                End_Object
+
+                Object oHelpAbout_MenuItem is a cCJAboutMenuItem
+                    Set psCaption to C_$CaptionAbout
+                    Set psDescription to C_$DescAbout
+                    Set pbControlBeginGroup to True
+                End_Object
+            End_Object
+
+        End_Object
+
+        Object oMainToolBar is a cCJToolbar
+            Set psTitle to "Main Toolbar"
+            Set peStretched to stStretchShared
+            Set pbCloseable to False
+            Set pbCustomizable to False
+
+            /* The Start Center - the screen before a workspace is open, and the startup view (see
+               oMain.Add_Focus). The boards' workspace crumbs are the other way back, so this item
+               is a convenience rather than the only route - which matters, because a NEW toolbar
+               item is dropped from the SAVED CodeJock layout and may not appear until the layout
+               is reset. Losing a convenience to that is survivable; losing the only route would
+               not be. */
+            Object oStartCenter_MenuItem is a cCJMenuItem
+                Set psToolTip to "Start Center - open a workspace, or pick the guided or manual flow"
+                Set psDescription to "Open the Start Center"
+                Set psImage to "StartCenter.ico"
+                Set pbActiveUpdate to True
+                Set peControlStyle to xtpButtonIconAndCaption
+                Set psCaption to "Start Center"
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send Activate_oStartCenter_vw of (Client_Id(ghoCommandBars))
+                End_Procedure
+            End_Object
+
+            /* THE dashboard since 2026-08-10. It was the "Dashboard (WIP)" trail built on the
+               guided-flow-redesign branch, shown alongside the old split board so the two could be
+               compared; Nils's call is that this one wins, so the view file is now DashboardFT.vw
+               and the old split board is retired below. */
+            /* ITS OWN PICTURE since 2026-10-04 - the sparkles, the Start Center's Guided refactor lane glyph
+               (Nils: "I think that is what we should use for the Guided Dashboard"). The two dashboards shared
+               the gauge, which could not be told apart once the toolbar text is hidden; the button, the lane
+               and the view's tab now show the one picture. */
+            Object oDashboard_MenuItem is a cCJMenuItem
+                Set psToolTip to "Guided Dashboard - the guided flow, one step at a time"
+                Set psDescription to "Open the guided dashboard"
+                Set psImage to "GuidedDashboard.ico"
+                Set pbActiveUpdate to True
+                Set peControlStyle to xtpButtonIconAndCaption
+                // Same text as the view's Label, so the button and the tab it opens agree.
+                Set psCaption to "Guided Dashboard"
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send Activate_oDashboard_vw of (Client_Id(ghoCommandBars))
+                End_Procedure
+            End_Object
+
+            /* The manual flow on its own board (Nils 2026-08-02). It outlived the split Dashboard it
+               was trialled against: with that board retired, these two - Guided and Manual - are the
+               dashboards. */
+            // Its own picture since 2026-10-04: Nils's open hand (Manual.ico), which the Start Center's Manual
+            // refactor lane shows too (CS_GlyphManual) - the gauge it shared with the Guided Dashboard is gone.
+            Object oManualDash_MenuItem is a cCJMenuItem
+                Set psToolTip to "Manual Dashboard - pick folders and functions yourself"
+                Set psDescription to "Open the manual-flow board"
+                Set psImage to "Manual.ico"
+                Set pbActiveUpdate to True
+                Set peControlStyle to xtpButtonIconAndCaption
+                Set psCaption to "Manual Dashboard"
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send Activate_oManualDashboard_vw of (Client_Id(ghoCommandBars))
+                End_Procedure
+            End_Object
+
+            // The editor, beside the boards (Nils 2026-09-23) - the view's own icon, so the button
+            // and the tab it opens read as one thing.
+            Object oEditor_MenuItem is a cCJMenuItem
+                Set psToolTip to "Editor - the source file you are working on"
+                Set psDescription to "Open the editor view"
+                Set psImage to "Editor.ico"
+                Set pbActiveUpdate to True
+                Set peControlStyle to xtpButtonIconAndCaption
+                Set psCaption to "Editor"
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send Activate_oEditorView_vw of (Client_Id(ghoCommandBars))
+                End_Procedure
+            End_Object
+
+            /* RETIRED 2026-08-10 - the old split "cockpit" board's toolbar button. The guided board
+               above is the Dashboard now, so this was the last way in to DashboardFTOLD.vw, which is
+               no longer Used (see the Use block further down).
+
+               Remarked rather than deleted. The view file itself was deleted on 2026-09-23 - it is in
+               git history (e.g. git show b870d411:AppSrc/DashboardFTOLD.vw). Note the send
+               below would NOT reach it any more even if re-enabled: Activate_oDashboard_vw now
+               resolves to the guided board, which took that object name with it.
+
+            Object oDashBoardOLD_MenuItem is a cCJMenuItem
+                Set psToolTip to "Dashboard"
+                Set psDescription to "Open Dashboard"
+                Set psImage to "Dashboard.ico"
+                Set pbActiveUpdate to True
+                Set pbControlBeginGroup to True
+                Set peControlStyle to xtpButtonIconAndCaption
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send Activate_oDashboard_vw of (Client_Id(ghoCommandBars))
+                End_Procedure
+
+            End_Object
+            */
+
+            Object oShowCompilePane_MenuItem is a cCJMenuItem
+                Set psCaption to "Show Compile pane"
+                Set psToolTip to "Compile pane"
+                Set psDescription to "Show or hide the Compile pane"
+                Set psImage to "CompilePane.ico"
+                Set pbActiveUpdate to True
+                Set pbControlBeginGroup to True
+                Set peControlStyle to xtpButtonIconAndCaption
+                Set pbChecked to False
+
+                // Toggle the Modernize dock: show it (switching to its home editor view first, since the
+                // toolbar can be clicked from any view) when hidden, hide it when shown. The hide branch
+                // mirrors the editor's Ctrl+M toggle exactly (clear the user-wants flag so it won't
+                // auto-restore, then close the dock).
+                Procedure OnExecute Variant vCommandBarControl
+                    Boolean bWanted
+                    Get pbModernizePanelWanted of ghoApplication to bWanted
+                    If (bWanted) Begin
+                        Set pbModernizePanelWanted of ghoApplication to False
+                        Send CloseTestCompileDialog of (Client_Id(ghoCommandBars))
+                    End
+                    Else Begin
+                        Send Activate_oEditorView_vw of (Client_Id(ghoCommandBars))
+                        Send ShowTestCompileDockOnly of (Client_Id(ghoCommandBars))
+                    End
+                End_Procedure
+
+                // IsEnabled is polled by pbActiveUpdate, so we ALSO reflect the dock state here from the
+                // single-source pbModernizePanelWanted flag (flipped by EVERY show/hide path - this toolbar,
+                // the editor's Ctrl+M / web toggle, and the dock's own Close). Pressed + "Hide Compile
+                // pane" when shown; released + "Show Compile pane" when hidden. Both are set only on a
+                // change, so there's no per-poll churn.
+                Function IsEnabled Returns Boolean
+                    String sSWSFile sWantCap sCurCap
+                    Boolean bWanted bChecked
+
+                    Get pbModernizePanelWanted of ghoApplication to bWanted
+                    Get pbChecked to bChecked
+                    If (bChecked <> bWanted) ;
+                        Set pbChecked to bWanted
+                    If (bWanted) ;
+                        Move "Hide Compile pane" to sWantCap
+                    Else ;
+                        Move "Show Compile pane" to sWantCap
+                    Get psCaption to sCurCap
+                    If (sCurCap <> sWantCap) ;
+                        Set psCaption to sWantCap
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Function_Return (sSWSFile <> "")
+                End_Function
+
+            End_Object
+
+
+
+            Object oSplitView_MenuItem is a cCJMenuItem
+                Set psCaption to "Split View"
+                Set psToolTip to "Split / Un-split View Workspace"
+                Set psDescription to "Toggle a side-by-side split: Dashboard left, the other views right. Click again to merge back into one group."
+                Set psImage to "SplitVertical.ico"
+                Set pbChecked to False
+                Set pbActiveUpdate to True
+                Set peControlStyle to xtpButtonIconAndCaption
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send SplitViewWorkspace of (phoMainPanel(ghoApplication))
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sSWSFile
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Function_Return (sSWSFile <> "")
+                End_Function
+
+            End_Object
+
+            Object oClear_MenuItem is a cCJMenuItem
+                Set pbControlBeginGroup to True
+                Set pbActiveUpdate to True
+                Set psCaption to "Clear"
+                Set psToolTip to "Clear/Close Workspace/File"
+                Set psDescription to "Clears the currently selected workspace/or File depending on the selected mode"
+                Set psImage to "ActionClear.ico"
+                Set peControlStyle to xtpButtonIconAndCaption
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Boolean bChanged bMode
+                    Integer iRetval
+                    Handle hoEditor
+
+                    Send UpdateWorkspaceSelectorDisplay of ghoApplication ""
+                    Get phoEditor of ghoApplication to hoEditor
+                    Send Request_Clear of hoEditor
+                    Set pbWorkspaceMode of ghoApplication to True
+                    Broadcast Recursive Send Request_Clear of (Client_Id(ghoCommandBars))
+                    /* THE START CENTER, not a board (Nils 2026-08-08). Clear closes the workspace -
+                       it has just set psSWSFile to "" - and a board with no workspace open is the
+                       empty screen the Start Center exists to replace: every band short-circuits
+                       and the guidance names buttons that are not there. This is precisely the
+                       state the Start Center is for, so it is where Clear should land. */
+                    Send Activate_oStartCenter_vw of (Client_Id(ghoCommandBars))
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sSWSFile
+                    Get psSWSFile of ghoApplication to sSWSFile
+                    Function_Return (sSWSFile <> "")
+                End_Function
+
+            End_Object
+
+            Object oSave_ToolItem is a cCJSaveMenuItem
+                Set peControlStyle to xtpButtonIcon
+                Set psCaption to "&Save"
+                Set psToolTip to "Save"
+                Set psDescription to "Save editor changes (Alt+S)"
+                Set psShortcut to "Alt+S"
+
+                Function IsEnabled Returns Boolean
+                    Boolean bChanged
+
+                    Move False to bChanged
+//                    If (oSysfile_DD(phoRefactorView(ghoApplication))) Begin
+//                        Get Should_Save of (oSysfile_DD(phoRefactorView(ghoApplication))) to bChanged
+//                    End
+                    If (oSysfile_DD(phoFoldersView(ghoApplication))) Begin
+                        Get Should_Save of (oSysfile_DD(phoFoldersView(ghoApplication))) to bChanged
+                    End
+                    If (bChanged = False) Begin
+                        Get pbShouldSave of (phoEditorView(ghoApplication)) to bChanged
+                    End
+                    If (bChanged = False) Begin
+//                        Get pbShouldSave of (phoFunctionView(ghoApplication)) to bChanged
+//                        Get pbShouldSave of (phoRefactorView(ghoApplication)) to bChanged
+                    End
+                    Function_Return bChanged
+                End_Function
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send Request_Save of (Focus(Self))
+                End_Procedure
+
+            End_Object
+
+            Object oUndo_MenuItem is a cCJMenuItem
+                Set psToolTip to "Undo"
+                Set psDescription to "Undo last editor action (Ctrl+Z)"
+                Set psImage to "ActionUndo.ico"
+                Set pbActiveUpdate to True
+                Set pbControlBeginGroup to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send CME_UndoAction of (Focus(Desktop))
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    Boolean bCanUndo
+                    Get Can_UndoAction of (Focus(Desktop)) to bCanUndo
+                    Function_Return bCanUndo
+                End_Function
+
+            End_Object
+
+            Object oRedo_MenuItem is a cCJMenuItem
+                Set psToolTip to "Redo"
+                Set psDescription to "Redo last editor action (Ctrl+Y)"
+                Set psImage to "ActionRedo.ico"
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send CME_RedoAction of (Focus(Desktop))
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    Boolean bCanRedo
+                    Get Can_RedoAction of (Focus(Desktop))  to bCanRedo
+                    Function_Return bCanRedo
+                End_Function
+
+            End_Object
+
+            Object oCodeExplorer_ToolbarButton is a cCJMenuItem
+                Set psCaption to "StarZens Source &Explorer"
+                Set psToolTip to "DataFlex Source Explorer"
+                Set psDescription to "Run Starzen's DataFlex Source Code Explorer (Ctrl+E)"
+                Set psImage to "DataFlexSourceExplorer.ico"
+                Set psShortcut to "Ctrl+E"
+                Set pbControlBeginGroup to True
+                Set peControlStyle to xtpButtonIcon
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    String sProgram sSWSPath
+                    
+                    Get private.psStarZenSourceExplorer of ghoApplication to sProgram
+                    If (sProgram = "") Begin
+                        Send FTInfoBox "You first need to setup the path to StarZen's Source Code Explorer program with 'Program Settings'"
+                        Procedure_Return
+                    End
+                    Get psSWSFile of ghoApplication to sSWSPath
+                    If (sSWSPath <> "") Begin
+                        Move ("-ws" * '"' + sSWSPath + '"') to sSWSPath
+                    End
+                    Runprogram Background sProgram sSWSPath
+                End_Procedure
+
+                Function IsEnabled Returns Boolean
+                    String sProgram sSWSPath
+                    Get psStarZenSourceExplorer of ghoApplication to sProgram
+                    Get psSWSFile of ghoApplication to sSWSPath
+                    Function_Return (sProgram <> "" and sSWSPath <> "")
+                End_Function
+
+            End_Object
+
+        End_Object
+        
+        Object oExit_toolbar is a cCJToolbar
+            Set pbCloseable to False
+            Set pbCustomizable to False
+            Set pbShowExpandButton to False
+            Set peStretched to stStretchShared
+
+            Object oSettings_MenuItem is a cCJMenuItem
+                Set psCaption to "&Settings..."
+                Set psDescription to "The program's settings"
+                Set psImage to "Settings.ico"
+                Set psShortcut to "Ctrl+T"
+                Set pbControlBeginGroup to True
+
+                Procedure OnExecute Variant vCommandBarControl
+                    Send Popup of (oProgramSetup_dg(Client_Id(ghoCommandBars)))
+                End_Procedure
+            End_Object
+
+            Object oAbout_MenuItem is a cCJAboutMenuItem
+                Set pbActiveUpdate to True
+                Set psCaption to C_$CaptionAbout
+                Set psDescription to C_$DescAbout
+                Set psToolTip to C_$ToolTipAbout
+                Set pbControlBeginGroup to True
+            End_Object
+
+            Object oKoFi_MenuItem is a cCJMenuItem
+                Set psCaption to "Ko-fi"
+                Set psToolTip to "Coffee Time!"
+                Set psDescription to "Buy me a coffee, to support me"
+                Set psImage to "Ko-fi.ico"
+                Set pbControlBeginGroup to True
+                Procedure OnExecute Variant vCommandBarControl
+                    Runprogram Shell Background "https://ko-fi.com/nilss"
+                End_Procedure
+            End_Object
+
+            Object oSuggestion_MenuItem is a cCJMenuItem
+                Set psToolTip to "GitHub"
+                Set psDescription to "Suggest a feature, or report a bug on DFRefactor's GitHub page"
+                Set psImage to "Suggestion.ico"
+                Set pbControlBeginGroup to True
+
+                Procedure OnExecute Variant vCommandBarControl  
+                    Runprogram Shell Background "https://github.com/NilsSve/DfRefactor-FlexTron-Issues/issues/new/choose"
+//                    Runprogram Shell Background "https://github.com/NilsSve/DfRefactor-FlexTron-Issues"
+//                    Runprogram Shell Background "https://github.com/NilsSve/DfRefactor/issues"
+                End_Procedure
+
+            End_Object
+
+            Object oHelpMenu is a cCJMenuItem
+                Set psCaption to "Help"
+                Set psToolTip to "Help"
+                Set psDescription to "Help about the program (F1)"
+                Set psImage to "ActionHelp.ico"
+                Set peControlType to xtpControlSplitButtonPopup
+                Set pbActiveUpdate to True
+
+                Procedure OnExecute Variant vCommandBarControl 
+                    Runprogram Shell Background "https://nilssve.github.io/DfRefactor/"
+                End_Procedure
+
+                Object oHelpMenuItemLocal is a cCJHelpMenuItem
+                    Set psCaption to "Local HTML Help"
+                End_Object
+
+                Object oHelpMenuItemInternetBrowser is a cCJMenuItem
+                    Set psCaption to "Online HTML Help"
+                    Set psImage to "ActionHelpInternet.ico"
+                    Procedure OnExecute Variant vCommandBarControl
+                        Runprogram Shell Background "https://nilssve.github.io/DfRefactor/"
+                    End_Procedure
+                End_Object
+
+                Object oHelpGitHub is a cCJMenuItem
+                    Set psCaption to "GitHub source code repository"
+                    Set psToolTip to "Link to GitHub source code repository"
+                    Set psDescription to "Github source code"
+                    Set psImage to "GitHub.ico"
+                    Set pbControlBeginGroup to True
+                    Procedure OnExecute Variant vCommandBarControl
+                        Forward Send OnExecute vCommandBarControl
+                        Runprogram Shell Background "https://github.com/NilsSve/DFRefactor.git"
+                    End_Procedure
+                End_Object
+                
+            End_Object
+
+            Object oExitMenuItem is a cCJExitMenuItem
+                Set psImage to "ActionExit.ico"
+                Set psToolTip to "Exit"
+                Set psDescription to "Exit the program (Alt+F4)"
+                Set pbControlBeginGroup to True
+            End_Object
+
+        End_Object
+
+        // Only here to create a bit of space between the toolbar icons and the view tab-pages.
+        // Else it looks a bit crampet.
+//        Object oDummy_Toolbar is a cCJToolbar
+//            Set psTitle to "Dummy Toolbar"
+//            Set peStretched to stStretch
+//            Set pbCloseable to False
+//            Set pbCustomizable to False
+//            Set pbDockNextTo to False  
+//        End_Object
+
+        Object oStatusBar is a cCJStatusBar
+            Set Statusbar_Id to Self
+
+            // PANE 1 = the ACTIVE VIEW's name. phoViewPane is the pane the framework writes the
+            // current view's label into ("Check workspace"), and it used to be pane 2 - the same
+            // pane StatusText uses - so activating a view after an analyze WIPED its "Total XXs"
+            // result (Nils 2026-07-26). The two are different kinds of message: the view name is
+            // WHERE YOU ARE (pane 1, alongside the idle text), a run's result is WHAT HAPPENED
+            // (pane 2). ActionText below now names pane 2 explicitly rather than following
+            // phoViewPane, so it stays with StatusText where it belongs.
+            Object oStatusPane1 is a cCJStatusBarPane
+                Set piID to sbpIDIdlePane
+                Set phoViewPane to Self
+                Set pbStyleStretch to True
+            End_Object
+
+            Object oStatusPane2 is a cCJStatusBarPane
+                Set pbStyleStretch to True
+            End_Object
+
+            // Made these objects mimic NotePad++
+            Object oNumberOfCharacters_StatusbarPane is a cCJStatusBarPane
+                Set psText to "length:"
+            End_Object
+
+            Object oNumberOfLines_StatusbarPane is a cCJStatusBarPane
+                Set psText to "lines:"
+            End_Object
+
+            Object oUTF8_OEM_Text is a cCJStatusBarPane
+                Set psText to "OEM"
+            End_Object
+
+            Procedure Set NumberOfEditorLines String sText
+                Move (FormatValue(sText, ",###")) to sText
+                Set psText of oNumberOfLines_StatusbarPane to ("lines:" * String(sText))
+            End_Procedure
+
+            Procedure Set NumberOfEditorCharacters String sText
+                Move (FormatValue(sText, ",###")) to sText
+                Set psText of oNumberOfCharacters_StatusbarPane to ("length:" * String(sText))
+            End_Procedure
+
+            Procedure Set StatusText String sText
+                Set psText of oStatusPane2 to sText
+            End_Procedure                          
+            
+            // Named pane, NOT phoViewPane: that now points at pane 1 (the view name), and an
+            // action message belongs beside StatusText in pane 2 (see the pane comment above).
+            Procedure Set ActionText String sText
+                Set psText of oStatusPane2 to sText
+            End_Procedure
+
+            /* The framework's view-name write, pinned to pane 1 EXPLICITLY.
+               Dfadlg.pkg's Entering_Scope sends Show_View_Name (Label(Self)) to Statusbar_Id, and the
+               stock handler writes it to whatever phoViewPane happens to point at - which is resolved
+               by delegation up the object tree and is therefore easy to get wrong from a pane object.
+               Naming the pane here settles it: the view name lands in pane 1 whatever phoViewPane says,
+               so it can never again overwrite the analyze result in pane 2 (Nils 2026-07-26). */
+            Procedure Show_View_Name String sName
+                Set psText of oStatusPane1 to sName
+            End_Procedure
+
+            Procedure Set UTF8Text String sText
+                Set psText of (oUTF8_OEM_Text(Self)) to sText
+            End_Procedure
+            
+        End_Object
+
+    End_Object
+
+    Object oClientArea is a ClientArea
+        Use oMainRefactorObjects.pkg
+        /* In oMainRefactorObjects, the two main refactoring objects are created;
+            Object oRefactorEngine is a cRefactorEngine
+                Set pbBatchMode to (pbBatchMode(ghoApplication))
+                #Include oRefactorFuncLib.pkg
+            End_Object
+
+           cRefactorFuncLib -> ghoFuncLib and,
+           cRefactorEngine  -> ghoEngine.
+            
+           Always use at top of ClientArea.
+        */
+        
+        // *** Other program files: ***
+//        Use Dd_debug.dg
+        Use ProgramSetupFT.dg
+        Use CompilerSetupFT.dg
+        Use ScintillaParameters.dg
+        Use DropSelfConfirmFT.dg         // FT: Drop Self's question with FT buttons - BEFORE EditorViewFT.vw, whose editor packages then leave DropSelfConfirm.dg out
+        Use ScintillaGotoFT.dg           // FT: the editor's Go To Line with FT buttons - BEFORE EditorViewFT.vw, as the line above
+        Use ScintillaFindFT.dg           // FT: the editor's Find with FT buttons - BEFORE EditorViewFT.vw, as the lines above
+        Use ScintillaReplaceFT.dg        // FT: the editor's Replace with FT buttons - BEFORE EditorViewFT.vw, as the lines above
+        Use GotoDefinitionPickerFT.dg    // FT: the editor's Go to definition chooser with FT buttons - BEFORE EditorViewFT.vw, as the lines above
+        Use EngineErrorLogFT.dg
+        Use BackupFilesFT.dg
+        Use RetireShadowsFT.dg           // the per-file Rename dialog behind the board's overriding-copies line (ChooseShadowCopiesToRetire)
+        Use EngineLogFileFT.dg
+        Use ModProgressHistoryFT.dg      // FT: phase-2 burn-down history modal (opened from the dashboard progress strip)
+        Use ShowOtherLogFilesFT.dg
+        Use CmdLineIniFileExporterFT.dg
+        Use DeepScanRulesFT.dg           // FT: per-rule enable UI for the Deep Scan catalog (Data\DeepScanRules.json)
+
+        // FT: the merged bottom dock - ONE cRefactorCJToolPanel hosting the Compiler Output + Modernization
+        // Analyzer areas as bottom tabs. OutputDockFT.dg Uses CompilerOutputFT.dg + ModAnalyzerFT.dg as
+        // Container3d AREAS inside its panel, and carries all their global entry procs
+        // (ActivateCompileErrorDialog / ActivateModAnalyzer / ShowCompileOutputLive / ...). MUST precede
+        // RefactorView.vw (TestCompileFT.dg) + the toolbar buttons that Send those globals.
+        Use OutputDockFT.dg
+        Use EditorViewFT.vw
+        Use ConvertWorkspaceFT.dg  // the .sws INI -> DF26 JSON conversion, with df-cli's output live
+        Use AddPackageFT.dg        // the one field: a path, publisher/package, or a git url
+        Use MaintainLibrariesFT.dg // THE Libraries dialog: the list, its verdicts, and Add / Remove
+        Use SelectCopyScopeFT.dg   // migration step 0 - what to copy to the new location
+        Use SelectFoldersViewFT.vw
+        Use SelectFunctionsFT.vw
+        Use DashboardFT.vw         // THE dashboard: the guided flow (this file was CheckWorkspaceFT.vw until 2026-08-10)
+        Use ManualDashboardFT.vw   // the manual flow on its own board
+        Use StartCenterFT.vw       // the pre-workspace screen: workspaces, Getting Started, and the Guided|Manual door
+
+        Use AboutFT.pkg            // the About text as the DFAbout library's resource, then the library's FTStdAbout.pkg:
+                                   // Activate_About and DoAbout, as StdAbout.pkg (the About dialog is the library's
+                                   // cFTAboutDialog since 2026-10-08; a page of this program's own from 2026-10-06)
+        Procedure Activate_About
+            // True, show the Help\AboutFT.html file in the dialog.
+            Set pbShowAboutFile of ghoFTAboutDialog to True // False
+            Send DoAbout "" "" "" "" "DFRefactor72x72.bmp"
+        End_Procedure
+
+        Function Verify_Exit_Application Returns Integer
+            Integer iFail iRetval
+            Boolean bChanged
+
+            Move 0 to iFail
+            Broadcast Recursive Get pbShouldSave to bChanged
+            If (bChanged = True) Begin
+                Get YesNoCancel_Box "Changes exists! Do you want to save changes?" "" MB_DEFBUTTON3 to iRetval
+                If (iRetval = MBR_Yes) Begin
+                    Send Execute of (oSave_ToolItem(ghoCommandBars))
+                    Move 0 to iFail
+                End
+                If (iRetval = MBR_No) Begin
+                    Move 0 to iFail
+                End
+                If (iRetval = MBR_Cancel) Begin
+                    Move 1 to iFail
+                End
+            End
+            Function_Return iFail
+        End_Function
+
+    End_Object
+
+    Procedure ActivateWorkspaceDialog
+        String sFileName
+        Get SelectWorkspaceFile of ghoApplication to sFileName
+        If (sFileName <> "") ;
+            Send UpdateWorkspaceSelectorDisplay of ghoApplication sFileName
+    End_Procedure
+
+    Procedure ActivateFileRadioButton
+        Boolean bMode
+        Get pbWorkspaceMode of ghoApplication to bMode
+        Set pbWorkspaceMode of ghoApplication to (not(bMode))
+    End_Procedure
+
+    Procedure ActivateCompare
+        String sCompareApp
+        Boolean bWsMode
+        Get psFileCompareApp of ghoApplication to sCompareApp
+        Get pbWorkspaceMode of ghoApplication to bWsMode
+        If (bWsMode = True) ;
+            Send ComparePaths of ghoApplication sCompareApp
+        Else ;
+            Send CompareFiles of ghoApplication sCompareApp
+    End_Procedure
+
+    Procedure ActivateBrowseDialog
+        Send SelectSourceFile of ghoApplication
+    End_Procedure
+
+Use cFolderSelDtlDataDictionary.dd
+    Procedure StartRefactoreCode
+        Handle hoEditor hoDD hoStatusBar hoTC
+        tRefactorFiles RefactorFiles
+        String sFileFilter
+        Integer iRetval
+        Boolean bGuidedRun bWsMode
+
+        Move False to Err
+        // CollectFileData scans the selected folders and can take a while before the engine's Yes/No question
+        // appears - show the wait cursor + a status-bar note so the click feels responsive (both reset before
+        // the question pops). PumpMsgQueue flushes the paint so the text shows before the synchronous scan.
+        Send Cursor_Wait of Cursor_Control
+        Get Statusbar_Id of (phoMainPanel(ghoApplication)) to hoStatusBar
+        Set StatusText of hoStatusBar to "Collecting data for manual refactoring..."
+        Send PumpMsgQueue of Desktop
+        Get Create (RefClass(cFolderSelDtlDataDictionary)) to hoDD
+        Get CollectFileData of ghoApplication hoDD to RefactorFiles
+        Send Destroy of hoDD
+        Send Cursor_Ready of Cursor_Control
+        Set StatusText of hoStatusBar to ""
+        Get phoEditor of ghoApplication to hoEditor
+        If (Err = True) Begin
+            Procedure_Return
+        End
+
+        // Start the Engine!
+        Set peRunOrigin of ghoEngine to eRunManual
+        Send StartEngine of ghoEngine RefactorFiles hoEditor
+        // MANUAL-RUN VERIFY HANDOFF (Nils 2026-07-16): a manual pass (Tidy Up, workspace or single
+        // file) that CHANGED files has a natural next step - compile and check nothing was mangled.
+        // The scan loop auto re-scans (cheap, scope already confirmed); a compile needs a PROGRAM
+        // pick, so ASK, and on Yes just OPEN the Test Compile dock - the user picks the program in
+        // its combo and presses Compile, nothing auto-starts (Nils's chosen shape).
+        // SysFile.iCountNumberOfChangedFiles is zeroed per run (InitializeEngine -> ResetSysFile)
+        // and counts THIS run's changed files. A READ-ONLY run still tallies would-be changes, so
+        // it is excluded - nothing was written, nothing to verify. Plan/scan-origin runs enter via
+        // StartAutoSelect, never here, so this cannot double up with the compile loop's post-run
+        // relight or the scan loop's auto verify re-scan. A /bm batch run force-exits inside
+        // StartEngine and never reaches this point.
+        /* IF THE GUIDED TRAIL SENT THE USER HERE, SEND THEM BACK (Nils 2026-07-29) - and OUTSIDE the
+           changed-files gate, which is what stranded him. A Tidy Up over 1,796 files that changed
+           NOTHING skipped this block entirely, so the trail never came back and its stepper never
+           learned the stage had run: "after the tidy up was done, the (WIP) page was not activated."
+           Whether a run found anything is a fact about the run; being returned to the flow you were
+           following is not conditional on it.
+
+           A run that CHANGED files has something to verify, so it offers Check. One that changed
+           nothing has nothing to verify and just goes back. Either way the stage is recorded, so the
+           stepper can mark step 4. The flag is ONE-SHOT, so a pass the user starts on their own still
+           gets the Test Compile handoff below, which is right for it. */
+        Get pbGuidedTidyUpRun of ghoApplication to bGuidedRun
+        If (bGuidedRun = True) Begin
+            Set pbGuidedTidyUpRun of ghoApplication to False
+            // Stamped BEFORE the offer below, and the dirty half is independent of the ANSWER:
+            // whether the run left unverified changes is a fact about the run, not about what the
+            // user chose to do next. Persisted per workspace, so the trail's Tidy Up stage and its
+            // Ready badge survive a restart (see WriteTidyUpStamp).
+            Send WriteTidyUpStamp of ghoApplication (SysFile.iCountNumberOfChangedFiles > 0 and SysFile.bReadOnly = False)
+            If (SysFile.iCountNumberOfChangedFiles > 0 and SysFile.bReadOnly = False) Begin
+                Get FTYesNoBox ("The run changed" * String(SysFile.iCountNumberOfChangedFiles) * "file(s).\n\nRun Check to verify they still compile, and see what is left?") "Back to Check?" to iRetval
+                If (iRetval = MBR_Yes) Begin
+                    Broadcast Send StartGuidedCheckFromRun of (Client_Id(phoMainPanel(ghoApplication)))
+                    Procedure_Return
+                End
+            End
+            // Nothing changed, or the user declined the Check - either way, back to the trail.
+            Broadcast Send ActivateGuidedTrail of (Client_Id(phoMainPanel(ghoApplication)))
+            Procedure_Return
+        End
+        /* NOT FOR A SINGLE-FILE RUN (Nils 2026-09-17). Single-file mode exists for a file that has no
+           program to compile under - a legacy file dropped beside the workspace, opened on its own from
+           the Manual board - so "verify with a compile" is an offer the user cannot take up, and the
+           question read as noise right after the run. The editor already shows the rewritten file, which
+           is the verification that mode has. A workspace run keeps the offer. */
+        Get pbWorkspaceMode of ghoApplication to bWsMode
+        If (SysFile.iCountNumberOfChangedFiles > 0 and SysFile.bReadOnly = False and bWsMode = True) Begin
+            Get FTYesNoBox ("The run changed" * String(SysFile.iCountNumberOfChangedFiles) * "file(s).\n\nOpen Test Compile to verify the changes still compile cleanly?") "Verify with a compile?" to iRetval
+            If (iRetval = MBR_Yes) Begin
+                // Mirror the dashboard's Compile-step entry (CI_DashTestCompile): a standing Deep
+                // Scan view would keep the bar's Compile chip LOCKED - reset it first so the dock
+                // opens ready to compile instead of steering back at the stale scan.
+                If (ghoModAnalyzerDock <> 0) ;
+                    Send ClearScanView of (oModAnalyzer_grd(ghoModAnalyzerDock))
+                Send ShowTestCompilePanel of (Client_Id(ghoCommandBars))
+                Get phoTestCompileFT of ghoApplication to hoTC
+                If (hoTC <> 0) Begin
+                    Send ShowAnalyzeSummary of hoTC False
+                    Send SyncWebButtonStates of hoTC
+                End
+            End
+        End
+    End_Procedure
+
+    Procedure ActivateProcess
+        Send StartRefactoreCode
+    End_Procedure
+    
+    Procedure ActivateSave
+        Send Execute of (oSave_ToolItem(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateClearAll
+        Send Execute of (oClear_MenuItem(ghoCommandBars))
+    End_Procedure
+
+    // Build the "Dashboard left / other views right" tab-group layout on demand, instead of relying on
+    // CodeJock's fiddly drag-to-split (which also degrades after the tool-panel dock/close churn). Re-asserts
+    // ComEnableGroups first (a docked CommandBars dialog-bar may have dropped it), then moves the three work
+    // views into ONE new side-by-side group, leaving the Dashboard in the original (left) group. Called by the
+    // Main toolbar "Split View" button; ghoTabWorkspace is captured in oCJCommandBarSystem.OnCreateTabbedWorkspace.
+
+    // Helper for SplitViewWorkspace: read the just-activated tab (ComSelected) and move it to iGroup.
+    // PumpMsgQueue first so the activation's tab-selection has settled before we read it.
+    Procedure _MoveActiveTabToGroup Handle hoTab Integer iGroup
+        Variant vItem
+        Send PumpMsgQueue of Desktop
+        Get ComSelected of hoTab to vItem
+        Send ComMoveToGroup of hoTab vItem iGroup
+    End_Procedure
+
+    // Helper for SplitViewWorkspace: a SNAPSHOT of every tab in the workspace, taken before anything moves.
+    // ComMoveToGroup reorders the workspace's own item list, so a loop that reads ComItem(i) while it moves
+    // walks past items (the "loses one view" index shift); collecting first and moving afterwards cannot.
+    Function _WorkspaceTabItems Handle hoTab Returns Variant[]
+        Variant[] avItems
+        Variant   vItem
+        Integer   iCount i
+
+        Get ComItemCount of hoTab to iCount
+        Move 0 to i
+        While (i < iCount)
+            Get ComItem of hoTab i to vItem
+            Move vItem to avItems[i]
+            Increment i
+        Loop
+        Function_Return avItems
+    End_Function
+
+    // TOGGLE the workspace split. ComGroupCount gives the real state - 1 = not split (so split it), >1 =
+    // already split (so merge back) - which stops repeated clicks from spawning ever-smaller groups.
+    // No window handle / object id needed (a cRDCDbView answers neither, ComFindItem is pure CodeJock):
+    // each view is identified by ACTIVATING it and reading the now-selected tab via ComSelected.
+    //
+    // MERGING SWEEPS EVERY TAB, and does not re-use the split's list of views. What collapses a split is a
+    // group going EMPTY, so un-splitting by moving back exactly the three views the split had moved left any
+    // other tab holding its group open - and one stray tab is the whole difference between "the split is
+    // gone" and "the second click did nothing". A tab the split never touched gets there in several ordinary
+    // ways: the Start Center and the Manual Dashboard are views too (both added after this toggle was
+    // written), a view opened while the right-hand group is active is CREATED in it, and the closing
+    // Activate_oDashboard_vw below opens the Dashboard itself into the active group whenever its tab is not
+    // already up. Reading the workspace's own tab list settles all of them at once, and a view added later
+    // needs no change here.
+    //
+    // SPLITTING STAYS NAMED, and that is a DECISION, not the other half of the same bug (Nils, 2026-09-15,
+    // asked directly): the three WORK views move right and every other view stays left with the Dashboard -
+    // the Start Center and the Manual Dashboard are boards, and a board belongs beside the Dashboard, not
+    // stacked with the grids being worked on. So the two halves are deliberately NOT mirrors. Sweeping the
+    // tab list is right for the merge, where the goal is only "end up with one group"; it would be wrong
+    // here, where WHICH side a view lands on is the whole point. Do not "finish the symmetry".
+    Procedure SplitViewWorkspace
+        Handle    hoTab
+        Variant   vTab vItem vAnchor
+        Variant[] avItems
+        Integer   iGroup iGroupCount iThis iCount i
+
+        If (ghoCommandBars = 0) Procedure_Return
+
+        // Acquire the live tab workspace on demand (Nils's proven pattern: a fresh DF wrapper bound to the
+        // workspace COM object).
+        Get Create (RefClass(cCJTabWorkspace)) to hoTab
+        Get ComShowTabWorkspace of ghoCommandBars True to vTab
+        Set pvComObject of hoTab to vTab
+
+        Get ComGroupCount of hoTab to iGroupCount
+        If (iGroupCount > 1) Begin
+            // ---- Toggle OFF: gather EVERY tab into the Dashboard's group; the groups that empty
+            // auto-collapse, so ComGroupCount returns to 1. ----
+            Send Activate_oDashboard_vw of (Client_Id(ghoCommandBars))
+            Send PumpMsgQueue of Desktop
+            Get ComSelected of hoTab to vAnchor
+
+            // Snapshot AFTER that activation - it may have opened the Dashboard's tab.
+            Get _WorkspaceTabItems hoTab to avItems
+            Move (SizeOfArray(avItems)) to iCount
+
+            // The Dashboard's tab is the anchor everything gathers onto. If it cannot be resolved, the
+            // FIRST tab does instead: which group wins matters far less than ending up with one, and an
+            // unresolvable anchor would otherwise skip every move and leave the split standing silently.
+            Get ComFindGroup of hoTab vAnchor to iGroup
+            If (iGroup < 0 and iCount > 0) ;
+                Move avItems[0] to vAnchor
+
+            Move 0 to i
+            While (i < iCount)
+                // Re-read the anchor's group every time: a group that collapses renumbers the ones after it.
+                Get ComFindGroup of hoTab vAnchor    to iGroup
+                Get ComFindGroup of hoTab avItems[i] to iThis
+                If (iGroup >= 0 and iThis >= 0 and iThis <> iGroup) ;
+                    Send ComMoveToGroup of hoTab avItems[i] iGroup
+                Increment i
+            Loop
+        End
+        Else Begin
+            // ---- Toggle ON: Dashboard left, the other three in a new VERTICAL (left/right) group.
+            // NEWVERTICAL acts on the ACTIVE tab, so activate Folders first; ComFindGroup gives its index. ----
+            Send ComEnableGroups of hoTab
+            Send Activate_oSelectFoldersView of (Client_Id(ghoCommandBars))
+            Send PumpMsgQueue of Desktop
+            Send ComDoWorkspaceCommand of hoTab XTP_ID_WORKSPACE_NEWVERTICAL
+            Get ComSelected of hoTab to vItem
+            Get ComFindGroup of hoTab vItem to iGroup
+
+            Send Activate_oSelectFunctionsView of (Client_Id(ghoCommandBars))
+            Send _MoveActiveTabToGroup hoTab iGroup
+            Send Activate_oEditorView_vw       of (Client_Id(ghoCommandBars))
+            Send _MoveActiveTabToGroup hoTab iGroup
+        End
+
+        Send ComRefresh of hoTab
+        // Report the state the workspace is REALLY in, not the branch that was taken: a merge that could
+        // not collapse the split must not leave the button claiming it did.
+        Get ComGroupCount of hoTab to iGroupCount
+        Set pbChecked of (oSplitView_MenuItem(ghoCommandBars)) to (iGroupCount > 1)
+        Send Destroy of hoTab
+        // Dashboard stays in the (left) group; re-select it so it is the focused tab there.
+        Send Activate_oDashboard_vw of (Client_Id(ghoCommandBars))
+    End_Procedure
+
+    Procedure ActivateSourceExplorer
+        Send Execute of (oCodeExplorer_ToolbarButton(ghoCommandBars))
+    End_Procedure
+
+    // The two settings dialogs, which the Tools menu opens the same way (their toolbar is gone, 2026-11-19).
+    Procedure ActivateSettings
+        Send Popup of (oProgramSetup_dg(Client_Id(ghoCommandBars)))
+    End_Procedure
+
+    Procedure ActivateEditorSettings
+        Send Popup of (oScintillaParameters_dg(Client_Id(ghoCommandBars)))
+    End_Procedure
+
+    Procedure ActivateUndoRefactoringDialog
+        tRFSearchResult[] BackpupFileArray
+        Get AllBackupFolderFiles of ghoApplication to BackpupFileArray
+        Send FillBackupFilesDialog of (Client_Id(ghoCommandBars)) BackpupFileArray
+    End_Procedure
+
+    /* Migration step 0 - what to copy to the new location. A DEVELOPMENT entry point for now: the
+       dialog is the first piece of the Prepare flow, and the flow that will call it for real (copy,
+       then write the target-version .sws, then retarget the libraries) does not exist yet. When it
+       does, this becomes a step in that sequence and the shortcut can go. */
+    Procedure ActivateCopyScopeDialog
+        tCopyItem[] aChosen
+        String sDest sVer
+        Boolean bOk
+        Get SelectMigrationCopyScope of (Client_Id(ghoCommandBars)) to aChosen
+        If (SizeOfArray(aChosen) = 0) ;
+            Procedure_Return          // cancelled, or nothing ticked - same action either way
+        Get MigrationCopyDestination of (Client_Id(ghoCommandBars)) to sDest
+        Get psTargetDfVersion of ghoApplication to sVer
+        Get RunWorkspaceCopy of (Client_Id(ghoCommandBars)) aChosen sDest sVer to bOk
+    End_Procedure
+
+    /* Library Maintenance on the workspace that is OPEN - the in-place counterpart to the copy
+       flow's call, which points the same dialog at the copy it has just written. "" means "the
+       loaded workspace", which MaintainWorkspaceLibraries resolves itself. */
+    Procedure ActivateLibraryMaintenance
+        Boolean bOk
+        Get MaintainWorkspaceLibraries "" to bOk
+    End_Procedure
+
+    Procedure Switch_Prior_View
+        Send Switch_Prior_View of (ClientAreaObject (ghoCommandBars))
+    End_Procedure
+
+    Procedure Switch_Next_View
+        Send Switch_Next_View of (ClientAreaObject (ghoCommandBars))
+    End_Procedure
+
+    Procedure ToggleActionButton
+        Integer iActiveView
+        Handle  hoView
+        Get piActiveView of ghoApplication to iActiveView
+        If (iActiveView = CI_CleanupSource) Begin
+            Get phoActiveView of ghoApplication to hoView
+            Send ToggleActionButton of hoView
+        End
+    End_Procedure
+    
+//    Cant't have this as it collides with the DD_Debug dialog...
+//    On_Key Key_Ctrl+Key_D  Send ActivateEditorSettings
+    /* Alt+E, Alt+F, Alt+T and Alt+W open the Edit, File, Tools and Workspace menus (2026-11-19): Alt plus a letter
+       is how a menu bar opens. Their commands keep their Ctrl keys - Source Explorer, the workspace/file switch,
+       Settings and Open Workspace. */
+    On_Key Key_Alt+Key_D   Send ActivateEditorSettings
+    On_Key Key_Ctrl+Key_E  Send ActivateSourceExplorer
+    On_Key Key_Ctrl+Key_F  Send ActivateFileRadioButton
+    On_Key Key_Alt+Key_G   Send ToggleActionButton
+    On_Key Key_Ctrl+Key_G  Send ToggleActionButton
+    On_Key Key_Alt+Key_L   Send ShowLogFile of ghoApplication
+    On_Key Key_Alt+Key_M   Send ActivateCompare   // Ctrl+M freed for the editor view's Modernize-dock toggle (EditorViewFT.vw)
+    On_Key Key_Ctrl+Key_O  Send ActivateBrowseDialog
+    On_Key Key_Alt+Key_O   Send ActivateBrowseDialog
+    On_Key Key_Alt+Key_P   Send ActivateCopyScopeDialog   // Prepare migration - what to copy (dev entry point)
+    On_Key Key_Alt+Key_B   Send ActivateLibraryMaintenance  // Library maintenance for the open workspace
+    On_Key Key_Ctrl+Key_F5 Send ActivateProcess
+    On_Key Key_Ctrl+Key_S  Send ActivateSave
+    On_Key Key_Alt+Key_S   Send ActivateSave
+    On_Key Key_Ctrl+Key_T  Send ActivateSettings
+    On_Key Key_Alt+Key_U   Send ActivateUndoRefactoringDialog
+    On_Key Key_Ctrl+Key_W  Send ActivateWorkspaceDialog
+    On_Key Key_Alt+Key_X   Send Exit_Application
+    On_Key Key_F2          Send ActivateSave
+//    On_Key Key_Ctrl+Key_F4 Send ActivateBrowseDialog
+
+    // On_Key constant for Ctrl+Shift+Tab: C_CtrlShiftTab, RefactorConstants.h.pkg
+
+    Procedure End_Construct_Object
+        Forward Send End_Construct_Object
+        Set Icon to "DFRefactor.ico"
+    End_Procedure
+
+    On_Key C_CtrlShiftTab   Send Switch_Prior_View
+    On_Key Key_Ctrl+Key_Tab Send Switch_Next_View
+End_Object
+
+Use cCIScan.pkg
+
+/* THE CI SCAN, run from OnStartup when the command line said /scan <ini> (2026-11-20 - cCIScan.pkg says why it
+   works the way it does). Analyze Source over the INI's folders, or the workspace's source folders when it names
+   none. It changes nothing: the findings go to the JSON and the SARIF file, each marked new or unchanged against
+   the baseline - or, with /baseline, become the baseline. Then the program ENDS, with exit code 0 (no new
+   findings), 1 (new findings) or 2 (the scan could not run), and the result file the INI names says the same. */
+Procedure RunCIScanAndExit
+    Handle hoScan
+    tCompileError[] aMsgs
+    tCIScanFinding[] aFindings
+    tCIScanReport Report
+    tCIScanBaseline Baseline
+    tSarifLog Sarif
+    String[] asFolders asBaseline
+    String sError sHome sSws sNow sSummary sBaselineFile sWhy sFilter sCRLF sJsonFile sSarifFile sBaseCreated
+    Integer i iLast iScanExit iFilesTotal iCacheHits iNew iGone iShown iRet
+    Boolean bCancelled bFound bOK bBaseline
+
+    Move (Character(13) + Character(10)) to sCRLF
+    Get Create (RefClass(cCIScan)) to hoScan
+    Move 0 to iNew
+    Move 0 to iGone
+    Move 0 to iFilesTotal
+    Move False to bFound
+    Get psScanError of ghoApplication to sError
+    If (sError = "") Begin
+        Get psSWSFile    of ghoApplication to sSws
+        Get psHomeTarget of ghoApplication to sHome
+        If (sSws = "" or Trim(sHome) = "") ;
+            Move ("the workspace could not be opened: " + sSws) to sError
+    End
+    If (sError = "") Begin
+        Get pasScanFolders of ghoApplication to asFolders
+        If (SizeOfArray(asFolders) = 0) ;
+            Get WorkspaceSourceRoots of ghoApplication to asFolders
+        Move (SizeOfArray(asFolders) - 1) to iLast
+        If (iLast < 0) ;
+            Move "there are no source folders to scan" to sError
+        // A folder that is not there fails the run: scanning less than the INI asks for, and passing, is the worst outcome.
+        // So does a FILE named as a folder - vPathIsDirectory, since vFolderExists is True for an existing file (2026-11-20).
+        For i from 0 to iLast
+            If (sError = "") Begin
+                If (vPathIsDirectory(asFolders[i]) = False) Begin
+                    If (vFilePathExists(asFolders[i]) = True) ;
+                        Move ("the INI names a file, not a folder: " + asFolders[i]) to sError
+                    Else ;
+                        Move ("a folder the INI names is not there: " + asFolders[i]) to sError
+                End
+            End
+        Loop
+    End
+    If (sError = "") Begin
+        // The INI's file filter, in the buffer for this run - never saved, so the stored filter stays the user's.
+        Get psScanFilter of ghoApplication to sFilter
+        If (sFilter <> "") ;
+            Move sFilter to SysFile.FileExtensionFilter
+        Get ScanFoldersToMessages of ghoDeepScanDriver asFolders "CI scan - Analyze Source..." (&bCancelled) (&iFilesTotal) (&iCacheHits) to aMsgs
+        If (bCancelled = True) ;
+            Move "the scan was cancelled" to sError
+        Else If (iFilesTotal = 0) ;
+            Move "no source files were found in the folders to scan" to sError
+    End
+    If (sError = "") Begin
+        Get FindingsFromMessages of hoScan (&aMsgs) sHome to aFindings
+        Get TodayIsoDateTime of ghoApplication to sNow
+        Get pbScanBaseline     of ghoApplication to bBaseline
+        Get psScanBaselineFile of ghoApplication to sBaselineFile
+        If (bBaseline = True) Begin
+            Get BaselineFor of hoScan (&aFindings) sSws sNow to Baseline
+            Get WriteBaseline of hoScan Baseline sBaselineFile to bOK
+            If (bOK = False) ;
+                Move ("the baseline file could not be written: " + sBaselineFile) to sError
+            Else Begin
+                Move True to bFound
+                Move CI_CIScanPass to iScanExit
+                Move (String(SizeOfArray(aFindings)) + " finding(s) in " + String(iFilesTotal) + " file(s) are the baseline now:" + sCRLF + sBaselineFile) to sSummary
+            End
+        End
+        Else Begin
+            Get BaselineFingerprints of hoScan sBaselineFile (&bFound) (&sBaseCreated) (&sWhy) to asBaseline
+            If (sWhy <> "") ;
+                Move sWhy to sError
+            Else Begin
+                Get MarkNewFindings of hoScan (&aFindings) asBaseline (&iGone) to iNew
+                Move (If(iNew > 0, CI_CIScanNewFindings, CI_CIScanPass)) to iScanExit
+                Move (String(SizeOfArray(aFindings)) + " finding(s) in " + String(iFilesTotal) + " file(s): " + String(iNew) + " new, " + String(SizeOfArray(aFindings) - iNew) + " in the baseline.") to sSummary
+                If (iGone > 0) ;
+                    Move (sSummary + " " + String(iGone) + " of the baseline's are gone.") to sSummary
+                // The baseline it was compared with, by name, size and date: which file decides is never a guess.
+                If (bFound = False) ;
+                    Move (sSummary + sCRLF + "There is no baseline file, so every finding counts as new. Run once with /baseline to accept today's findings:" + sCRLF + sBaselineFile) to sSummary
+                Else ;
+                    Move (sSummary + sCRLF + "Baseline: " + sBaselineFile + " - " + String(SizeOfArray(asBaseline)) + " finding(s), written " + sBaseCreated + ".") to sSummary
+                // The first new ones, for the build log; the SARIF and the JSON file have them all.
+                Move 0 to iShown
+                Move (SizeOfArray(aFindings) - 1) to iLast
+                For i from 0 to iLast
+                    If (aFindings[i].bNew = True) Begin
+                        Increment iShown
+                        If (iShown <= 25) ;
+                            Move (sSummary + sCRLF + "  NEW " + aFindings[i].sRule + " " + aFindings[i].sFile + ":" + String(aFindings[i].iLine) + "  " + aFindings[i].sSymbol) to sSummary
+                    End
+                Loop
+                If (iShown > 25) ;
+                    Move (sSummary + sCRLF + "  ... and " + String(iShown - 25) + " more") to sSummary
+            End
+        End
+    End
+    If (sError = "") Begin
+        Move CI_CIScanVersion  to Report.iVersion
+        Move sSws              to Report.sWorkspace
+        Move sNow              to Report.sCreated
+        Move sBaselineFile     to Report.sBaselineFile
+        Move bFound            to Report.bBaselineFound
+        Move iFilesTotal       to Report.iFilesScanned
+        Move (SizeOfArray(aFindings)) to Report.iFindings
+        Move iNew              to Report.iNew
+        Move iGone             to Report.iGone
+        Move iScanExit         to Report.iExitCode
+        Move aFindings         to Report.aFindings
+        Get psScanJsonFile  of ghoApplication to sJsonFile
+        Get psScanSarifFile of ghoApplication to sSarifFile
+        Get WriteReport of hoScan Report sJsonFile to bOK
+        If (bOK = False) ;
+            Move ("the JSON file could not be written: " + sJsonFile) to sError
+        Else Begin
+            Get SarifFor of hoScan (&aFindings) sHome to Sarif
+            Get WriteSarif of hoScan Sarif sSarifFile to bOK
+            If (bOK = False) ;
+                Move ("the SARIF file could not be written: " + sSarifFile) to sError
+            Else ;
+                Move (sSummary + sCRLF + "JSON: " + sJsonFile + sCRLF + "SARIF: " + sSarifFile) to sSummary
+        End
+    End
+    If (sError <> "") Begin
+        Move CI_CIScanError to iScanExit
+        Move ("The CI scan could not run: " + sError + ".") to sSummary
+    End
+    Send WriteResultFile of hoScan (psBatchResultFile(ghoApplication)) iScanExit (TodayIsoDateTime(ghoApplication)) sSummary
+    Send Destroy of hoScan
+    // /bm's way out: TerminateProcess carries the exit code (ExitProcess deadlocks on COM detach).
+    Move (TerminateProcessEf(-1, iScanExit)) to iRet
+    Send Exit_Application
+End_Procedure
+
+Procedure OnStartup
+    Handle hoBatchDD hoBatchFolderDD
+
+    // This is weird. If this program is started from the TestBench,
+    // the icon in Windows task bar is not showing. And the following line doesn't help either.
+    Set Icon of (phoMainPanel(ghoApplication)) to "DFRefactor.ico"
+
+    // The status panel in the FT colours - FTColorPanel (RDCFlexTron). Here rather than beside the object,
+    // because the object lives in a SHARED package the two light builds also compile. By this point every
+    // object exists and the theme has been read, which is what the colouring needs.
+    Send FTColorPanel ghoStatusPanel
+
+    /* THE CI SCAN (/scan <ini>, 2026-11-20) comes first, and ends the program. pbBatchMode is set for it too,
+       to keep every dialog away, so the refactoring batch below must never follow it. */
+    If (pbScanMode(ghoApplication) = True) Begin
+        Send RunCIScanAndExit
+        Procedure_Return
+    End
+    
+    If (pbBatchMode(ghoApplication) = True) Begin
+        Set pbBatchMode of ghoEngine to True
+        // The INI's per-function parameters go into the table before the run (the engine
+        // reads them from FunctionsA.Parameter) and the user's own values go back after -
+        // a batch run must leave the standing configuration as it found it.
+        Get Create (RefClass(cFunctionsDataDictionary)) to hoBatchDD
+        Send ApplyCmdLineFunctionParameters of ghoApplication hoBatchDD
+        // ...and the INI's function ticks and file filter, the user's own saved first (2026-11-20).
+        Send ApplyCmdLineSelections of ghoApplication hoBatchDD
+        // The command line's folders ticked for the run, so the Start Center's Source folders line shows what
+        // the run works on; ExitBatchWithCode puts the earlier ticks back (Nils 2026-10-24).
+        Get Create (RefClass(cFolderSelHeaDataDictionary)) to hoBatchFolderDD
+        Send ApplyCmdLineFolderTicks of ghoApplication hoBatchFolderDD
+        Broadcast Send RequestTileRefresh of (Client_Id(phoMainPanel(ghoApplication)))
+        Send StartRefactoreCode of (phoMainPanel(ghoApplication))
+        Send RestoreCmdLineFunctionParameters of ghoApplication
+        Send RestoreCmdLineFolderTicks of ghoApplication
+        Send RestoreCmdLineSelections of ghoApplication
+        Send Destroy of hoBatchFolderDD
+        Send Destroy of hoBatchDD
+        // A batch run that gets back here never reached ExitBatchWithCode: it stopped before the engine ran
+        // (a blank file filter, for one). Exit with STATUS=FAILED rather than go on to Start_UI and wait with
+        // the window open (live run, 2026-10-24).
+        Send ExitBatchWithCode of ghoApplication eEngineError "The run stopped before any file was refactored: check the CmdLine INI's folders, file filter and functions."
+    End
+End_Procedure
+Send OnStartup
+
+//  - If you get compile error: "Can't include resource ..\HELP\ABOUTFT.HTML",
+//    the About text, Help\AboutFT.html, is missing: AboutFT.pkg compiles it in as a resource
+//    (since 2026-10-06; it was AboutFT.rtf in a RichEdit before). It can be empty, but it must exist.
+//
+// -  If you get compile Error 4295: "xxx Can't include resource FILELISTBACKUPFILE.CFG",
+//    you will need to manually make a copy of the Filelist.cfg in the Data folder -> "FilelistBackupFile.cfg"
+Start_UI

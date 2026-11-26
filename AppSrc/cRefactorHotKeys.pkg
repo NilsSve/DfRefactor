@@ -1,0 +1,1310 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cRefactorHotKeys
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-28
+//
+// Description : The editor's keyboard-shortcut engine, brought home from SciControlLib
+//               (cSciCommandHotKeySupport.pkg).
+//
+//               A FAITHFUL port. Both command tables come across whole and unchanged, because a
+//               command ID is not just a constant - it is DATA. Every binding a user has ever made is
+//               stored in psEditorHotKeys as "<cmd|dfkey|vk|vk...>", so dropping a command from the
+//               table would orphan that user's binding for it, silently. Nils's call, 2026-07-28, and
+//               the right one: keep everything, wire handlers only for what DFRefactor implements.
+//
+//               That also keeps something valuable. Of the 143 internal commands, DFRefactor's mixin
+//               binds 32; the other 111 are ordinary editor operations - word movement, scrolling,
+//               selection extension - that Scintilla can already perform and that are already named
+//               and already listed on the Keyboard page. Exposing one later is a single DefineOnKey,
+//               not an archaeology exercise.
+//
+//               WHAT DID CHANGE, and only this:
+//
+//                 * The _T() translation wrapper is gone from all 143 command descriptions. It is a
+//                   no-op unless TH_TRANSLATION is defined, which DFRefactor never defines, and it was
+//                   the file's last dependency on cSciLexerSupport.pkg. The descriptions now simply
+//                   say what they say.
+//
+//                 * AssignShortCutToCmd no longer puts a modal Info_Box on screen when a shortcut is
+//                   already taken. It records the conflict and returns; the Keyboard page decides
+//                   whether and how to tell the user. An engine that announces its own errors cannot
+//                   be tested without dialogs appearing - which is exactly what happened when the
+//                   characterization tests were written (2026-07-28, a modal box in a headless runner).
+//                   See piAssignConflictCmd / psAssignConflictName below.
+//
+//               MapVKtoString stays as it is, all three hundred lines of it. It is not a duplicate of
+//               Windows' key naming: WinAPIGetKeyNameText is its FALLBACK, and the table is the
+//               override list for the keys Windows names badly or not at all.
+//
+//               NAMING DEBT, deliberately not paid here. The CM_ and CMD_ prefixes and the
+//               oSciCommandHotKeys object name are CodeMax's, and every consumer and every stored
+//               setting uses them. Renaming is cosmetic, touches four files and the saved data format,
+//               and belongs in its own pass - not mixed into a port whose whole value is being
+//               faithful.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use ScintillaLexerApi.h.pkg                 // the CMD_* command ids
+Use WinAPIGetKeyNameText.pkg   // WinAPIGetKeyNameText - the FALLBACK inside
+                                // MapVKtoString for keys the table does not name
+
+Define KS_KeyDown For |CI$80
+
+//
+// A shortcut is defined as both a dataflex code that can be used in an On_Key as well as the windows
+// virtual Key code which is stored per key and thus has to be in an array.
+// eg. ctrl+F3 = dataflex integer 5138, but also VK_Ctrl+VK_F3
+// where 5138 is the integer representation of Key_Ctrl+Key_F3 which is equivalent to 5138 in our example.
+//
+Struct tShortCut
+    Integer   iDFKey
+    Integer[] VKcode
+End_Struct
+
+
+Struct tSciCommandHotKey
+    Integer iCmd
+    String  sName
+    String  sDescription
+    tShortCut HotKey
+    tShortCut HotKey2
+End_Struct
+
+Class cRefactorHotKeyTable is a cObject
+    Procedure Construct_Object
+        Property tSciCommandHotKey[] pCommands
+        /* How AssignShortCutToCmd reports a clash. The library popped a modal Info_Box
+           from in here; that made the engine untestable without dialogs appearing, and
+           it took the decision about what to SAY away from the page that knows the
+           context. -1 means the last assignment succeeded. */
+        Property Integer piAssignConflictCmd  -1
+        Property String  psAssignConflictName ""
+    End_Procedure
+
+    Procedure RegisterCommand Integer iCmd String sName String sDesc
+        tSciCommandHotKey Command
+        tSciCommandHotKey[] Commands
+        Get pCommands to Commands
+        Move iCmd  to Command.iCmd
+        Move sName to Command.sName
+        Move sDesc to Command.sDescription
+        Move Command to Commands[SizeOfArray(Commands)]
+        Set pCommands to Commands
+    End_Procedure
+
+    Function FindCommand Integer iCmd Returns tSciCommandHotKey
+        Integer iItem
+        Integer iCount
+        tSciCommandHotKey Command
+        tSciCommandHotKey[] Commands
+
+        Move -1 to Command.iCmd
+        Get pCommands to Commands
+        Move (SizeOfArray(Commands)) to iCount
+        For iItem From 0 to (iCount-1)
+            If (iCmd=Commands[iItem].iCmd) Begin
+                Move Commands[iItem] to Command
+                Move iCount to iItem
+            End
+        Loop
+        Function_Return Command
+    End_Function
+
+
+    Function FindCommandIndex Integer iCmd Returns Integer
+        Integer iItem
+        Integer iIndex
+        Integer iCount
+        tSciCommandHotKey[] Commands
+
+        Move -1 to iIndex
+        Get pCommands to Commands
+        Move (SizeOfArray(Commands)) to iCount
+        For iItem From 0 to (iCount-1)
+            If (iCmd=Commands[iItem].iCmd) Begin
+                Move iItem to iIndex
+                Move iCount to iItem
+            End
+        Loop
+        Function_Return iIndex
+    End_Function
+
+    Function CommandHasHotKey tSciCommandHotKey Command Returns Boolean
+        Boolean bHasHotKey
+
+        Move False to bHasHotKey
+        If (SizeOfArray(Command.HotKey.VKcode)>0 or SizeOfArray(Command.HotKey2.VKcode)>0) Begin
+            Move True to bHasHotKey
+        End
+        Function_Return bHasHotKey
+    End_Function
+
+    //
+    // Searches the current command to see if a shortcut has already been assigned elsewhere
+    // Returns the command if it has or Command.iCmd with -1 if it hasn't
+    //
+    Function ShortCutIsAssignedTo tShortCut ShortCut Returns tSciCommandHotKey
+        Integer iItem
+        Integer iCount
+        tSciCommandHotKey Command
+        tSciCommandHotKey[] Commands
+
+        Move -1 to Command.iCmd
+        Get pCommands to Commands
+        Move (SizeOfArray(Commands)) to iCount
+        For iItem From 0 to (iCount-1)
+            If (ShortCut.iDFKey=Commands[iItem].HotKey.iDFKey or ShortCut.iDFKey=Commands[iItem].HotKey2.iDFKey) Begin
+                Move Commands[iItem] to Command
+                Move iCount to iItem
+            End
+        Loop
+        Function_Return Command
+    End_Function
+
+    //
+    // Assigns a keyboard shortcut to the selected command. If a shortcut already exists
+    // then it will assign a 2nd shortcut. We can never have more as 2 shortcuts for one command.
+    //
+    Procedure AssignShortCutToCmd Integer iCmd tShortCut ShortCut
+        Boolean bHasHotKey
+        Integer iItem
+        tSciCommandHotKey  Assigned
+        tSciCommandHotKey[] Commands
+
+        Set piAssignConflictCmd  to -1
+        Set psAssignConflictName to ""
+        Get FindCommandIndex iCmd to iItem
+        If (iItem>-1) Begin
+            Get ShortCutIsAssignedTo ShortCut to Assigned
+            If (Assigned.iCmd=-1) Begin
+                Get pCommands to Commands
+                Get CommandHasHotKey Commands[iItem] to bHasHotKey
+                If (bHasHotKey=False) Begin
+                    Move ShortCut to Commands[iItem].HotKey
+                End
+                Else Begin
+                    Move ShortCut to Commands[iItem].HotKey2
+                End
+                Set pCommands to Commands
+            End
+            Else Begin
+                // Taken. Record who has it and return - announcing is the caller's job.
+                Set piAssignConflictCmd  to Assigned.iCmd
+                Set psAssignConflictName to Assigned.sName
+            End
+        End
+    End_Procedure
+
+    //
+    // Removes all associated keyboard shortcuts from the command
+    //
+    Procedure RemoveShortCutFromCmd Integer iCmd
+        Integer iItem
+        tShortCut EmptyShortCut
+        tSciCommandHotKey[] Commands
+
+        Get FindCommandIndex iCmd to iItem
+        If (iItem>-1) Begin
+            Get pCommands to Commands
+            Move EmptyShortCut to Commands[iItem].HotKey
+            Move EmptyShortCut to Commands[iItem].HotKey2
+            Set pCommands to Commands
+        End
+    End_Procedure
+
+    //
+    // For sorting on the cmd.Name part in the structure
+    //
+    Function CompareCommands tSciCommandHotKey Cmd1 tSciCommandHotKey Cmd2 Returns Integer
+        String sName1
+        String sName2
+
+        Move (uppercase(Cmd1.sName)) to sName1
+        Move (Uppercase(Cmd2.sName)) to sName2
+        If (sName1 > sName2) ;
+            Function_Return (GT)
+        Else If (sName1 < sName2) ;
+            Function_Return (LT)
+        Function_Return (EQ)
+    End_Function
+
+    Procedure SortByCommandName
+        tSciCommandHotKey[] Commands
+        tSciCommandHotKey[] SortedCommands
+
+        Get pCommands to Commands
+        Move (SortArray(Commands, Self, RefFunc(CompareCommands))) to SortedCommands
+        Set pCommands to SortedCommands
+    End_Procedure
+
+
+    Function MapVKtoString Integer iVK Returns String
+        String  sKey
+
+        If (iVK>=48 and iVK<=57) Begin
+            // VK_0 thru VK_9 are the same as ASCII '0' thru '9'
+            Move (Character(iVK)) to sKey
+        End
+        Else If (iVK>=65 and iVK<=90) Begin
+            // VK_A thru VK_Z are the same as ASCII 'A' thru 'Z'
+            Move (Character(iVK)) to sKey
+        End
+        Else Begin
+            Case Begin
+                Case (iVK=VK_LBUTTON)
+                    Move "LBUTTON" to sKey
+                    Case Break
+                Case (iVK=VK_RBUTTON)
+                    Move "RBUTTON" to sKey
+                    Case Break
+                Case (iVK=VK_CANCEL)
+                    Move "CANCEL" to sKey
+                    Case Break
+                Case (iVK=VK_MBUTTON)
+                    Move "MBUTTON" to sKey
+                    Case Break
+                Case (iVK=VK_BACK)
+                    Move "Backspace" to sKey
+                    Case Break
+                Case (iVK=VK_TAB)
+                    Move "Tab" to sKey
+                    Case Break
+                Case (iVK=VK_CLEAR)
+                    Move "CLEAR" to sKey
+                    Case Break
+                Case (iVK=VK_RETURN)
+                    Move "Enter" to sKey
+                    Case Break
+                Case (iVK=VK_SHIFT)
+                    Move "Shift" to sKey
+                    Case Break
+                Case (iVK=VK_CONTROL)
+                    Move "Ctrl" to sKey
+                    Case Break
+                Case (iVK=VK_MENU)
+                    Move "Alt" to sKey
+                    Case Break
+                Case (iVK=VK_PAUSE)
+                    Move "PAUSE" to sKey
+                    Case Break
+                Case (iVK=VK_CAPITAL)
+                    Move "CAPITAL" to sKey
+                    Case Break
+                Case (iVK=VK_ESCAPE)
+                    Move "Escape" to sKey
+                    Case Break
+                Case (iVK=VK_SPACE)
+                    Move "Space" to sKey
+                    Case Break
+                Case (iVK=VK_PRIOR)
+                    Move "Page Up" to sKey
+                    Case Break
+                Case (iVK=VK_NEXT)
+                    Move "Page Down" to sKey
+                    Case Break
+                Case (iVK=VK_END)
+                    Move "End" to sKey
+                    Case Break
+                Case (iVK=VK_HOME)
+                    Move "Home" to sKey
+                    Case Break
+                Case (iVK=VK_LEFT)
+                    Move "Left" to sKey
+                    Case Break
+                Case (iVK=VK_UP)
+                    Move "Up" to sKey
+                    Case Break
+                Case (iVK=VK_RIGHT)
+                    Move "Right" to sKey
+                    Case Break
+                Case (iVK=VK_DOWN)
+                    Move "Down" to sKey
+                    Case Break
+                Case (iVK=VK_SELECT)
+                    Move "SELECT" to sKey
+                    Case Break
+                Case (iVK=VK_PRINT)
+                    Move "PRINT" to sKey
+                    Case Break
+                Case (iVK=VK_EXECUTE)
+                    Move "EXECUTE" to sKey
+                    Case Break
+                Case (iVK=VK_SNAPSHOT)
+                    Move "SNAPSHOT" to sKey
+                    Case Break
+                Case (iVK=VK_INSERT)
+                    Move "Insert" to sKey
+                    Case Break
+                Case (iVK=VK_DELETE)
+                    Move "Delete" to sKey
+                    Case Break
+                Case (iVK=VK_HELP)
+                    Move "Help" to sKey
+                    Case Break
+                Case (iVK=VK_LWIN)
+                    Move "LWIN" to sKey
+                    Case Break
+                Case (iVK=VK_RWIN)
+                    Move "RWIN" to sKey
+                    Case Break
+                Case (iVK=VK_APPS)
+                    Move "APPS" to sKey
+                    Case Break
+                Case (iVK=VK_NUMPAD0)
+                    Move "NUMPAD0" to sKey
+                    Case Break
+                Case (iVK=VK_NUMPAD1)
+                    Move "NUMPAD1" to sKey
+                    Case Break
+                Case (iVK=VK_NUMPAD2)
+                    Move "NUMPAD2" to sKey
+                    Case Break
+                Case (iVK=VK_NUMPAD3)
+                    Move "NUMPAD3" to sKey
+                    Case Break
+                Case (iVK=VK_NUMPAD4)
+                    Move "NUMPAD4" to sKey
+                    Case Break
+                Case (iVK=VK_NUMPAD5)
+                    Move "NUMPAD5" to sKey
+                    Case Break
+                Case (iVK=VK_NUMPAD6)
+                    Move "NUMPAD6" to sKey
+                    Case Break
+                Case (iVK=VK_NUMPAD7)
+                    Move "NUMPAD7" to sKey
+                    Case Break
+                Case (iVK=VK_NUMPAD8)
+                    Move "NUMPAD8" to sKey
+                    Case Break
+                Case (iVK=VK_NUMPAD9)
+                    Move "NUMPAD9" to sKey
+                    Case Break
+                Case (iVK=VK_MULTIPLY)
+                    Move "MULTIPLY" to sKey
+                    Case Break
+                Case (iVK=VK_ADD)
+                    Move "ADD" to sKey
+                    Case Break
+                Case (iVK=VK_SEPARATOR)
+                    Move "SEPARATOR" to sKey
+                    Case Break
+                Case (iVK=VK_SUBTRACT)
+                    Move "SUBTRACT" to sKey
+                    Case Break
+                Case (iVK=VK_DECIMAL)
+                    Move "DECIMAL" to sKey
+                    Case Break
+                Case (iVK=VK_DIVIDE)
+                    Move "DIVIDE" to sKey
+                    Case Break
+                Case (iVK=VK_F1)
+                    Move "F1" to sKey
+                    Case Break
+                Case (iVK=VK_F2)
+                    Move "F2" to sKey
+                    Case Break
+                Case (iVK=VK_F3)
+                    Move "F3" to sKey
+                    Case Break
+                Case (iVK=VK_F4)
+                    Move "F4" to sKey
+                    Case Break
+                Case (iVK=VK_F5)
+                    Move "F5" to sKey
+                    Case Break
+                Case (iVK=VK_F6)
+                    Move "F6" to sKey
+                    Case Break
+                Case (iVK=VK_F7)
+                    Move "F7" to sKey
+                    Case Break
+                Case (iVK=VK_F8)
+                    Move "F8" to sKey
+                    Case Break
+                Case (iVK=VK_F9)
+                    Move "F9" to sKey
+                    Case Break
+                Case (iVK=VK_F10)
+                    Move "F10" to sKey
+                    Case Break
+                Case (iVK=VK_F11)
+                    Move "F11" to sKey
+                    Case Break
+                Case (iVK=VK_F12)
+                    Move "F12" to sKey
+                    Case Break
+                Case (iVK=VK_F13)
+                    Move "F13" to sKey
+                    Case Break
+                Case (iVK=VK_F14)
+                    Move "F14" to sKey
+                    Case Break
+                Case (iVK=VK_F15)
+                    Move "F15" to sKey
+                    Case Break
+                Case (iVK=VK_F16)
+                    Move "F16" to sKey
+                    Case Break
+                Case (iVK=VK_F17)
+                    Move "F17" to sKey
+                    Case Break
+                Case (iVK=VK_F18)
+                    Move "F18" to sKey
+                    Case Break
+                Case (iVK=VK_F19)
+                    Move "F19" to sKey
+                    Case Break
+                Case (iVK=VK_F20)
+                    Move "F20" to sKey
+                    Case Break
+                Case (iVK=VK_F21)
+                    Move "F21" to sKey
+                    Case Break
+                Case (iVK=VK_F22)
+                    Move "F22" to sKey
+                    Case Break
+                Case (iVK=VK_F23)
+                    Move "F23" to sKey
+                    Case Break
+                Case (iVK=VK_F24)
+                    Move "F24" to sKey
+                    Case Break
+                Case (iVK=VK_NUMLOCK)
+                    Move "NUMLOCK" to sKey
+                    Case Break
+                Case (iVK=VK_SCROLL)
+                    Move "SCROLL" to sKey
+                    Case Break
+                Case (iVK=VK_LSHIFT)
+                    Move "LSHIFT" to sKey
+                    Case Break
+                Case (iVK=VK_RSHIFT)
+                    Move "RSHIFT" to sKey
+                    Case Break
+                Case (iVK=VK_LCONTROL)
+                    Move "LCONTROL" to sKey
+                    Case Break
+                Case (iVK=VK_RCONTROL)
+                    Move "RCONTROL" to sKey
+                    Case Break
+                Case (iVK=VK_LMENU)
+                    Move "LMENU" to sKey
+                    Case Break
+                Case (iVK=VK_RMENU)
+                    Move "RMENU" to sKey
+                    Case Break
+                Case (iVK=VK_PROCESSKEY)
+                    Move "PROCESSKEY" to sKey
+                    Case Break
+                Case (iVK=VK_ATTN)
+                    Move "ATTN" to sKey
+                    Case Break
+                Case (iVK=VK_CRSEL)
+                    Move "CRSEL" to sKey
+                    Case Break
+                Case (iVK=VK_EXSEL)
+                    Move "EXSEL" to sKey
+                    Case Break
+                Case (iVK=VK_EREOF)
+                    Move "EREOF" to sKey
+                    Case Break
+                Case (iVK=VK_PLAY)
+                    Move "PLAY" to sKey
+                    Case Break
+                Case (iVK=VK_ZOOM)
+                    Move "ZOOM" to sKey
+                    Case Break
+                Case (iVK=VK_NONAME)
+                    Move "NONAME" to sKey
+                    Case Break
+                Case (iVK=VK_PA1)
+                    Move "PA1" to sKey
+                    Case Break
+                Case (iVK=VK_OEM_CLEAR)
+                    Move "OEM_CLEAR" to sKey
+                    Case Break
+                Case Else
+                    // Hello undocumented DF command, welcome to the pleasure dome
+                    //MAP_VK_TO_UNSHIFTED_CHAR iVK to iKey
+                    //Move (Character(iKey)) To sKey
+                    // The above works, but perhaps it is better to rely on something we can support
+                    Move (WinAPIGetKeyNameText(iVK))  to sKey
+            Case End
+        End
+        Function_Return sKey
+    End_Function
+
+    //
+    // Juggles the order of the keys in the array a bit so that they end up looking more natural
+    // to the end user. Eg. Ctrl+Alt+Enter looks a lot better as Enter+Alt+Ctrl
+    // After this the order is left to right Ctrl+Alt+Shift ->> everything else
+    Function NaturalOrderKeys Integer[] Keys Returns Integer[]
+        Integer iKey
+
+        // Move Shift in front position
+        Move (SearchArray(VK_SHIFT,Keys)) to iKey
+        If (iKey>-1) Begin
+            Move (RemoveFromArray(Keys,iKey)) to Keys
+            Move (InsertInArray(Keys,0,VK_SHIFT)) to Keys
+        End
+        // Move Alt in front position
+        Move (SearchArray(VK_MENU,Keys)) to iKey
+        If (iKey>-1) Begin
+            Move (RemoveFromArray(Keys,iKey)) to Keys
+            Move (InsertInArray(Keys,0,VK_MENU)) to Keys
+        End
+        // Move Ctrl in front position if it exists as "Ctrl+Enter" looks better as "Enter+Ctrl"
+        Move (SearchArray(VK_CONTROL,Keys)) to iKey
+        If (iKey>-1) Begin
+            Move (RemoveFromArray(Keys,iKey)) to Keys
+            Move (InsertInArray(Keys,0,VK_CONTROL)) to Keys
+        End
+        Function_Return Keys
+    End_Function
+
+
+    Function ReadKeyboardState Returns Integer[]
+        Boolean   bFiltered // filter left/right alt/ctrl/shift keys as we don't want to see those
+        Integer   iSuccess
+        Integer   iKey
+        Integer[] Keys
+
+        UChar[256] KeyState
+
+        Move True to bFiltered
+        Move (ResizeArray(Keys,0)) to Keys
+        Move (GetKeyboardState(AddressOf(KeyState))) to iSuccess
+        If (iSuccess) Begin
+            /* FROM 1, NOT 0. Virtual key 0 does not exist - 0x00 is unassigned in the
+               VK table - so index 0 of the keyboard state is undefined, and Windows is
+               free to leave its high bit set. When it did, capture recorded a key that
+               is not a key, and every binding made that way carried a phantom leading
+               zero: Nils's FindReplace decoded to 3144|0|16|17|72 (seen 2026-07-26, in
+               the ini long before the JSON, so it had been happening for years).
+
+               Dispatch always ignored it and the display was taught to skip it, which
+               is why it never broke anything - it was only ever wrong. This is the fix
+               at the source. */
+            For iKey From 1 to 255
+                If ((KeyState[iKey] iAnd KS_KeyDown) = KS_KeyDown) Begin
+                    If (bFiltered) Begin
+                        If (iKey <> VK_LSHIFT and iKey <> VK_LCONTROL and iKey <> VK_LMENU and iKey <> VK_RSHIFT and iKey <> VK_RCONTROL and iKey <> VK_RMENU ) Begin
+                            Move iKey to Keys[SizeOfArray(Keys)]
+                        End
+                    End
+                    Else Begin
+                        Move iKey to Keys[SizeOfArray(Keys)]
+                    End
+                End
+            Loop
+        End
+        Function_Return Keys
+    End_Function
+
+    Function KeysToString Integer[] Keys Returns String
+        Integer iKey
+        Integer iCount
+        String  sKey
+        String  sShortCut
+
+        Move "" to sShortCut
+        Move (SizeOfArray(Keys)) to iCount
+        If (iCount>0) Begin
+            Get NaturalOrderKeys Keys to Keys
+            For iKey From 0 to (iCount-1)
+                Get MapVKtoString Keys[iKey] to sKey
+                // The capture path can leave a phantom 0 in the VK list (stored bindings
+                // like 3144|0|16|17|72 - the 0 predates the JSON settings and is ignored
+                // by dispatch). MapVKtoString maps it to "", which used to render as a
+                // doubled joiner: "Ctrl + Shift + + H" (Nils 2026-07-26). Skip empties.
+                If (sKey<>"") Begin
+                    If (sShortCut="") ;
+                        Move sKey to sShortCut
+                    Else ;
+                        Move (sShortCut * "+" * sKey) to sShortCut
+                End
+            Loop
+        End
+        Function_Return sShortCut
+    End_Function
+
+    Function CommandHotKeyString tSciCommandHotKey Command Returns String
+        String sShortCut
+        String sShortCut2
+
+        Get KeysToString Command.HotKey.VKcode  to sShortCut
+        Get KeysToString Command.HotKey2.VKcode to sShortCut2
+        If (sShortCut2<>"") Begin
+            Move (sShortCut + ", " + sShortCut2) to sShortCut
+        End
+        Function_Return sShortCut
+    End_Function
+
+    Procedure ClearAllShortCutKeyDefinitions
+        Integer iItem
+        Integer iCmdCount
+        tShortCut EmptyHotKey
+        tSciCommandHotKey Command
+        tSciCommandHotKey[] Commands
+
+        Get pCommands to Commands
+        Move (SizeOfArray(Commands)) to iCmdCount
+        For iItem From 0 to (iCmdCount-1)
+            Move Commands[iItem] to Command
+            Move EmptyHotKey to Command.HotKey
+            Move EmptyHotKey to Command.HotKey2
+            Move Command to Commands[iItem]
+        Loop
+        Set pCommands to Commands
+    End_Procedure
+
+    //
+    // Returns a serialized version of all the current shortcut definitions for the available commands
+    // format is <CmdShortcut1>,<CmdShortcut2>,<CmdShortcut3>,..
+    // Where <CmdShortcut1> = <iCmd,iDfKeyCode1,VKCode(s):iDfKeyCode2,VKCode2(s)>
+    //
+    // If a command has no defined shortcut, then the command is not in the list
+    Function ShortCutKeyDefinitions Returns String
+        Boolean bHasHotKey
+        Integer iItem
+        Integer iKey
+        Integer iKeyCount
+        Integer iCmdCount
+        String  sHotKey
+        String  sDefinitions
+        tShortCut HotKey
+        tSciCommandHotKey Command
+        tSciCommandHotKey[] Commands
+
+        Move "" to sDefinitions
+        Get pCommands to Commands
+        Move (SizeOfArray(Commands)) to iCmdCount
+        For iItem From 0 to (iCmdCount-1)
+            Move Commands[iItem] to Command
+            Get CommandHasHotKey Command to bHasHotKey
+            If (bHasHotKey) Begin
+                Move Command.HotKey to HotKey
+                Move ("<"+Trim(Command.iCmd)+"|"+Trim(HotKey.iDFKey)) to sHotKey
+                Move (SizeOfArray(HotKey.VKcode)) to iKeyCount
+                For iKey From 0 to (iKeyCount-1)
+                    Move (sHotKey+'|'+Trim(HotKey.VKcode[iKey])) to sHotKey
+                Loop
+                Move Command.HotKey2 to HotKey
+                If (SizeOfArray(HotKey.VKcode)>0) Begin
+                    // there's a second hotkey defined
+                    Move (sHotKey+":"+Trim(HotKey.iDFKey)) to sHotKey
+                    Move (SizeOfArray(HotKey.VKcode)) to iKeyCount
+                    For iKey From 0 to (iKeyCount-1)
+                        Move (sHotKey+'|'+Trim(HotKey.VKcode[iKey])) to sHotKey
+                    Loop
+                End
+                Move (sHotKey+">") to sHotKey
+                If (sDefinitions="") ;
+                    Move sHotKey to sDefinitions
+                Else ;
+                    Move (sDefinitions+sHotKey) to sDefinitions
+            End
+        Loop
+        Function_Return sDefinitions
+    End_Function
+
+    //
+    // Deserialize vkKeys passed in a string as "nnn|nnn|nnn" to an integer array with vkKey items
+    //
+    Function DeserializeVkKeys String sVkKeys Returns Integer[]
+        Integer iPos
+        String  sVkKey
+        Integer[] vkKeys
+
+        Move "" to sVkKey
+        Move (ResizeArray(vkKeys,0))  to vkKeys
+        While (Pos("|",sVkKeys))
+            Move (Pos("|",sVkKeys)) to iPos
+            Move (Left(sVkKeys,iPos-1)) to sVkKey
+            Move (Replace(sVkKey+"|",sVkKeys,"")) to sVkKeys
+            // Skip a stored 0 - see ReadKeyboardState. Bindings saved before that fix
+            // carry one, and dropping it here means the next save quietly cleans them
+            // up rather than leaving the old shape in the file forever.
+            If (Cast(sVkKey,Integer) <> 0) ;
+                Move (Cast(sVkKey,Integer)) to vkKeys[SizeOfArray(vkKeys)]
+        Loop
+        If (sVkKeys <> "" and Cast(sVkKeys,Integer) <> 0) Begin
+            Move (Cast(sVkKeys,Integer)) to vkKeys[SizeOfArray(vkKeys)]
+        End
+        Function_Return vkKeys
+    End_Function
+
+    //
+    // Reads the above defined shortcut serialization format from sDefinitions and assigns it to our command list.
+    //
+    Procedure Set ShortCutKeyDefinitions String sDefinitions
+        Integer iItem
+        Integer iPos
+        Integer iCmd
+        Integer iDfkey iDfKey2
+        Integer[] vkKeys vkKeys2
+        String  sHotKey
+        String  sCmd
+        String  sDfKey sDfKey2
+        String  sVkKeys sVkKey
+        tSciCommandHotKey Command
+        tSciCommandHotKey[] Commands
+
+        Send ClearAllShortCutKeyDefinitions
+        Get pCommands to Commands
+        While (Pos("<",sDefinitions)>0)
+            Move "" to sHotKey
+            Move (Pos(">",sDefinitions)) to iPos
+            If (iPos>0) Begin
+                Move (Left(sDefinitions,iPos)) to sHotKey // HotKey definition for 1 command
+                Move (Replace(sHotKey,sDefinitions,"")) to sDefinitions
+            End
+            Else ;
+                Move "" to sDefinitions
+
+            Move (Replace("<",sHotKey,"")) to sHotKey
+            Move (Replace(">",sHotKey,"")) to sHotKey
+            If (sHotKey<>"") Begin
+                Move "" to sCmd            // first initialize all variables we use for parsing
+                Move "" to sDfKey
+                Move "" to sDfKey2
+                Move "" to sVkKeys
+                Move 0  to iCmd
+                Move 0  to iDfkey
+                Move 0  to iDfKey2
+                Move (ResizeArray(vkKeys,0))  to vkKeys
+                Move (ResizeArray(vkKeys2,0)) to vkKeys2
+
+                Move (Pos("|",sHotKey)) to iPos
+                If (iPos>0) Begin
+                    Move (Left(sHotKey,iPos-1)) to sCmd
+                    Move (Replace(sCmd+"|",sHotKey,"")) to sHotKey
+                    Move (Pos("|",sHotKey)) to iPos
+                    If (iPos>0) Begin
+                        Move (Left(sHotKey,iPos-1)) to sDfkey
+                        Move (Replace(sDfKey+"|",sHotKey,"")) to sHotKey
+                        Move (Pos(":",sHotKey)) to iPos
+                        If (iPos>0) Begin
+                            Move (Left(sHotKey,iPos-1)) to sVkKeys
+                            Move (Replace(sVkKeys+":",sHotKey,"")) to sHotKey
+                        End
+                        Else Begin
+                            Move sHotKey to sVkKeys
+                            Move "" to sHotKey
+                        End
+                    End
+                    Else ;
+                        Move "" to sHotKey
+                End
+                Else ;
+                    Move "" to sHotKey
+                If (sVkKeys<>"") Begin
+                    Get DeserializeVkKeys sVkKeys to vkKeys
+                End
+                If (sHotKey<>"") Begin
+                    // there's a 2nd hotkey in here
+                    Move (Pos("|",sHotKey)) to iPos
+                    If (iPos>0) Begin
+                        Move (Left(sHotKey,iPos-1)) to sDfkey2
+                        Move (Replace(sDfKey2+"|",sHotKey,"")) to sHotKey
+                        Move sHotKey to sVkKeys
+                        Get DeserializeVkKeys sVkKeys to vkKeys2
+                    End
+                End
+                Move (Cast(sCmd,Integer))    to iCmd
+                Move 0 to iItem
+                If (iCmd<>0) Begin
+                    Get FindCommandIndex iCmd to iItem
+                End
+                If (iItem>-1) Begin
+                    Move Commands[iItem] to Command
+                    Move (Cast(sDfKey,Integer))  to iDfkey
+
+                    Move iDfkey to Command.HotKey.iDFKey
+                    Move vkKeys to Command.HotKey.VKcode
+                    If (sDfKey2<>"") Begin
+                        Move (Cast(sDfKey2,Integer)) to iDfKey2
+                        Move iDfkey2 to Command.HotKey2.iDFKey
+                        Move vkKeys2 to Command.HotKey2.VKcode
+                    End
+                    Move Command to Commands[iItem]
+                End
+            End
+        Loop
+
+        Set pCommands to Commands
+    End_Procedure
+
+    // If no definition has been found then we need to set some defaults
+    // Below are our defaults (You can create defaults by copy&paste from the config ini file)
+    Function DefaultDefinitions Returns String
+        String sShortCuts
+
+        Move "<206|299|17|40><205|298|17|38><204|279|13|17><1025|270|118><1024|269|116><203|260|37><202|5127|16|37><201|261|39><200|5128|16|39><242|7174|16|17|40><243|2080|17|32><198|2147|17|67><197|2168|17|88><196|2679|17|18|87>" to sShortCuts
+        Move (sShortCuts+"<195|277|46><194|278|8:5123|8|16><191|301|17|35><190|7178|16|17|35><189|300|17|36><188|7177|16|17|36><1005|312|17|115><1007|2158|17|78><1001|2159|17|79><1004|2163|17|83><1002|265|113><1003|6161|17|113><178|2150|17|70>") to sShortCuts
+        Move (sShortCuts+"<1010|3142|16|17|70><176|281|114><175|6162|17|114><174|5138|16|114><173|7186|16|17|114><169|6674|17|18|114><168|2151|17|71><166|2141|17|221><165|294|36><164|5129|16|36><163|296|9>") to sShortCuts
+        Move (sShortCuts+"<1064|2664|17|18|72><161|2169|17|89><157|273|40><156|5126|16|40><155|295|35><154|5130|16|35><153|3150|16|17|78><149|272|38><148|5125|16|38><1050|4615|18|37><1057|559|18|191><1051|4614|18|40><1052|4616|18|39>") to sShortCuts
+        Move (sShortCuts+"<147|2156|17|76><146|291|34><145|5132|16|34><144|290|33><143|5131|16|33><140|2166|17|86><224|4609|13|18><213|3154|16|17|82><1079|3155|16|17|83><137|2145|17|65><136|6679|17|18|119><134|3160|16|17|88>") to sShortCuts
+        Move (sShortCuts+"<1011|2167|17|87><133|2667|17|18|75><132|6663|17|18|37><131|6664|17|18|39><187|2162|17|82><130|3156|16|17|84><1060|609|18|65><186|276|45><185|2676|17|18|84><1062|2152|17|72><129|2170|17|90><127|262|9|16>") to sShortCuts
+        Move (sShortCuts+"<126|3104|16|17|32><125|2165|17|85><1043|6146|9|17><1044|7170|9|16|17><120|292|17|33><119|293|17|34><1040|268|18|112><1042|6166|17|118><112|6158|17|46><111|297|8|17><108|302|17|37><107|7175|16|17|37><103|303|17|39>") to sShortCuts
+        Move (sShortCuts+"<102|7176|16|17|39>") to sShortCuts
+        /* Quick Marks: 1084 Push = Ctrl+Q, 1085 Pop = Ctrl+Shift+Q. The stored code for a Ctrl+letter
+           carries the LOWERCASE character (2048 + 113 = 2161) and DataFlexOnKey takes the 32 off
+           to reach Key_Ctrl+Key_Q = 2129; with Shift the letter is upright already, so the code
+           is the On_Key code itself (2048 + 1024 + 81 = 3153 = Key_Ctrl+Key_Shift+Key_Q). Both
+           were checked against the compiler's own constants, and oEditorHotKeys-Tests keeps it so. */
+        Move (sShortCuts+"<1084|2161|17|81><1085|3153|16|17|81>") to sShortCuts
+        // Go to definition: 1086 = Ctrl+Shift+G (2048 + 1024 + 71 = 3143 = Key_Ctrl+Key_Shift+Key_G).
+        Move (sShortCuts+"<1086|3143|16|17|71>") to sShortCuts
+        Function_Return sShortCuts
+    End_Function
+
+    Function HasVkKey Integer[] VKcode Integer vk Returns Boolean
+        Boolean bHasKey
+        Integer iKey
+        Integer iCount
+
+        Move False to bHasKey
+        Move (SizeOfArray(VKcode)) to iCount
+        For iKey From 0 to (iCount-1)
+            If (VKcode[iKey]=vk) Begin
+                Move True to bHasKey
+                Move iCount to iKey
+            End
+        Loop
+        Function_Return bHasKey
+    End_Function
+
+    //
+    // If a hotkey has alt then it has that annoying bell sound unless you handle it.
+    // Here's the code to detect that.
+    // Pre: only call this if the command actually has a hotkey assigned.
+    //
+    Function HotKeyHasAlt Integer iCmd Returns Boolean
+        Boolean bAlt
+        tSciCommandHotKey Command
+
+        Move False to bAlt
+        Get FindCommand of oSciCommandHotKeys iCmd to Command
+        If (Command.iCmd=iCmd) Begin
+            Get HasVkKey of oSciCommandHotKeys Command.HotKey.VKcode VK_MENU to bAlt
+            If (bAlt=False) Begin
+                Get HasVkKey of oSciCommandHotKeys Command.HotKey2.VKcode VK_MENU to bAlt
+            End
+        End
+        Function_Return bAlt
+    End_Function
+
+
+    //
+    // On_Key shortcut definitions are so much fun. You can't just pass them the DataFlex value as retrieved from procedure Key
+    // You'll have to do some math on them to return back the correct integer value that the On_Key wants in order
+    // to have it work correctly.
+    // You also cannot use expressions (see forum: https://support.dataaccess.com/Forums/showthread.php?60684-Dynamic-Keyboard-shortcut-brain-teaser )
+    // In this function we will try to figure out what it takes.
+    //
+    // For the moment it is still pretty much a riddle, here's what testing shows:
+    //
+    //  iDfKey < 605       ==> iOnKey = iDfKey
+    //  iDfKey 2139..2141  ==> iOnKey = iDfKey (ctrl+[ and ctrl+])
+    //  iDfKey 605..3141   ==> iOnKey = iDfKey-32
+    //  iDfKey 3142..4609  ==> iOnKey = iDfKey
+    //  iDfKey > 4609 ==> if ctrl/alt/shift subtract $1000 then subtract value for each modifier key
+    //                    add back new value for each modifier key and add offset
+    //  iDfKey >= 6672 ==> iOnKey = iDfKey
+    //
+    Function DataFlexOnKey tShortCut HotKey Returns Integer
+        Boolean bAlt bShift bCtrl
+        Integer iOnKey
+        Integer iDfKey
+        Integer iDfOffset
+
+        Move HotKey.iDFKey to iDfKey
+        //
+        Move iDFKey to iOnKey
+        Move 32     to iDfOffset
+        If (iDfKey>2138 and iDfKey<2142) ;
+            Move 0 to iDfOffset
+        If (iDfkey>605 and iDfKey<3142) ;
+            Move (iDfKey-iDfOffset) to iOnkey
+        Else If (iDfkey>4609 and iDfkey<6672) Begin
+            Get HasVkKey HotKey.VKcode VK_MENU    to bAlt
+            Get HasVkKey HotKey.VKcode VK_SHIFT   to bShift
+            Get HasVkKey HotKey.VKcode VK_CONTROL to bCtrl
+
+            If (bAlt or bShift or bCtrl) Begin
+                Move |CI$1000 to iDfOffset
+                If (bAlt) ;
+                    Move (iDfOffset+|CI$0200) to iDfOffset
+                If (bShift) ;
+                    Move (iDfOffset+|CI$0400) to iDfOffset
+                If (bCtrl) ;
+                    Move (iDfOffset+|CI$0800) to iDfOffset
+                If (iDfOffset=|CI$1200 or iDfOffset=|CI$1400 or iDfOffset=|CI$1800) Begin
+                    // only 1 modifier key was pressed, offset goes back to 0, iDfKey=iOnKey
+                    Move 0 to iDfOffset
+                End
+                If (iDfOffset<>0) Begin
+                    Move |CI$EF8 to iDfOffset
+                    Move (iDfKey-iDfOffset) to iOnKey
+                End
+            End
+
+        End
+
+        Function_Return iOnKey
+    End_Function
+
+    /* THE COMMAND BOUND TO A KEY-EVENT CODE, or -1. iDfKey is the value DataFlex's Key message
+       carries - the same value the Keyboard page captured into a binding's iDFKey, so the two
+       compare directly; either of a command's two bindings counts.
+
+       WHY THIS EXISTS BESIDE DefineOnKey. The riddle table above ends "3142..4609 => iOnKey =
+       iDfKey", and that row was never true of On_Key. A probe on 2026-09-10 (KeyDispatchProbe,
+       scratch) posted Ctrl+Shift+G to a Form and to the Scintilla control with the modifiers held:
+       DataFlex delivered a Key event with iKey = 3143 - exactly Key_Ctrl+Key_Shift+Key_G - and the
+       On_Key defined with that constant fired in neither, while Ctrl+G and Ctrl+Q fired through
+       On_Key and never reached Key at all. So a Shift chord on a character key can be captured,
+       stored and displayed, but only a Key override can act on it - cRefactorEditorHotKeys has
+       one, and this is its lookup. */
+    Function CommandForDfKey Integer iDfKey Returns Integer
+        tSciCommandHotKey[] Commands
+        tSciCommandHotKey Command
+        Integer i iMax
+
+        If (iDfKey <= 0) ;
+            Function_Return -1
+        Get pCommands to Commands
+        Move (SizeOfArray(Commands) - 1) to iMax
+        For i from 0 to iMax
+            Move Commands[i] to Command
+            If (SizeOfArray(Command.HotKey.VKcode) > 0 and Command.HotKey.iDFKey = iDfKey) ;
+                Function_Return Command.iCmd
+            If (SizeOfArray(Command.HotKey2.VKcode) > 0 and Command.HotKey2.iDFKey = iDfKey) ;
+                Function_Return Command.iCmd
+        Loop
+        Function_Return -1
+    End_Function
+
+End_Class
+
+Object oSciCommandHotKeys is a cRefactorHotKeyTable
+End_Object
+
+Procedure RegisterEditorCommand Global Integer iCmd String sName String sDesc
+    Send RegisterCommand of oSciCommandHotKeys iCmd sName sDesc
+End_Procedure
+
+// Used for declaring a Userdefined Command which can be accesed from within
+// our editing control.
+#COMMAND DeclareEditorCommand R R R R
+    Define !1 For ( CMD_USER_BASE + !2 )
+    Send RegisterEditorCommand ( CMD_USER_BASE + !2 )  !3 !4
+#ENDCOMMAND
+
+Procedure RegisterInternalCommand Global Integer iCmd String sName String sDesc
+    Send RegisterCommand of oSciCommandHotKeys iCmd sName sDesc
+End_Procedure
+
+//
+// Need to register all our internal commands so that we have a similar set as with
+// codemax. The below text is pretty much a copy of what codemax has.
+//
+Procedure RegisterAllInternalCommands
+    tSciCommandHotKey[] ltCommands
+
+    Set pCommands of oSciCommandHotKeys to ltCommands
+    Send RegisterInternalCommand  CMD_WORDUPPERCASE               "WordUpperCase"             "Makes the current word uppercase"
+    Send RegisterInternalCommand  CMD_WORDTRANSPOSE               "WordTranspose"             "Swaps the current and previous words"
+    Send RegisterInternalCommand  CMD_WORDRIGHTEXTEND             "WordRightExtend"           "Extends the selection forward to the start of the next word"
+    Send RegisterInternalCommand  CMD_WORDRIGHT                   "WordRight"                 "Moves forward to the start of the next word"
+    Send RegisterInternalCommand  CMD_WORDENDRIGHT                "WordEndRight"              "Moves forward to the end of the next word"
+    Send RegisterInternalCommand  CMD_WORDENDRIGHTEXTEND          "WordEndRightExtend"        "Extends the selection forward to the end of the next word"
+    Send RegisterInternalCommand  CMD_WORDLOWERCASE               "WordLowerCase"             "Makes the current word lowercase"
+    Send RegisterInternalCommand  CMD_WORDLEFTEXTEND              "WordLeftExtend"            "Extends the selection backward to the start of the previous word"
+    Send RegisterInternalCommand  CMD_WORDLEFT                    "WordLeft"                  "Moves backward to the start of the previous word"
+    Send RegisterInternalCommand  CMD_WORDENDLEFT                 "WordEndLeft"               "Moves backward to the end of the previous word"
+    Send RegisterInternalCommand  CMD_WORDENDLEFTEXTEND           "WordEndLeftExtend"         "Extends the selection backward to the end of the previous word"
+    Send RegisterInternalCommand  CMD_WORDDELETETOSTART           "WordDeleteToStart"         "Deletes a word to the left"
+    Send RegisterInternalCommand  CMD_WORDDELETETOEND             "WordDeleteToEnd"           "Deletes a word to the right"
+    Send RegisterInternalCommand  CMD_WORDCAPITALIZE              "WordCapitalize"            "Makes the first character uppercase"
+    Send RegisterInternalCommand  CMD_WINDOWSTART                 "WindowStart"               "Moves to the top of the text window"
+    Send RegisterInternalCommand  CMD_WINDOWSCROLLUP              "WindowScrollUp"            "Scrolls the file contents up one line"
+    Send RegisterInternalCommand  CMD_WINDOWSCROLLTOTOP           "WindowScrollToTop"         "Scrolls the line to the top of the window"
+    Send RegisterInternalCommand  CMD_WINDOWSCROLLTOCENTER        "WindowScrollToCenter"      "Scrolls the line to the center of the window"
+    Send RegisterInternalCommand  CMD_WINDOWSCROLLTOBOTTOM        "WindowScrollToBottom"      "Scrolls the line to the bottom of the window"
+    Send RegisterInternalCommand  CMD_WINDOWSCROLLRIGHT           "WindowScrollRight"         "Scrolls the window to the right"
+    Send RegisterInternalCommand  CMD_WINDOWSCROLLLEFT            "WindowScrollLeft"          "Scrolls the window to the left"
+    Send RegisterInternalCommand  CMD_WINDOWSCROLLDOWN            "WindowScrollDown"          "Scrolls the file contents down one line"
+    Send RegisterInternalCommand  CMD_WINDOWRIGHTEDGE             "WindowRightEdge"           "Moves to the right edge of the text window"
+    Send RegisterInternalCommand  CMD_WINDOWLEFTEDGE              "WindowLeftEdge"            "Moves to the left edge of the text window"
+    Send RegisterInternalCommand  CMD_WINDOWEND                   "WindowEnd"                 "Moves to the bottom of the text window"
+    Send RegisterInternalCommand  CMD_UPPERCASESELECTION          "UpperCaseSelection"        "Makes the selection all uppercase"
+    Send RegisterInternalCommand  CMD_UNTABIFYSELECTION           "UntabifySelection"         "Replaces tabs with spaces in the selection"
+    Send RegisterInternalCommand  CMD_UNINDENTSELECTION           "UnindentSelection"         "Indents the selected text left one stop"
+    Send RegisterInternalCommand  CMD_UNDOCHANGES                 "UndoChanges"               "Undo's the last action, ignoring movement commands"
+    Send RegisterInternalCommand  CMD_UNDO                        "Undo"                      "Undo the last action"
+    Send RegisterInternalCommand  CMD_TABIFYSELECTION             "TabifySelection"           "Replaces spaces with tabs in the selection"
+    Send RegisterInternalCommand  CMD_SENTENCERIGHT               "SentenceRight"             "Moves to the beginning of the next sentence"
+    Send RegisterInternalCommand  CMD_SENTENCELEFT                "SentenceLeft"              "Moves to the beginning of the previous sentence"
+    Send RegisterInternalCommand  CMD_SENTENCECUT                 "SentenceCut"               "Deletes the remainder of the sentence"
+    Send RegisterInternalCommand  CMD_SELECTSWAPANCHOR            "SelectSwapAnchor"          "Swaps the anchor and the cursor in a selection"
+    Send RegisterInternalCommand  CMD_SELECTPARA                  "SelectPara"                "Selects the current paragraph"
+    Send RegisterInternalCommand  CMD_SELECTLINE                  "SelectLine"                "Selects lines of text"
+    Send RegisterInternalCommand  CMD_SELECTALL                   "SelectAll"                 "Selects the entire document"
+    Send RegisterInternalCommand  CMD_REDOCHANGES                 "RedoChanges"               "Redoes the last action, ignoring movement commands"
+    Send RegisterInternalCommand  CMD_REDO                        "Redo"                      "Redoes the previously undone action"
+    Send RegisterInternalCommand  CMD_PASTE                       "Paste"                     "Inserts the clipboard contents at the insertion point"
+    Send RegisterInternalCommand  CMD_PARAUP                      "ParaUp"                    "Moves to the beginning of the previous paragraph"
+    Send RegisterInternalCommand  CMD_PARADOWN                    "ParaDown"                  "Moves to the beginning of the next paragraph"
+    Send RegisterInternalCommand  CMD_PAGEUPEXTEND                "PageUpExtend"              "Extends the selection up one page"
+    Send RegisterInternalCommand  CMD_PAGEUP                      "PageUp"                    "Moves the cursor up one page"
+    Send RegisterInternalCommand  CMD_PAGEDOWNEXTEND              "PageDownExtend"            "Extends the selection down one page"
+    Send RegisterInternalCommand  CMD_PAGEDOWN                    "PageDown"                  "Moves the cursor down one page"
+    Send RegisterInternalCommand  CMD_LOWERCASESELECTION          "LowerCaseSelection"        "Makes the selection all lowercase"
+    Send RegisterInternalCommand  CMD_LINEUPEXTEND                "LineUpExtend"              "Extends the selection up one line"
+    Send RegisterInternalCommand  CMD_LINEUP                      "LineUp"                    "Moves the cursor up one line"
+    Send RegisterInternalCommand  CMD_LINETRANSPOSE               "LineTranspose"             "Swaps current and previous lines"
+    Send RegisterInternalCommand  CMD_LINESTART                   "LineStart"                 "Moves to the start of the current line"
+    Send RegisterInternalCommand  CMD_LINEOPENBELOW               "LineOpenBelow"             "Opens a new line below the cursor"
+    Send RegisterInternalCommand  CMD_LINEOPENABOVE               "LineOpenAbove"             "Opens a new line above the cursor"
+    Send RegisterInternalCommand  CMD_LINEENDEXTEND               "LineEndExtend"             "Extends the selection to the end of the current line"
+    Send RegisterInternalCommand  CMD_LINEEND                     "LineEnd"                   "Moves the cursor to the end of the current line"
+    Send RegisterInternalCommand  CMD_LINEDOWNEXTEND              "LineDownExtend"            "Extends the selection down one line"
+    Send RegisterInternalCommand  CMD_LINEDOWN                    "LineDown"                  "Moves the cursor down one line"
+    Send RegisterInternalCommand  CMD_LINEDELETETOSTART           "LineDeleteToStart"         "Deletes to the beginning of the current line"
+    Send RegisterInternalCommand  CMD_LINEDELETETOEND             "LineDeleteToEnd"           "Deletes to the end of the current line"
+    Send RegisterInternalCommand  CMD_LINEDELETE                  "LineDelete"                "Deletes the selected line"
+    Send RegisterInternalCommand  CMD_LINECUT                     "LineCut"                   "Deletes the selected line and places the text on the clipboard"
+    Send RegisterInternalCommand  CMD_INDENTTOPREV                "IndentToPrev"              "Indents to the position of the next text on the previous line"
+    Send RegisterInternalCommand  CMD_INDENTSELECTION             "IndentSelection"           "Indents to the selected text right one stop"
+    Send RegisterInternalCommand  CMD_HOMEEXTEND                  "HomeExtend"                "Extends the selection to either the start of the current line or the start of the text on that line"
+    Send RegisterInternalCommand  CMD_HOME                        "Home"                      "Moves to either the start of the current line or the start of the text on that line"
+    Send RegisterInternalCommand  CMD_GOTOMATCHBRACE              "GoToMatchBrace"            "Finds the matching brace"
+    Send RegisterInternalCommand  CMD_GOTOINDENTATION             "GoToIndentation"           "Moves to the end of the indentation"
+    Send RegisterInternalCommand  CMD_GOTOLINE                    "GoToLine"                  "Moves to a user-specified line"
+    Send RegisterInternalCommand  CMD_FINDREPLACE                 "FindReplace"               "Displays the Find & Replace dialog box"
+    Send RegisterInternalCommand  CMD_REPLACE                     "Replace"                   "Replaces the first occurrence of the find text after the current position with the replace text"
+    Send RegisterInternalCommand  CMD_REPLACEALLINBUFFER          "ReplaceAllInBuffer"        "Replaces the find text with the replace text in the entire buffer"
+    Send RegisterInternalCommand  CMD_REPLACEALLINSELECTION       "ReplaceAllInSelection"     "Replaces the find text with the replace text in the selection"
+    Send RegisterInternalCommand  CMD_FINDPREVWORD                "FindPrevWord"              "Finds the previous occurrence of the selected word"
+    Send RegisterInternalCommand  CMD_FINDPREV                    "FindPrev"                  "Finds the previous occurrence of the specified text"
+    Send RegisterInternalCommand  CMD_FINDNEXTWORD                "FindNextWord"              "Finds the next occurrence of the selected word"
+    Send RegisterInternalCommand  CMD_FINDNEXT                    "FindNext"                  "Finds the next occurrence of the specified text"
+    Send RegisterInternalCommand  CMD_FINDMARKALL                 "FindMarkAll"               "Finds the specified text and sets a bookmark at the specified locations"
+    Send RegisterInternalCommand  CMD_FIND                        "Find"                      "Finds the specified text"
+    Send RegisterInternalCommand  CMD_SETFINDTEXT                 "SetFindKeyWord"            "Sets the text to search for in subsequent find commands"
+    Send RegisterInternalCommand  CMD_SETREPLACETEXT              "SetReplaceKeyWord"         "Sets the text to substitute for the find text in subsequent find & replace commands"
+    Send RegisterInternalCommand  CMD_TOGGLEPRESERVECASE          "TogglePreserveCase"        "Toggles intelligent case preservation when replacing text"
+    Send RegisterInternalCommand  CMD_TOGGLEWHOLEWORD             "ToggleWholeWord"           "Toggles whole word searching on and off"
+    Send RegisterInternalCommand  CMD_TOGGLECASESENSITIVE         "ToggleCaseSensitive"       "Toggles case sensitive searching on and off"
+    Send RegisterInternalCommand  CMD_END                         "End"                       "Moves to the end of the current line, bottom of the text window, or end of the file"
+    Send RegisterInternalCommand  CMD_TOGGLEWHITESPACEDISPLAY     "ToggleWhiteSpaceDisplay"   "Shows or hides whitespace indicators"
+    Send RegisterInternalCommand  CMD_TOGGLEOVERTYPE              "ToggleOvertype"            "Toggles between inserting and replacing text"
+    Send RegisterInternalCommand  CMD_SETREPEATCOUNT              "SetRepeatCount"            "Sets the repeat count for the next command"
+    Send RegisterInternalCommand  CMD_DOCUMENTSTARTEXTEND         "DocumentStartExtend"       "Extends the selection to the beginning of the file"
+    Send RegisterInternalCommand  CMD_DOCUMENTSTART               "DocumentStart"             "Moves to the beginning of the file"
+    Send RegisterInternalCommand  CMD_DOCUMENTENDEXTEND           "DocumentEndExtend"         "Extends the selection to the end of the file"
+    Send RegisterInternalCommand  CMD_DOCUMENTEND                 "DocumentEnd"               "Moves to the end of the file"
+    Send RegisterInternalCommand  CMD_DELETEHORIZONTALSPACE       "DeleteHorizontalSpace"     "Deletes the spaces and the tabs around the cursor"
+    Send RegisterInternalCommand  CMD_DELETEBLANKLINES            "DeleteBlankLines"          "Delete the blank lines adjacent to the cursor"
+    Send RegisterInternalCommand  CMD_DELETEBACK                  "DeleteBack"                "Deletes the selection or, if there is no selection, the character to the left of the cursor"
+    Send RegisterInternalCommand  CMD_DELETE                      "Delete"                    "Deletes the selection"
+    Send RegisterInternalCommand  CMD_CUTSELECTION                "CutSelection"              "Cuts the selection and puts it on the clipboard"
+    Send RegisterInternalCommand  CMD_CUT                         "Cut"                       "Cuts the selection and puts it on the clipboard"
+    Send RegisterInternalCommand  CMD_COPY                        "Copy"                      "Copies the selection to the clipboard"
+    Send RegisterInternalCommand  CMD_CHARTRANSPOSE               "CharTranspose"             "Swap characters around the insertion point"
+    Send RegisterInternalCommand  CMD_CHARRIGHTEXTEND             "CharRightExtend"           "Extends the selection one character to the right"
+    Send RegisterInternalCommand  CMD_CHARRIGHT                   "CharRight"                 "Moves the cursor one character to the right"
+    Send RegisterInternalCommand  CMD_CHARLEFTEXTEND              "CharLeftExtend"            "Extends the selection one character to the left"
+    Send RegisterInternalCommand  CMD_CHARLEFT                    "CharLeft"                  "Moves the cursor one character to the left"
+    Send RegisterInternalCommand  CMD_BOOKMARKTOGGLE              "BookmarkToggle"            "Toggles a bookmark for the current line on and off"
+    Send RegisterInternalCommand  CMD_BOOKMARKPREV                "BookmarkPrev"              "Moves to the line containing the previous bookmark"
+    Send RegisterInternalCommand  CMD_BOOKMARKNEXT                "BookmarkNext"              "Moves to the line containing the next bookmark"
+    Send RegisterInternalCommand  CMD_BOOKMARKCLEARALL            "BookmarkClearAll"          "Clears all bookmarks in the window"
+    Send RegisterInternalCommand  CMD_BOOKMARKJUMPTOFIRST         "BookmarkJumpToFirst"       "Moves to the first line containing a bookmark"
+    Send RegisterInternalCommand  CMD_BOOKMARKJUMPTOLAST          "BookmarkJumpToLast"        "Moves to the last line containing a bookmark"
+    Send RegisterInternalCommand  CMD_APPENDNEXTCUT               "AppendNextCut"             "Appends the next cut text to end of clipboard"
+    Send RegisterInternalCommand  CMD_INSERTCHAR                  "InsertChar"                "Inserts a character at the current location"
+    Send RegisterInternalCommand  CMD_NEWLINE                     "NewLine"                   "Inserts a new-line character at the current location"
+    Send RegisterInternalCommand  CMD_RECORDMACRO                 "RecordMacro"               "Begins/ends keystroke macro recording"
+    Send RegisterInternalCommand  CMD_PLAYMACRO1                  "PlayMacro1"                "Plays keystroke macro 1"
+    Send RegisterInternalCommand  CMD_PLAYMACRO2                  "PlayMacro2"                "Plays keystroke macro 2"
+    Send RegisterInternalCommand  CMD_PLAYMACRO3                  "PlayMacro3"                "Plays keystroke macro 3"
+    Send RegisterInternalCommand  CMD_PLAYMACRO4                  "PlayMacro4"                "Plays keystroke macro 4"
+    Send RegisterInternalCommand  CMD_PLAYMACRO5                  "Playmacro5"                "Plays keystroke macro 5"
+    Send RegisterInternalCommand  CMD_PLAYMACRO6                  "Playmacro6"                "Plays keystroke macro 6"
+    Send RegisterInternalCommand  CMD_PLAYMACRO7                  "Playmacro7"                "Plays keystroke macro 7"
+    Send RegisterInternalCommand  CMD_PLAYMACRO8                  "Playmacro8"                "Plays keystroke macro 8"
+    Send RegisterInternalCommand  CMD_PLAYMACRO9                  "Playmacro9"                "Plays keystroke macro 9"
+    Send RegisterInternalCommand  CMD_PLAYMACRO10                 "Playmacro10"               "Plays keystroke macro 10"
+    Send RegisterInternalCommand  CMD_PROPERTIES                  "Properties"                "Displays the properties dialog"
+    Send RegisterInternalCommand  CMD_BEGINUNDO                   "BeginUndo"                 "Starts an undo transaction"
+    Send RegisterInternalCommand  CMD_ENDUNDO                     "EndUndo"                   "Ends an undo transaction"
+    //Send RegisterInternalCommand  CMD_RESERVED3                   "" ""  // internal use only (1227)
+
+    Send RegisterInternalCommand  CMD_TOGGLEREGEXP                "ToggleRegExp"              "Toggles regular expression searching on and off"
+    Send RegisterInternalCommand  CMD_CLEARSELECTION              "ClearSelection"            "Empties the selection"
+    Send RegisterInternalCommand  CMD_REGEXPON                    "RegExpOn"                  "Turns on regular expression searching"
+    Send RegisterInternalCommand  CMD_REGEXPOFF                   "RegExpOff"                 "Turns off regular expression searching"
+    Send RegisterInternalCommand  CMD_WHOLEWORDON                 "WholeWordOn"               "Turns on whole word searching"
+    Send RegisterInternalCommand  CMD_WHOLEWORDOFF                "WholeWordOff"              "Turns off whole word searching"
+    Send RegisterInternalCommand  CMD_PRESERVECASEON              "PreserveCaseOn"            "Turns on case preservation when replacing text"
+    Send RegisterInternalCommand  CMD_PRESERVECASEOFF             "PreserveCaseOff"           "Turns off case preservation when replacing text"
+    Send RegisterInternalCommand  CMD_CASESENSITIVEON             "CaseSensitiveOn"           "Turns on case sensitive searching"
+    Send RegisterInternalCommand  CMD_CASESENSITIVEOFF            "CaseSensitiveOff"          "Turns off case sensitive searching"
+    Send RegisterInternalCommand  CMD_WHITESPACEDISPLAYON         "WhiteSpaceDisplayOn"       "Turns on white space display"
+    Send RegisterInternalCommand  CMD_WHITESPACEDISPLAYOFF        "WhiteSpaceDisplayOff"      "Turns off white space display"
+    Send RegisterInternalCommand  CMD_OVERTYPEON                  "OvertypeOn"                "Turns on overtype mode"
+    Send RegisterInternalCommand  CMD_OVERTYPEOFF                 "OvertypeOff"               "Turns off overtype mode"
+    Send RegisterInternalCommand  CMD_CODELIST                    "CodeList"                  "Activates the code list control"
+    Send RegisterInternalCommand  CMD_CODETIP                     "CodeTip"                   "Activates the code tip control"
+    //Send RegisterInternalCommand  CMD_LAST                        "" ""
+End_Procedure
+
+// Registers commands for CodeMax so that these function can be accessed in macros and keyAssignments
+// This does only the registration! Connecting these commands to the actual code needs to be
+// done in the DefinePredefinedHotKeys of cEditorHotKey_Mixin
+Procedure RegisterExtraCommands
+
+    // File Menu. 1-9
+    DeclareEditorCommand CMD_FileOpenFile               1 "FileOpenFile"            "Opens a file"
+    DeclareEditorCommand CMD_FileSaveFile               2 "FileSaveFile"            "Saves the file"
+    DeclareEditorCommand CMD_FileSaveFileAs             3 "FileSaveFileAs"          "Save file as..."
+    DeclareEditorCommand CMD_FileSaveAll                4 "FileSaveAll"             "Saves all opened files"
+    DeclareEditorCommand CMD_FileCloseFile              5 "FileCloseFile"           "Closes the file"
+    DeclareEditorCommand CMD_FileCloseAllFiles          6 "FileCloseAllFiles"       "Closes all files"
+    DeclareEditorCommand CMD_FileNewFile                7 "FileNewFile"             "Create a new file"
+
+    // Options Menu 10-19
+    DeclareEditorCommand CMD_FindInFiles                10 "FindInFiles"            "Search the text in multiple files"
+    DeclareEditorCommand CMD_SelectWorkSpace            11 "SelectWorkSpace"       "Select another workspace to work in"
+
+    // Build Menu 20-29
+    DeclareEditorCommand CMD_BuildRun                   20 "BuildRun"                "Compiles and runs the main program (or current file if is '.SRC')"
+    DeclareEditorCommand CMD_BuildRunCurrent            21 "BuildRunCurrent"         "Compiles and runs the current file"
+    DeclareEditorCommand CMD_BuildCompileCurrent        22 "BuildCompile"            "Compiles the current file"
+    DeclareEditorCommand CMD_BuildPreCompile            23 "BuildPrecompile"         "PreCompiles the current file"
+    DeclareEditorCommand CMD_BuildExecute               24 "BuildExecute"            "Starts the main program (or current file if it is '.SRC') without compiling"
+    DeclareEditorCommand CMD_BuildDebugRun              25 "BuildDebugRun"           "ReCompiles with debug info and starts the main program"
+    DeclareEditorCommand CMD_BuildDebugRunCurrent       26 "BuildDebugRunCurrent"    "ReCompiles with debug info and starts the current program"
+
+    // Window Menu. 40-49
+    DeclareEditorCommand CMD_WindowSwitchToCodeView     40 "WindowSwitchToCodeView"   "Activates the codeview window"
+    DeclareEditorCommand CMD_WindowSwitchToErrorView    41 "WindowSwitchToErrorView"  "Activates the error window"
+    DeclareEditorCommand CMD_WindowSyncCodeView         42 "WindowSyncCodeView"       "Synchronizes the CodeView with cursorposition"
+    DeclareEditorCommand CMD_WindowNextView             43 "WindowNextView"           "Activates the next view"
+    DeclareEditorCommand CMD_WindowPreviousView         44 "WindowPreviousView"       "Activates the privious view"
+
+    // Lists 50-59
+    DeclareEditorCommand CMD_ListCreator                50 "ListCreator"              "Activates the Creator list"
+    DeclareEditorCommand CMD_ListObjects                51 "ListObjects"              "Activates the Object List"
+    DeclareEditorCommand CMD_ListVars                   52 "ListVariables"            "Activates the Variables List"
+    DeclareEditorCommand CMD_ListKeys                   53 "ListKeys"                 "Activates the Keys List"
+    DeclareEditorCommand CMD_ListProcedures             54 "ListProcedures"           "Activates the Procedures List (Overwriting)"
+    DeclareEditorCommand CMD_ListFunctions              55 "ListFunctions"            "Activates the Functions List (Overwriting)"
+    DeclareEditorCommand CMD_ListClasses                56 "ListClasses"              "Activates the Classes List"
+    DeclareEditorCommand CMD_ListIDETags                57 "ListIDETags"              "Activates the List with IDE tags"
+
+
+    // Mixed. 60-69
+    DeclareEditorCommand CMD_ToggleComment              60 "ToggleComment"              "Toggled the current line comment"
+    DeclareEditorCommand CMD_ToolsInsertHeaderGlobal    61 "ToolsInsertHeaderGlobal"    "Inserts a header into the current file (global)"
+    DeclareEditorCommand CMD_ToolsInsertHeaderUser      62 "ToolsInsertHeaderUser"      "Inserts a header into the current file (userspecific)"
+    DeclareEditorCommand CMD_OpenFileUnderCursor        63 "OpenFileUnderCursor"        "Tries to open the file under the current cursorposition"
+    DeclareEditorCommand CMD_InsertRevisionMark         64 "InsertRevisionMark"         "Inserts a Revisionmark"
+    DeclareEditorCommand CMD_InsertColor                65 "InsertColor"                "Inserts a RGB Color value"
+
+    // Convertion 70-79
+    DeclareEditorCommand CMD_ConvertOnItemToAddItem   70 "ConvertOnItemToAddItem"       "Converts On_Item block to send Add_Item and back"
+    DeclareEditorCommand CMD_ConvertCStructToVDF      71 "ConvertCStructToVDF"          "Converts a C structure to VDF syntax"
+    DeclareEditorCommand CMD_ConvertCDllCallToVDF     72 "ConvertCDllCallToVDF"         "Converts a C Dll call to VDF syntax"
+    DeclareEditorCommand CMD_ConvertVDFTypeToHandler  73 "ConvertVDFTypeToHandler"      "Converts a VDF TYPE structure to a Handler class"
+
+    DeclareEditorCommand CMD_MarkScopeBlock           74 "MarkScopeBlock"               "Marks the current Scope Begin/End block for the current Line"
+
+    // v3.0 by SVN
+    DeclareEditorCommand CMD_MOVELINEUP               75 "MoveLineUp"                   "Moves selected editor's code line up"
+    DeclareEditorCommand CMD_MOVELINEDOWN             76 "MoveLineDown"                 "Moves selected editor's code line down"
+    DeclareEditorCommand CMD_DUPLICATESELECTION       77 "DuplicateSelection"           "Duplicates selection or code line"
+
+    // by WvA
+    DeclareEditorCommand CMD_DEBUGPERFCOUNTERS        78 "Performance counters"         "Displays some statistics using performance counters (used for debugging purposes)"
+    DeclareEditorCommand CMD_REFACTORDROPSELF         79 "Refactor Drop Self"           "Refactor option to clean up Self references that are not required in recent code"
+    DeclareEditorCommand CMD_REFACTOROBJECTNEIGHBORHOOD 80 "Refactor Object Neighborhood" "Refactor option to clean up nested object references that are not required anymore due to object neighborhood logic"
+    DeclareEditorCommand CMD_REFACTORREINDENT         81 "Refactor Re-Indent"           "Refactor option to remove all existing indentation in the current file and replace it with your preferred indentation settings"
+    DeclareEditorCommand CMD_GOTOFIRSTINDENTMISMATCH  82 "GoTo First Indent Mismatch"   "Will try to locate the first line that mismatches the current indentation rules."
+    DeclareEditorCommand CMD_REFACTORMETHODEXTRACT    83 "Method extract"               "Extract the selected lines of code for method extraction"
+
+    /* Quick Marks (2026-09-10) - a STACK of places rather than a set of bookmarks: Push records
+       where the caret is, Pop returns to the newest place recorded, in another file when that
+       is where it was pushed. The stack is cQuickMarkStack, driven from cRefactorScintillaEditor;
+       these are the two rebindable commands over it. Defaults Ctrl+Q / Ctrl+Shift+Q below. */
+    DeclareEditorCommand CMD_QuickMarkPush            84 "QuickMarkPush"                "Pushes the current line onto the Quick Mark stack"
+    DeclareEditorCommand CMD_QuickMarkPop             85 "QuickMarkPop"                 "Pops the newest Quick Mark and returns to it"
+    // Go to definition (same day) - the Studio's Ctrl+Shift+G; pushes a Quick Mark before it jumps.
+    DeclareEditorCommand CMD_GotoDefinition           86 "GotoDefinition"               "Jumps to where the word under the cursor is defined"
+End_Procedure
+
+Send RegisterAllInternalCommands
+Send RegisterExtraCommands
+
+
+Function SetEditorHotKeys Global String sHotKeys Returns Integer
+    If (sHotKeys="") Begin
+        Get DefaultDefinitions of oSciCommandHotKeys to sHotKeys
+    End
+    Set ShortCutKeyDefinitions of oSciCommandHotKeys to sHotKeys
+    Function_Return 1
+End_Function
+
+// Not used in The Hammer
+//Function CMResetDefaultHotKeys global  Returns Integer
+//  send DevTest "CMResetDefaultHotKeys"
+//  function_return 0
+//End_Function
+// CMGetHotKeysForCmd was here. Its entire body was "Send DevTest" - a debugging marker
+// in cSciLexer.h for a function nobody implemented - and it returned 0 unconditionally.
+// Nothing in DFRefactor called it. Carrying it home would have meant importing DevTest
+// to keep a no-op alive.
+
+//
+// Is there a hotkey defined for the following command? If so then return
+// the hotkey as a string
+//
+Function CommandHotKeyText Integer iCmd Returns String
+    String sRet
+    tSciCommandHotKey Command
+
+    Move "" to sRet
+    Get FindCommand of oSciCommandHotKeys iCmd to Command
+    If (Command.iCmd>-1 and Command.iCmd=iCmd) Begin
+        Get CommandHotKeyString of oSciCommandHotKeys Command to sRet
+    End
+    Function_Return sRet
+End_Function
+
+
+// CMGetKeyForCommand was here: a signature wrapping twelve lines of commented-out body
+// and nothing else, calling a CMGetHotKeysForCmd that was itself a stub. Nothing called
+// it. CMGetHotkeys went the same way - a one-line wrapper round ShortCutKeyDefinitions
+// with no callers either; the settings dialog and LoadIni both ask the object directly.
+
+
+// The following functions are Not used in the hammer
+//Function CMRegisterHotKey global Pointer pHotKey Integer wCmd   Returns Integer
+//  send DevTest "CMRegisterHotKey"
+//  function_return 0
+//End_Function
+//Function CMUnregisterHotKey global Pointer pHotKey   Returns Integer
+//  send DevTest "CMUnregisterHotKey"
+//  function_return 0
+//End_Function
+//Function CMGetCommandString global Integer wCmd Integer bDescription Pointer pszBuff Integer nBuffLen   Returns Integer
+//  send DevTest "CMGetCommandString"
+//  function_return 0
+//End_Function

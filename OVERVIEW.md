@@ -107,7 +107,7 @@ This isn't a weekend hack. DFRefactor has:
 
 ## Get started
 
-See [README.md](README.md) for installation, cloning (with submodules), and a tour of the three programs (`DFRefactor.exe`, `TestBench.exe`, `DFUnit_TestRunner.exe`). The short version:
+See [README.md](README.md) for installation, cloning (with submodules), and a tour of the three programs (`DFRefactor.exe`, `TestBench.exe`, `UnitTests.exe`). The short version:
 
 1. Clone the repo with `--recurse-submodules` (the DFUnit, DUF, and SciControlLib libraries are submodules).
 2. Open `DFRefactor25.0.sws` in DataFlex Studio. Target is x64.

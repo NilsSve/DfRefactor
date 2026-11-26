@@ -1,0 +1,287 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oChangeCollidingMethodName-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-22
+//
+// Description : Unit tests for the ChangeCollidingMethodName refactor function.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+    Object oChangeCollidingMethodName is a cTestFixture
+        Set psFunctionName to "ChangeCollidingMethodName"
+
+        // The class family under test, as a fixture: cSummaryTable OVERRIDES cHashTable's Value with a
+        // different return type, which is the shape that causes error 4544 in the first place.
+        Function CCMN_Family Returns String[]
+            String[] asFam
+            Move "cHashTable"    to asFam[0]
+            Move "cSummaryTable" to asFam[1]
+            Function_Return asFam
+        End_Function
+
+        // --- class harvesting ---
+
+        // Both articles are legal DataFlex, and a class-decl reader that only knows "is a" silently
+        // misses every "is an" class - here cObject-derived ones.
+        { Published = True }
+        Procedure CCMN_ClassPairsAcceptsBothArticles
+            String[] asLines asPairs
+            Move "Class cHashTable is a cObject"       to asLines[0]
+            Move "Class cOther is an cObject"          to asLines[1]
+            Move "    Function Value String s Returns Variant" to asLines[2]
+            Get _ClassPairsFromLines of ghoFuncLib asLines to asPairs
+            Send Assert (SizeOfArray(asPairs) = 2)
+            Send AssertSAreEqual "cHashTable|cObject" asPairs[0]
+            Send AssertSAreEqual "cOther|cObject"     asPairs[1]
+        End_Procedure
+
+        // A subclass that OVERRIDES the method must join the family. Renaming only the class the compiler
+        // named would leave cSummaryTable still declaring Value - still ambiguous, still 4544.
+        { Published = True }
+        Procedure CCMN_FamilyPullsInOverridingSubclass
+            String[] asPairs asSeeds asFamily
+            Move "cSummaryTable|cHashTable" to asPairs[0]
+            Move "cUnrelated|cObject"       to asPairs[1]
+            Move "cHashTable"               to asSeeds[0]
+            Get _ExpandClassFamily of ghoFuncLib asPairs asSeeds to asFamily
+            Send Assert (SizeOfArray(asFamily) = 2)
+            Send Assert (SearchArray("cSummaryTable", asFamily, Desktop, RefFunc(DFSTRICMP)) <> -1)
+            Send Assert (SearchArray("cUnrelated",    asFamily, Desktop, RefFunc(DFSTRICMP)) = -1)
+        End_Procedure
+
+        // A grandchild joins too - the closure is iterated, and declaration order across files is arbitrary.
+        { Published = True }
+        Procedure CCMN_FamilyIsTransitiveAndOrderIndependent
+            String[] asPairs asSeeds asFamily
+            Move "cGrandChild|cChild"  to asPairs[0]
+            Move "cChild|cHashTable"   to asPairs[1]
+            Move "cHashTable"          to asSeeds[0]
+            Get _ExpandClassFamily of ghoFuncLib asPairs asSeeds to asFamily
+            Send Assert (SizeOfArray(asFamily) = 3)
+        End_Procedure
+
+        // The compiler names the MESSAGE, never the classes behind it; this is what bridges the two.
+        { Published = True }
+        Procedure CCMN_ClassesDeclaringNameFindsTheOwner
+            String[] asLines asOwners
+            Move "Class cHashTable is a cObject"                    to asLines[0]
+            Move "    Function Value String sKey Returns Variant"   to asLines[1]
+            Move "    End_Function"                                 to asLines[2]
+            Move "End_Class"                                        to asLines[3]
+            Move "Function Value Integer i Returns String"          to asLines[4]
+            Get _ClassesDeclaringName of ghoFuncLib asLines "Value" to asOwners
+            // The one at line 5 is outside any class - a different job, deliberately not a seed.
+            Send Assert (SizeOfArray(asOwners) = 1)
+            Send AssertSAreEqual "cHashTable" asOwners[0]
+        End_Procedure
+
+        // A settable property declares through "Procedure Set <name>" - word 2, not word 1.
+        { Published = True }
+        Procedure CCMN_ClassesDeclaringNameSeesProcedureSet
+            String[] asLines asOwners
+            Move "Class cHashTable is a cObject"                        to asLines[0]
+            Move "    Procedure Set Value String sKey Variant vValue"   to asLines[1]
+            Move "End_Class"                                            to asLines[2]
+            Get _ClassesDeclaringName of ghoFuncLib asLines "Value" to asOwners
+            Send Assert (SizeOfArray(asOwners) = 1)
+        End_Procedure
+
+        // --- receivers ---
+
+        // Both provable shapes, and the objects-only mode that carries across files.
+        { Published = True }
+        Procedure CCMN_ReceiversFromObjectAndCreate
+            String[] asLines asFamily asRecv
+
+            Get CCMN_Family to asFamily
+            Move "Object oTbl is a cHashTable"                  to asLines[0]
+            Move "    Get Create (RefClass(cSummaryTable)) to h" to asLines[1]
+            Move "Object oGrid is a cCJGrid"                    to asLines[2]
+            Get _ReceiverNamesFromLines of ghoFuncLib asLines asFamily False to asRecv
+            Send Assert (SizeOfArray(asRecv) = 2)
+            Send Assert (SearchArray("oTbl", asRecv, Desktop, RefFunc(DFSTRICMP)) <> -1)
+            Send Assert (SearchArray("h",    asRecv, Desktop, RefFunc(DFSTRICMP)) <> -1)
+            Send Assert (SearchArray("oGrid", asRecv, Desktop, RefFunc(DFSTRICMP)) = -1)
+            // Objects-only: an object NAME is workspace-wide, a local handle is not, so only the former
+            // may be carried into other files.
+            Get _ReceiverNamesFromLines of ghoFuncLib asLines asFamily True to asRecv
+            Send Assert (SizeOfArray(asRecv) = 1)
+            Send AssertSAreEqual "oTbl" asRecv[0]
+        End_Procedure
+
+        // --- the rewrite ---
+
+        // THE WHOLE POINT. The declaration and the calls that provably target it are renamed; the call on
+        // a form control, which merely shares the name, is left exactly as it was. Getting this wrong in
+        // either direction is a broken build - a missed rename leaves the 4544, a stray one invents an
+        // error where there was none.
+        { Published = True }
+        Procedure CCMN_RenamesDeclarationAndProvenCallsOnly
+            String[] asCode asFamily asRecv
+            Integer iChanged
+
+            Get CCMN_Family to asFamily
+            Move "oTbl" to asRecv[0]
+            Move "h"    to asRecv[1]
+            Move "Class cHashTable is a cObject"                  to asCode[0]
+            Move "    Function Value String sKey Returns Variant" to asCode[1]
+            Move "    End_Function"                               to asCode[2]
+            Move "End_Class"                                      to asCode[3]
+            Move "    Get Value of oTbl sKey to vAny"             to asCode[4]
+            Move "    Move (Value(oTbl, sKey)) to vAny"           to asCode[5]
+            Move "    Get Value  of h sKey to vAny"               to asCode[6]
+            Move "    Set psDebitPeriod to (Value(oForm3(v)))"    to asCode[7]
+            Get _RenameMethodInLines of ghoFuncLib (&asCode) "Value" "ValueByKey" asRecv asFamily "t.pkg" False to iChanged
+            Send Assert (iChanged = 4)
+            Send AssertSAreEqual "    Function ValueByKey String sKey Returns Variant" asCode[1]
+            Send AssertSAreEqual "    Get ValueByKey of oTbl sKey to vAny"             asCode[4]
+            Send AssertSAreEqual "    Move (ValueByKey(oTbl, sKey)) to vAny"           asCode[5]
+            Send AssertSAreEqual "    Get ValueByKey  of h sKey to vAny"               asCode[6]
+            // The bystander - a DEO control Value, nothing to do with the hash table.
+            Send AssertSAreEqual "    Set psDebitPeriod to (Value(oForm3(v)))"         asCode[7]
+        End_Procedure
+
+        // A declaration of the same name in a class OUTSIDE the family is somebody else's method.
+        { Published = True }
+        Procedure CCMN_LeavesForeignClassDeclarationAlone
+            String[] asCode asFamily asRecv
+            Integer iChanged
+            Get CCMN_Family to asFamily
+            Move "Class cSomethingElse is a cObject"                  to asCode[0]
+            Move "    Function Value Integer iItem Returns String"    to asCode[1]
+            Move "End_Class"                                          to asCode[2]
+            Get _RenameMethodInLines of ghoFuncLib (&asCode) "Value" "ValueByKey" asRecv asFamily "t.pkg" False to iChanged
+            Send Assert (iChanged = 0)
+            Send AssertSAreEqual "    Function Value Integer iItem Returns String" asCode[1]
+        End_Procedure
+
+        // Inside a family class body the receiver is implicit Self, so an unqualified call renames - but
+        // the same unqualified call outside the family must not.
+        { Published = True }
+        Procedure CCMN_RenamesUnqualifiedSelfCallInsideFamilyOnly
+            String[] asCode asFamily asRecv
+            Integer iChanged
+
+            Get CCMN_Family to asFamily
+            Move "Class cSummaryTable is a cHashTable"    to asCode[0]
+            Move "    Procedure SortKeys"                 to asCode[1]
+            Move "        Get Value sKey to nVal"         to asCode[2]
+            Move "    End_Procedure"                      to asCode[3]
+            Move "End_Class"                              to asCode[4]
+            Move "    Get Value sKey to nVal"             to asCode[5]
+            Get _RenameMethodInLines of ghoFuncLib (&asCode) "Value" "ValueByKey" asRecv asFamily "t.pkg" False to iChanged
+            Send Assert (iChanged = 1)
+            Send AssertSAreEqual "        Get ValueByKey sKey to nVal" asCode[2]
+            Send AssertSAreEqual "    Get Value sKey to nVal"          asCode[5]
+        End_Procedure
+
+        // A call in a COMMENT is not code. A rename that edits comments produces a diff nobody can review.
+        { Published = True }
+        Procedure CCMN_IgnoresCommentsAndStringLiterals
+            String[] asCode asFamily asRecv
+            Integer iChanged
+            Get CCMN_Family to asFamily
+            Move "oTbl" to asRecv[0]
+            Move "// Get Value of oTbl sKey to vAny"                to asCode[0]
+            Move ('    Move "Get Value of oTbl" to sMsg')          to asCode[1]
+            Get _RenameMethodInLines of ghoFuncLib (&asCode) "Value" "ValueByKey" asRecv asFamily "t.pkg" False to iChanged
+            Send Assert (iChanged = 0)
+        End_Procedure
+
+        // An untypable receiver is LEFT ALONE and recorded - never guessed at. Recording is gated on the
+        // family being in play in that file, or a workspace would drown in rows about form controls.
+        { Published = True }
+        Procedure CCMN_UnprovableReceiverIsRecordedNotRenamed
+            String[] asCode asFamily asRecv asUnproven
+            Integer iChanged
+            Send ClearFuncLibProperties of ghoFuncLib
+            Send _InitializeFuncLib of ghoFuncLib
+            Get CCMN_Family to asFamily
+            Move "    Get Value of hoSomething sKey to vAny" to asCode[0]
+            Get _RenameMethodInLines of ghoFuncLib (&asCode) "Value" "ValueByKey" asRecv asFamily "t.pkg" True to iChanged
+            Send Assert (iChanged = 0)
+            Send AssertSAreEqual "    Get Value of hoSomething sKey to vAny" asCode[0]
+            Get pasRenameUnproven of ghoFuncLib to asUnproven
+            Send Assert (SizeOfArray(asUnproven) = 1)
+        End_Procedure
+
+        // ... and stays silent where the family is not in play at all.
+        { Published = True }
+        Procedure CCMN_UnprovableNotRecordedWhenFamilyNotInPlay
+            String[] asCode asFamily asRecv asUnproven
+            Integer iChanged
+            Send ClearFuncLibProperties of ghoFuncLib
+            Send _InitializeFuncLib of ghoFuncLib
+            Get CCMN_Family to asFamily
+            Move "    Get Value of hoSomething sKey to vAny" to asCode[0]
+            Get _RenameMethodInLines of ghoFuncLib (&asCode) "Value" "ValueByKey" asRecv asFamily "t.pkg" False to iChanged
+            Get pasRenameUnproven of ghoFuncLib to asUnproven
+            Send Assert (SizeOfArray(asUnproven) = 0)
+        End_Procedure
+
+        // --- the position helpers the scanner leans on ---
+
+        // Reading past either end of the line must be "" rather than a fault - the one line that starts
+        // or ends with the name is otherwise a crash waiting to happen.
+        { Published = True }
+        Procedure CCMN_WordHelpersHandleLineEdges
+            String sBefore sAfter
+            Get _WordBeforePos of ghoFuncLib "Value(oTbl)" 1 to sBefore
+            Send AssertSAreEqual "" sBefore
+            Get _WordAfterPos of ghoFuncLib "Get Value" 10 to sAfter
+            Send AssertSAreEqual "" sAfter
+            Get _WordBeforePos of ghoFuncLib "Get Value of oTbl" 5 to sBefore
+            Send AssertSAreEqual "get" sBefore
+            Get _WordAfterPos of ghoFuncLib "Get Value of oTbl" 10 to sAfter
+            Send AssertSAreEqual "of" sAfter
+        End_Procedure
+
+
+        // A hand rename is the declaration AND every call that means it. Handing back only the two
+        // declarations was no help at all (Nils 2026-07-22) - the uses are what cannot be found by eye.
+        { Published = True }
+        Procedure CCMN_SitesListsDeclarationsAndUses
+            String[] asCode asRows
+
+            Move "Function Split Global String sKey String sText Returns String[]" to asCode[0]
+            Move "    Move (Split(sKey, sText)) to asParts"                        to asCode[1]
+            Move "    Get Split sKey sText to asParts"                             to asCode[2]
+            Move "    Move (MySplitter(sKey)) to asParts"                          to asCode[3]
+            Get _NameSitesInLines of ghoFuncLib asCode "Split" "w.pkg" "DECL" "USE" "why" to asRows
+            // The declaration, plus the two real uses. MySplitter must not match - a rename that edits
+            // a longer name that merely contains this one is a broken build.
+            Send Assert (SizeOfArray(asRows) = 3)
+            Send AssertSAreEqual "w.pkg|1|DECL|why" asRows[0]
+            Send AssertSAreEqual "w.pkg|2|USE|why"  asRows[1]
+            Send AssertSAreEqual "w.pkg|3|USE|why"  asRows[2]
+        End_Procedure
+
+        // A name in a comment or a string literal is not a site - a worklist full of remarks is noise.
+        { Published = True }
+        Procedure CCMN_SitesIgnoresCommentsAndLiterals
+            String[] asCode asRows
+            Move (Character(47) + Character(47) + " Split is used here")   to asCode[0]
+            Move ('    Move "Split this text" to sMsg')                   to asCode[1]
+            Move "    Move (Split(sKey, sText)) to asParts"               to asCode[2]
+            Get _NameSitesInLines of ghoFuncLib asCode "Split" "w.pkg" "DECL" "USE" "why" to asRows
+            Send Assert (SizeOfArray(asRows) = 1)
+            Send AssertSAreEqual "w.pkg|3|USE|why" asRows[0]
+        End_Procedure
+
+        // A Property declaration of the name is labelled a declaration too, not a use.
+        { Published = True }
+        Procedure CCMN_SitesLabelsPropertyDeclaration
+            String[] asCode asRows
+            Move "    Property String pbSilent False" to asCode[0]
+            Move "    Set pbSilent to True"           to asCode[1]
+            Get _NameSitesInLines of ghoFuncLib asCode "pbSilent" "w.pkg" "DECL" "USE" "why" to asRows
+            Send Assert (SizeOfArray(asRows) = 2)
+            Send AssertSAreEqual "w.pkg|1|DECL|why" asRows[0]
+            Send AssertSAreEqual "w.pkg|2|USE|why"  asRows[1]
+        End_Procedure
+
+    End_Object
+

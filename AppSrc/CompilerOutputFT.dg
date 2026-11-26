@@ -1,0 +1,1270 @@
+﻿// Compiler-output AREA - was the standalone oCompilerOutput_dg dock; now a Container3d #Include'd INSIDE
+// OutputDockFT.dg's merged bottom dock (its tab strip switches between this and the analyzer area), so this
+// object is constructed as a CHILD of the dock - that parenting realizes the grid's ActiveX before
+// OnUpdate -> Initialize. The Use lines below keep this file self-contained; they are harmless no-ops here
+// because OutputDockFT.dg Use's the same packages at file scope BEFORE this #Include (DataFlex Use is once-
+// only, so a redundant load pastes nothing). Only External_Function / Register_Procedure can
+// NOT live here (not once-only - they would be pasted inside the object body); those stay in OutputDockFT.dg.
+Use cCJGrid.pkg
+Use cFTDockArea.pkg             // the area root: Container3d with the Designer's top-level tag
+Use cRDCGridToolTip.pkg          // cRDCToolTipGrid / cRDCToolTipColumn - the tooltip settings (RDCToolsLib)
+Use cFTDockPanelGrid.pkg         // the grid inside the dock - one look for the three tabs, on RDCToolsLib's cRDCCJToolPanelGrid
+Use cRDCGridClipboard.pkg        // RDCCopyGridRows - the grid's rows onto the clipboard (RDCToolsLib)
+Use cCJCommandBars.pkg
+Use cCompilerOutputContextMenu.pkg 
+Use FTMarkupBuilders.pkg         // the HTML vocabulary - OpenHtml, IconLabel, the builders
+Use FTThemeColors.pkg            // FTWebBg / FTCJTheme - the FT palette
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+
+Object oCompilerArea is a cFTDockArea
+    Set Size to 47 400
+    Set Location to 0 0
+    Set Color to (FTViewBg())
+    Set Border_Style to Border_None
+    Set peAnchors to anAll
+    Move Self to ghoCompilerOutputDock
+    
+    Procedure End_Construct_Object
+        Handle ho
+        Forward Send End_Construct_Object
+        Get Create (RefClass(cCompileOutputCJCommandBarSystem)) to ho
+        Set Name of ho to "oCompileOutputCJCommandBarSystem"
+        Set phoToolPanelContextMenu to ho
+    End_Procedure
+    
+    Property String psErrorFile ""
+    // When non-blank, the dock shows this log file's lines verbatim (live df-cli compiler
+    // output, refreshed while a compile runs) instead of the parsed .err. Cleared by
+    // ActivateCompileErrorDialog / CloseCompileErrorDialog. See LoadRawOutput / Initialize.
+    Property String psRawLogFile ""
+
+    // ---- Studio-style banner inputs (fed by TestCompileFT) ----
+    // The header banner (program name + full .src path + target bitness) is set at StartCompile so the
+    // live stream shows it from the first paint; piCompileSeconds is set at FinishCompile once the
+    // elapsed time is known. A blank program name suppresses the banner (e.g. a stray .err opened
+    // directly). Consumed by StudioBannerHeader / StudioBannerSummary in the grid below.
+    Property String  psCompileProgramName ""
+    Property String  psCompileProgramPath ""
+    Property String  psCompileBitness     ""
+    Property Integer piCompileSeconds      0
+    // True while the banner describes a PACKAGE precompile: TryStartPrecompile feeds the
+    // package's name/path and sets this; StartCompile resets it. The banners then read
+    // "----Pre-compiling <pkg>----" / "----Pre-compile Finished ...----" so a precompile
+    // attempt is unmistakable in the output (Nils 2026-07-05).
+    Property Boolean pbCompileIsPrecompile False
+    // Warning count for the "- Total Warnings" line. Fed by the host from the .prn LISTING - the .err
+    // the dock shows carries ERRORS only, so warnings have to come from the .prn. (Errors are counted
+    // in the dock from the .err it already has.)
+    Property Integer piCompileWarnings     0
+    // Error total for the compiler chip band (Test Compile bar): the FULL parsed-.err count, set at grid-load
+    // (LoadData / LoadCombined) - unlike the analyzer's source-line subset. pbCompileSummaryReady gates the band
+    // (True once a compile's errors have loaded; StartCompile clears it so a new compile shows progress first).
+    Property Integer piCompileErrors       0
+    /*  LINK errors, counted APART from piCompileErrors since 2026-09-10 (Nils: three link errors
+        for bitmaps a workspace could not find were being reported as compile errors).
+
+        They are a different kind of failure and answer a different question. A compile error is
+        something wrong in the source; a link error is the .exe stage failing to find a bitmap, an
+        icon or a manifest, with the code behind it perfectly compiled. Folding them together made
+        the errors chip disagree with the summary block right beneath it, which has separated the
+        two since it was written ("The code compiled - only the link failed").
+
+        Counted rather than discarded, because a link-only failure must not read as success: the
+        chip band shows this beside the errors chip whenever it is non-zero, so 0 errors and a
+        build that produced no .exe cannot look the same. */
+    Property Integer piLinkErrors          0
+    Property Boolean pbCompileSummaryReady False
+    // The RESOLVED runnable .exe of a JUST-FINISHED successful compile (clean or warnings-only) - drives the
+    // Studio-style success footer's "----Executable written: <path>" line (StudioBannerFooter). Fed by
+    // FinishCompile's success branches (ResolveProgramExe); cleared at compile start (StartCompile /
+    // TryStartPrecompile banner feeds) and by the failure/empty entry procs, so a failed or stale view never
+    // shows a previous compile's footer. "" = no footer.
+    Property String psCompiledExe ""
+    // The auto-chain phase note: when a program compile was started AUTOMATICALLY because its
+    // targeted precompile just verified green (TestCompileFT's Error-4522 chain, 2026-07-19), the
+    // host stores the full "----Pre-compile of <pkg> succeeded ...----" line here and
+    // StudioBannerHeader prints it ABOVE the "----Compiling <prog>----" banner - the chained
+    // compile rebuilds the live view from a fresh log, so without this line the precompile's
+    // success would vanish from the output the moment the compile starts. StartCompile clears it
+    // for every non-chained compile. "" = no note.
+    Property String psCompileChainNote ""
+
+    // (The old "one-at-a-time" Activate override that hid the analyzer dock is gone - the merged dock's
+    // bottom tab strip / ShowTab does the switching now.)
+
+    Object oCompileErrors_grd is a cFTDockPanelGrid
+        Set Size to 60 394   // full width
+        Set piMinSize to 54 100
+        Set Location to 2 4
+        // The single "Output" header (oText_Col) matches the Analyzer tab's headered grid, so the top does not jump on a tab switch.
+        Set psNoItemsText to "No errors"
+        Set psLayoutSection to "oCompileErrors_grd"
+        Set phoContextMenu to (phoToolPanelContextMenu(Self))
+        Set peAnchors to anAll
+        
+        // The four output-row icons (Studio-style), loaded in LoadIcons. piIconOff is the neutral
+        // triangle for plain lines; piCompileIcon marks the Studio "----...----" section-header rows
+        // ("----Compiling ...", "----Compile Finished ...", "----Compiler Error Summary----").
+        Property Integer piIconOff
+        Property Integer piWarningIcon
+        Property Integer piErrorIcon
+        Property Integer piCompileIcon
+        Property Integer piCompileEndIcon
+
+        Object oIcon_Col is a cCJGridColumn
+            Set piWidth to 30
+            Set pbDrawFooterDivider to False
+            Set pbDrawHeaderDivider to False
+            Set peIconAlignment to xtpAlignmentIconCenter
+            Set pbShowInFieldChooser to False
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+            Set pbEditable to False
+            Set pbResizable to False
+
+            Procedure OnSetDisplayMetrics Handle hoGridItemMetrics Integer iRow String ByRef sValue
+                String sText sU
+                Integer iVal
+
+                Forward Send OnSetDisplayMetrics hoGridItemMetrics iRow
+
+                // Pick the row's icon Studio-style. The parser's obError_Col only flags ERROR vs not-error
+                // (bError is a Boolean - CompileErrorParser.pkg: "if false, it is a warning"), so warnings
+                // AND plain lines both arrive as 0. So we read the line TEXT (works for parsed + raw rows):
+                //   - the "----Compile Finished ..." row -> compile-END glyph
+                //   - any other Studio "----...----" SECTION HEADER (Compiling / Error Summary)
+                //     -> compile-project glyph
+                //   - a "Warning <n>" diagnostic -> warning glyph
+                //   - an error (parser-flagged, or an "Error <n>" line in the raw output) -> error glyph
+                //   - everything else (incl. the "- Summary" / "- Total ..." lines) -> the neutral triangle
+                // The trailing space in "WARNING "/"ERROR " targets the "<word> <number>" diagnostic form and
+                // skips plural summary lines ("3 warnings"). Headers are tested FIRST (the Error-Summary
+                // header itself contains "ERROR ").
+                Get RowValue of oText_Col   iRow to sText
+                Get RowValue of obError_Col iRow to iVal
+                Move (Uppercase(sText)) to sU
+                If ((sText contains "----Compile Finished") or (sText contains "----Pre-compile Finished")) Begin
+                    Set ComItemIcon of hoGridItemMetrics to (piCompileEndIcon(Self))
+                End
+                Else If (Left(Trim(sText), 4) = "----") Begin
+                    Set ComItemIcon of hoGridItemMetrics to (piCompileIcon(Self))
+                End
+                Else If (sU contains "WARNING ") Begin
+                    Set ComItemIcon of hoGridItemMetrics to (piWarningIcon(Self))
+                End
+                Else If ((iVal = 1) or (sU contains "ERROR ")) Begin
+                    Set ComItemIcon of hoGridItemMetrics to (piErrorIcon(Self))
+                End
+                Else Begin
+                    Set ComItemIcon of hoGridItemMetrics to (piIconOff(Self))
+                End
+           End_Procedure
+
+        End_Object
+        
+        Object oText_Col is a cCJGridColumn
+            Set piWidth to 200
+            Set psCaption to "Output"
+            Set pbAllowDrag to False
+            Set pbAllowRemove to False
+            Set pbComboEntryState to False
+            Set pbEditable to False
+            Set pbShowInFieldChooser to False
+        End_Object
+        
+        // Hidden columns:
+        Object obError_Col is a cCJGridColumn
+            Set piWidth to 4
+            Set pbVisible to False
+            Set pbCheckbox to True
+            Set pbShowInFieldChooser to False
+        End_Object 
+        
+        Object oErrorNum_Col is a cCJGridColumn
+            Set piWidth to 4
+            Set pbVisible to False
+            Set pbShowInFieldChooser to False
+        End_Object 
+        
+        Object oLine_Col is a cCJGridColumn
+            Set piWidth to 4
+            Set pbVisible to False
+            Set pbShowInFieldChooser to False
+        End_Object 
+        
+        Object oFileName_Col is a cCJGridColumn
+            Set piWidth to 4
+            Set pbVisible to False
+            Set pbShowInFieldChooser to False
+        End_Object 
+        
+        Object oErrorTxt_Col is a cCJGridColumn
+            Set piWidth to 4
+            Set pbVisible to False
+            Set pbShowInFieldChooser to False
+        End_Object  
+        
+        Procedure Delete_Data
+            Handle hoDataSource
+            tDataSourceRow[] TheData
+
+            If (not(IsComObjectCreated(Self))) Begin
+                Procedure_Return
+            End
+            
+            Send InitializeData TheData
+        End_Procedure
+
+        // Studio-style header banner rows: "----Compiling <prog> (<bits>) ----" then
+        // "- Compiling Program: <full path>". Returns an empty array when no program name has been
+        // fed (a stray .err view), so callers prepend nothing. The host (TestCompileFT) feeds the
+        // inputs via psCompileProgramName / psCompileProgramPath / psCompileBitness.
+        Function StudioBannerHeader Returns String[]
+            String sName sPath sBits sVerb sKind sChain
+            Boolean bPre
+            String[] asOut
+
+            Get psCompileProgramName to sName
+            If (sName = "") ;
+                Function_Return asOut
+            Get psCompileProgramPath to sPath
+            Get psCompileBitness     to sBits
+            If (sBits = "") ;
+                Move "64-bit" to sBits
+            Get pbCompileIsPrecompile to bPre
+            If (bPre = True) Begin
+                Move "Pre-compiling" to sVerb
+                Move "Package"       to sKind
+            End
+            Else Begin
+                Move "Compiling" to sVerb
+                Move "Program"   to sKind
+            End
+            // A compile CHAINED from a green precompile carries the phase note first, so the
+            // output reads as one narrative: pre-compile succeeded -> the program compile.
+            Get psCompileChainNote to sChain
+            If (sChain <> "") ;
+                Move sChain to asOut[-1]
+            Move ("----" + sVerb + " " + sName + " (" + sBits + ") ----") to asOut[-1]
+            If (sPath <> "") ;
+                Move ("- " + sVerb + " " + sKind + ": " + sPath) to asOut[-1]
+            Function_Return asOut
+        End_Function
+
+        // Studio-style failure summary block, ending with the "----Compiler Error Summary----" section
+        // header that precedes the parsed error list. iErrors / iLinkErrors are counted from the parsed
+        // .err; iWarnings comes from the .prn (via the host); the elapsed time comes from piCompileSeconds.
+        // A LINK-ONLY failure (no compile errors, only LINK errors - e.g. a missing .manifest) gets a
+        // distinct, reassuring block: the code compiled, only the .exe link failed.
+        Function StudioBannerSummary Integer iWarnings Integer iErrors Integer iLinkErrors Returns String[]
+            Integer iSec iCompileErr iCnt iMax
+            String sVerb
+            Boolean bPre
+            String[] asOut asFooter
+
+            Get piCompileSeconds to iSec
+            Get pbCompileIsPrecompile to bPre
+            If (bPre = True) Begin
+                Move "Pre-compile" to sVerb
+            End
+            Else Begin
+                Move "Compile" to sVerb
+            End
+            Move (iErrors - iLinkErrors) to iCompileErr
+            // WARNINGS-ONLY SUCCESS (0 errors - the .exe was built): totals + the Studio success footer
+            // ("Finished" + "Executable written"), then a section header naming the parsed rows below for
+            // what they are - warnings. (This branch used to fall through to the error block and headline
+            // "Finished (with Errors!)" on a 0-error build - Nils 2026-07-08.)
+            If (iErrors = 0) Begin
+                Move "- Summary"                                 to asOut[0]
+                Move ("- Total Warnings : " + String(iWarnings)) to asOut[1]
+                Move  "- Total Errors   : 0"                     to asOut[2]
+                Get StudioBannerFooter to asFooter
+                Move (SizeOfArray(asFooter) - 1) to iMax
+                For iCnt from 0 to iMax
+                    Move asFooter[iCnt] to asOut[-1]
+                Loop
+                Move "----Compiler Warning Summary----" to asOut[-1]
+                Function_Return asOut
+            End
+            If (iCompileErr = 0 and iLinkErrors > 0) Begin
+                Move "- Summary"                                                            to asOut[0]
+                Move ("- Total Warnings : " + String(iWarnings))                            to asOut[1]
+                Move  "- Compile errors : 0"                                                to asOut[2]
+                Move ("- Link errors    : " + String(iLinkErrors))                          to asOut[3]
+                Move  "- The code compiled - only the link failed (the .exe was not built)." to asOut[4]
+                Move ("----" + sVerb + " Finished (compiled OK - link failed) in " + String(iSec) + " seconds ----") to asOut[5]
+                Move "----Compiler Error Summary----"                                       to asOut[6]
+            End
+            Else Begin
+                Move "- Summary"                                            to asOut[0]
+                Move ("- Total Warnings : " + String(iWarnings))            to asOut[1]
+                Move ("- Total Errors   : " + String(iErrors))              to asOut[2]
+                Move ("- " + String(iErrors) + " ERRORS HAVE BEEN FOUND.")  to asOut[3]
+                Move ("----" + sVerb + " Finished (with Errors!) in " + String(iSec) + " seconds ----") to asOut[4]
+                Move "----Compiler Error Summary----"                       to asOut[5]
+            End
+            Function_Return asOut
+        End_Function
+
+        // Studio-style SUCCESS footer - the two lines the Studio always ends a successful compile with:
+        //     ----Compile Finished in N seconds ----
+        //     ----Executable written: <Programs\...exe>
+        // (Nils 2026-07-08.) The exe line renders only when FinishCompile resolved one (psCompiledExe on the
+        // area; "" e.g. after a precompile). The icon painter needs no change: "----Compile Finished" already
+        // maps to the compile-end glyph and the "----Executable..." line to the section glyph.
+        Function StudioBannerFooter Returns String[]
+            Integer iSec
+            String sVerb sExe
+            Boolean bPre
+            String[] asOut
+
+            Get piCompileSeconds to iSec
+            Get pbCompileIsPrecompile to bPre
+            If (bPre = True) Begin
+                Move "Pre-compile" to sVerb
+            End
+            Else Begin
+                Move "Compile" to sVerb
+            End
+            Move ("----" + sVerb + " Finished in " + String(iSec) + " seconds ----") to asOut[0]
+            Get psCompiledExe to sExe
+            If (sExe <> "") ;
+                Move ("----Executable written: " + sExe) to asOut[-1]
+            Function_Return asOut
+        End_Function
+
+        // Count parsed errors (bError flags an error; everything else is a warning). Warnings are
+        // the array remainder, so callers derive them as SizeOfArray - this.
+        Function CountErrors tCompileError[] asCompileError Returns Integer
+            Integer iSize iCount iErr
+            Move 0 to iErr
+            Move (SizeOfArray(asCompileError) - 1) to iSize
+            For iCount from 0 to iSize
+                If (asCompileError[iCount].bError = True) ;
+                    Increment iErr
+            Loop
+            Function_Return iErr
+        End_Function
+
+        // Count parsed LINK errors (sText begins "Link Error" - see ExtractData). Used to tell a link-only
+        // failure (manifest/exe; code compiled) from genuine compile errors.
+        Function CountLinkErrors tCompileError[] asCompileError Returns Integer
+            Integer iSize iCount iLink
+            Move 0 to iLink
+            Move (SizeOfArray(asCompileError) - 1) to iSize
+            For iCount from 0 to iSize
+                If (Uppercase(Left(Trim(asCompileError[iCount].sText), 10)) = "LINK ERROR") ;
+                    Increment iLink
+            Loop
+            Function_Return iLink
+        End_Function
+
+        // Append the compile's WARNINGS (harvested live from the .prn by the Test Compile dock's tail)
+        // to the parsed .err set, so the post-compile grid shows the FULL diagnostic picture for EVERY
+        // compiler - the .err carries errors only (Nils 2026-07-03: "the output window always looks the
+        // same"). Errors keep their position; warnings follow, each rendered with the warning icon
+        // (bError False). Self-guarding: nothing is appended while a compile is still RUNNING (the
+        // cache is only stamped at compile end - so the live mid-compile refreshes stay errors-only,
+        // keeping the 500 ms tick light), when no compile ran this session, when the cache is stale,
+        // or when the .err being shown is not the cached listing's program (base-path compare: both
+        // extensions are 4 chars, so "...\LegacyApp.err" and "...\LegacyApp.prn" match on Left(-4)).
+        Function AppendCachedPrnWarnings tCompileError[] asCompileError Returns tCompileError[]
+            Handle hoTC
+            Integer i iMax iOut
+            String sPrnFile sErrFile
+            tCompileError[] aWarn
+
+            Get phoTestCompileFT of ghoApplication to hoTC
+            If (hoTC = 0) ;
+                Function_Return asCompileError
+            Get CachedPrnStampedFile of hoTC to sPrnFile
+            If (sPrnFile = "") ;
+                Function_Return asCompileError
+            Get psErrorFile to sErrFile
+            If (Lowercase(Left(sPrnFile, (Length(sPrnFile) - 4))) <> Lowercase(Left(sErrFile, (Length(sErrFile) - 4)))) ;
+                Function_Return asCompileError
+            Get CachedPrnWarningMessages of hoTC to aWarn
+            Move (SizeOfArray(aWarn) - 1) to iMax
+            Move (SizeOfArray(asCompileError)) to iOut
+            For i from 0 to iMax
+                Move aWarn[i] to asCompileError[iOut]
+                Increment iOut
+            Loop
+            Function_Return asCompileError
+        End_Function
+
+        Procedure LoadData
+            String sFileName sCompSum
+            Integer iSize iCount iItem iErrCount iLiveWarn iLinkCount
+            Integer iIcon_Col iText_Col ibError_Col iErrorNum_Col iLine_Col iFileName_Col iErrorTxt_Col
+            String[] asErrData
+            tCompileError[] asCompileError
+            Handle hoDataSource hoTCLive
+            tDataSourceRow[] TheData TheDataEmpty
+
+            If (not(IsComObjectCreated(Self))) Begin
+                Procedure_Return
+            End
+
+            Get psErrorFile to sFileName
+            // WholeLines variant: a mid-write / kill-truncated .err's INCOMPLETE last line must not
+            // become a row (its half path breaks the source jump - see ReadErrorFileWholeLines).
+            Get ReadErrorFileWholeLines sFileName to asErrData
+            Get MassageErrorFile asErrData to asCompileError
+            Get AppendCachedPrnWarnings asCompileError to asCompileError
+            /* Compiler chip band. iErrCount stays the FULL error-row total - the warnings maths
+               below is rows-minus-errors and would over-count warnings by every link error if it
+               narrowed here. Only what the CHIP is told changes: compile errors are the total less
+               the link errors, and the link errors go to a count of their own. */
+            Get CountErrors     asCompileError to iErrCount
+            Get CountLinkErrors asCompileError to iLinkCount
+            Set piLinkErrors    to iLinkCount
+            Set piCompileErrors to (iErrCount - iLinkCount)
+            Move (SizeOfArray(asCompileError)) to iSize
+            // The appended cached .prn warnings own the warnings chip too - the legacy compilers
+            // never call FeedDockCompileWarnings (that feed is df-cli's combined-view path only).
+            // Guarded so an errors-only load (mid-compile refresh, or no cache) never zeroes a
+            // count the full .prn read fed.
+            If (iSize > iErrCount) Begin
+                Set piCompileWarnings to (iSize - iErrCount)
+            End
+            Else Begin
+                // MID-COMPILE: no stamped cache yet (warning ROWS only append at compile end - a
+                // 25k-row live rebuild would stutter), but the .prn tail COUNTS warnings as it
+                // harvests - tick the chip live alongside the error count (Nils 2026-07-04).
+                // LivePrnWarnCount is -1 outside a running compile, leaving the chip untouched.
+                Get phoTestCompileFT of ghoApplication to hoTCLive
+                If (hoTCLive <> 0) Begin
+                    Get LivePrnWarnCount of hoTCLive to iLiveWarn
+                    If (iLiveWarn >= 0) Begin
+                        Set piCompileWarnings to iLiveWarn
+                    End
+                End
+            End
+            Set pbCompileSummaryReady to True
+            Send RefreshCompileSummaryChips of ghoCompilerOutputDock
+            If (iSize = 0) Begin
+                // Nothing parsed: CLEAR the grid before returning. The old early return left the PREVIOUS
+                // compile's rows standing - ShowEmptyCompileOutput (the keep-the-dock-open-but-empty show)
+                // relies on this actually emptying the view. (Nils 2026-07-08.)
+                Send InitializeData TheDataEmpty
+                Set psLoadedViewSig to ("data|" + sFileName + "|g" + String(ghiCompileGen))
+                Procedure_Return
+            End
+            
+            Get phoDataSource to hoDataSource
+            Get DataSource of hoDataSource to TheData
+            Move TheDataEmpty to TheData
+
+            Get piColumnId of oIcon_Col     to iIcon_Col
+            Get piColumnId of oText_Col     to iText_Col
+            Get piColumnId of obError_Col   to ibError_Col
+            Get piColumnId of oErrorNum_Col to iErrorNum_Col
+            Get piColumnId of oLine_Col     to iLine_Col
+            Get piColumnId of oFileName_Col to iFileName_Col
+            Get piColumnId of oErrorTxt_Col to iErrorTxt_Col
+            
+            Move 0 to iItem
+            // With cached .prn warnings appended the banner carries the split; a plain .err-only view
+            // (live mid-compile refresh, or no cache) keeps the familiar error-count banner.
+            If (iSize > iErrCount) ;
+                Move ("----Compiler Summary---- (" + String(iErrCount) + " errors, " + String(iSize - iErrCount) + " warnings)") to sCompSum
+            Else ;
+                Move ("----Compiler Error Summary----(" + String(iSize) + ")") to sCompSum
+            Move ""         to TheData[iItem].sValue[iIcon_Col] 
+            Move sCompSum   to TheData[iItem].sValue[iText_Col]
+            Move False      to TheData[iItem].sValue[ibError_Col]
+            Move 0          to TheData[iItem].sValue[iErrorNum_Col]
+            Move 0          to TheData[iItem].sValue[iLine_Col]
+            Move ""         to TheData[iItem].sValue[iFileName_Col]
+            Move ""         to TheData[iItem].sValue[iErrorTxt_Col] 
+            Decrement iSize
+            Increment iItem
+            For iCount from 0 to iSize   
+                Move ""                                 to TheData[iItem].sValue[iIcon_Col]
+                Move asCompileError[iCount].sText       to TheData[iItem].sValue[iText_Col]
+                Move asCompileError[iCount].bError      to TheData[iItem].sValue[ibError_Col]
+                Move asCompileError[iCount].iErrorNo    to TheData[iItem].sValue[iErrorNum_Col]
+                Move asCompileError[iCount].iLine       to TheData[iItem].sValue[iLine_Col]
+                Move asCompileError[iCount].sFileName   to TheData[iItem].sValue[iFileName_Col]
+                Move asCompileError[iCount].sErrorTxt   to TheData[iItem].sValue[iErrorTxt_Col] 
+                Increment iItem
+            Loop
+
+            Send InitializeData TheData
+            // Row focus (Nils 2026-07-08): the "----Compiler Summary---- (N errors, M warnings)" line is row 0 in
+            // this legacy parsed-only view (no "Compiling" banner / streamed output above it, unlike df-cli's
+            // LoadCombined), so an ERRORS build lands on it via MoveToFirstRow. A WARNINGS-ONLY build leaves the
+            // focus where it is (no move) - consistent with LoadCombined; a live error refresh (RefreshErrorOutput)
+            // still MoveToLastRow-tails on top of this.
+            If (iErrCount > 0) ;
+                Send MoveToFirstRow
+            Set psLoadedViewSig to ("data|" + sFileName + "|g" + String(ghiCompileGen))
+        End_Procedure
+
+        /* ONE SHAPE FOR A TEXT-ONLY ROW. The three loaders below (raw, combined, success) each wrote the Studio
+           banner, the compiler's own lines and the footer as rows with the text in the Output column and the rest
+           blank - the same nine lines, five times over, each after its own seven column-id reads. */
+        Procedure _AppendOutputTextRows tDataSourceRow[] ByRef TheData Integer ByRef iItem String[] asLines
+            Integer i iLast
+            Integer iIcon_Col iText_Col ibError_Col iErrorNum_Col iLine_Col iFileName_Col iErrorTxt_Col
+
+            Get piColumnId of oIcon_Col     to iIcon_Col
+            Get piColumnId of oText_Col     to iText_Col
+            Get piColumnId of obError_Col   to ibError_Col
+            Get piColumnId of oErrorNum_Col to iErrorNum_Col
+            Get piColumnId of oLine_Col     to iLine_Col
+            Get piColumnId of oFileName_Col to iFileName_Col
+            Get piColumnId of oErrorTxt_Col to iErrorTxt_Col
+            Move (SizeOfArray(asLines) - 1) to iLast
+            For i from 0 to iLast
+                Move ""         to TheData[iItem].sValue[iIcon_Col]
+                Move asLines[i] to TheData[iItem].sValue[iText_Col]
+                Move False      to TheData[iItem].sValue[ibError_Col]
+                Move 0          to TheData[iItem].sValue[iErrorNum_Col]
+                Move 0          to TheData[iItem].sValue[iLine_Col]
+                Move ""         to TheData[iItem].sValue[iFileName_Col]
+                Move ""         to TheData[iItem].sValue[iErrorTxt_Col]
+                Increment iItem
+            Loop
+        End_Procedure
+
+        // Show psRawLogFile's lines verbatim - no parse, no source-jump - as plain rows.
+        // Used while a df-cli compile is still running to stream its stdout; FinishCompile
+        // swaps to the parsed .err (LoadData) when it finishes. Driven by the host via the
+        // ShowCompileOutputLive / RefreshCompileOutputLive globals.
+        Procedure LoadRawOutput
+            String sLogFile
+            Integer iItem
+            String[] asLines asBanner
+            Handle hoDataSource
+            tDataSourceRow[] TheData TheDataEmpty
+
+            If (not(IsComObjectCreated(Self))) Begin
+                Procedure_Return
+            End
+
+            Get psRawLogFile to sLogFile
+            Get ReadErrorFile sLogFile to asLines
+
+            Get phoDataSource to hoDataSource
+            Get DataSource of hoDataSource to TheData
+            Move TheDataEmpty to TheData
+
+            Move 0 to iItem
+
+            // ---- Studio-style header banner ("----Compiling <prog> (<bits>) ----" + program path) ----
+            Get StudioBannerHeader to asBanner
+            Send _AppendOutputTextRows (&TheData) (&iItem) asBanner
+
+            Send _AppendOutputTextRows (&TheData) (&iItem) asLines
+
+            Send InitializeData TheData
+            // Auto-scroll to the newest line, mimicking Studio's output window.
+            Send MoveToLastRow
+            Set psLoadedViewSig to ("raw|" + sLogFile + "|g" + String(ghiCompileGen))
+        End_Procedure
+
+        // Combined view (df-cli finished with errors): the raw compiler output FIRST (file
+        // includes, intermediate warnings/errors), then the parsed, jumpable errors LAST -
+        // mimicking Studio's output window. The view sits at the start of the error section
+        // (right after the last output line) so the errors read from the top. Falls back to
+        // errors-only when the log is empty. Driven by the ActivateCombinedCompileOutput global.
+        Procedure LoadCombined
+            String sLogFile sFileName sUp
+            Integer iSize iCount iItem iErrStart iMax iErrors iWarnings iLinkErrors iFinishRow
+            Integer iIcon_Col iText_Col ibError_Col iErrorNum_Col iLine_Col iFileName_Col iErrorTxt_Col
+            String[] asLines asErrData asBanner
+            tCompileError[] asCompileError
+            Handle hoDataSource
+            tDataSourceRow[] TheData TheDataEmpty
+            Boolean bLinkOnly
+
+            If (not(IsComObjectCreated(Self))) Begin
+                Procedure_Return
+            End
+
+            Get psRawLogFile to sLogFile
+            Get ReadErrorFile sLogFile to asLines
+            Get psErrorFile to sFileName
+            // WholeLines variant for the PARSED section (see LoadData); the raw log above keeps the
+            // plain read - a growing last log line is fine to display verbatim.
+            Get ReadErrorFileWholeLines sFileName to asErrData
+            Get MassageErrorFile asErrData to asCompileError
+            // Warnings display: append the cached .prn warnings (see AppendCachedPrnWarnings) so the
+            // combined view's parsed section carries warnings + errors. Counted BEFORE the link-only /
+            // chip math below on purpose: CountErrors/CountLinkErrors test bError, so appended warnings
+            // never disturb the error tallies or the link-only verdict.
+            Get AppendCachedPrnWarnings asCompileError to asCompileError
+
+            // A LINK-ONLY build (compile OK, only the link/manifest failed) is reported with the
+            // friendly amber summary; df-cli's bare "Failed" verdict in the raw log below would
+            // contradict it, so suppress it. Flag it here (asCompileError is ready); mirror the
+            // link-only test in StudioBannerSummary: every error is a link error, and there's >= 1.
+            Get CountErrors     asCompileError to iErrors
+            Get CountLinkErrors asCompileError to iLinkErrors
+            Move (((iErrors - iLinkErrors) = 0) and (iLinkErrors > 0)) to bLinkOnly
+            /* Compiler chip band - the same split as LoadData. iErrors stays the full total for the
+               warnings maths below; the chip is told compile errors only. Both counts are already
+               in hand here, because the link-only verdict above needed them. */
+            Set piLinkErrors    to iLinkErrors
+            Set piCompileErrors to (iErrors - iLinkErrors)
+            // Appended cached .prn warnings own the warnings chip (see LoadData); guarded so a
+            // no-cache load never zeroes the count FeedDockCompileWarnings' full read just fed.
+            If (SizeOfArray(asCompileError) > iErrors) ;
+                Set piCompileWarnings to (SizeOfArray(asCompileError) - iErrors)
+            Set pbCompileSummaryReady to True
+            Send RefreshCompileSummaryChips of ghoCompilerOutputDock
+
+            Get phoDataSource to hoDataSource
+            Get DataSource of hoDataSource to TheData
+            Move TheDataEmpty to TheData
+
+            Get piColumnId of oIcon_Col     to iIcon_Col
+            Get piColumnId of oText_Col     to iText_Col
+            Get piColumnId of obError_Col   to ibError_Col
+            Get piColumnId of oErrorNum_Col to iErrorNum_Col
+            Get piColumnId of oLine_Col     to iLine_Col
+            Get piColumnId of oFileName_Col to iFileName_Col
+            Get piColumnId of oErrorTxt_Col to iErrorTxt_Col
+
+            Move 0 to iItem
+
+            // ---- Studio-style header banner ("----Compiling <prog> (<bits>) ----" + program path) ----
+            Get StudioBannerHeader to asBanner
+            Send _AppendOutputTextRows (&TheData) (&iItem) asBanner
+
+            // ---- Raw compiler output (non-jumping) - whatever df-cli streamed to stdout ----
+            Move (SizeOfArray(asLines) - 1) to iSize
+            For iCount from 0 to iSize
+                // On a link-only build, drop df-cli's bare "Failed" verdict line - the link-only
+                // summary below explains it, and the bare "Failed" reads as a hard compile failure.
+                Move (Uppercase(Trim(asLines[iCount]))) to sUp
+                If (bLinkOnly = True and (sUp = "FAILED" or sUp = "FAILED.")) Begin
+                    // skip
+                End
+                Else Begin
+                    Move ""              to TheData[iItem].sValue[iIcon_Col]
+                    Move asLines[iCount] to TheData[iItem].sValue[iText_Col]
+                    Move False           to TheData[iItem].sValue[ibError_Col]
+                    Move 0               to TheData[iItem].sValue[iErrorNum_Col]
+                    Move 0               to TheData[iItem].sValue[iLine_Col]
+                    Move ""              to TheData[iItem].sValue[iFileName_Col]
+                    Move ""              to TheData[iItem].sValue[iErrorTxt_Col]
+                    Increment iItem
+                End
+            Loop
+
+            // ---- Studio-style failure summary, then the parsed (jumpable) errors ----
+            Move (SizeOfArray(asCompileError)) to iSize
+            If (iSize > 0) Begin
+                // The summary block heads the error section, so the view scrolls to it (Studio order).
+                // iErrors / iLinkErrors were already counted above (for the link-only "Failed" suppression).
+                Move iItem to iErrStart
+                Move iErrStart to iFinishRow   // fallback: the summary-block start if the "Finished" line isn't found
+                Get piCompileWarnings to iWarnings
+                Get StudioBannerSummary iWarnings iErrors iLinkErrors to asBanner
+                Move (SizeOfArray(asBanner) - 1) to iMax
+                For iCount from 0 to iMax
+                    Move ""               to TheData[iItem].sValue[iIcon_Col]
+                    Move asBanner[iCount] to TheData[iItem].sValue[iText_Col]
+                    Move False            to TheData[iItem].sValue[ibError_Col]
+                    Move 0                to TheData[iItem].sValue[iErrorNum_Col]
+                    Move 0                to TheData[iItem].sValue[iLine_Col]
+                    Move ""               to TheData[iItem].sValue[iFileName_Col]
+                    Move ""               to TheData[iItem].sValue[iErrorTxt_Col]
+                    // Remember the "----<verb> Finished ...----" row so the post-fill focus lands there, not on
+                    // the top banner: "Finished (" matches the error and link-only summaries, "Finished in" the
+                    // SUCCESS footer inside the warnings-only summary (Nils 2026-07-09 - it was never captured,
+                    // so a warnings-only build had no landing row).
+                    If ((asBanner[iCount] contains "Finished (") or (asBanner[iCount] contains "Finished in ")) ;
+                        Move iItem to iFinishRow
+                    Increment iItem
+                Loop
+                Decrement iSize
+                For iCount from 0 to iSize
+                    Move ""                                    to TheData[iItem].sValue[iIcon_Col]
+                    Move ("- " + asCompileError[iCount].sText) to TheData[iItem].sValue[iText_Col]
+                    Move asCompileError[iCount].bError         to TheData[iItem].sValue[ibError_Col]
+                    Move asCompileError[iCount].iErrorNo       to TheData[iItem].sValue[iErrorNum_Col]
+                    Move asCompileError[iCount].iLine          to TheData[iItem].sValue[iLine_Col]
+                    Move asCompileError[iCount].sFileName      to TheData[iItem].sValue[iFileName_Col]
+                    Move asCompileError[iCount].sErrorTxt      to TheData[iItem].sValue[iErrorTxt_Col]
+                    Increment iItem
+                Loop
+            End
+
+            Send InitializeData TheData
+            // Row focus after the fill (Nils 2026-07-08, warnings rule revised 2026-07-09):
+            //  - ERRORS present -> land on the "----Compile Finished (with Errors!)----" summary row (iFinishRow),
+            //    so the failure summary + the parsed errors just below it read from there - NOT the top "Compiling"
+            //    banner. (df-cli's combined view has the banner + streamed output above the summary block.)
+            //  - WARNINGS ONLY  -> land on the "----Compile Finished in N seconds ----" success-footer row, the
+            //    same iFinishRow rule. The old "leave the focus where it is" left the TOP row selected on a fresh
+            //    fill (new workspace / compiler switch - there is no prior row to preserve; Nils 2026-07-09).
+            //    This is a FINISHED-only view (live streaming is LoadRawOutput), so there is no live tail to yank.
+            //  - output only (no parsed rows) -> the newest streamed line.
+            If (SizeOfArray(asCompileError) = 0) Begin
+                Send MoveToLastRow
+            End
+            Else Begin
+                Send MoveToRow iFinishRow
+            End
+            Set psLoadedViewSig to ("combined|" + sLogFile + "|" + sFileName + "|g" + String(ghiCompileGen))
+        End_Procedure
+
+        // The FINISHED-CLEAN view (Nils 2026-07-08, Studio-style): the compile's streamed log (when there is
+        // one) capped by the success footer - "----Compile Finished in N seconds ----" + "----Executable
+        // written: <exe>". Replaces the EMPTY grid a truly-clean build showed (and the dock-close before
+        // that): a positive confirmation, exactly what the Studio prints. Routed from Initialize when
+        // FinishCompile stamped psCompiledExe and no .err view is set. MoveToLastRow leaves the verdict
+        // lines on screen - devs read the bottom of compiler output (feedback_compile_status_at_output_end).
+        Procedure LoadSuccessOutput
+            String sLogFile
+            Integer iItem
+            String[] asLines asBanner
+            Handle hoDataSource
+            tDataSourceRow[] TheData TheDataEmpty
+
+            If (not(IsComObjectCreated(Self))) Begin
+                Procedure_Return
+            End
+
+            Get psRawLogFile to sLogFile
+            Get ReadErrorFile sLogFile to asLines
+
+            Get phoDataSource to hoDataSource
+            Get DataSource of hoDataSource to TheData
+            Move TheDataEmpty to TheData
+
+            Move 0 to iItem
+
+            // ---- Studio-style header banner ("----Compiling <prog> (<bits>) ----" + program path) ----
+            Get StudioBannerHeader to asBanner
+            Send _AppendOutputTextRows (&TheData) (&iItem) asBanner
+
+            // ---- Raw compiler output (non-jumping) - whatever the compiler streamed to stdout ----
+            Send _AppendOutputTextRows (&TheData) (&iItem) asLines
+
+            // ---- The Studio success footer: "Finished in N seconds" + "Executable written: <exe>" ----
+            Get StudioBannerFooter to asBanner
+            Send _AppendOutputTextRows (&TheData) (&iItem) asBanner
+
+            Send InitializeData TheData
+            Send MoveToLastRow
+            Set psLoadedViewSig to ("success|" + sLogFile + "|g" + String(ghiCompileGen))
+        End_Procedure
+
+        // Parses a df-cli stdout diagnostic line - "file(900,1) Warning 4532: ..." (or
+        // "Error NNNN:") - into its file name + line number. Returns False for any other
+        // line shape ("Compiling X", "Building Y (26.0.0+windows-32)...", plain text).
+        // The line number is digit-guarded BEFORE the Move into the Integer - a Move from
+        // a non-numeric string FAULTS in DF26.
+        Function _ParseRawDiagnostic String sData String ByRef sFile Integer ByRef iLine Returns Boolean
+            Integer iParen iComma iClose i
+            String  sTrim sRest sNum sAfter
+
+            Move (Trim(sData)) to sTrim
+            Move (Pos("(", sTrim)) to iParen
+            If (iParen <= 1) ;
+                Function_Return False
+            Move (Mid(sTrim, Length(sTrim), (iParen + 1))) to sRest
+            Move (Pos(",", sRest)) to iComma
+            Move (Pos(")", sRest)) to iClose
+            If (iComma = 0 or iClose = 0 or iComma > iClose) ;
+                Function_Return False
+            // ") Warning " / ") Error " must follow the parens, else not a diagnostic.
+            Move (Lowercase(Mid(sRest, Length(sRest), (iClose + 1)))) to sAfter
+            If ((Left(sAfter, 9) <> " warning ") and (Left(sAfter, 7) <> " error ")) ;
+                Function_Return False
+            Move (Left(sRest, (iComma - 1))) to sNum
+            If (sNum = "") ;
+                Function_Return False
+            For i from 1 to (Length(sNum))
+                If (Pos(Mid(sNum, 1, i), "0123456789") = 0) ;
+                    Function_Return False
+            Loop
+            Move sNum to iLine
+            If (iLine <= 0) ;
+                Function_Return False
+            Move (Left(sTrim, (iParen - 1))) to sFile
+            Function_Return (sFile <> "")
+        End_Function
+
+        // Resolve the (usually relative) file name from a df-cli stdout diagnostic to a
+        // full path: an absolute path stays as-is; otherwise try the target workspace's
+        // AppSrc, its library source folders, and finally the TARGET DataFlex install's
+        // Pkg folder - system packages (cMapiHandler.pkg, cCrystal.pkg, ...) live there.
+        // The editor opens those fine for a closer look; the OS write-protection on
+        // Program Files guards against accidental saves. Returns "" when nothing matches.
+        Function _ResolveRawDiagnosticFile String sFile Returns String
+            String sPath sSWS sPkg
+            String[] asLibs
+            Integer i iMax
+            tSwsFile WS
+
+            If (sFile contains ":") ;
+                Function_Return sFile
+            Get pCurrentSws of ghoApplication to WS
+            Get AppSrcFolderFor of ghoApplication WS sFile to sPath
+        If (sPath <> "") Begin
+                Move (vFolderFormat(sPath) + sFile) to sPath
+                If (vFilePathExists(sPath)) ;
+                    Function_Return sPath
+            End
+            Get psSWSFile of ghoApplication to sSWS
+            Get GetWorkspaceLibrarySourceFolders of ghoApplication sSWS to asLibs
+            Move (SizeOfArray(asLibs) - 1) to iMax
+            For i from 0 to iMax
+                Move (vFolderFormat(asLibs[i]) + sFile) to sPath
+                If (vFilePathExists(sPath)) ;
+                    Function_Return sPath
+            Loop
+            Get psTargetPkgFolder of ghoApplication to sPkg
+            If (sPkg <> "") Begin
+                Move (vFolderFormat(sPkg) + sFile) to sPath
+                If (vFilePathExists(sPath)) ;
+                    Function_Return sPath
+            End
+            // Fallback: resolve via DF_OPEN_PATH - the compiler's OWN search path, which UpdateDFOpenPath has
+            // pointed at the target workspace. Catches library packages that live in folders
+            // GetWorkspaceLibrarySourceFolders does not enumerate (nested libraries, or the DataFlex install's
+            // own libs like vWin32fh.pkg) - the compiler found them this way, so can we.
+            Move "" to sPath
+            Get_File_Path sFile to sPath
+            If (sPath <> "") ;
+                Function_Return sPath
+            // Last resort: the file may sit in a SUBFOLDER of a source path - e.g. a Reports folder holding .rv
+            // report views - which is not a DF_OPEN_PATH entry, so none of the flat lookups above (nor
+            // Get_File_Path) find it. Walk the workspace source tree recursively by basename. Only reached when
+            // every flat lookup failed, and only on an explicit double-click, so the one-time walk is acceptable.
+            Get ResolveSourceFileInTree of ghoApplication sFile to sPath
+            If (sPath <> "") ;
+                Function_Return sPath
+            Function_Return ""
+        End_Function
+
+        Procedure DisplayCurrentSourceLine
+            Integer iLine_Col iText_Col iFileName_Col iLine iItem
+            String sData sFileName sProduct
+            Boolean bParsed
+            Handle hoDataSource hoEditor
+            tDataSourceRow[] TheData
+
+            Get piColumnId of oLine_Col to iLine_Col
+            Get piColumnId of oText_Col to iText_Col
+            Get piColumnId of oFileName_Col to iFileName_Col
+            Get phoDataSource to hoDataSource
+            Get SelectedRow of hoDataSource to iItem
+            Get DataSource of hoDataSource to TheData
+            Move TheData[iItem].sValue[iText_Col] to sData
+            If (sData contains "----Compiler Error Summary----") Begin
+                Procedure_Return
+            End
+
+            Move TheData[iItem].sValue[iLine_Col]     to iLine
+            Move TheData[iItem].sValue[iFileName_Col] to sFileName
+            // Raw compiler-output rows (the live / combined view) carry no File/Line -
+            // historically non-jumping. But a df-cli diagnostic line has both right in
+            // its text ("cMapiHandler.Pkg(900,1) Warning 4532: ..."), so parse it and
+            // resolve the relative name against the workspace + the target install's
+            // Pkg, and the double-click works there too (Nils 2026-06-10 - "nothing
+            // happens" on a system-package warning row).
+            If (sFileName = "" or iLine <= 0) Begin
+                Get _ParseRawDiagnostic sData (&sFileName) (&iLine) to bParsed
+                If (bParsed = True) Begin
+                    Get _ResolveRawDiagnosticFile sFileName to sFileName
+                End
+                Else Begin
+                    Move "" to sFileName
+                End
+            End
+            // This dock is shared by TestBench and DFRefactor. Both expose the source editor as
+            // phoEditor (in TestBench phoEditor == phoEditorRefactored == its refactored editor;
+            // in DFRefactor it is the main Scintilla editor). Only the jump differs - TestBench's
+            // editor already shows the just-compiled code (jump only), while DFRefactor must open
+            // the error's file first. psProduct picks the path, so phoEditorRefactored - which only
+            // TestBench implements - is never called in DFRefactor.
+            Get psProduct of ghoApplication to sProduct
+            If (sProduct = "Test Bench") Begin
+                // TestBench (unchanged): the refactored code is already in the editor; just jump.
+                If (iLine <> -1) Begin
+                    Decrement iLine
+                    Send JumpToSourceLine of (Client_Id(phoMainPanel(ghoApplication))) iLine
+                    Send Activate of (phoEditorRefactored(ghoApplication))
+                End
+            End
+            Else Begin
+                // DFRefactor (and any other host): open the error's file in the main editor, then jump.
+                Get phoEditor of ghoApplication to hoEditor
+                If (hoEditor <> 0 and sFileName <> "" and iLine > 0) Begin
+                    // Activate the VIEW via its registered activation message (declared in
+                    // OutputDockFT.dg): a bare object Activate moves the DataFlex focus tree
+                    // WITHOUT switching CodeJock's TabWorkspace page (Nils 2026-07-23).
+                    Send Activate_oEditorView_vw of (Client_Id(ghoCommandBars))
+                    Send LoadFile of hoEditor sFileName
+                    Send JumpToSourceLine of hoEditor (iLine - 1)
+                End
+            End
+        End_Procedure
+
+        Procedure LoadIcons
+            Integer iImage
+
+            // Studio-style output icons: a neutral triangle for plain lines, warning + error glyphs for
+            // diagnostics, and the compile-project glyph for the section-header rows. (Triangle.ico must
+            // exist in the Bitmaps folder alongside the others.)
+            Get AddImage "Triangle.ico" 0 to iImage
+            Set piIconOff to iImage
+            Get AddImage "Warning.ico" 0 to iImage
+            Set piWarningIcon to iImage
+            Get AddImage "Error.ico" 0 to iImage
+            Set piErrorIcon  to iImage
+            Get AddImage "CompileProjectSmall.ico" 0 to iImage
+            Set piCompileIcon to iImage
+            Get AddImage "CompileEnd.ico" 0 to iImage
+            Set piCompileEndIcon to iImage
+        End_Procedure
+        
+        Procedure Initialize
+            String sRawLog sErrFile sExe
+
+            Send LoadIcons
+            Get psRawLogFile to sRawLog
+            Get psErrorFile  to sErrFile
+            Get psCompiledExe to sExe
+            // A stamped success exe with NO .err view = a finished CLEAN compile: the log (if any) capped by
+            // the Studio success footer (LoadSuccessOutput). Both set = a df-cli compile finished with errors
+            // OR a warnings-carrying success (LoadCombined - the summary carries the footer there). Only the
+            // log = a compile still streaming (LoadRawOutput; psCompiledExe is cleared at compile start, so a
+            // live stream never routes to the success view). Only the .err = parsed errors (LoadData).
+            If (sExe <> "" and sErrFile = "") Begin
+                Send LoadSuccessOutput
+            End
+            Else If (sRawLog <> "" and sErrFile <> "") Begin
+                Send LoadCombined
+            End
+            Else If (sRawLog <> "") Begin
+                Send LoadRawOutput
+            End
+            Else Begin
+                Send LoadData
+            End
+            Send Activate
+        End_Procedure
+
+        // Tab-switch highlight keeper (Nils 2026-07-05): the merged dock re-Initializes this grid on
+        // EVERY OnUpdate - a plain Output<->Analyzer tab swap included - which re-reads the files and
+        // re-positions the view, losing the highlighted row. The dock brackets that Initialize with
+        // CaptureHighlight / RestoreHighlight: capture the selected row's cell IDENTITY + index; after
+        // the reload re-select the best identity match - the one NEAREST the old index, because raw
+        // log rows repeat (blank lines), so nearest beats first-match. Changed content (a fresh
+        // compile) simply finds no match and keeps the loader's own positioning (error-summary top /
+        // newest line). Deliberately NOT inside the Load* procedures themselves: the live-compile
+        // refresh reloads via LoadRawOutput every ~500ms and must keep FOLLOWING THE TAIL, never pin
+        // an old row. (The Analyzer grid needs no keeper - its DisplayFiltered preserves the
+        // highlight itself.)
+        Property Integer piCapturedRow -1
+        Property String  psCapturedKey ""
+        // View signature of the content the grid CURRENTLY displays, stamped by each loader
+        // (mode + the file(s) it rendered). The keeper restores ONLY when the reload produced
+        // the SAME view again (a tab swap). A live->combined transition at compile-finish must
+        // keep the loader's own positioning - the error-summary jump - because restoring there
+        // matched the captured live-log row inside the combined view's raw-log section and
+        // pinned the view near the top instead of the "----Compiler Error Summary----" block
+        // (Nils, 2026-07-05 evening).
+        Property String psLoadedViewSig ""
+        Property String psCapturedViewSig ""
+
+        // The identity of one row: the visible text + the jump-metadata cells. Re-finds a parsed
+        // error row exactly; duplicate raw-log rows are disambiguated by index distance above.
+        Function HighlightRowKey tDataSourceRow Row Returns String
+            Integer iText_Col iErrorNum_Col iLine_Col iFileName_Col
+            Get piColumnId of oText_Col     to iText_Col
+            Get piColumnId of oErrorNum_Col to iErrorNum_Col
+            Get piColumnId of oLine_Col     to iLine_Col
+            Get piColumnId of oFileName_Col to iFileName_Col
+            Function_Return (Row.sValue[iText_Col] + "|" + Row.sValue[iFileName_Col] + "|" + Row.sValue[iLine_Col] + "|" + Row.sValue[iErrorNum_Col])
+        End_Function
+
+        Procedure CaptureHighlight
+            Integer iSel
+            String sKey sSig
+            Handle hoDS
+            tDataSourceRow[] TheData
+
+            Set piCapturedRow to -1
+            Set psCapturedKey to ""
+            // Remember WHICH view the selection belongs to (see psLoadedViewSig).
+            Get psLoadedViewSig to sSig
+            Set psCapturedViewSig to sSig
+            If (not(IsComObjectCreated(Self))) ;
+                Procedure_Return
+            Get phoDataSource to hoDS
+            Get SelectedRow of hoDS to iSel
+            Get DataSource of hoDS to TheData
+            If (iSel >= 0 and iSel < SizeOfArray(TheData)) Begin
+                Get HighlightRowKey TheData[iSel] to sKey
+                Set piCapturedRow to iSel
+                Set psCapturedKey to sKey
+            End
+        End_Procedure
+
+        Procedure RestoreHighlight
+            Integer iOld iRow iSize iBest iDist iBestDist
+            String sKey sRowKey sRaw sErr sCapSig sNowSig
+            Handle hoDS
+            tDataSourceRow[] TheData
+
+            Get piCapturedRow to iOld
+            Get psCapturedKey to sKey
+            Get psCapturedViewSig to sCapSig
+            Set piCapturedRow to -1
+            Set psCapturedKey to ""
+            Set psCapturedViewSig to ""
+            If (iOld < 0 or sKey = "") ;
+                Procedure_Return
+            // The reload produced a DIFFERENT view than the selection came from (live stream ->
+            // combined error view at compile-finish, or a new .err/log path): the loader's own
+            // positioning (error-summary block / newest line) is the right one - never pin the
+            // old row across a view change. A plain tab swap reloads the SAME view (identical
+            // signature) and restores as before.
+            Get psLoadedViewSig to sNowSig
+            If (sCapSig <> sNowSig) ;
+                Procedure_Return
+            // Pure live-stream mode (log only, no parsed .err yet) is TAILING - the newest line IS the
+            // view; never pin the old row there.
+            Get psRawLogFile to sRaw
+            Get psErrorFile  to sErr
+            If (sRaw <> "" and sErr = "") ;
+                Procedure_Return
+            Get phoDataSource to hoDS
+            Get DataSource of hoDS to TheData
+            Move (SizeOfArray(TheData) - 1) to iSize
+            Move -1 to iBest
+            Move 0  to iBestDist
+            For iRow from 0 to iSize
+                Get HighlightRowKey TheData[iRow] to sRowKey
+                If (sRowKey = sKey) Begin
+                    Move (Abs(iRow - iOld)) to iDist
+                    If (iBest = -1 or iDist < iBestDist) Begin
+                        Move iRow  to iBest
+                        Move iDist to iBestDist
+                    End
+                End
+            Loop
+            If (iBest >= 0) ;
+                Send MoveToRow iBest
+        End_Procedure
+
+        Function CurrentSourceLine Returns String
+            Integer iText_Col iLine iItem
+            String sValue
+            Handle hoDataSource
+            tDataSourceRow[] TheData
+            
+            Get piColumnId of oText_Col to iText_Col
+            Get phoDataSource to hoDataSource 
+            Get SelectedRow of hoDataSource to iItem
+            Get DataSource of hoDataSource to TheData  
+            Move TheData[iItem].sValue[iText_Col] to sValue
+            Function_Return sValue
+        End_Function
+
+        Function CurrentErrorLineNo Returns String
+            Integer iLine_Col iLine iItem
+            String sValue
+            Handle hoDataSource
+            tDataSourceRow[] TheData
+            
+            Get piColumnId of oLine_Col to iLine_Col
+            Get phoDataSource to hoDataSource 
+            Get SelectedRow of hoDataSource to iItem
+            Get DataSource of hoDataSource to TheData  
+            Move TheData[iItem].sValue[iLine_Col] to sValue
+            Function_Return sValue
+        End_Function
+
+//        Procedure Copy 
+//            Integer iCh
+//            String sData
+//            
+//            Get CurrentSourceLine to sData
+//            If (sData contains "----Compiler Error Summary----(") Begin
+//                Procedure_Return    
+//            End
+//            
+//            Get rfOpenOutput ("Clipboard:") to iCh
+//            If (iCh < 0) Begin
+//                Procedure_Return
+//            End
+//            Write channel iCh sData
+//            Send rfCloseOutput iCh
+//            Set StatusText of (Statusbar_Id(Self)) to "Line copied to Windows clipboard."
+//        End_Procedure
+
+        // The selected rows - the current row when none is selected - onto the clipboard, one line each
+        // (RDCCopyGridRows, RDCToolsLib): the DISPLAYED text column alone - the hidden error, line and file
+        // columns are not part of it; they used to leak as a trailing "000" on plain output rows. Ctrl+C and
+        // the context menu send it.
+        Procedure Copy
+            Handle[] ahoColumns
+            Integer iRows
+
+            Move (oText_Col(Self)) to ahoColumns[-1]
+            Get RDCCopyGridRows Self ahoColumns to iRows
+            If (iRows > 0) ;
+                Set StatusText of (Statusbar_Id(Self)) to (String(iRows) * "row(s) copied to Windows clipboard.")
+        End_Procedure
+        
+        // Ctrl+A selects every row, so the whole list can be copied in one go.
+        // Toogles between marking all and if all rows are selected,
+        // all rows are deselected.
+        Procedure SelectAllRows
+            Integer iCount iSelected
+            Handle hoDataSource
+    
+            Get phoDataSource to hoDataSource
+            Get RowCount of hoDataSource to iCount
+            Get GetSelectedRowsCount to iSelected
+            If (iCount <> iSelected) Begin
+                Send SetSelectedRowsAll True
+            End
+            Else Begin
+                Send SetSelectedRowsAll False
+            End
+        End_Procedure
+
+        Procedure CopyErrorLineNo
+            Boolean bOk
+            String sData
+            
+            Get CurrentErrorLineNo to sData
+            If (sData contains "----Compiler Error Summary----") Begin
+                Procedure_Return
+            End
+            
+            Get rfSetClipboardText sData to bOk
+            If (bOk = False) ;
+                Procedure_Return
+            Set StatusText of (Statusbar_Id(Self)) to "Error ln  number copied to Windows clipboard."
+        End_Procedure
+        
+        // Just before the dock's shared menu pops for this grid (cRDCCJToolPanelGrid claims it - on focus, and
+        // again at right-click time, since the two grids share ONE merged dock (OutputDockFT) and ONE
+        // context-menu slot, so a right-click on this tab before it took the focus used to act on the
+        // sibling): the menu's "Unfold / Fold occurrences" item belongs to the ANALYZER grid's merged rows -
+        // this grid has none, so grey it out here (Nils 2026-07-09).
+        Procedure OnToolPanelMenuPopup Handle hoMenu
+            Handle hoItem
+            Get phoFoldOccItem of hoMenu to hoItem
+            If (hoItem <> 0) ;
+                Set pbEnabled of hoItem to False
+        End_Procedure
+
+        // Shared-menu safety net: the Unfold/Fold item is disabled for this grid (above), but if
+        // it ever fires here anyway the message must exist - folding is an Analyzer-grid concept.
+        Procedure ToggleFoldOccurrences
+        End_Procedure
+
+        Procedure OnComRowDblClick Variant llRow Variant llItem
+            Send DisplayCurrentSourceLine
+        End_Procedure
+
+        On_Key kEnter Send DisplayCurrentSourceLine
+        On_Key Key_Ctrl+Key_C Send Copy
+        On_Key Key_Ctrl+Key_A Send SelectAllRows
+    End_Object
+
+    // (OnCreateToolPanel / OnUpdate / Close_Panel live on the merged panel oOutputDock_dg now; this is a
+    // Container3d area. RefreshLiveOutput / RefreshErrorOutput stay - they're called via ghoCompilerOutputDock.)
+
+    // Reload the live compiler-output rows without re-activating (no focus steal/flicker).
+    // Called each poll tick by the host while a df-cli compile streams to its stdout log.
+    Procedure RefreshLiveOutput
+        Send LoadRawOutput to oCompileErrors_grd
+    End_Procedure
+
+    // Reload the parsed .err error grid without re-activating, then scroll to the newest error so
+    // the live view tails the compile - the legacy-compiler counterpart of RefreshLiveOutput.
+    // LIVE-TAIL (and cancel) ONLY: the unconditional MoveToLastRow IS the tailing. The compile-end
+    // reload must use RefreshErrorOutputFinal below instead - this tail-scroll overrode LoadData's
+    // focus rule after a finished legacy compile (first the fast-path finalize, then the verdict's
+    // same-view-signature skip preserved it), leaving the LAST row selected instead of the error
+    // summary on top (Nils 2026-07-09).
+    // COM guard on the GRID: LoadData self-guards, but MoveToLastRow is a raw cCJGrid message and
+    // faults 4399 when the dock has never been shown - FinalizePrnCache refreshes unconditionally
+    // at compile end (e.g. Bin64\DFComp.exe detaches instantly, so no error stream ever popped the
+    // dock). A never-realized grid has nothing to refresh; it loads the cache when first shown.
+    Procedure RefreshErrorOutput
+        If (IsComObjectCreated(oCompileErrors_grd(Self))) Begin
+            Send LoadData      to oCompileErrors_grd
+            Send MoveToLastRow to oCompileErrors_grd
+        End
+    End_Procedure
+
+    // The COMPILE-END counterpart: same guarded reload (the prn-cache finalize appends the cached
+    // .prn warnings to the parsed errors), but NO tail scroll - LoadData's own focus rule stands:
+    // errors -> the "----Compiler Summary----" row on top; warnings-only -> the user's row stays.
+    Procedure RefreshErrorOutputFinal
+        If (IsComObjectCreated(oCompileErrors_grd(Self))) Begin
+            Send LoadData to oCompileErrors_grd
+        End
+    End_Procedure
+
+    // Build the compiler-totals chip band for the Test Compile bar (mirrors the analyzer's pill style): the FULL
+    // compiler warning + error counts from the last compile. Distinct from the analyzer's chips, which count only
+    // the source-line subset it can act on - so the error numbers legitimately differ (the tooltips say so). The
+    // warnings match the analyzer's (both read the same .prn listing).
+    Function CompileSummaryHtml Returns String
+        String sH
+        Integer iWarn iErr iLink
+        Get piCompileWarnings to iWarn
+        Get piCompileErrors   to iErr
+        Get piLinkErrors      to iLink
+        Move (CS_PaletteCssLink + CssLink("compileroutput") + CS_PillsCssLink) to sH
+        Move (sH + (DivOpen("sbar"))) to sH
+        Move (sH + (((SpanOpenTip("lbl", "Totals from the last compile - the full compiler tally, before the analyzer narrows to what it can refactor.")) + 'Compiler') + CS_SpanEnd)) to sH
+        Move (sH + SepHtml()) to sH
+        Move (sH + (SpanOpenTip("pill warn", "Total compiler warnings in the listing (.prn) - the FULL tally. The Analyzer warnings chip excludes warnings in Studio COM-proxy files and file-less diagnostics (nothing there to refactor), so it can be slightly lower.")) + String(iWarn) + (' warnings' + CS_SpanEnd)) to sH
+        Move (sH + (SpanOpenTip("pill err", "Compiler errors (.err) - things wrong in the source. Link errors are counted separately and shown as their own pill, because a missing bitmap or manifest is the .exe stage failing rather than the code. Studio COM-proxy diagnostics are included here. The Analyzer errors chip counts only the subset tied to a source line it can act on, so it is usually lower.")) + String(iErr) + (' errors' + CS_SpanEnd)) to sH
+        /* THE LINK PILL APPEARS ONLY WHEN THERE ARE LINK ERRORS - a nought here would be noise on
+           every ordinary compile. It is also what stops the split from hiding a failure: a build
+           whose only errors are link errors now reads "0 errors - 3 link errors", where before the
+           split it read "3 errors" and after it, without this, would read "0 errors" beside a build
+           that produced no .exe at all. Amber rather than red: the code compiled. */
+        If (iLink > 0) ;
+            Move (sH + (SpanOpenTip("pill review", "Link errors - the .exe stage could not find something it needed (a bitmap, an icon, a manifest) or could not write the executable. The code itself compiled, so these are not source errors and the Analyzer cannot act on them.")) + String(iLink) + (' link errors' + CS_SpanEnd)) to sH
+        Move (sH + CS_DivEnd) to sH
+        Function_Return sH
+    End_Function
+
+    // Push the compiler-totals band into the Test Compile bar's chip strip and show it - but ONLY while the
+    // Compiler tab is the one on top (else we'd stomp the analyzer's chips) and only once a compile's counts are
+    // ready (pbCompileSummaryReady); otherwise reveal the result text. Called on tab switch (OutputDockFT.ShowTab)
+    // and when a compile's errors finish loading (LoadData / LoadCombined). IsCompilerTabShowing is read by
+    // runtime message so the forward reference to the merged dock (defined after this #Include) resolves fine.
+    Procedure RefreshCompileSummaryChips
+        Handle  hoBar
+        Boolean bReady bShowing
+
+        Get phoTestCompileFT of ghoApplication to hoBar
+        If (hoBar = 0) ;
+            Procedure_Return
+        Get IsCompilerTabShowing of ghoOutputDock to bShowing
+        If (bShowing = False) ;
+            Procedure_Return
+        Get pbCompileSummaryReady to bReady
+        If (bReady = True) Begin
+            // bWithTriage False: the Toggle Explain / Ignore / Clear Ignored chips act on the ANALYZER
+            // grid, so they ride only the analyzer's band - not this compiler-totals one (Nils 2026-07-10).
+            Send SetAnalyzeSummaryHtml of hoBar (CompileSummaryHtml(Self)) False
+            Send ShowAnalyzeSummary    of hoBar True
+        End
+        Else ;
+            Send ShowAnalyzeSummary of hoBar False
+    End_Procedure
+
+End_Object
+

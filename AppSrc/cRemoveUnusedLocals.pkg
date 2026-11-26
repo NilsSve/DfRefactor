@@ -87,7 +87,7 @@ Class cRemoveUnusedLocals is a cObject
     Procedure RemoveUnusedVariablesFromSourceArray String[] ByRef asCode tUnusedLocals[] asLocalVariables Integer ByRef iUnusedLocalVariables
         Integer iCount iSize iItem iLength iOffset
         String sVarName sLine sVarType sVariableDeclarationConstant
-        Boolean bInUse bFound bIgnore bChanged
+        Boolean bInUse bFound bChanged
 
         Move 0 to iOffset
         Get CleanupLocalVariables asLocalVariables      to asLocalVariables
@@ -103,19 +103,18 @@ Class cRemoveUnusedLocals is a cObject
                 Move asLocalVariables[iCount].VarName   to sVarName
                 Move (Length(sVarName))                 to iLength
                 Move asCode[iItem]                to sLine
-                // RemoveLocalKeyWord checks pTokenizer.bIsVariableDeclaration, which is only
-                // valid during the live ParseFile pass. Strip "Local " directly here instead.
-                // CS_Local = "Local", so "Local " is 6 characters.
-                If (Lowercase(Left(Trim(sLine), 6)) = "local ") Begin
-                    Move (Pos("Local ", sLine)) to iLength
-                    If (iLength = 0) Begin
-                        Move (Pos("local ", sLine)) to iLength
-                    End
-                    If (iLength > 0) Begin
-                        Move (Remove(sLine, iLength, 6)) to sLine
-                    End
-                End
-                Get _RetrieveFirstToken of ghoFuncLib sLine   to sVarType
+                /* 'Local' STAYS ON THE LINE (a tester's report, 2026-09-24): with iRet unused,
+                   'Local Integer iRet iCount' came back as 'Integer iCount' - the keyword was
+                   stripped to read the data type, and that stripped line was written back.
+                   Removing Local is RemoveLocalKeyWord's job, which the user may not have
+                   picked, and a character-mode (3.x) program needs the word: there a method
+                   variable is local only because of it. So only COPIES of the line lose it:
+                   here to read the data type, below to see whether any names are left. Not
+                   RemoveLocalKeyWord itself - it checks pTokenizer, which now describes the
+                   last line ParseFile read. The old search here was also case-sensitive: it
+                   missed 'LOCAL', and an all-unused line was left as a bare 'LOCAL INTEGER'. */
+                Get _RemoveLocalKeyWord of ghoFuncLib sLine to sVarType
+                Get _RetrieveFirstToken of ghoFuncLib sVarType to sVarType
 
                 Move ((sLine + CS_S) contains (CS_S + sVarName + CS_S))  to bFound
                 If (bFound = False) Begin
@@ -128,8 +127,7 @@ Class cRemoveUnusedLocals is a cObject
                 Get _NormalizeArrayNotation of ghoFuncLib (&sLine) to bChanged
                 // If all that remains on the line is the variable type declaration,
                 // remove the line from the source array.
-                Move sLine to sVariableDeclarationConstant
-                Get RemoveLocalKeyWord of ghoFuncLib (&sVariableDeclarationConstant) to bIgnore
+                Get _RemoveLocalKeyWord of ghoFuncLib sLine to sVariableDeclarationConstant
                 Get _RemoveEndComment of ghoFuncLib sVariableDeclarationConstant to sVariableDeclarationConstant
                 Move (Trim(sVariableDeclarationConstant)) to sVariableDeclarationConstant
                 If (sVarType = sVariableDeclarationConstant) Begin
@@ -158,12 +156,12 @@ Class cRemoveUnusedLocals is a cObject
     End_Function
 
     Function ParseFile String[] ByRef asCode Returns Integer
-        String sLine sVars sVariableName sMethodName sSourceFile sOverstrikeLine
+        String sLine sVars sVariableName sMethodName sSourceFile sOverstrikeLine sFirstToken
         Integer iArrayCount iMax iCounter iItems iLineCount iUnusedLocalVariables iSize iCount
-        tUnusedLocals[] asLocalVars  
+        tUnusedLocals[] asLocalVars
         tTokenizer TokenizerData
         String[] asVars
-        Boolean bInMethod bVariableDeclaration bIsVariable bMethodEnd bIgnore bIsInFunction bIsInProcedure  
+        Boolean bInMethod bVariableDeclaration bIsVariable bMethodEnd bIgnore bIsInFunction bIsInProcedure
         Boolean bLocalVariableDeclaration bLocalVariableArrayDeclaration bStop
 
         Move 0 to iUnusedLocalVariables
@@ -177,6 +175,25 @@ Class cRemoveUnusedLocals is a cObject
 
         Decrement iSize
         Move False to Err
+
+        // #INCLUDE BLINDNESS GUARD (Nils 2026-07-16, the LegacyApp2 incident - 1895 compile errors):
+        // legacy char-mode code #INCLUDEs a fragment INTO a method body, and locals declared in
+        // the HOST are used only INSIDE the included file - usage this per-file parse can never
+        // see. Removing those "unused" locals deletes LIVE declarations, and the compiler then
+        // rains 4328/4345 errors at the include's lines (Booking.VW's sLager1/sLager2, used only
+        // inside its '#Include StockAcc.pkg', was the proven case). A file that textually
+        // includes another SHARES its local scope with it, so the only safe call is to skip the
+        // whole file. First-token test on the CODE-ONLY line (a commented-out #INCLUDE never
+        // triggers); the cheap Pos("#") pre-gate keeps the extra pass native for normal files.
+        For iCount from 0 to iSize
+            Move asCode[iCount] to sLine
+            If (Pos("#", sLine) > 0) Begin
+                Get _CodeOnlyLine of ghoFuncLib sLine to sLine
+                Get _RetrieveFirstToken of ghoFuncLib sLine to sFirstToken
+                If (Lowercase(sFirstToken) = "#include") ;
+                    Function_Return 0
+            End
+        Loop
 
         For iCount From 0 to iSize
             Move asCode[iCount] to sLine
@@ -210,13 +227,21 @@ Class cRemoveUnusedLocals is a cObject
                         Get Tokenizer of ghoFuncLib sLine to TokenizerData
                         Move TokenizerData.sOverstrikeLine to sOverstrikeLine
                     End
-                    Move False to bMethodEnd
-                    If (bIsInFunction = True) Begin
-                        Move (sOverstrikeLine = CS_FunctionEnd) to bMethodEnd
-                    End
-                    Else If (bIsInProcedure = True) Begin
-                        Move (sOverstrikeLine = CS_ProcedureEnd) to bMethodEnd
-                    End
+                    /* EITHER ENDER CLOSES EITHER KIND (Nils 2026-09-03, the WinServ Tidy Up): the
+                       compiler accepts a Function closed with End_Procedure and the reverse, and
+                       39 files in that workspace do it. Keyed on the header's OWN ender, this
+                       loop ran past the mismatched close to the next matching ender - or EOF -
+                       and took the file-scope lines with it: AdvanceInvoice.pkg's
+                       'Global_Variable Handle ghoAdvanceInvoiceHelper' lost its 'Handle'
+                       (IsVariableDeclarationLine says True for Global_Variable, by design) and
+                       the compile gained 5 errors. The lexer's own in-method tracking has always
+                       taken either ender; this now agrees with it. */
+                    /* ...AND IN ANY CASE (2026-09-24): '=' on strings is case-sensitive, so an
+                       all-caps END_PROCEDURE - common in character-mode code - did not close the
+                       method either, and a file-scope 'INTEGER giX' below it was deleted as an
+                       unused local. Both sides are lowercased, as the lexer does. The Trim is a
+                       guard: the tokenizer turns a tab into a space after it has trimmed the line. */
+                    Move (Lowercase(Trim(sOverstrikeLine)) = Lowercase(CS_FunctionEnd) or Lowercase(Trim(sOverstrikeLine)) = Lowercase(CS_ProcedureEnd)) to bMethodEnd
                         
                     If (bMethodEnd = False) Begin
                         // Does the line contain one or more variable declarations?
@@ -273,10 +298,16 @@ Class cRemoveUnusedLocals is a cObject
                     // never sees it and keeps processing files. Cancel now
                     // takes effect at the engine's file boundary instead.
                     Increment iLineCount
-                Until (bMethodEnd or iCount = iSize or iLineCount >= iSize)
+                Until (bMethodEnd or iCount = iSize or iLineCount > iSize)
             End
+            /* EVERY LINE IS READ, ONCE (2026-09-24). The Until above said 'iLineCount >= iSize',
+               so the method scan stopped one line early and never read a file's last line. And
+               this moved iCount to iLineCount - the line AFTER the last one read - before the
+               Loop added 1 more, so the line right after an ender was never read. A method that
+               started there was never scanned, and a block comment that opened there was never
+               seen, so a method commented out inside it was scanned as code. */
             If (iCount < iLineCount) Begin
-                Move iLineCount to iCount
+                Move (iLineCount - 1) to iCount
             End
             If (Active_State(ghoStatusPanel) = True) Begin
                 Send Update_StatusPanel of ghoStatusPanel ("Source line:" * String(sLine) * String(iCount + 1) * "of:" * String(iSize + 1))

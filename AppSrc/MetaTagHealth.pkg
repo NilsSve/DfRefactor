@@ -1,0 +1,207 @@
+//****************************************************************************
+// $Module type: Package
+// $Module name: MetaTagHealth
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : The two DataFlex 26 meta-tag limits, and the scan that finds violations of
+//               them, as GLOBAL functions with no class or application dependencies.
+//
+//               DELIBERATELY DEPENDENCY-FREE. The MetaTagCheck service program has to run when
+//               oRefactorFuncLib.pkg is broken - that is the whole point of it - so it cannot
+//               link the function library, and cRefactorFuncLib.pkg is not standalone (it pulls
+//               in cModAnalyzer and cDfLanguageFile, which need the application scaffolding).
+//               Its one consumer is MetaTagCheck.src, the service program. It was briefly
+//               also a refactoring function (MetaTagHealthReport), removed 2026-08-23: every
+//               other refactoring function acts on the USER'S application code, while this one
+//               acts on DFRefactor's own meta-tag syntax - a maintainer's concern with no place
+//               in the end user's function picker.
+//               Nothing here may Use anything beyond RefactorConstants.h.pkg.
+//
+// The limits were MEASURED against df-cli 1.0.0 (DF 26 GA) on 2026-08-23 by compiling generated
+// probes. Both failures are SILENT: the build prints its "Compiling ..." line and then nothing,
+// exits 0, and leaves a zero-byte .err file. Re-measure when the DataFlex major version changes.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+
+// How many leading spaces/tabs a RAW source line carries. A tab counts as one character, which
+// is what the compiler's own dedent of a triple-quoted value does.
+Function rfLeadingIndent Global String sLine Returns Integer
+    Integer i iLen
+    String sCh sTab
+
+    Move (Character(9)) to sTab
+    Move (Length(sLine)) to iLen
+    For i from 1 to iLen
+        Move (Mid(sLine, 1, i)) to sCh
+        If (sCh <> " " and sCh <> sTab) ;
+            Function_Return (i - 1)
+    Loop
+    Function_Return iLen
+End_Function
+
+/* Checks every MULTI-LINE meta-tag value in asCode - a { Description = ... } written with
+   triple-quote delimiters, and any other tag written the same way - against the two DF 26
+   compiler limits. Appends a human-readable line per problem to asReport and returns the count.
+   Pure: no engine, file or application state.
+
+     RULE 1  A body line indented LESS than the closing delimiter. Nothing to do with length -
+             a five-line tag dies exactly like a fifty-line one. It is a dedent underflow, and it
+             is what happens when prose is pasted in and lands flush left. Verified across the
+             matrix: body 6 or 7 under a closing at 8 crashes, body 8 / 9 / 16 compile; body 3
+             under a closing at 4 crashes, body 4 compiles. A wholly blank line is safe.
+     RULE 2  The whole block over CI_MetaTagCrashChars characters, counting indentation, line
+             breaks and every embedded sub-tag. Warned from CI_MetaTagMaxSafeChars upward, so a
+             function is never one added sub-tag away from a build that breaks without saying why.
+     RULE 3  A brace in the PROSE of a { Description }. This one does not crash - it truncates.
+             ParseHelpText takes everything before the FIRST brace as the function's help
+             text, so a sentence mentioning a tag by name silently cuts the description off
+             there. Write 'a Description tag', never the braced form.
+
+   Deliberately does NOT skip commented-out meta-tags: a block that would crash on the day
+   somebody uncomments it is worth knowing about, and reporting changes nothing either way.
+   A single-line value (both delimiters on one line) has no body lines and is skipped.
+*/
+Function rfMetaTagHealthScan Global String[] ByRef asCode String[] ByRef asReport Returns Integer
+    Integer iLine iLineLast iOpen iClose iCloseInd iInd iProblems iR iChars i
+    Integer iBrace iCloseBrace iQ iRestLen
+    String sQ sLine sRest
+    String[] asKnownTags
+    Boolean bGate bOpening bSeenTag bKnown
+
+    // The sub-tags that legitimately appear inside a { Description }. Anything else that
+    // opens a brace there is prose, and prose with a brace in it truncates the help.
+    Move "MethodType"   to asKnownTags[0]
+    Move "FnGroup"      to asKnownTags[1]
+    Move "FnFamily"     to asKnownTags[2]
+    Move "SummaryText"  to asKnownTags[3]
+    Move "EnumList"     to asKnownTags[4]
+    Move "InitialValue" to asKnownTags[5]
+    Move "ParamHelp"    to asKnownTags[6]
+    Move "ModRecipe"    to asKnownTags[7]
+    Move "Private"      to asKnownTags[8]
+    Move "NoDoc"        to asKnownTags[9]
+
+    Move ((Character(34)) + (Character(34)) + (Character(34))) to sQ
+    Move (SizeOfArray(asCode)) to iLineLast
+    If (iLineLast = 0) ;
+        Function_Return 0
+    Decrement iLineLast
+
+    // FILE PRE-GATE - no triple-quote anywhere means no multi-line meta-tag value to check.
+    // Inlined rather than borrowed from cBaseFuncLib._FileContainsText: this package stays free
+    // of class dependencies (see the header).
+    Move False to bGate
+    For i from 0 to iLineLast
+        If (bGate = False) Begin
+            If (Pos(sQ, asCode[i]) > 0) ;
+                Move True to bGate
+        End
+    Loop
+    If (bGate = False) ;
+        Function_Return 0
+
+    Move 0 to iProblems
+    Move 0 to iLine
+    While (iLine <= iLineLast)
+        Move asCode[iLine] to sLine
+        Move (Pos(sQ, sLine)) to iQ
+        Move (Pos("{", sLine)) to iBrace
+        // An OPENING line carries a brace before a triple-quote, with no second triple-quote
+        // after it (that would be a single-line value - no body lines, nothing to check).
+        Move False to bOpening
+        If (iQ > 0 and iBrace > 0 and iBrace < iQ) Begin
+            Move (Length(sLine) - iQ - 2) to iRestLen
+            Move "" to sRest
+            If (iRestLen > 0) ;
+                Move (Mid(sLine, iRestLen, (iQ + 3))) to sRest
+            If (Pos(sQ, sRest) = 0) ;
+                Move True to bOpening
+        End
+
+        If (bOpening = True) Begin
+            Move iLine to iOpen
+            // The closing line is the first later line whose trimmed text STARTS with the
+            // delimiter. Stop at the first hit - never scan on to the end of the file.
+            Move -1 to iClose
+            Move (iOpen + 1) to i
+            While (i <= iLineLast and iClose = -1)
+                If (Left(Trim(asCode[i]), 3) = sQ) ;
+                    Move i to iClose
+                Increment i
+            Loop
+
+            If (iClose = -1) Begin
+                Move (SizeOfArray(asReport)) to iR
+                Move ("  Line " + String(iOpen + 1) + ":  UNTERMINATED meta-tag value - no closing delimiter found.") to asReport[iR]
+                Increment iProblems
+                Move iLineLast to iLine
+            End
+            Else Begin
+                Move (rfLeadingIndent(asCode[iClose])) to iCloseInd
+                // RULE 1 - each body line must reach the closing delimiter's indent. A wholly
+                // blank line is safe (verified against the compiler), so skip those.
+                For i from (iOpen + 1) to (iClose - 1)
+                    If (Trim(asCode[i]) <> "") Begin
+                        Move (rfLeadingIndent(asCode[i])) to iInd
+                        If (iInd < iCloseInd) Begin
+                            Move (SizeOfArray(asReport)) to iR
+                            Move ("  Line " + String(i + 1) + ":  RULE 1 - indented " + String(iInd) + " where the closing delimiter is at " + String(iCloseInd) + " - THIS CRASHES THE COMPILER.") to asReport[iR]
+                            Move ("      " + Trim(asCode[i])) to asReport[iR + 1]
+                            Increment iProblems
+                        End
+                    End
+                Loop
+                // RULE 2 - measure the whole block, from the opening brace through the closing
+                // brace, counting indentation and one character per line break.
+                Move (Pos("}", asCode[iClose])) to iCloseBrace
+                If (iCloseBrace = 0) ;
+                    Move (Length(asCode[iClose])) to iCloseBrace
+                Move (Length(asCode[iOpen]) - iBrace + 1) to iChars
+                For i from (iOpen + 1) to (iClose - 1)
+                    Move (iChars + 1 + Length(asCode[i])) to iChars
+                Loop
+                Move (iChars + 1 + iCloseBrace) to iChars
+                // RULE 3 - a brace in the PROSE truncates the help text at that point. Only
+                // applies to a Description: it is ParseHelpText that stops at the first brace.
+                If (Lowercase(sLine) contains "description") Begin
+                    Move False to bSeenTag
+                    For i from (iOpen + 1) to (iClose - 1)
+                        Move (Pos("{", asCode[i])) to iQ
+                        If (iQ > 0 and bSeenTag = False) Begin
+                            Move (Trim(Mid(asCode[i], (Length(asCode[i]) - iQ), (iQ + 1)))) to sRest
+                            Move False to bKnown
+                            For iInd from 0 to (SizeOfArray(asKnownTags) - 1)
+                                If (Lowercase(Left(sRest, Length(asKnownTags[iInd]))) = Lowercase(asKnownTags[iInd])) ;
+                                    Move True to bKnown
+                            Loop
+                            If (bKnown = True) Begin
+                                Move True to bSeenTag
+                            End
+                            Else Begin
+                                Move (SizeOfArray(asReport)) to iR
+                                Move ("  Line " + String(i + 1) + ":  RULE 3 - a brace in the prose TRUNCATES the help text here (everything after it is lost). Write the tag name without braces.") to asReport[iR]
+                                Increment iProblems
+                                Move True to bSeenTag
+                            End
+                        End
+                    Loop
+                End
+                If (iChars > CI_MetaTagMaxSafeChars) Begin
+                    Move (SizeOfArray(asReport)) to iR
+                    If (iChars > CI_MetaTagCrashChars) ;
+                        Move ("  Line " + String(iOpen + 1) + ":  RULE 2 - block is " + String(iChars) + " characters, past the " + String(CI_MetaTagCrashChars) + " limit - THIS CRASHES THE COMPILER.") to asReport[iR]
+                    Else ;
+                        Move ("  Line " + String(iOpen + 1) + ":  RULE 2 - block is " + String(iChars) + " characters, over the " + String(CI_MetaTagMaxSafeChars) + " budget. Only " + String(CI_MetaTagCrashChars - iChars) + " characters left before the build breaks.") to asReport[iR]
+                    Increment iProblems
+                End
+                Move iClose to iLine
+            End
+        End
+        Increment iLine
+    Loop
+    Function_Return iProblems
+End_Function

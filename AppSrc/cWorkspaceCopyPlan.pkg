@@ -1,0 +1,1485 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cWorkspaceCopyPlan
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-05
+//
+// Description : Builds the migration copy plan: which files a workspace copy carries, and
+//               which stay behind. The scope rules live here so the copy step and its tests
+//               share one authority.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use RefactorFileIO.pkg
+Use cLibraryInventory.pkg
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+
+/*  cWorkspaceCopyPlan - what does "this workspace" actually consist of, and what would copying it
+    cost?
+
+    Step 0 of a DataFlex-version migration. Copying the workspace first is what lets the migration
+    be a DERIVATION instead of an in-place mutation: the original keeps compiling and running while
+    the copy gets the new .sws, the retargeted libraries and the refactoring. Every other safety
+    mechanism in DFRefactor (the backup tree, Undo Refactoring, the overwrite cycle) exists to
+    manage the risk of editing in place; a copy removes most of that risk by construction.
+
+    THE ROWS COME FROM THE WORKSPACE, NOT FROM A DISK WALK. Measured on a real 19.1 workspace
+    2026-08-05: declared folders 978 MB / 3,199 files, home directory 6,540 MB / 12,965 files. The
+    5.5 GB difference is six dead "Data - *" / "DataNils" copies sitting beside the live one, and
+    nothing on disk distinguishes them - only the configuration does. A recursive walk would copy
+    all seven.
+
+    READ THE .ws VERBATIM. The path keys live in the legacy .ws config that the .sws points at
+    ([WorkspacePaths] ConfigFile=), and there are MORE of them than tWorkspacePaths models - that
+    same workspace declares IdeSrcPath, which the struct has no field for. Driving the copy off the
+    struct would silently drop a declared folder, so every key ending in "Path" becomes a row,
+    including ones this build has never heard of. Silently-dropped is the worst failure this step
+    can have.
+
+    A STANDALONE CLASS extending cLibraryInventory - for the .sws/.ws section parsing and the
+    [Libraries] chain, and because UnitTests builds a plain cApplication, so nothing on
+    cRefactorApplication is reachable from the suite (see cLibraryInventory's own note).
+
+    CHEAP, in the sense that matters: BuildCopyPlan never walks the COPY TREE. Sizes stay a separate
+    per-row call (MeasureCopyItem) because a web tile's psHtml builder runs at first paint and a
+    recursive walk there renders the tile blank - there is a test asserting bMeasured is False.
+
+    It does now read the library CHAIN (LibraryCopyItems -> WorkspaceLibraryTree, 2026-08-14): a
+    bounded set of small .sws files plus a directory search per library, the same walk the Libraries
+    tile does. That is fine HERE because BuildCopyPlan has exactly one production caller -
+    SelectCopyScopeFT's BuildPlan, once per Popup, cached in paCopyItems - and is not on a render
+    path. If it ever becomes one, memoise it the way cFTLibraryReport.RefreshLibraryCounts does;
+    recomputing that walk per paint is the shape of the pinned-indicator regression.
+*/
+Class cWorkspaceCopyPlan is a cLibraryInventory
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // How many compiler-output files the last CopyFileList left out (see _IsCompilerOutput) - the
+        // executor's report names the count, so a leaner copy never reads as a smaller one.
+        Property Integer piCompilerOutputsSkipped 0
+    End_Procedure
+    // _IsAbsolutePath / RemoveFolderSeperator / _FolderOf / _ResolvePath / WorkspaceConfigFile /
+    // WorkspaceHomeFromConfig are INHERITED from cLibraryInventory - they are .sws/.ws reading, so
+    // they live with the rest of it and cWorkspaceFile gets them too.
+
+
+
+    // Which eCopy* role a declared .ws key carries. Unknown "*Path" keys deliberately get their
+    // own role rather than being folded into a neighbour - the point is that they stay VISIBLE.
+    Function _RoleForConfigKey String sKey Returns Integer
+        String sLow
+
+        Move (Lowercase(Trim(sKey))) to sLow
+        If (sLow = "appsrcpath" or sLow = "ddsrcpath") ;
+            Function_Return eCopySource
+        // IdeSrcPath holds the Studio's own project files - NOT application source (Nils
+        // 2026-08-05). It still travels with the workspace, but calling it "source" would put it in
+        // the same class as AppSrc and invite it into decisions where it does not belong.
+        If (sLow = "idesrcpath") ;
+            Function_Return eCopyStudio
+        If (sLow = "datapath") ;
+            Function_Return eCopyData
+        If (sLow = "programpath") ;
+            Function_Return eCopyOutput
+        If (sLow = "bitmappath" or sLow = "helppath" or sLow = "apphtmlpath") ;
+            Function_Return eCopyResource
+        Function_Return eCopyDeclaredOther
+    End_Function
+
+    /* A declared path that CANNOT be a copy row, however legitimately it is declared.
+
+       Found in the wild 2026-08-05: a real .ws carries "Path=c:\". The rule that makes a row out of
+       every key ending in "path" takes that literally, so the plan offered the WHOLE C: DRIVE - and
+       Measure would then walk it and hang the dialog.
+
+       Two shapes are refused:
+         - a drive root ("C:\", "C:") - never a workspace folder, and unbounded to measure;
+         - an ANCESTOR of the workspace home - copying it would copy the destination into itself.
+       "Outside the home" is NOT one of them: an older workspace can legitimately declare
+       AppSrcPath=C:\Program Files (x86)\..., and dropping that would silently lose real source. It
+       is flagged instead (tCopyItem.bOutsideHome). */
+    Function _IsUnusableDeclaredPath String sPath String sHome Returns Boolean
+        String sLow sHomeLow
+
+        Move (Trim(sPath)) to sLow
+        If (sLow = "") ;
+            Function_Return True
+        Move (Lowercase(RemoveFolderSeperator(Self, sLow))) to sLow
+        // "c:" is what a drive root collapses to once the trailing separator is stripped.
+        If (Length(sLow) <= 2) ;
+            Function_Return True
+        If (sHome = "") ;
+            Function_Return False
+        Move (Lowercase(RemoveFolderSeperator(Self, sHome))) to sHomeLow
+        // An ancestor of home: home starts with it, and it is shorter.
+        If (Length(sLow) < Length(sHomeLow)) Begin
+            If (Left(sHomeLow, Length(sLow) + 1) = (sLow + "\")) ;
+                Function_Return True
+        End
+        Function_Return False
+    End_Function
+
+    // Does sPath sit outside the workspace home? Real and common in older workspaces - reported,
+    // never refused.
+    Function _IsOutsideHome String sPath String sHome Returns Boolean
+        String sLow sHomeLow
+        If (sPath = "" or sHome = "") ;
+            Function_Return False
+        Move (Lowercase(RemoveFolderSeperator(Self, sPath))) to sLow
+        Move (Lowercase(RemoveFolderSeperator(Self, sHome))) to sHomeLow
+        If (sLow = sHomeLow) ;
+            Function_Return False
+        If (Left(sLow, Length(sHomeLow) + 1) = (sHomeLow + "\")) ;
+            Function_Return False
+        Function_Return True
+    End_Function
+
+    // A folder that must never be copied: DFRefactor's own backup trees (BOTH the underscore form
+    // and the legacy form with a space) and version-control metadata. Copying a backup tree into a
+    // migration target would double the size and carry stale originals into a new workspace.
+    Function _IsExcludedFolderName String sName Returns Boolean
+        String sLow
+        Move (Lowercase(Trim(sName))) to sLow
+        If (sLow = Lowercase(CS_BackupFolder)) ;
+            Function_Return True
+        If (sLow = "dfrefactor backup") ;
+            Function_Return True
+        If (sLow = ".git" or sLow = ".svn" or sLow = ".hg") ;
+            Function_Return True
+        Function_Return False
+    End_Function
+
+    /* A file that is the OUTPUT of a compile of the source workspace - a .prn listing, a .err message
+       file, a .dep dependency list - and must not travel with the copy (Nils 2026-08-17). They are
+       regenerated by any compile, so nothing is lost; and carried across they are actively wrong:
+       the analyzer's "Show last Check" re-parses the plan's sSourcePrn, and the recopied WinServ
+       came with the ORIGINAL's 55 MB WINSERV.prn plus three .err files from June - a compile that
+       never happened in this copy, presented as its findings. Executables, .dbg and precompiled
+       packages are left alone: they are outputs too, but they are what the copy RUNS with until it
+       is rebuilt, and none of them feeds the analyzer. Extension match only, case-insensitive. */
+    Function _IsCompilerOutput String sFile Returns Boolean
+        String sExt
+        Integer iPos
+        Move (RightPos(".", sFile)) to iPos
+        If (iPos = 0) ;
+            Function_Return False
+        Move (Lowercase(Mid(sFile, (Length(sFile) - iPos), (iPos + 1)))) to sExt
+        Function_Return (sExt = "prn" or sExt = "err" or sExt = "dep")
+    End_Function
+
+    /* Measure ONE row of a plan and hand the whole plan back with that row filled in.
+
+       ARRAY IN, ARRAY OUT - and that shape is forced, not stylistic. A method that returns a BARE
+       struct cannot be called across objects: "Get <fn> of hoPlan ... to MyStruct" yields an empty
+       struct, every field at its default, with no error raised. Proved 2026-08-05 - rfFolderSize
+       reported the fixture's file correctly while the same value returned through a bare-struct
+       method arrived as zeros. Struct ARRAYS do marshal (BuildCopyPlan returns one), so anything
+       the view has to call lives behind an array-returning signature. A self-send inside the class
+       is fine either way, which is exactly why _MakeCopyItem gets away with it.
+
+       Also the right shape for the job: the view owns one plan array and walks it a row at a time,
+       so the count and the running total can stream instead of freezing on a full-tree walk.
+
+       RECURSIVE on disk - never call this from a web tile's psHtml builder, which runs at first
+       paint; a heavy walk there renders the tile blank. */
+    Function MeasureCopyItems tCopyItem[] aItems Integer iRow Returns tCopyItem[]
+        tRFFolderSize lsSize
+        String sPath
+        Boolean bExists bIsLink
+
+        If (iRow < 0 or iRow >= SizeOfArray(aItems)) ;
+            Function_Return aItems
+
+        Move aItems[iRow].sPath to sPath
+        Move (vFolderExists(sPath) <> 0) to bExists
+        Move (rfIsReparsePoint(sPath)) to bIsLink
+        Move bExists to aItems[iRow].bExists
+        Move bIsLink to aItems[iRow].bIsLink
+        Move 0 to aItems[iRow].nBytes
+        Move 0 to aItems[iRow].iFiles
+        If (bExists = True and bIsLink = False) Begin
+            // A link is reported, never measured - walking it would price a shared library pool as
+            // if it lived inside this workspace.
+            Move (rfFolderSize(sPath)) to lsSize
+            Move lsSize.nBytes to aItems[iRow].nBytes
+            Move lsSize.iFiles to aItems[iRow].iFiles
+        End
+        Move True to aItems[iRow].bMeasured
+        Function_Return aItems
+    End_Function
+
+    // One row from a resolved folder. No disk I/O beyond an existence probe, so the plan stays
+    // cheap; sizes arrive later via MeasureCopyItem.
+    Function _MakeCopyItem String sKey String sPath Integer eRole Boolean bDeclared Boolean bSelected Returns tCopyItem
+        tCopyItem Item
+        String sLeaf
+        Integer iPos
+
+        Move sKey to Item.sKey
+        Move (RemoveFolderSeperator(Self, sPath)) to Item.sPath
+        Move (RightPos("\", Item.sPath)) to iPos
+        If (iPos > 0) ;
+            Move (Mid(Item.sPath, (Length(Item.sPath)), (iPos + 1))) to sLeaf
+        Else ;
+            Move Item.sPath to sLeaf
+        Move sLeaf to Item.sName
+        Move eRole to Item.eRole
+        Move bDeclared to Item.bDeclared
+        Move (vFolderExists(Item.sPath) <> 0) to Item.bExists
+        Move (rfIsReparsePoint(Item.sPath)) to Item.bIsLink
+        Move bSelected to Item.bSelected
+        Move False to Item.bMeasured
+        Function_Return Item
+    End_Function
+
+    /* The rows the workspace itself declares: every "*Path" key in the .ws [Workspace] section.
+
+       A path value may hold SEVERAL folders separated by ";" (the .sws permits multiples, which is
+       why tWorkspacePaths documents its fields as "first entry where the .sws permits multiple").
+       Each one becomes its own row - taking only the first would silently drop the rest. */
+    Function DeclaredCopyItems String sSwsFile Returns tCopyItem[]
+        tCopyItem[] aItems
+        String[] asEntries asParts
+        String sWsFile sHome sEntry sKey sValue sPart
+        Integer i iMax j jMax iPos eRole iRow
+
+        Get WorkspaceConfigFile sSwsFile to sWsFile
+        If (sWsFile = "") ;
+            Function_Return aItems
+        Get WorkspaceHomeFromConfig sWsFile to sHome
+
+        Get SwsSectionEntries sWsFile "Workspace" to asEntries
+        Move (SizeOfArray(asEntries) - 1) to iMax
+        For i from 0 to iMax
+            Move asEntries[i] to sEntry
+            Move (Pos("=", sEntry)) to iPos
+            If (iPos > 1) Begin
+                Move (Trim(Left(sEntry, iPos - 1))) to sKey
+                Move (Trim(Mid(sEntry, (Length(sEntry) - iPos), (iPos + 1)))) to sValue
+                // "Home" anchors everything else and is not itself a row; "Description" and
+                // "FileList" are not folders (FileList names a file INSIDE DataPath).
+                If (Lowercase(sKey) <> "home" and Right(Lowercase(sKey), 4) = "path" and sValue <> "") Begin
+                    Get _RoleForConfigKey sKey to eRole
+                    Move (StrSplitToArray(sValue, ";")) to asParts
+                    Move (SizeOfArray(asParts) - 1) to jMax
+                    For j from 0 to jMax
+                        Move (Trim(asParts[j])) to sPart
+                        If (sPart <> "") Begin
+                            Get _ResolvePath sHome sPart to sPart
+                            // A drive root or an ancestor of home is refused outright - see
+                            // _IsUnusableDeclaredPath for the "Path=c:\" case that forced this.
+                            If (_IsUnusableDeclaredPath(Self, sPart, sHome) = False) Begin
+                                Move (SizeOfArray(aItems)) to iRow
+                                Get _MakeCopyItem sKey sPart eRole True True to aItems[iRow]
+                                Move (_IsOutsideHome(Self, sPart, sHome)) to aItems[iRow].bOutsideHome
+                            End
+                        End
+                    Loop
+                End
+            End
+        Loop
+        Function_Return aItems
+    End_Function
+
+    /* Library folders, from the .sws [Libraries] chain.
+
+       Copied by DEFAULT, and that is deliberate. The entries are relative to home
+       ("Lib1=Libraries\DFAbout\DFAbout19.1.sws"), so a copy that leaves them behind has three
+       dangling references. Giving the copy its own library folders also makes the migration's
+       central promise true: retargeting the copy cannot reach the original.
+
+       A library folder that is a JUNCTION (the shared-pool model) is flagged, not followed - it
+       still gets a row, so the view can offer the choice rather than duplicating a pool silently. */
+    Function LibraryCopyItems String sSwsFile Returns tCopyItem[]
+        tCopyItem[] aItems
+        tLibraryInfo[] aLibs
+        String[] asSeenRoots
+        String sRoot sNoKey sNoVersion sRootKey
+        Integer i iMax iRow
+
+        // sNoKey is a VARIABLE holding "", never the literal. An empty string literal passed as a
+        // message argument is DROPPED by DataFlex: the remaining arguments shift left and the last
+        // one is simply absent, which surfaces as error 57 "Required message argument missing"
+        // inside the callee rather than at the call. Cost an Alt+P crash 2026-08-05.
+        Move "" to sNoKey
+        Move "" to sNoVersion
+        /* THE WHOLE TREE, not just the workspace's own [Libraries] (Nils 2026-08-14).
+
+           Libraries declare libraries. WinServ declares one - WebAppSrc - and WebAppSrc's own
+           .sws declares seven more (vwin32fh, five otherdev ones, VDFQuery). Reading only the
+           workspace's list meant those seven were never CANDIDATES for the copy: the flat reader
+           cannot see them, so the dialog could not offer them and the copy could not take them.
+
+           It usually looked fine because a sub-library normally lives INSIDE its parent's folder,
+           where the parent's own recursive copy sweeps it up anyway - BuildCopyPlan drops such a
+           row through _IsCovered, so nothing is copied twice. What that masked is the case this
+           exists for: a sub-library sitting OUTSIDE its parent's root, which nothing would then
+           copy and which df-cli later reports as a workspace that will not load.
+
+           bFound only - a declaration pointing at nothing is a defect to report, not a folder to
+           copy - and one row per ROOT, because several .sws files in one library resolve to the
+           same folder. */
+        Get WorkspaceLibraryTree sSwsFile sNoVersion CI_LibraryTreeMaxDepth to aLibs
+        Move (SizeOfArray(aLibs) - 1) to iMax
+        For i from 0 to iMax
+            Move "" to sRoot
+            If (aLibs[i].bFound = True) ;
+                Get LibraryRootFolder aLibs[i].sFolder to sRoot
+            Move (Lowercase(RemoveFolderSeperator(Self, sRoot))) to sRootKey
+            If (sRoot <> "" and (SearchArray(sRootKey, asSeenRoots)) <> -1) ;
+                Move "" to sRoot
+            If (sRoot <> "") Begin
+                Move sRootKey to asSeenRoots[SizeOfArray(asSeenRoots)]
+                // Straight into the array element, exactly as DeclaredCopyItems and
+                // UndeclaredCopyItems do. Returning into a plain local struct and appending it
+                // afterwards left every field at its default here - the row arrived with eRole 0
+                // and bSelected False, and only LOOKED right because sName was overwritten below.
+                Move (SizeOfArray(aItems)) to iRow
+                Get _MakeCopyItem sNoKey sRoot eCopyLibrary True True to aItems[iRow]
+                If (aLibs[i].sName <> "") ;
+                    Move aLibs[i].sName to aItems[iRow].sName
+            End
+        Loop
+        Function_Return aItems
+    End_Function
+
+    // Is sPath already represented by (or inside) one of the rows in aItems?
+    Function _IsCovered tCopyItem[] aItems String sPath Returns Boolean
+        String sLow sRow
+        Integer i iMax
+
+        Move (Lowercase(RemoveFolderSeperator(Self, sPath))) to sLow
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            Move (Lowercase(RemoveFolderSeperator(Self, aItems[i].sPath))) to sRow
+            If (sRow = sLow) ;
+                Function_Return True
+            // A declared path nested under this folder means the folder itself is already spoken
+            // for by a more precise row.
+            If (Left(sRow, Length(sLow) + 1) = (sLow + "\")) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    /* Everything else sitting directly under home - offered, but UNTICKED.
+
+       This is the 5.5 GB category on a real workspace: six stale "Data - *" copies that nothing
+       references. They are shown rather than hidden, because a user who really does need one must
+       be able to say so; they are unticked, because nothing in the workspace claims them. */
+    Function UndeclaredCopyItems String sSwsFile tCopyItem[] aKnown Returns tCopyItem[]
+        tCopyItem[] aItems
+        tRFSearchResult[] asDirs
+        String sWsFile sHome sPath sName sNoKey
+        Integer i iMax eRole
+        Boolean bCovered
+
+        // See LibraryCopyItems - an empty string LITERAL as a message argument gets dropped.
+        Move "" to sNoKey
+
+        Get WorkspaceConfigFile sSwsFile to sWsFile
+        If (sWsFile = "") ;
+            Function_Return aItems
+        Get WorkspaceHomeFromConfig sWsFile to sHome
+        If (sHome = "") ;
+            Function_Return aItems
+
+        Move (rfFileSearch((vFolderFormat(sHome) + "*.*"), DIRMODE_DIRECTORIES_ONLY, False)) to asDirs
+        Move (SizeOfArray(asDirs) - 1) to iMax
+        For i from 0 to iMax
+            Move asDirs[i].sFilename to sName
+            Move (vFolderFormat(sHome) + sName) to sPath
+            Get _IsCovered aKnown sPath to bCovered
+            If (bCovered = False) Begin
+                Move eCopyUndeclared to eRole
+                If (_IsExcludedFolderName(Self, sName)) ;
+                    Move eCopyExcluded to eRole
+                Get _MakeCopyItem sNoKey sPath eRole False False to aItems[SizeOfArray(aItems)]
+            End
+        Loop
+        Function_Return aItems
+    End_Function
+
+    /* Add a hand-picked folder to a plan (the dialog's Ins / "Add Folder").
+
+       ARRAY IN, ARRAY OUT for the marshalling reason documented on MeasureCopyItems - and the row
+       is built straight into the array element, never into a local struct, which silently arrives
+       empty.
+
+       A folder already in the plan is TICKED rather than duplicated: the user asking for a folder
+       that is already listed means "I want this copied", and answering with a second identical row
+       would be a worse answer to the same request. */
+    Function AddFolderToPlan tCopyItem[] aItems String sFolder Returns tCopyItem[]
+        Integer i iMax iRow
+        String sLow sRow sNoKey
+
+        Move "" to sNoKey
+        If (Trim(sFolder) = "") ;
+            Function_Return aItems
+        Move (Lowercase(RemoveFolderSeperator(Self, Trim(sFolder)))) to sLow
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            Move (Lowercase(RemoveFolderSeperator(Self, aItems[i].sPath))) to sRow
+            If (sRow = sLow) Begin
+                If (aItems[i].eRole <> eCopyExcluded) ;
+                    Move True to aItems[i].bSelected
+                Function_Return aItems
+            End
+        Loop
+
+        Move (SizeOfArray(aItems)) to iRow
+        Get _MakeCopyItem sNoKey sFolder eCopyAdded False True to aItems[iRow]
+        Function_Return aItems
+    End_Function
+
+    // Drop one row from a plan, matched by PATH rather than index - the grid can be sorted by any
+    // column, so a positional delete would remove whichever folder happened to sit there.
+    Function RemoveFolderFromPlan tCopyItem[] aItems String sFolder Returns tCopyItem[]
+        tCopyItem[] aKept
+        Integer i iMax
+        String sLow sRow
+
+        If (Trim(sFolder) = "") ;
+            Function_Return aItems
+        Move (Lowercase(RemoveFolderSeperator(Self, Trim(sFolder)))) to sLow
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            Move (Lowercase(RemoveFolderSeperator(Self, aItems[i].sPath))) to sRow
+            If (sRow <> sLow) ;
+                Move aItems[i] to aKept[SizeOfArray(aKept)]
+        Loop
+        Function_Return aKept
+    End_Function
+
+    // sPath expressed as ".\rest" relative to sHome, or "" when it does not sit under sHome.
+    Function _RelativeToHome String sPath String sHome Returns String
+        String sLow sHomeLow sRest
+
+        Move (Lowercase(RemoveFolderSeperator(Self, sPath))) to sLow
+        Move (Lowercase(RemoveFolderSeperator(Self, sHome))) to sHomeLow
+        If (sHomeLow = "" or sLow = "") ;
+            Function_Return ""
+        If (sLow = sHomeLow) ;
+            Function_Return ".\"
+        If (Left(sLow, Length(sHomeLow) + 1) <> (sHomeLow + "\")) ;
+            Function_Return ""
+        // Take the tail from the ORIGINAL string so the caller keeps its own capitalisation.
+        Move (Mid(RemoveFolderSeperator(Self, sPath), Length(sPath), Length(sHomeLow) + 2)) to sRest
+        Function_Return (".\" + sRest)
+    End_Function
+
+    /* True when sPath sits BESIDE the home rather than inside it - a sibling library folder
+       (..\vdfquery) or something under a sibling pool (..\Libraries\DataFlex Reports 5.0.1).
+
+       Such a row is copied to the same position beside the NEW home, which has two consequences
+       the callers depend on: the .ws / .sws entry naming it needs NO rewriting (the very string
+       "..\Libraries\X" resolves against the copy just as it did against the original), and the
+       destination is a folder other workspaces may already share - so the copy CREATES it or
+       leaves it alone, and never merges into it.
+
+       Excludes the parent itself: mirroring ".\" would copy everything beside the workspace.
+
+       AND EXCLUDES HOME'S OWN SUBTREE, which is the whole point of the name and was missing until
+       2026-08-06. "Under the parent" is true of everything under HOME as well - home is itself
+       under its parent - so `E:\LegacyApp10\AppSrc` tested against home `E:\GP` came back True: a sibling
+       library. DestinationForRow never noticed, because it resolves inside-home FIRST and returns;
+       the damage landed on _UsesExistingSibling, which asks this question on its own.
+
+       The consequence was not a wording slip. On a SECOND copy to a destination that already held
+       the first one, every one of the workspace's own folders - AppSrc, Data, DDSrc, Programs -
+       matched "an existing folder beside the destination", so CopyFileList dropped them and the
+       re-copy silently refreshed nothing (Nils 2026-08-06: "it is only Libraries\vdfquery that is
+       a library, the rest should be copied again"). A skip meant for folders the workspace does
+       not own was being applied to the ones it does.
+
+       Inside home the answer is always False and the caller's own inside-home handling takes over:
+       those folders belong to this workspace, so they are copied - and if something is already at
+       the destination the newer-file guard decides per FILE, which is the right granularity for
+       content we own. */
+    Function _MirrorsBesideHome String sPath String sHome Returns Boolean
+        String sParent sRel
+
+        // Inside home - including home itself, which _RelativeToHome answers ".\" - is not beside it.
+        Get _RelativeToHome sPath sHome to sRel
+        If (sRel <> "") ;
+            Function_Return False
+        Get _FolderOf (RemoveFolderSeperator(Self, sHome)) to sParent
+        If (sParent = "") ;
+            Function_Return False
+        Get _RelativeToHome sPath sParent to sRel
+        Function_Return (sRel <> "" and sRel <> ".\")
+    End_Function
+
+    /* The rewritten [Workspace] section for a COPIED workspace.
+
+       WHY THIS EXISTS AND IS NOT OPTIONAL. A .ws may declare its folders as ABSOLUTE paths - found
+       on this machine 2026-08-05, and not rarely: one real file declares every single path that way
+       (AppSrcPath=C:\Visual DataFlex Projects\OldApp\AppSrc). Copy such a workspace anywhere and
+       the copy's .ws still points at the ORIGINAL folders. It would compile and run against the
+       original's source and data, and refactoring the "copy" would edit the originals - exactly the
+       accident that copying first is meant to make impossible.
+
+       The rule, per line:
+         - a path that resolves INSIDE the old home  -> rewritten as ".\rest", so it follows the copy
+           (this covers both the already-relative case and the absolute-inside-home case);
+         - a path that resolves OUTSIDE the old home -> depends on the PLAN. A ticked row is copied
+           under the new home by its leaf name (DestinationForRow), so the entry is repointed at
+           ".\leaf" and the copy becomes self-contained. An unticked one is left EXACTLY as written:
+           it was not copied, so repointing would aim at nothing, and the copy legitimately shares it
+           with the original - PathsSharedWithOriginal names those so the user is told;
+         - Home=, Description= and anything unrecognised -> passed through untouched.
+
+       Returns the whole file's lines, so the caller writes it out verbatim. */
+    Function RewrittenWorkspaceLines String sSwsFile String sNewHome tCopyItem[] aItems Returns String[]
+        String[] asLines asOut
+        String sWsFile sHome sLine sTrim sKey sValue sAbs sRel sLeaf
+        Integer i iMax iPos
+
+        Get WorkspaceConfigFile sSwsFile to sWsFile
+        If (sWsFile = "") ;
+            Function_Return asOut
+        Get WorkspaceHomeFromConfig sWsFile to sHome
+        Move (rfReadEncodedFileAsStringArray(sWsFile)) to asLines
+
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move asLines[i] to sLine
+            Move (Trim(Replaces(Character(13), sLine, ""))) to sTrim
+            Move (Pos("=", sTrim)) to iPos
+            If (iPos > 1 and Left(sTrim, 1) <> "[" and Left(sTrim, 1) <> ";") Begin
+                Move (Trim(Left(sTrim, iPos - 1))) to sKey
+                Move (Trim(Mid(sTrim, (Length(sTrim) - iPos), (iPos + 1)))) to sValue
+                If (Lowercase(sKey) <> "home" and sValue <> "" and ;
+                    (Right(Lowercase(sKey), 4) = "path" or Lowercase(sKey) = "filelist")) Begin
+                    Get _ResolvePath sHome sValue to sAbs
+                    Get _RelativeToHome sAbs sHome to sRel
+                    If (sRel <> "") Begin
+                        Move (sKey + "=" + sRel) to sLine
+                    End
+                    Else Begin
+                        // Outside the home: repoint only if the plan says it travels, AND it
+                        // travels to a different relative position. A row that lands BESIDE the
+                        // new home keeps the exact path it was written with - "..\Libraries\X"
+                        // resolves against the copy just as it did against the original, so
+                        // rewriting it would break what already works.
+                        Get _SelectedLeafFor aItems sAbs to sLeaf
+                        If (sLeaf <> "" and _MirrorsBesideHome(Self, sAbs, sHome) = False) ;
+                            Move (sKey + "=.\" + sLeaf) to sLine
+                    End
+                End
+            End
+            Move sLine to asOut[SizeOfArray(asOut)]
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // The leaf name an out-of-home path will be copied to, or "" when the plan does not carry it.
+    Function _SelectedLeafFor tCopyItem[] aItems String sPath Returns String
+        String sLow sRow sLeaf
+        Integer i iMax iPos
+
+        Move (Lowercase(RemoveFolderSeperator(Self, sPath))) to sLow
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            Move (Lowercase(RemoveFolderSeperator(Self, aItems[i].sPath))) to sRow
+            If (sRow = sLow and aItems[i].bSelected = True) Begin
+                Move (RightPos("\", sRow)) to iPos
+                If (iPos = 0) ;
+                    Function_Return ""
+                Move (RemoveFolderSeperator(Self, aItems[i].sPath)) to sLeaf
+                Function_Return (Right(sLeaf, (Length(sLeaf) - iPos)))
+            End
+        Loop
+        Function_Return ""
+    End_Function
+
+    /* The declared paths a copy would still SHARE with the original - absolute, outside the home,
+       and therefore not rewritable. Each entry reads "<Key>=<value>".
+
+       Surfaced rather than silently accepted: sharing a Data folder between the original and its
+       migration copy is sometimes exactly right and sometimes a disaster, and only the user knows
+       which. Saying nothing would let the copy look independent when it is not. */
+    Function PathsSharedWithOriginal String sSwsFile tCopyItem[] aItems Returns String[]
+        String[] asLines asOut
+        String sWsFile sHome sTrim sKey sValue sAbs sRel sLeaf
+        Integer i iMax iPos
+
+        Get WorkspaceConfigFile sSwsFile to sWsFile
+        If (sWsFile = "") ;
+            Function_Return asOut
+        Get WorkspaceHomeFromConfig sWsFile to sHome
+        Move (rfReadEncodedFileAsStringArray(sWsFile)) to asLines
+
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move (Trim(Replaces(Character(13), asLines[i], ""))) to sTrim
+            Move (Pos("=", sTrim)) to iPos
+            If (iPos > 1 and Left(sTrim, 1) <> "[" and Left(sTrim, 1) <> ";") Begin
+                Move (Trim(Left(sTrim, iPos - 1))) to sKey
+                Move (Trim(Mid(sTrim, (Length(sTrim) - iPos), (iPos + 1)))) to sValue
+                If (Lowercase(sKey) <> "home" and sValue <> "" and ;
+                    (Right(Lowercase(sKey), 4) = "path" or Lowercase(sKey) = "filelist")) Begin
+                    Get _ResolvePath sHome sValue to sAbs
+                    Get _RelativeToHome sAbs sHome to sRel
+                    If (sRel = "") Begin
+                        // A TICKED out-of-home path travels with the copy and was repointed by
+                        // RewrittenWorkspaceLines, so it is not shared - reporting it anyway would
+                        // contradict what the copy actually did.
+                        Get _SelectedLeafFor aItems sAbs to sLeaf
+                        If (sLeaf = "") ;
+                            Move (sKey + "=" + sValue) to asOut[SizeOfArray(asOut)]
+                    End
+                End
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    // "19.1" -> "191". Some library headers spell the version without the dot (vWin32fh-Library-DF191).
+    Function _VersionCompact String sVer Returns String
+        Function_Return (Replaces(".", Trim(sVer), ""))
+    End_Function
+
+    /* The FILENAME for a library .sws header that does not exist yet.
+
+       Filename conventions across libraries are irreconcilable - three libraries, three schemes, and
+       vwin32fh changed its own - so nothing here PARSES a filename to learn a version. It works the
+       other way round: the template's version is known from INSIDE the file, and that known string is
+       substituted where it appears in the name.
+
+         AlphaLibrary19.1.sws      + 19.1 -> 26.0  =>  AlphaLibrary26.0.sws
+         vWin32fh-Library-DF191.sws + 19.1 -> 26.0  =>  vWin32fh-Library-DF260.sws   (compact form)
+         something-with-no-version  + ...          =>  <stem> DF26.0.sws             (appended)
+
+       The appended fallback is deliberately plain: when the scheme cannot be recognised, inventing a
+       clever name is worse than an obvious one. */
+    Function SynthesizedLibrarySwsName String sTemplateFile String sTemplateVersion String sTargetVersion Returns String
+        String sName sStem sExt sFrom sTo
+        Integer iPos
+
+        If (sTemplateFile = "" or sTargetVersion = "") ;
+            Function_Return ""
+        Move (RightPos("\", sTemplateFile)) to iPos
+        If (iPos > 0) ;
+            Move (Right(sTemplateFile, (Length(sTemplateFile) - iPos))) to sName
+        Else ;
+            Move sTemplateFile to sName
+
+        Move (RightPos(".", sName)) to iPos
+        If (iPos > 1) Begin
+            Move (Left(sName, iPos - 1)) to sStem
+            Move (Right(sName, (Length(sName) - iPos + 1))) to sExt
+        End
+        Else Begin
+            Move sName to sStem
+            Move ".sws" to sExt
+        End
+
+        If (Trim(sTemplateVersion) <> "") Begin
+            // Dotted form first - it is the more specific of the two.
+            Move (Trim(sTemplateVersion)) to sFrom
+            Move (Trim(sTargetVersion)) to sTo
+            If (sStem contains sFrom) ;
+                Function_Return (Replaces(sFrom, sStem, sTo) + sExt)
+            Get _VersionCompact sFrom to sFrom
+            Get _VersionCompact sTo to sTo
+            If (sFrom <> "" and sStem contains sFrom) ;
+                Function_Return (Replaces(sFrom, sStem, sTo) + sExt)
+        End
+        Function_Return (sStem + " DF" + Trim(sTargetVersion) + sExt)
+    End_Function
+
+    /* Remove a product-and-version token from a name stem: "DF" or "VDF" together with a number.
+
+       "_DF25.0", " DF191", "-DF260", and - Nils 2026-08-14 - " VDF 18.0", where "VDF" is the old
+       Visual DataFlex name and the number is separated from it by a space. The whole thing is the
+       version marker, so the whole thing goes: "Acme-UMS VDF 18.0" is the workspace Acme-UMS, and
+       nothing else.
+
+       It is also the suffix MigratedSwsFileName itself appends, so a workspace copied twice would
+       otherwise accumulate them ("MyApp_DF25.0_DF26.0").
+
+       Deliberately NOT a general digit-stripper: this file's whole naming philosophy is that a
+       filename is never PARSED to learn a version (see SynthesizedLibrarySwsName), and "Route180"
+       must survive intact - there is a test that says so.
+
+       Three guards keep it honest:
+         - a DIGIT must follow, after optional separators, so "ExportPDF" and a bare "MyApp DF" are
+           untouched - "together with a number" is the rule, and no number means no token;
+         - the token must start at the beginning, after a separator, OR run to the END of the stem.
+           That last case is what makes "WinServDF19" - a real workspace, hit on 2026-08-14 - become
+           "WinServ", while "MyDF25Tool" keeps its letters: a version marker is a SUFFIX or a word of
+           its own, never something with a name carrying on after it;
+         - "VDF" is tried BEFORE "DF", or the V would be left stranded.
+
+       Only the FIRST such token is removed; a second would mean a name this function never wrote. */
+    { Visibility=Private }
+    Function _StripDfVersionToken String sStem Returns String
+        String  sCh sPrev sHead sTail
+        Integer iLen i iAt iTokLen iEnd iDigits
+        Boolean bFound bStop bAtBoundary
+
+        Move (Length(sStem)) to iLen
+        If (iLen < 3) ;
+            Function_Return sStem
+
+        Move 0 to iAt
+        Move 0 to iEnd
+        Move False to bFound
+        Move 1 to i
+        While (i <= iLen and bFound = False)
+            Move "" to sPrev
+            If (i > 1) ;
+                Move (Mid(sStem, 1, i - 1)) to sPrev        // the character right before the token
+            Move (i = 1 or sPrev = "_" or sPrev = "-" or sPrev = " ") to bAtBoundary
+            /* "VDF" first - testing "DF" first would match its last two letters and strand the V -
+               but ONLY at a word boundary. Without that gate "WinServDF19" matches "vDF" at the v
+               (uppercased, it IS "VDF") and comes out as "WinSer": the product name is a word of its
+               own, while a v sitting in front of DF inside a word is just a letter. Cost a failing
+               test to find, 2026-08-14. */
+            Move 0 to iTokLen
+            If (bAtBoundary = True and Uppercase(Mid(sStem, 3, i)) = "VDF") ;
+                Move 3 to iTokLen
+            Else If (Uppercase(Mid(sStem, 2, i)) = "DF") ;
+                Move 2 to iTokLen
+            If (iTokLen > 0) Begin
+                // Separators between the token and its number ("VDF 18.0").
+                Move (i + iTokLen) to iEnd
+                Move False to bStop
+                While (iEnd <= iLen and bStop = False)
+                    Move (Mid(sStem, 1, iEnd)) to sCh
+                    If (sCh = " " or sCh = "_" or sCh = "-") ;
+                        Increment iEnd
+                    Else ;
+                        Move True to bStop
+                Loop
+                // The number itself. A dot counts only once digits have started, so a token
+                // followed by ".something" cannot swallow the rest of the name.
+                Move 0 to iDigits
+                Move False to bStop
+                While (iEnd <= iLen and bStop = False)
+                    Move (Mid(sStem, 1, iEnd)) to sCh
+                    If (sCh >= "0" and sCh <= "9") Begin
+                        Increment iDigits
+                        Increment iEnd
+                    End
+                    Else If (sCh = "." and iDigits > 0) Begin
+                        Increment iEnd
+                    End
+                    Else ;
+                        Move True to bStop
+                Loop
+                /* ACCEPT at a word boundary, or when the token runs to the END of the stem.
+                   The second case is "WinServDF19" - no separator before the DF, but nothing after
+                   the number either, so it is a suffix and not part of a word. "MyDF25Tool" fails
+                   both tests and keeps its letters, which is the distinction that matters. */
+                If (iDigits > 0 and (bAtBoundary = True or iEnd > iLen)) Begin
+                    Move i to iAt
+                    Move True to bFound
+                End
+            End
+            Increment i
+        Loop
+        If (bFound = False) ;
+            Function_Return sStem
+
+        Move "" to sHead
+        If (iAt > 1) ;
+            Move (Left(sStem, iAt - 1)) to sHead
+        Move "" to sTail
+        If (iEnd <= iLen) ;
+            Move (Mid(sStem, (iLen - iEnd + 1), iEnd)) to sTail
+        Function_Return (sHead + sTail)
+    End_Function
+
+    /* The filename for the COPY's .sws.
+
+       "Acme-UMS VDF 18.0.sws" migrating to 25.0 became "Acme-UMS VDF 18.0 DF25.0.sws" - stating two
+       versions, one of them wrong, and carrying spaces (Nils 2026-08-05). Four rules:
+
+         1. a "DF"/"VDF" token carrying a number is removed - both the suffix this function wrote on
+            an earlier copy and the old "VDF 18.0" product-and-version spelling. First, because rule
+            2 would otherwise take the number and strand the letters;
+         2. the SOURCE version is removed. Which token that is comes from INSIDE the file, never from
+            reading the name - the same rule the library headers follow. The compact form ("180") is
+            tried only when the dotted one is absent, so a name that merely contains those digits is
+            not mangled;
+         3. spaces become underscores, and runs of them collapse - a workspace path with spaces is
+            legal but a nuisance in every command line it later appears in;
+         4. the target version is appended once, as "_DF<ver>" - but ONLY below
+            CI_DfUnversionedSwsFrom.
+
+       RULE 4 STOPS AT DATAFLEX 26 (Nils 2026-08-14). From DF26 the workspace carries its own version
+       inside the JSON .sws and libraries/packages are resolved by the package handler, so a suffix
+       would restate what the file already says and could later contradict it - the suffix is frozen
+       at copy time, the "df" value is what the tooling reads. See CI_DfUnversionedSwsFrom.
+
+       "Acme-UMS VDF 18.0.sws" + 18.0 -> 25.0  =>  "Acme-UMS_DF25.0.sws"
+       "Acme-UMS VDF 18.0.sws" + 18.0 -> 26.0  =>  "Acme-UMS.sws"
+       "MyApp_DF25.0.sws"     + 25.0 -> 26.0  =>  "MyApp.sws" */
+    Function MigratedSwsFileName String sSourceSwsFile String sSourceVersion String sTargetVersion Returns String
+        String sStem sFrom sOriginal
+        Integer iPos iGuard iTargetKey
+
+        If (sSourceSwsFile = "" or sTargetVersion = "") ;
+            Function_Return ""
+        Move (RightPos("\", sSourceSwsFile)) to iPos
+        If (iPos > 0) ;
+            Move (Right(sSourceSwsFile, (Length(sSourceSwsFile) - iPos))) to sStem
+        Else ;
+            Move sSourceSwsFile to sStem
+        Move (RightPos(".", sStem)) to iPos
+        If (iPos > 1) ;
+            Move (Left(sStem, iPos - 1)) to sStem
+        // Kept so the removals below can never strip a name down to nothing: a workspace called
+        // "DF26.0.sws" is all version and no name, and ".sws" is not a filename.
+        Move sStem to sOriginal
+
+        /* 1. drop a "DF<ver>" token an earlier copy left behind, so the suffixes cannot stack.
+
+              BEFORE the source-version removal, not after: for "MyApp_DF25.0" with 25.0 inside the
+              file, removing the version first leaves "MyApp_DF" - a stranded "DF" this pass can no
+              longer recognise, because the digits that identified it are gone. */
+        Get _StripDfVersionToken sStem to sStem
+
+        // 2. drop the source version token
+        Move (Trim(sSourceVersion)) to sFrom
+        If (sFrom <> "") Begin
+            If (sStem contains sFrom) Begin
+                Move (Replaces(sFrom, sStem, "")) to sStem
+            End
+            Else Begin
+                Get _VersionCompact sFrom to sFrom
+                If (sFrom <> "" and sStem contains sFrom) ;
+                    Move (Replaces(sFrom, sStem, "")) to sStem
+            End
+        End
+
+        // 3. spaces -> underscores, then collapse the runs the removal above tends to leave
+        Move (Replaces(" ", sStem, "_")) to sStem
+        Move 0 to iGuard
+        While (sStem contains "__" and iGuard < 40)
+            Move (Replaces("__", sStem, "_")) to sStem
+            Increment iGuard
+        Loop
+        // Trim the separators a removed token can strand at either end.
+        While (Right(sStem, 1) = "_" or Right(sStem, 1) = "-")
+            Move (Left(sStem, Length(sStem) - 1)) to sStem
+        Loop
+        While (Left(sStem, 1) = "_")
+            Move (Mid(sStem, Length(sStem), 2)) to sStem
+        Loop
+
+        If (Trim(sStem) = "") ;
+            Move sOriginal to sStem
+
+        // 4. the target version, unless the target is DF26 or later - where the file says it itself.
+        Get _VersionKey sTargetVersion to iTargetKey
+        If (iTargetKey >= CI_DfUnversionedSwsFrom) ;
+            Function_Return (sStem + ".sws")
+        Function_Return (sStem + "_DF" + Trim(sTargetVersion) + ".sws")
+    End_Function
+
+    /* The library headers that must be WRITTEN because the library ships none for the target.
+
+       The template is the .sws the workspace actually references - the build it is known to work
+       with - copied with its [Properties] Version= changed. That is the same edit the library author
+       makes when supporting a new release.
+
+       Paths are returned relative to the library folders as they stand NOW; the caller writing into
+       a COPY must redirect them, because adding a header to the ORIGINAL library folder would modify
+       the workspace this whole exercise exists to leave alone. */
+    Function LibrarySwsToAdd String sSwsFile String sTargetVersion Returns tLibrarySwsToAdd[]
+        tLibraryInfo[] aLibs
+        tLibrarySwsToAdd[] aOut
+        String sNewName
+        Integer i iMax iRow iTargetKey
+
+        If (sTargetVersion = "") ;
+            Function_Return aOut
+        /* NOTHING TO WRITE FROM DF26 UP, because nothing will reference it. The header exists only
+           to be named by a retargeted [Libraries] entry, and _RetargetedLibraryEntry stops
+           renaming at 26 - so synthesising one here would put an unreferenced file into the copy
+           and call it progress. Bringing a library forward to DF26 is the Libraries dialog's job,
+           where it is a decision rather than a guess. */
+        Get _VersionKey sTargetVersion to iTargetKey
+        If (iTargetKey >= CI_DfUnversionedSwsFrom) ;
+            Function_Return aOut
+        Get WorkspaceLibraryInventory sSwsFile sTargetVersion to aLibs
+        Move (SizeOfArray(aLibs) - 1) to iMax
+        For i from 0 to iMax
+            If (aLibs[i].eStatus = eLibNoLocalBuild) Begin
+                Get SynthesizedLibrarySwsName aLibs[i].sRefSwsFile aLibs[i].sRefVersion sTargetVersion to sNewName
+                If (sNewName <> "") Begin
+                    Move (SizeOfArray(aOut)) to iRow
+                    Move aLibs[i].sName        to aOut[iRow].sLibName
+                    Move aLibs[i].sRefSwsFile  to aOut[iRow].sTemplateFile
+                    Move (aLibs[i].sFolder + sNewName) to aOut[iRow].sNewFile
+                    Move sTargetVersion        to aOut[iRow].sVersion
+                End
+            End
+        Loop
+        Function_Return aOut
+    End_Function
+
+    /* The [Libraries] value retargeted to sTargetVersion, or "" when it cannot be.
+
+       The entry is home-relative ("Libraries\DFAbout\DFAbout19.1.sws"), and the target build lives
+       in the SAME folder as the one referenced - so retargeting keeps the entry's own folder part
+       and swaps only the filename. That matters: rebuilding the path from the resolved absolute one
+       would turn a relative entry into an absolute one, and an absolute [Libraries] entry does not
+       survive being copied. */
+    Function _RetargetedLibraryEntry String sRawEntry String sHome tLibraryInfo[] aLibs String sTargetVersion Returns String
+        String sResolved sRefLow sNewFile sFolderPart
+        Integer i iMax iPos iTargetKey
+
+        /* FROM DATAFLEX 26, A LIBRARY FILENAME IS NOT OURS TO REWRITE (Nils 2026-08-14).
+
+           "The .sws file names for libraries should never be touched when the Target version is
+           DF 26 and up. That seems to me is the bug in the logic here." It is.
+
+           Below 26 the version lives in the filename, so retargeting a copy means renaming the
+           entry and writing the header it now names - the pair below. From 26 the workspace
+           declares DEPENDENCIES and the package handler resolves them; a versioned filename is
+           whatever the library author happened to ship, not a name this program can derive.
+
+           Deriving it anyway is what broke E:\WinServ. The synthesised WebAppSrc header had its
+           nested entry rewritten from vWin32fh-Library-DF191.sws to -DF260, a file that exists
+           nowhere - vwin32fh ships DF181/182/190/191/200 and no DF260 - so df-cli refused to load
+           the workspace at all. An entry left as written at least RESOLVES; a workspace that will
+           not load cannot even be converted, let alone have a package added.
+
+           Returning "" means "no change": NewSwsLines keeps the line exactly as it read it. */
+        Get _VersionKey sTargetVersion to iTargetKey
+        If (iTargetKey >= CI_DfUnversionedSwsFrom) ;
+            Function_Return ""
+
+        Get ResolveLibraryPath sRawEntry sHome to sResolved
+        Move (Lowercase(sResolved)) to sRefLow
+        Move (SizeOfArray(aLibs) - 1) to iMax
+        For i from 0 to iMax
+            If (Lowercase(aLibs[i].sRefSwsFile) = sRefLow) Begin
+                If (aLibs[i].sTargetSwsFile <> "") Begin
+                    If (Lowercase(aLibs[i].sTargetSwsFile) = sRefLow) ;
+                        Function_Return ""      // already the target build - nothing to change
+                    Move (RightPos("\", aLibs[i].sTargetSwsFile)) to iPos
+                    Move (Right(aLibs[i].sTargetSwsFile, (Length(aLibs[i].sTargetSwsFile) - iPos))) to sNewFile
+                End
+                Else Begin
+                    // No build for the target ships with this library, so a header is SYNTHESISED
+                    // (LibrarySwsToAdd writes it). The entry has to name the file that will exist,
+                    // not the one that does - otherwise the new workspace points at the old build
+                    // and the synthesised header is dead weight.
+                    Get SynthesizedLibrarySwsName aLibs[i].sRefSwsFile aLibs[i].sRefVersion sTargetVersion to sNewFile
+                    If (sNewFile = "") ;
+                        Function_Return ""
+                End
+                Move (RightPos("\", sRawEntry)) to iPos
+                If (iPos > 0) ;
+                    Move (Left(sRawEntry, iPos)) to sFolderPart
+                Else ;
+                    Move "" to sFolderPart
+                Function_Return (sFolderPart + sNewFile)
+            End
+        Loop
+        Function_Return ""
+    End_Function
+
+    /* The .sws for the copy: [Properties] Version= set to the target, and every [Libraries] entry
+       repointed at that library's build for the target where one exists locally.
+
+       BOTH changes belong here. The .sws is the file that states which DataFlex version a workspace
+       is for, and its [Libraries] block is where the library versions are named - so a copy created
+       "for DF 26" whose libraries still point at the 19.1 builds is not a DF 26 workspace, it just
+       claims to be. Nils 2026-08-05.
+
+       A library with NO local build for the target is left exactly as it was, not guessed at and not
+       dropped - the workspace still opens, and LibrariesWithoutTargetBuild names them so the user
+       knows which ones need fetching. That is the eLibNoLocalBuild verdict doing its job: the long
+       hop always ends at "get a newer library", and this refuses to pretend otherwise.
+
+       A missing [Properties]/Version= is ADDED - a .sws without one cannot state its target. */
+    /* NewSwsLines with a DROP list: the [Libraries] entries named in asDropRaw (as written in the
+       source .sws) are left out of the copy's file, and the survivors are renumbered from Lib1 -
+       the Studio reads Lib1, Lib2... in sequence, so a gap ends the list early. The drop list is
+       what UncopiedInsideHomeLibraries found: a library inside the original's home that the copy
+       leaves behind (Nils 2026-09-03). An empty list is plain NewSwsLines. */
+    Function NewSwsLinesDropping String sSwsFile String sTargetVersion String[] asDropRaw Returns String[]
+        String[] asLines asOut asDropLow
+        tLibraryInfo[] aLibs
+        String sLine sTrim sKey sValue sHome sNewValue
+        Integer i iMax iPos iFormat iLibNo
+        Boolean bInProps bInLibs bDone bSkipLine
+
+        If (sTargetVersion = "") ;
+            Function_Return asOut
+        Move (SizeOfArray(asDropRaw) - 1) to iMax
+        For i from 0 to iMax
+            Move (Lowercase(Trim(asDropRaw[i]))) to asDropLow[i]
+        Loop
+        Move 0 to iLibNo
+
+        /* REFUSE a JSON .sws rather than damage it.
+
+           Everything below is INI surgery: it finds [Properties] to rewrite Version=, finds
+           [Libraries] to repoint the entries, and passes every other line through. On a JSON
+           document none of those headers exist, so nothing is rewritten AND - worse - the
+           "no Version= found" fallback at the foot appends [Properties]/Version= to the end of a
+           JSON file, producing something neither the Studio nor this tool can read. A silently
+           wrong answer is bad; a corrupted workspace file is worse, and this is the only path here
+           that can destroy rather than merely mislead.
+
+           The test is on the FILE, not the caller, which is what makes it correct for both users of
+           this function: a workspace .sws may be JSON (the DF26 Studio converts it), while the
+           library headers NewLibrarySwsLines writes are always INI.
+
+           Empty return = "not written". Callers already treat an empty array that way, and
+           RunWorkspaceCopy says so plainly rather than reporting a copy it did not make. */
+        Get SwsFormatOf sSwsFile to iFormat
+        If (iFormat = eSwsJson) ;
+            Function_Return asOut
+
+        Move (rfReadEncodedFileAsStringArray(sSwsFile)) to asLines
+        Get WorkspaceLibraryInventory sSwsFile sTargetVersion to aLibs
+        Get _FolderOf sSwsFile to sHome
+        Move False to bInProps
+        Move False to bInLibs
+        Move False to bDone
+
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move asLines[i] to sLine
+            Move (Trim(Replaces(Character(13), sLine, ""))) to sTrim
+            Move False to bSkipLine
+            If (Left(sTrim, 1) = "[") Begin
+                Move (Lowercase(sTrim) = "[properties]") to bInProps
+                Move (Lowercase(sTrim) = "[libraries]") to bInLibs
+            End
+            Else Begin
+                Move (Pos("=", sTrim)) to iPos
+                If (iPos > 1) Begin
+                    Move (Trim(Left(sTrim, iPos - 1))) to sKey
+                    Move (Trim(Mid(sTrim, (Length(sTrim) - iPos), (iPos + 1)))) to sValue
+                    If (bInProps = True and bDone = False and Lowercase(sKey) = "version") Begin
+                        Move ("Version=" + sTargetVersion) to sLine
+                        Move True to bDone
+                    End
+                    If (bInLibs = True and sValue <> "") Begin
+                        // DROPPED, not repointed: the copy has no folder for it (see the drop list).
+                        If (SearchArray(Lowercase(Trim(sValue)), asDropLow) <> -1) ;
+                            Move True to bSkipLine
+                        Else Begin
+                            Get _RetargetedLibraryEntry sValue sHome aLibs sTargetVersion to sNewValue
+                            If (sNewValue = "") ;
+                                Move sValue to sNewValue
+                            Increment iLibNo
+                            // Only a copy that DROPS something renumbers; otherwise every line
+                            // goes through exactly as it was read, keys included.
+                            If (SizeOfArray(asDropLow) > 0) ;
+                                Move ("Lib" + String(iLibNo) + "=" + sNewValue) to sLine
+                            Else If (sNewValue <> sValue) ;
+                                Move (sKey + "=" + sNewValue) to sLine
+                        End
+                    End
+                End
+            End
+            If (bSkipLine = False) ;
+                Move sLine to asOut[SizeOfArray(asOut)]
+        Loop
+
+        If (bDone = False) Begin
+            Move "[Properties]" to asOut[SizeOfArray(asOut)]
+            Move ("Version=" + sTargetVersion) to asOut[SizeOfArray(asOut)]
+        End
+        /* EVERY PROGRAM GOES INTO THE COPY (Nils 2026-09-11). A [Projects] section whose slots
+           repeat a number, or skip one, is renumbered Project0..N here with every program kept -
+           the copy's .sws is the file a DataFlex 26 conversion reads next, and df-cli keeps only
+           the last of two lines that share a key. A healthy section comes through untouched. See
+           SwsIniProjectsFromLines in cLibraryInventory.pkg. */
+        Move (SwsIniLinesWithProjectsRenumbered(asOut)) to asOut
+        Function_Return asOut
+    End_Function
+
+    // The plain form - nothing dropped. Defined AFTER the worker: an expression call needs it declared first.
+    Function NewSwsLines String sSwsFile String sTargetVersion Returns String[]
+        String[] asNone
+        Function_Return (NewSwsLinesDropping(Self, sSwsFile, sTargetVersion, asNone))
+    End_Function
+
+    /* The CONTENT of a synthesised library header: the template's lines with [Properties] Version=
+       changed to the target.
+
+       The same rule the workspace's own .sws follows, and for the same reason - a header that names
+       one version while sitting in a file named for another is the exact confusion the "never parse
+       the filename, read the version inside" rule exists to prevent. NewSwsLines does the work;
+       this is the library-facing name for it. */
+    Function NewLibrarySwsLines String sTemplateSwsFile String sTargetVersion Returns String[]
+        String[] asOut
+        Get NewSwsLines sTemplateSwsFile sTargetVersion to asOut
+        Function_Return asOut
+    End_Function
+
+    // Libraries with no build for the target anywhere in their own folder - the ones the user has to
+    // fetch. Named, never guessed at: see the eLibNoLocalBuild note in cLibraryInventory.
+    /* Library references anywhere in the copy's chain that do not resolve to a file on disk - or
+       resolve to one that cannot be read as a workspace file (git conflict markers, 2026-09-14).
+
+       WHY THE WHOLE TREE AND NOT JUST [Libraries] (Nils 2026-08-14, from a real hang). The copy of
+       C:\Projects\DF19\WinServ declared one library, and it resolved. What did not resolve was one
+       level DOWN: the synthesised WebAppSrc-Library-DF260.sws names seven nested libraries of its
+       own - vwin32fh, five otherdev ones, VDFQuery - and none of those DF260 files exist. A
+       one-level check would have declared that copy healthy.
+
+       The chain was ALREADY broken at the source: vWin32fh-Library-DF191.sws is missing beside the
+       original too. So this is not the copy failing, it is the copy faithfully carrying a defect
+       forward - which is exactly why the answer is to TELL the user rather than to try to repair
+       anything.
+
+       Same depth as the Libraries report, so the two cannot disagree about what "declared" means.
+       Reports the entry AS WRITTEN, because that is the string the user will search the .sws for. */
+    Function UnresolvableLibraryRefs String sSwsFile String sTargetVersion Returns String[]
+        tLibraryInfo[] aLibs
+        String[] asBad
+        Integer i iMax
+        String sWhich
+
+        Get WorkspaceLibraryTree sSwsFile sTargetVersion CI_LibraryTreeMaxDepth to aLibs
+        Move (SizeOfArray(aLibs)) to iMax
+        Decrement iMax
+        For i from 0 to iMax
+            /* PACKAGES ARE NOT MISSING FILES. For an eDepPackage entry bFound means "is that exact
+               version installed in this cache" (LibraryEntriesInfo), not "does a file exist" - a
+               package that is simply not installed here is not a broken reference, and listing it
+               as one would blame the workspace for the state of a machine. */
+            If ((aLibs[i].bFound = False or aLibs[i].eStatus = eLibUnreadable) and aLibs[i].eKind <> eDepPackage) Begin
+                Move (Trim(aLibs[i].sRawEntry)) to sWhich
+                If (sWhich = "") ;
+                    Move (Trim(aLibs[i].sRefSwsFile)) to sWhich
+                // A file that IS there but carries git conflict markers says so, or the reader goes
+                // looking for a folder that exists (2026-09-14, see eLibUnreadable).
+                If (sWhich <> "" and aLibs[i].eStatus = eLibUnreadable) ;
+                    Move (sWhich + "  - the file is there but carries git conflict markers (an unfinished merge); resolve it in that repository") to sWhich
+                If (sWhich <> "") ;
+                    Move sWhich to asBad[SizeOfArray(asBad)]
+            End
+        Loop
+        Function_Return asBad
+    End_Function
+
+    Function LibrariesWithoutTargetBuild String sSwsFile String sTargetVersion Returns String[]
+        tLibraryInfo[] aLibs
+        String[] asOut
+        Integer i iMax
+
+        If (sTargetVersion = "") ;
+            Function_Return asOut
+        Get WorkspaceLibraryInventory sSwsFile sTargetVersion to aLibs
+        Move (SizeOfArray(aLibs) - 1) to iMax
+        For i from 0 to iMax
+            If (aLibs[i].eStatus = eLibNoLocalBuild) ;
+                Move aLibs[i].sName to asOut[SizeOfArray(asOut)]
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* Where one plan row lands under the new home. Three cases, by where the row sits relative
+       to the ORIGINAL home - the copy keeps the shape the workspace was built with.
+
+       INSIDE the old home -> the same relative position. An internal library stays internal.
+
+       BESIDE it - a sibling library (..\vdfquery) or one inside a sibling pool
+       (..\Libraries\DataFlex Reports 5.0.1) -> the same position beside the NEW home, so a
+       sibling stays a sibling and a pooled library stays pooled. This is what keeps the .ws and
+       .sws entries valid WITHOUT rewriting them, and it is why the executor may skip such a
+       folder when the destination already has it: a pool beside the destination can belong to
+       other workspaces, and copying into it would overwrite their files with this workspace's
+       older ones.
+
+       ANYWHERE ELSE (C:\Program Files\..., another drive) -> directly under the new home by its
+       leaf name, which is what makes the copy SELF-CONTAINED. That is the whole point of copying:
+       a workspace whose AppSrc lives in C:\Program Files would otherwise leave the "copy"
+       refactoring the original's source. */
+    /* Where a FILE that sat at sOldFile ends up in the copy - the same three-branch rule
+       DestinationForRow applies to folders, because it has to be: a file lands wherever its folder
+       landed, and any second implementation of that mapping is a bug waiting for the case the two
+       disagree on.
+
+       IT ALREADY DISAGREED. The synthesised library headers were placed with RelativeInsideHome,
+       which answers only the ENCLOSED case and returns "" for everything else - so for a SIBLING
+       library ("..\Example Library\") the header was silently skipped while NewSwsLines had already
+       retargeted the workspace's [Libraries] entry to name it. The result was a .sws pointing at a
+       file nobody wrote: df-cli reports "State of <workspace>: BROKEN", and it is broken (found on
+       a real 19.1 -> 26.0 copy, 2026-08-12). Sibling libraries are not an edge case - Nils's own
+       copy rule has a branch for them, and the pool model is built on them.
+
+       Delegates to DestinationForRow on the file's FOLDER rather than restating the rule, so the
+       two can never drift again. */
+    Function DestinationForFile String sOldFile String sOldHome String sNewHome Returns String
+        String sFolder sLeaf sDestFolder
+        Integer iPos
+
+        Move (RightPos("\", sOldFile)) to iPos
+        If (iPos = 0) ;
+            Function_Return ""
+        Move (Left(sOldFile, iPos)) to sFolder
+        Move (Right(sOldFile, (Length(sOldFile) - iPos))) to sLeaf
+        If (sLeaf = "") ;
+            Function_Return ""
+        // The folder WITHOUT its trailing separator - the form _RelativeToHome compares against.
+        Get RemoveFolderSeperator sFolder to sFolder
+        Get DestinationForFolder sFolder sOldHome sNewHome to sDestFolder
+        If (sDestFolder = "") ;
+            Function_Return ""
+        Function_Return (vFolderFormat(sDestFolder) + sLeaf)
+    End_Function
+
+    /* THE PLACEMENT RULE, on a plain path - where a folder that sat at sOldPath ends up in the copy.
+
+       Lifted out of DestinationForRow (2026-08-12) so it can be asked about a path that is not a
+       plan row. The rule was always about a PATH; taking a tCopyItem meant every other caller had to
+       manufacture a struct to ask, and a struct passed to a same-object Get came back empty - which
+       is how the first attempt at DestinationForFile silently returned "" for every case. One
+       implementation, reachable by both. */
+    Function DestinationForFolder String sOldPath String sOldHome String sNewHome Returns String
+        String sRel sLeaf sOldParent sNewParent
+        Integer iPos
+
+        If (sOldPath = "" or sNewHome = "") ;
+            Function_Return ""
+        /* THE DESTINATION MUST BE ABSOLUTE, and this is the one place that can guarantee it.
+
+           A RELATIVE sNewHome does not fail - it succeeds somewhere else. Every branch below
+           concatenates onto it, so "SpecializedComponents" produces "SpecializedComponents\AppSrc",
+           which Windows resolves against the PROCESS working directory. On 2026-08-12 that scattered
+           an entire workspace and its sibling library into
+           C:\Users\rdcto\OneDrive\Documents\, with nothing at all reaching the E: drive the user
+           chose - and no error, because writing to a valid relative path is not an error.
+
+           It passed every guard upstream: not empty, not a drive root, not inside the source. None
+           of them asks the only question that matters here. Refusing at the root means no caller can
+           reintroduce it - the copy list comes back empty and the run reports that it wrote nothing,
+           which is the correct outcome for a destination that was never usable. */
+        If (_IsAbsolutePath(Self, sNewHome) = False) ;
+            Function_Return ""
+        Get _RelativeToHome sOldPath sOldHome to sRel
+        If (sRel <> "") Begin
+            If (sRel = ".\") ;
+                Function_Return (RemoveFolderSeperator(Self, sNewHome))
+            Function_Return (vFolderFormat(sNewHome) + Mid(sRel, Length(sRel), 3))
+        End
+        If (_MirrorsBesideHome(Self, sOldPath, sOldHome) = True) Begin
+            Get _FolderOf (RemoveFolderSeperator(Self, sOldHome)) to sOldParent
+            Get _FolderOf (RemoveFolderSeperator(Self, sNewHome)) to sNewParent
+            If (sNewParent <> "") Begin
+                Get _RelativeToHome sOldPath sOldParent to sRel
+                Function_Return (vFolderFormat(sNewParent) + Mid(sRel, Length(sRel), 3))
+            End
+        End
+        Move (RightPos("\", RemoveFolderSeperator(Self, sOldPath))) to iPos
+        If (iPos = 0) ;
+            Function_Return ""
+        Move (Right(RemoveFolderSeperator(Self, sOldPath), (Length(RemoveFolderSeperator(Self, sOldPath)) - iPos))) to sLeaf
+        Function_Return (vFolderFormat(sNewHome) + sLeaf)
+    End_Function
+
+    // The plan-row form of the same question, kept because every existing caller asks it this way.
+    Function DestinationForRow tCopyItem Item String sOldHome String sNewHome Returns String
+        String sDest
+        Get DestinationForFolder Item.sPath sOldHome sNewHome to sDest
+        Function_Return sDest
+    End_Function
+
+    /* True when this row lands beside the new home in a folder that ALREADY EXISTS.
+
+       That folder is a library pool the destination may share with OTHER workspaces, and this
+       workspace's copy of a library is not necessarily the newest one in the world. Copying into
+       it would overwrite their files with ours. So the copy uses what is already there and writes
+       nothing - which is exactly what a shared pool is for, and leaves the .sws entry naming it
+       still valid.
+
+       The caller must also TELL the user, because the consequence is real: the copy then depends
+       on a folder it does not own. ExistingSiblingFolders exists for that.
+
+       Takes the row's path and its ALREADY-COMPUTED destination rather than the tCopyItem: a
+       struct parameter forwarded to a further self-send arrives all-defaults, so the first cut of
+       this read False for a pool that plainly existed - silently, with both its ingredients
+       checking out under a probe (2026-08-06). The caller has the destination in hand anyway. */
+    Function _UsesExistingSibling String sPath String sDest String sOldHome Returns Boolean
+        If (sDest = "" or sPath = "") ;
+            Function_Return False
+        If (_MirrorsBesideHome(Self, sPath, sOldHome) = False) ;
+            Function_Return False
+        Function_Return (rfDirectoryExists(sDest))
+    End_Function
+
+    // The destination folders the copy will deliberately NOT write, because they already exist
+    // beside the new home. Each entry is the destination path. Empty when nothing is reused.
+    Function ExistingSiblingFolders tCopyItem[] aItems String sOldHome String sNewHome Returns String[]
+        String[] asOut
+        String sDest
+        Boolean bReuse
+        Integer i iMax
+
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            If (aItems[i].bSelected = True and aItems[i].bExists = True and aItems[i].bIsLink = False) Begin
+                Get DestinationForRow aItems[i] sOldHome sNewHome to sDest
+                Get _UsesExistingSibling aItems[i].sPath sDest sOldHome to bReuse
+                If (bReuse = True) ;
+                    Move sDest to asOut[SizeOfArray(asOut)]
+            End
+        Loop
+        Function_Return asOut
+    End_Function
+
+    /* LIBRARIES DECLARED INSIDE THE HOME THAT THE COPY WILL NOT TAKE (Nils 2026-09-03, LegacyApp).
+
+       VDFQuery and vWin32fh lived under the workspace's own Libraries\ folder and were unticked.
+       Their [Libraries] entries went into the copy's .sws as written - the right rule for a
+       library BESIDE the workspace, which the copy legitimately shares, and the wrong one here:
+       inside the home there is nothing at that path in the copy. df-cli read the dangling pair,
+       refused to convert the workspace, and Add Package stayed dim with no word about why.
+
+       The workspace's OWN entries only (depth 0) - those are the lines NewSwsLinesDropping writes
+       the copy's .sws from; a nested library's .sws is never rewritten from DF26 up. An entry
+       counts when its .sws resolves INSIDE sOldHome and no chosen row's folder contains it. */
+    Function UncopiedInsideHomeLibraries tCopyItem[] aChosen String sSwsFile String sOldHome Returns tLibraryInfo[]
+        tLibraryInfo[] aLibs aOut
+        String sNoVersion sRel
+        Integer i iMax
+        Boolean bCovered
+
+        // A variable, never an empty literal - see LibraryCopyItems.
+        Move "" to sNoVersion
+        Get WorkspaceLibraryInventory sSwsFile sNoVersion to aLibs
+        Move (SizeOfArray(aLibs) - 1) to iMax
+        For i from 0 to iMax
+            Get _RelativeToHome aLibs[i].sRefSwsFile sOldHome to sRel
+            If (sRel <> "") Begin
+                Get _UnderAnyChosenRow aChosen aLibs[i].sFolder to bCovered
+                If (bCovered = False) ;
+                    Move aLibs[i] to aOut[SizeOfArray(aOut)]
+            End
+        Loop
+        Function_Return aOut
+    End_Function
+
+    // Is sFolder equal to, or inside, the path of one of the chosen rows?
+    Function _UnderAnyChosenRow tCopyItem[] aItems String sFolder Returns Boolean
+        String sLow sRow
+        Integer i iMax
+
+        Move (Lowercase(RemoveFolderSeperator(Self, sFolder))) to sLow
+        If (sLow = "") ;
+            Function_Return False
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            Move (Lowercase(RemoveFolderSeperator(Self, aItems[i].sPath))) to sRow
+            If (sRow <> "" and (sLow = sRow or Left(sLow, Length(sRow) + 1) = (sRow + "\"))) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    /* Every file the copy will write, source and destination, for the SELECTED rows only.
+
+       Computed up front rather than copied folder-by-folder so the executor can report honest
+       progress and stop between files - a 663 MB Data folder copied in one call is a minute of
+       apparent hang with no way out.
+
+       A row that is a LINK is skipped entirely: following a junction would duplicate whatever it
+       points at (a shared library pool, typically) into the copy, and silently fork it.
+
+       So is a row that lands in an EXISTING folder beside the new home - see
+       _UsesExistingSibling. Skipping it here rather than in the copy loop keeps the file count,
+       the byte total and the progress bar honest about what is actually going to be written.
+
+       And so is every COMPILER OUTPUT file (_IsCompilerOutput: .prn / .err / .dep) - counted in
+       piCompilerOutputsSkipped so the report can say so. */
+    Function CopyFileList tCopyItem[] aItems String sOldHome String sNewHome Returns tCopyPair[]
+        tCopyPair[] aOut
+        tRFSearchResult[] asFiles
+        String sDestRoot sSrcRoot sFile sRel
+        Boolean bReuse
+        Integer i iMax j jMax iRow iSkipped
+
+        Move 0 to iSkipped
+        Move (SizeOfArray(aItems) - 1) to iMax
+        For i from 0 to iMax
+            If (aItems[i].bSelected = True and aItems[i].bExists = True and aItems[i].bIsLink = False) Begin
+                Get DestinationForRow aItems[i] sOldHome sNewHome to sDestRoot
+                Get _UsesExistingSibling aItems[i].sPath sDestRoot sOldHome to bReuse
+                If (sDestRoot <> "" and bReuse = False) Begin
+                    Move (RemoveFolderSeperator(Self, aItems[i].sPath)) to sSrcRoot
+                    Move (rfFileSearchRecursive((sSrcRoot + "\*.*"), DIRMODE_FILES_ONLY, False)) to asFiles
+                    Move (SizeOfArray(asFiles) - 1) to jMax
+                    For j from 0 to jMax
+                        // rfFileSearchRecursive returns FULL paths in sFilename.
+                        Move asFiles[j].sFilename to sFile
+                        If (Left(Lowercase(sFile), Length(sSrcRoot) + 1) = Lowercase(sSrcRoot + "\")) Begin
+                            If (_IsCompilerOutput(Self, sFile)) Begin
+                                Increment iSkipped
+                            End
+                            Else Begin
+                                Move (Mid(sFile, Length(sFile), Length(sSrcRoot) + 2)) to sRel
+                                Move (SizeOfArray(aOut)) to iRow
+                                Move sFile to aOut[iRow].sSource
+                                Move (vFolderFormat(sDestRoot) + sRel) to aOut[iRow].sDest
+                            End
+                        End
+                    Loop
+                End
+            End
+        Loop
+        Set piCompilerOutputsSkipped to iSkipped
+        Function_Return aOut
+    End_Function
+
+    /* The whole plan: declared paths, then libraries, then everything else under home.
+
+       CHEAP - no recursive walks, so this is safe to call while building a tile. Row sizes are
+       absent (bMeasured False) until MeasureCopyItem fills them in one row at a time. */
+    Function BuildCopyPlan String sSwsFile Returns tCopyItem[]
+        tCopyItem[] aItems aLibs aRest aDeclared
+        Integer i iMax
+
+        Get DeclaredCopyItems sSwsFile to aItems
+        Get LibraryCopyItems sSwsFile to aLibs
+        /* A LIBRARY ROW IS COVERED ONLY BY A DECLARED ROW, never by another library
+           (2026-08-15, the WinServ copy that lost WebAppSrc itself while copying its
+           children).
+
+           _IsCovered treats a kept row NESTED UNDER the candidate as covering it - right for a
+           declared path ("a more precise row already names something inside this folder"),
+           and backwards for a library: a child library copied on its own does not carry the
+           parent library's OWN files. The tree emits rows in [Libraries] order, and WinServ
+           lists Lib2/Lib3 (vwin32fh, VDFQuery - both INSIDE WebAppSrc) before Lib1 (WebAppSrc),
+           so by the time WebAppSrc was tested a child of it was already kept and it was
+           judged covered - dropped, silently, while its children copied. df-cli then reported
+           WebAppSrc-Library-DF191.sws missing at a path that was perfectly correct.
+
+           So each library is tested against the DECLARED rows only, which is the coverage the
+           rule was written for. Library-vs-library overlap is what LibraryCopyItems' one-row-
+           per-root already handles, and a parent/child pair copies twice at worst - the child's
+           files land in the same place under the parent, which is harmless and correct. */
+        Get DeclaredCopyItems sSwsFile to aDeclared
+        Move (SizeOfArray(aLibs) - 1) to iMax
+        For i from 0 to iMax
+            If (_IsCovered(Self, aDeclared, aLibs[i].sPath) = False) ;
+                Move aLibs[i] to aItems[SizeOfArray(aItems)]
+        Loop
+
+        Get UndeclaredCopyItems sSwsFile aItems to aRest
+        Move (SizeOfArray(aRest) - 1) to iMax
+        For i from 0 to iMax
+            Move aRest[i] to aItems[SizeOfArray(aItems)]
+        Loop
+
+        Function_Return aItems
+    End_Function
+
+End_Class

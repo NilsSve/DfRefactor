@@ -1,0 +1,600 @@
+//****************************************************************************
+// $Module type: Dialog
+// $Module name: RetireShadowsFT.dg
+//
+// $Author     : Nils Svedmyr, RDC Tools International.
+// Copyright (c) 2026 RDC Tools International
+// E-mail      : support@rdctools.com
+// Web-site    : http://www.rdctools.com
+//
+// Created     : 2026-09-15 (Military date format - Year-Month-Day)
+//
+// Description : The per-file Rename dialog behind the board's overriding-copies line - one row per
+//               workspace copy standing in front of a DataFlex system package, a tick per row, and
+//               the two facts that decide the tick: whether THIS build compiled the copy, and
+//               whether it is byte-identical to the shipped file.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use Windows.pkg
+Use Cursor.pkg
+Use RefactorConstants.h.pkg      // tShadowCopy, eShadow*, the CS_Ico* icon names
+Use cRefactorApplication.pkg
+Use cFTModalPanel.pkg         // FT: the dark modal, same base as BackupFilesFT.dg
+Use cFTCJSelectionGrid.pkg    // the checkbox grid the Undo dialog and the copy-scope picker use
+Use FTAllWebControlClasses.pkg   // FT: cFTWebButton - the two button bars - and cFTWebHtmlBox, the note
+Use cFTLocalWebControlHost.pkg   // FT: hosts the note band
+Use cFTGridHost.pkg              // FT: the two button bars - hosts on a grid (RDCFlexTron)
+Use FTMarkupBuilders.pkg         // the HTML vocabulary - DivOpen, CssLink - for the note
+Use FTThemeColors.pkg            // FTWebBg / FTThemeInk - the FT palette
+Use FTMessageBox.pkg             // FTStopBox (RDCFlexTron)
+
+// What a press of Recommended does - on the button, and set again by RefreshFooterAndButtons whenever the button
+// is open. While a press would change nothing the button is shut and its tooltip says why instead.
+Define CS_RetireRecommendedTip for "Back to the recommended ticks: every copy a rename cannot cost anything is ticked - the ones byte-identical to the file they stand in front of, the ones that differ but add nothing the workspace uses, plus errornum.inc, an incomplete copy that starves the real one - and the rest are unticked."
+
+/*  WHY A DIALOG WITH A TICK PER FILE (Nils 2026-09-15).
+
+    Until today the board's [Rename them] renamed every overriding copy behind one confirm. That was
+    right for the population it was built on - copies of DataFlex system files, decades old, strict
+    subsets of the installed file - and wrong for the population that arrived with it: the
+    workspace's own copies of files its LIBRARIES ship. Measured on five workspaces, one to five
+    such copies each, and EVERY one differed from the library's file - an older version of the
+    library's own package, compiled in its place. Renaming those blind would break a build per fork.
+    Nils: "we probably need to suggest this on a file-by-file basis" - and both kinds now come here,
+    the install line included ("Yes, move the install line to the same per-file dialog").
+
+    THE TICK IS DECIDED BY THE CONTENT. A copy byte-identical to the shipped file is pure redundancy
+    and starts ticked; a copy that differs is a fork until someone looks and starts unticked. The
+    grid shows both facts per row - which file it stands in front of, whether this build compiled
+    it, identical or DIFFERENT - so the user decides with the evidence in front of them rather than
+    from a sentence in a confirm. Select All / None / Invert and Recommended are the bulk verbs;
+    the Space bar toggles the row under the cursor, as in every selection grid here.
+
+    SHAPED LIKE SelectCopyScopeFT / BackupFilesFT: a web select bar above a cFTCJSelectionGrid,
+    a note band and a web closer row below it, dark surface throughout. The array is the truth and
+    the grid renders it (RenderRows); a tick is copied back by PATH (SyncSelectionFromGrid), never by
+    index, because the grid can be sorted by any column.
+
+    FRAMEWORK BUTTONS IN BOTH BARS (2026-09-30): cFTWebButtons on grid hosts (RDCFlexTron), where the
+    bars were HTML chips. A button that works on the grid does it inside the click (an OnClick override);
+    a closer's own work runs after the click (OnButtonClick), where a message box or Close_Panel is safe.
+
+    SYSTEM PACKAGES ONLY (Nils 2026-10-05, looking at this dialog: "It is actually perfectly OK with
+    duplicate filenames, as long as they are not a DataFlex system package. Thus all other 'duplicates'
+    should be removed from the dialog"). The copies of library files described above are no longer
+    handed to it - the board's memo asks for the system-package copies only - and the "Stands in front
+    of" column went with them: every row would have said "DataFlex's own file".
+
+    ONE KIND OF LIBRARY-FILE COPY CAME BACK (2026-11-12): a copy the last build compiled in place of
+    the file of a package that has errors in the same build (cShadowedPackageFiles.FailingPackageCopies).
+    Its row says so in "This build" - "compiled; VDFQuery20 has errors" - and its tick follows the same
+    content rule as every other row.
+
+    A DIFFERENT COPY THAT ADDS NOTHING USED COMES TICKED (Nils 2026-11-12): "DIFFERENT - adds nothing
+    used" under Content, when no name it declares beyond the shipped file is used anywhere else in the
+    workspace. The board asks before the dialog opens (cShadowedPackageFiles.MarkCopiesThatAddNothingUsed).
+
+    TWO WAYS OUT, AND THE DIFFERENCE IS WHAT HAPPENS TO THE UNTICKED (Nils 2026-09-15, after the
+    first live press: "one conundrum on what to do with files that were NOT ticked? I choosed one file
+    to be unticked and that makes the 'Rename them...' button to stick"). [Rename N ticked] renames the
+    ticked and leaves the rest on the board's line, to be looked at later. [Rename N, keep the other M]
+    renames the ticked AND records the unticked as KEPT for this workspace - the user's explicit
+    verdict that those are their forks - so they leave the line and the dialog; the line's "M kept"
+    chip lists them and offers them again. Nothing is ever inferred: a copy renamed back by hand is
+    simply offered again, as before (the inferred skip was dropped the same day). */
+
+Object oRetireShadows_dg is a cFTModalPanel
+    Set Label to "Rename the overriding copies"
+    Set Size to 252 700
+    Set Location to 2 0
+    Set piMinSize to 208 560
+    Set Icon to "DFRefactor.ico"
+
+    /* THE ROWS, in and out. Set by ChooseShadowCopiesToRetire before Popup; read back with bTicked
+       filled once the user has pressed Rename. A struct ARRAY survives a cross-object Get; a bare
+       struct would not (see SelectCopyScopeFT). */
+    Property tShadowCopy[] paRows
+    Property Boolean pbConfirmed False
+    // True when the user pressed the "keep the other M" closer: the caller records every unticked
+    // row as kept. False after "Rename N ticked" - the unticked stay on the line.
+    Property Boolean pbKeepRest False
+
+    /* THE SELECT BAR: the bulk verbs, framework buttons (cFTWebButton, RDCFlexTron) on a grid host of 8 px
+       columns, as DeepScanRulesFT's. Each works on the grid INSIDE the click - an OnClick override, then
+       Forward - as the chips' OnClick did: the grid op is quick, and a grid read from the click relay's timer
+       faults (err 98). Spans fit the captions (Recommended ~123 px, Select All ~91, Select None ~107, Invert
+       ~73, measured 2026-09-30); column 56 takes the rest of the width. */
+    Object oWebSelectBar is a cFTGridHost
+        Set Location to 5 14
+        Set Size to 20 672
+        Set peAnchors to anTopLeftRight
+        Set piColumnCount to 57         // Recommended's 17, Select All's 13, Select None's 15, Invert's 11, then column 56
+        Set psColumnWidths to "56/1fr"  // column 56 takes the extra width
+
+        Object oRecommendedBtn is a cFTWebButton
+            Set piColumnIndex to 0
+            Set piColumnSpan to 17
+            Set psCaption to "Recommended"
+            Set psCSSClass to "ftbtn ftg-check"
+            Set psToolTip to CS_RetireRecommendedTip
+
+            Procedure OnClick
+                Send TickIdenticalOnly of oRetireShadows_dg
+                Forward Send OnClick
+            End_Procedure
+        End_Object
+
+        Object oSelectAllBtn is a cFTWebButton
+            Set piColumnIndex to 17
+            Set piColumnSpan to 13
+            Set psCaption to "Select All"
+            Set psCSSClass to "ftbtn ftg-selectall"
+
+            Procedure OnClick
+                Send SelectAll of oShadows_grd
+                Send AfterGridSelectionChanged of oRetireShadows_dg
+                Forward Send OnClick
+            End_Procedure
+        End_Object
+
+        Object oSelectNoneBtn is a cFTWebButton
+            Set piColumnIndex to 30
+            Set piColumnSpan to 15
+            Set psCaption to "Select None"
+            Set psCSSClass to "ftbtn ftg-selectnone"
+
+            Procedure OnClick
+                Send SelectNone of oShadows_grd
+                Send AfterGridSelectionChanged of oRetireShadows_dg
+                Forward Send OnClick
+            End_Procedure
+        End_Object
+
+        Object oInvertBtn is a cFTWebButton
+            Set piColumnIndex to 45
+            Set piColumnSpan to 11
+            Set psCaption to "Invert"
+            Set psCSSClass to "ftbtn ftg-invert"
+
+            Procedure OnClick
+                Send SelectInvert of oShadows_grd
+                Send AfterGridSelectionChanged of oRetireShadows_dg
+                Forward Send OnClick
+            End_Procedure
+        End_Object
+    End_Object
+
+    Object oShadows_grd is a cFTCJSelectionGrid
+        Set Location to 29 14
+        Set Size to 150 672
+        Set peAnchors to anAll
+        // A footer row: "N of M ticked" under the file column (RefreshFooterAndButtons).
+        Set pbShowFooter to True
+
+        Object oCJGridColumnRowIndicator is a cCJGridColumnRowIndicator
+            Set piWidth to 24
+            Set pbResizable to False
+        End_Object
+
+        Object oFile_col is a cCJGridColumn
+            Set piWidth to 150
+            Set psCaption to "File"
+        End_Object
+
+        Object oBuild_col is a cCJGridColumn
+            Set piWidth to 175
+            Set psCaption to "This build"
+            Set psToolTip to "Whether the last compile read the workspace's copy in place of the shipped file. A copy it did not read compiles nothing today and wins the day the compiler reaches it. A copy of a package's file is listed only when the build compiled it and that package has errors in the same build."
+        End_Object
+
+        Object oContent_col is a cCJGridColumn
+            Set piWidth to 150
+            Set psCaption to "Content"
+            Set psToolTip to "identical: the same bytes as the shipped file - renaming it loses nothing. DIFFERENT: a fork until you compare the two. DIFFERENT - adds nothing used: nothing in the workspace uses a name it declares beyond the shipped file, so it is ticked for you; a change inside a method both files have is not seen. DIFFERENT - retire anyway: named as a copy that starves the shipped file rather than forking it, so it is ticked for you."
+        End_Object
+
+        Object oPath_col is a cCJGridColumn
+            // The IDENTITY column - the selection grid reads phoData_Col to say which rows are
+            // ticked, and the full path is the only value here that is unique per row.
+            Set phoData_Col to Self
+            Set piWidth to 400              // 340, plus the 175 of the "Stands in front of" column that went, less 50 for "This build" and 65 for "Content"
+            Set psCaption to "Workspace copy"
+            Set psToolTip to "The copy in the workspace. It carries the name of a package DataFlex ships, or of a file of a package that has errors in the last build, and it is what the compiler reaches first."
+        End_Object
+
+        /* THE designed fill point. cFTCJSelectionGrid declares an empty LoadData and calls it
+           from its own Activating - the one moment the COM control exists and the panel is up. A
+           render from the DIALOG's Activate finds nothing to render into (see SelectCopyScopeFT). */
+        Procedure LoadData
+            Send RenderRows of (Parent(Self))
+        End_Procedure
+
+        /* A SINGLE tick, mouse or keyboard. The grid's own RefreshSelectionUpdate only fires from
+           the bulk verbs, and DoSetCheckboxFooterText is the one thing both ToggleCurrentItem and
+           OnComMouseUp send. Sync + repaint the closer only - NOT RenderRows, which re-initialises
+           the grid underneath the click still being handled. */
+        Procedure DoSetCheckboxFooterText
+            Forward Send DoSetCheckboxFooterText
+            Send SyncSelectionFromGrid of (Parent(Self))
+            Send RefreshFooterAndButtons of (Parent(Self))
+        End_Procedure
+    End_Object
+
+    /* THE NOTE BAND - the three facts the old confirm carried, now under the list they apply to:
+       what a rename does and how it is undone, why a DIFFERENT copy starts unticked, and that
+       nothing here is remembered as an exception. Prose, not a control. */
+    Object oWebNoteBar is a cFTLocalWebControlHost
+        Set Location to 183 14
+        Set Size to 30 672
+        Set peAnchors to anBottomLeftRight
+
+        Function NoteHtml Returns String
+            String sHtml
+            Move (CS_PaletteCssLink + CS_PageFitCssLink + CssLink("retireshadows")) to sHtml
+            Move (sHtml + (DivOpen("rsnote")) ;
+                + 'A ticked file is copied to the backup area, then renamed to <b>&lt;name&gt;.shadowed</b> ' ;
+                + 'so the next build reads the shipped file - <b>Revert</b> restores it, and so does renaming it back. ' ;
+                + 'A copy marked <b>DIFFERENT</b> starts unticked: it may be a fork the code depends on, and the next ' ;
+                + 'build that reaches the shipped file will fail if it was - compare the two first. ' ;
+                + 'One exception is ticked for you: <b>errornum.inc</b>, shown as <b>DIFFERENT - retire anyway</b>. ' ;
+                + 'A workspace copy of it does not fork the constants, it STARVES them - its include guard stops the ' ;
+                + 'real file loading, so every constant the old copy never had comes back undefined. Untick it like ' ;
+                + 'any other if you disagree. ' ;
+                + '<b>Rename</b> leaves the unticked on the board for later; <b>keep the other</b> records them as ' ;
+                + 'forks, off the board until its "kept" chip offers them again. A copy renamed back by hand is offered again.' ;
+                + CS_DivEnd) to sHtml
+            Function_Return sHtml
+        End_Function
+
+        Object oWebNote_htm is a cFTWebHtmlBox
+            Set piColumnSpan  to 1
+            Set pbServerOnClick to False
+            // DESIGN-TIME PLACEHOLDER for the Studio's Windows Designer, which models the LAST literal
+            // psHtml it can parse. It is the string the runtime seeds (dumped by the cFTWebHtmlBox design
+            // dump, no workspace loaded); the runtime expression sits in End_Construct_Object below.
+            Set psHtml to """
+            <link rel="stylesheet" href="RDCFlexTron/palette.css">
+            <link rel="stylesheet" href="RDCFlexTron/buttons.css">
+            <link rel="stylesheet" href="RDCFlexTron/bars.css">
+            <link rel="stylesheet" href="RDCFlexTron/pagefit.css">
+            <link rel="stylesheet" href="CssStyle/retireshadows.css">
+            <div class="rsnote">A ticked file is copied to the backup area, then renamed to <b>&lt;name&gt;.shadowed</b> so the next build reads the shipped file - <b>Revert</b> restores it, and so
+                does renaming it back. A copy marked <b>DIFFERENT</b> starts unticked: it may be a fork the code depends on, and the next build that reaches the shipped file will fail if it was -
+                compare the two first. One exception is ticked for you: <b>errornum.inc</b>, shown as <b>DIFFERENT - retire anyway</b>. A workspace copy of it does not fork the constants, it STARVES
+                them - its include guard stops the real file loading, so every constant the old copy never had comes back undefined. Untick it like any other if you disagree. <b>Rename</b> leaves the
+                unticked on the board for later; <b>keep the other</b> records them as forks, off the board until its "kept" chip offers them again. A copy renamed back by hand is offered again.</div>
+            """
+
+            // RUNTIME content - here rather than in the object body, so the Designer keeps the literal above.
+            Procedure End_Construct_Object
+                Forward Send End_Construct_Object
+                Set psHtml to (NoteHtml(Self))
+            End_Procedure
+        End_Object
+    End_Object
+
+    /* THE CLOSER ROW. Two verbs that differ only in what happens to the UNTICKED rows, each naming its
+       counts, and each shut when it has nothing to act on, with the reason in its tooltip - a button that
+       looks dead must be dead (the SelectCopyScopeFT rule). "Keep" alone, with nothing ticked, is a
+       legitimate press: the user has compared every copy and is keeping the lot. Not now is never shut.
+
+       Framework buttons (cFTWebButton, RDCFlexTron) since 2026-09-30. Their captions carry the counts, so
+       each has a column as wide as its caption (max-content, with ftbtn-fit's 76 px least - the message
+       box's answers' layout), and column 0 takes the rest; RefreshFooterAndButtons sets the captions and
+       states. A closer syncs the ticks from the grid INSIDE the click (OnClick, then Forward) - a grid read
+       from the click relay's timer faults (err 98) - and its OnButtonClick runs DoConfirm or DoCancel after
+       the click, where a message box and Close_Panel are safe. The chips did both inside the click. */
+    Object oWebBottomBar is a cFTGridHost
+        Set Location to 218 14
+        Set Size to 20 672
+        Set peAnchors to anBottomLeftRight
+        Set piColumnCount to 4
+        Set psColumnWidths to "0/1fr 1/max-content 2/max-content 3/max-content"
+
+        Object oRenameBtn is a cFTWebButton
+            Set piColumnIndex to 1
+            Set piColumnSpan to 1
+            Set psCaption to "Rename 0 ticked"
+            Set psCSSClass to "ftbtn ftbtn-fit ftg-check"
+            Set pbEnabled to False
+            Set psToolTip to "Nothing is ticked. Tick the copies to rename, keep the rest, or press Not now."
+
+            Procedure OnClick
+                Send SyncSelectionFromGrid of oRetireShadows_dg
+                Forward Send OnClick
+            End_Procedure
+
+            Procedure OnButtonClick
+                Send DoConfirm of oRetireShadows_dg False
+            End_Procedure
+        End_Object
+
+        Object oKeepBtn is a cFTWebButton
+            Set piColumnIndex to 2
+            Set piColumnSpan to 1
+            Set psCaption to "Keep all 0"
+            Set psCSSClass to "ftbtn ftbtn-fit ftg-check"
+            Set pbEnabled to False
+            Set psToolTip to "Every copy is ticked - there is nothing to keep."
+
+            Procedure OnClick
+                Send SyncSelectionFromGrid of oRetireShadows_dg
+                Forward Send OnClick
+            End_Procedure
+
+            Procedure OnButtonClick
+                Send DoConfirm of oRetireShadows_dg True
+            End_Procedure
+        End_Object
+
+        Object oNotNowBtn is a cFTWebButton
+            Set piColumnIndex to 3
+            Set piColumnSpan to 1
+            Set psCaption to "Not now"
+            Set psCSSClass to "ftbtn ftbtn-fit ftg-close"
+            Set psToolTip to "Close without renaming or keeping anything."
+
+            Procedure OnButtonClick
+                Send DoCancel of oRetireShadows_dg
+            End_Procedure
+        End_Object
+    End_Object
+
+    // Ticked rows. One function because the footer, the closer row and DoConfirm all ask, and
+    // they must never disagree.
+    Function TickedCount Returns Integer
+        tShadowCopy[] aRows
+        Integer i iLast iTicked
+
+        Get paRows to aRows
+        Move 0 to iTicked
+        Move (SizeOfArray(aRows) - 1) to iLast
+        For i from 0 to iLast
+            If (aRows[i].bTicked = True) ;
+                Increment iTicked
+        Loop
+        Function_Return iTicked
+    End_Function
+
+    // The words the fact columns show for a row. Kept short - they are read per row, not once.
+    Function BuildText tShadowCopy Row Returns String
+        If (Row.eKind = eShadowFailingPackage) ;
+            Function_Return ("compiled; " + Row.sSource + " has errors")
+        If (Row.iClass = 0) ;
+            Function_Return "compiled this copy"
+        Function_Return "did not read it"
+    End_Function
+
+    Function ContentText tShadowCopy Row Returns String
+        If (Row.bSame = True) ;
+            Function_Return "identical"
+        // A DIFFERENT row that is ticked anyway has to say so, or the tick looks arbitrary
+        // against the column beside it.
+        If (Row.bAlways = True) ;
+            Function_Return "DIFFERENT - retire anyway"
+        If (Row.bAddsNothingUsed = True) ;
+            Function_Return "DIFFERENT - adds nothing used"
+        Function_Return "DIFFERENT"
+    End_Function
+
+    /* Render paRows into the grid. One direction only - the array is the truth. GUARDED ON THE COM
+       OBJECT: the CodeJock grid does not exist until the dialog is created, and reaching into it
+       early raises error 4399, "pvComObject is NULL". */
+    Procedure RenderRows
+        Handle hoDataSource
+        tDataSourceRow[] TheData TheDataEmpty
+        tShadowCopy[] aRows
+        tShadowCopy Row
+        Integer i iLast iFile iBuild iContent iPath iCheck
+
+        If (not(IsComObjectCreated(oShadows_grd))) ;
+            Procedure_Return
+        Get paRows to aRows
+        Get phoDataSource of oShadows_grd to hoDataSource
+        If (hoDataSource = 0) ;
+            Procedure_Return
+        Get DataSource of hoDataSource to TheData
+        Move TheDataEmpty to TheData
+
+        Get piColumnId of oFile_col    to iFile
+        Get piColumnId of oBuild_col   to iBuild
+        Get piColumnId of oContent_col to iContent
+        Get piColumnId of oPath_col    to iPath
+        Get piColumnId of (phoCheckbox_Col(oShadows_grd)) to iCheck
+
+        Move (SizeOfArray(aRows) - 1) to iLast
+        For i from 0 to iLast
+            Move aRows[i] to Row
+            Move Row.sLeaf                 to TheData[i].sValue[iFile]
+            Move (BuildText(Self, Row))    to TheData[i].sValue[iBuild]
+            Move (ContentText(Self, Row))  to TheData[i].sValue[iContent]
+            Move Row.sPath                 to TheData[i].sValue[iPath]
+            // A Boolean, not "1"/"0" - the selection grid reads this slot straight back into a
+            // Boolean, so the raw value has to be one it wrote itself.
+            Move Row.bTicked               to TheData[i].sValue[iCheck]
+        Loop
+
+        Send InitializeData of oShadows_grd TheData
+        If (iLast >= 0) ;
+            Send MoveToFirstRow of oShadows_grd
+        Send RefreshFooterAndButtons
+    End_Procedure
+
+    /* Copy the grid's tick state back into paRows, matched by PATH. The grid can be sorted by any
+       column, so a positional copy would silently assign one file's answer to another. */
+    Procedure SyncSelectionFromGrid
+        tFolderData[] aGrid
+        tShadowCopy[] aRows
+        Integer i j iLast jLast
+
+        Get AllItems of oShadows_grd to aGrid
+        Get paRows to aRows
+        Move (SizeOfArray(aRows) - 1) to iLast
+        Move (SizeOfArray(aGrid) - 1) to jLast
+        For i from 0 to iLast
+            For j from 0 to jLast
+                If (Lowercase(Trim(aGrid[j].sFolderName)) = Lowercase(Trim(aRows[i].sPath))) ;
+                    Move aGrid[j].bSelected to aRows[i].bTicked
+            Loop
+        Loop
+        Set paRows to aRows
+    End_Procedure
+
+    // A bulk verb ran on the grid: read its result, then repaint from the array, so the display can
+    // never disagree with the answer that will be returned.
+    Procedure AfterGridSelectionChanged
+        Send SyncSelectionFromGrid
+        Send RenderRows
+    End_Procedure
+
+    // The recommended answer, re-applied: identical copies ticked, different ones not.
+    Procedure TickIdenticalOnly
+        tShadowCopy[] aRows
+        Integer i iLast
+
+        Get paRows to aRows
+        Move (SizeOfArray(aRows) - 1) to iLast
+        For i from 0 to iLast
+            // bAlways too: this is the RECOMMENDED answer, and dropping errornum.inc from it
+            // would untick the one row whose rename matters most.
+            Move (aRows[i].bSame or aRows[i].bAlways or aRows[i].bAddsNothingUsed) to aRows[i].bTicked
+        Loop
+        Set paRows to aRows
+        Send RenderRows
+    End_Procedure
+
+    // The footer count, the two closers and Recommended, from the same numbers - every tick path ends here.
+    Procedure RefreshFooterAndButtons
+        tShadowCopy[] aRows
+        Integer iTicked iRows iRest i iRec
+        String sRename sKeep sRenameTip sKeepTip sRecTip
+        Handle hoBar hoSelBar hoRename hoKeep hoRec
+        Boolean bWant bAsRec
+
+        Get TickedCount to iTicked
+        Get paRows to aRows
+        Move (SizeOfArray(aRows)) to iRows
+        Move (iRows - iTicked) to iRest
+        If (IsComObjectCreated(oShadows_grd)) ;
+            Set psFooterText of oFile_col to (String(iTicked) + " of " + String(iRows) + " ticked")
+        Move ("Rename " + String(iTicked) + " ticked") to sRename
+        If (iTicked > 0) Begin
+            Move ("Rename " + String(iTicked) + ", keep the other " + String(iRest)) to sKeep
+            Move "Back up and rename the ticked copies to <name>.shadowed. The unticked ones stay on the board's line, to be looked at later." to sRenameTip
+        End
+        Else Begin
+            Move ("Keep all " + String(iRest)) to sKeep
+            Move "Nothing is ticked. Tick the copies to rename, keep the rest, or press Not now." to sRenameTip
+        End
+        If (iRest > 0) ;
+            Move "The same rename for the ticked copies - and the unticked ones are recorded as KEPT forks, off the board's line until its kept chip offers them again." to sKeepTip
+        Else ;
+            Move "Every copy is ticked - there is nothing to keep." to sKeepTip
+        Move (oWebBottomBar(Self)) to hoBar
+        Move (oRenameBtn(hoBar)) to hoRename
+        Move (oKeepBtn(hoBar)) to hoKeep
+        Send UpdateCaption of hoRename sRename
+        Send UpdateEnabled of hoRename (iTicked > 0)
+        Send UpdateToolTip of hoRename sRenameTip
+        Send UpdateCaption of hoKeep sKeep
+        Send UpdateEnabled of hoKeep (iRest > 0)
+        Send UpdateToolTip of hoKeep sKeepTip
+        If (pbInitWebApp(hoBar) = False) ;
+            Send CheckUpdateWebUI of hoBar
+
+        /* RECOMMENDED follows the closers' rule: shut when a press would change nothing, with the reason in
+           its tooltip (Nils 2026-10-05, on a workspace whose 14 copies all differed from the shipped files:
+           "I'm not sure what the 'Recommended' button does? 0 is ticked if it is pressed?"). The recommended
+           ticks are the ones the dialog opens with - TickIdenticalOnly's rule, counted here. */
+        Move 0 to iRec
+        Move True to bAsRec
+        For i from 0 to (iRows - 1)
+            Move (aRows[i].bSame or aRows[i].bAlways or aRows[i].bAddsNothingUsed) to bWant
+            If (bWant = True) ;
+                Increment iRec
+            If (aRows[i].bTicked <> bWant) ;
+                Move False to bAsRec
+        Loop
+        If (bAsRec = True and iRec = 0) ;
+            Move "Nothing to recommend: none of these copies is identical to the file it stands in front of or shown to add nothing the workspace uses, so none is ticked for you. Compare a copy with that file before ticking it." to sRecTip
+        Else If (bAsRec = True) ;
+            Move ("The ticks are the recommended ones already: the " + String(iRec) + (If(iRec = 1, " copy", " copies")) + " a rename cannot cost anything.") to sRecTip
+        Else If (iRec = 0) ;
+            Move "Back to the recommended ticks. Here that is none: no copy is identical to the file it stands in front of or shown to add nothing the workspace uses." to sRecTip
+        Else ;
+            Move CS_RetireRecommendedTip to sRecTip
+        Move (oWebSelectBar(Self)) to hoSelBar
+        Move (oRecommendedBtn(hoSelBar)) to hoRec
+        Send UpdateEnabled of hoRec (bAsRec = False)
+        Send UpdateToolTip of hoRec sRecTip
+        If (pbInitWebApp(hoSelBar) = False) ;
+            Send CheckUpdateWebUI of hoSelBar
+    End_Procedure
+
+    /* Rename - and, with bKeepRest, keep the unticked. The array already holds the ticks: every tick
+       path syncs it, and the closers sync once more inside their click. Not here - this runs after the
+       click, from the click relay's timer, where a grid read faults (err 98). The disabled buttons cannot
+       reach here with nothing to do - the guards stay anyway: a greyed button must not be the only thing
+       between a user and a rename. */
+    Procedure DoConfirm Boolean bKeepRest
+        tShadowCopy[] aRows
+        Integer iTicked iRest
+
+        Get TickedCount to iTicked
+        Get paRows to aRows
+        Move (SizeOfArray(aRows) - iTicked) to iRest
+        If (bKeepRest = False and iTicked = 0) Begin
+            Send FTStopBox "Nothing is ticked. Tick the copies to rename, keep the rest, or press Not now." "Nothing to rename"
+            Procedure_Return
+        End
+        If (bKeepRest = True and iRest = 0) Begin
+            Send FTStopBox "Every copy is ticked - there is nothing to keep. Press Rename instead." "Nothing to keep"
+            Procedure_Return
+        End
+        Set pbKeepRest to bKeepRest
+        Set pbConfirmed to True
+        Send Close_Panel
+    End_Procedure
+
+    Procedure DoCancel
+        Set pbConfirmed to False
+        Set pbKeepRest to False
+        Send Close_Panel
+    End_Procedure
+
+    // Every Popup starts unconfirmed: the dialog object outlives one press, and a stale
+    // pbConfirmed or pbKeepRest would read as consent the user never gave this time.
+    Procedure Popup
+        Set pbConfirmed to False
+        Set pbKeepRest to False
+        Forward Send Popup
+    End_Procedure
+
+    On_Key Key_Alt+Key_A  Send SelectAll    of oShadows_grd
+    On_Key Key_Alt+Key_N  Send SelectNone   of oShadows_grd
+    On_Key Key_Alt+Key_I  Send SelectInvert of oShadows_grd
+    On_Key Key_Alt+Key_C  Send DoCancel
+End_Object
+
+/*  THE ONE WAY IN. Hands the rows to the dialog, shows it, and returns True with each row's bTicked
+    filled when the user pressed one of the two closers - bKeepRest says which: True means the
+    unticked rows are to be recorded as kept. False, rows untouched, on Not now. The caller then
+    renames exactly the ticked rows (cShadowedPackageFiles.RetireShadowCopies) and, when asked,
+    remembers the rest (RememberKept). */
+Function ChooseShadowCopiesToRetire Global tShadowCopy[] ByRef aRows Boolean ByRef bKeepRest Returns Boolean
+    Handle ho
+    Boolean bOk
+
+    Move (oRetireShadows_dg(Self)) to ho
+    Set paRows of ho to aRows
+    Send Popup of ho
+    Get pbConfirmed of ho to bOk
+    Move False to bKeepRest
+    If (bOk = True) Begin
+        Get paRows of ho to aRows
+        Get pbKeepRest of ho to bKeepRest
+    End
+    Function_Return bOk
+End_Function

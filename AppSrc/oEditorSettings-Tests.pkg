@@ -1,0 +1,916 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oEditorSettings-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-26
+//
+// Description : Characterization for the editor-settings store (SciControlLib JSON conversion,
+//               Nils 2026-07-26). Written against the INI backend FIRST and kept green across the
+//               swap to cRefactorEditorSettings' JSON serialization - the tests pin the STORE
+//               semantics (values, multi-rows, sub-values, unknown-line preservation), not the
+//               file format, by driving ReadSettingsStore / WriteSettingsStore directly on a
+//               sandbox instance. LoadIni / SaveIni are deliberately NOT used here: their
+//               cEditorProperties overrides drag in hotkeys, language registration and macro
+//               loading - side effects a unit test must not depend on.
+//
+//               The sandbox writes only to temp files (psSourceFile = full path, both legacy
+//               path flags off) so the user's real settings are never touched.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+// DELIBERATELY NO Use LINE for the editor-properties chain. The lib's Use graph is
+// CYCLIC (cEditorProperties -> cSciCommandHotKeySupport -> cSciLexerSupport ->
+// oEditorProperties -> cEditorProperties), so WHERE the graph is entered decides the
+// compile order of everything in it - entering it from this test package compiled the
+// hotkey mixin BEFORE the global CommandHotKeyText it calls, which turned the
+// compile-time binding into a late-bound self-message and every editor object then
+// died with Error 98 at Construct (Nils caught the popup, 2026-07-26). The runner's
+// .src Uses cRefactorScintillaEditor.pkg - the canonical entry - BEFORE the tests,
+// so the classes below are already defined in the established order.
+
+Use cRefactorEditorSettings.pkg   // the app-side replacement, built beside the library class
+Use cRefactorEditorSettings.pkg    // already loaded by the runner .src - no-op here, declares the class for the JSON sandbox
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+
+Object oEditorSettings is a cTestFixture
+    Set psFunctionName to "EditorSettings"
+
+    /* oSettingsSandbox - an instance of the LIBRARY's cEditorProperties - used to sit
+       here, driven by the two tests below it. Both are gone with the class: retiring
+       the settings stack took cEditorProperties out of DFRefactor's build entirely.
+
+       They are not simply deleted work. Their job was to pin the STORE's semantics
+       across the JSON conversion - values, multi-rows, sub-values, unknown-line
+       preservation - and every one of those contracts is now asserted against the
+       replacement instead, in the NewClass tests further down. What is gone is the
+       coverage of a class DFRefactor no longer ships. */
+
+    // The JSON backend under test. psJsonSettingsFile is its test seam - a full path
+    // here keeps every test write away from the real Data\ScintillaEdit.json.
+    Object oJsonSandbox is a cRefactorEditorSettings
+    End_Object
+
+    /* The REPLACEMENT under construction (2026-07-27): the app-side settings class that
+       will retire cEditorProperties + cIniManager. Nothing in the program uses it yet -
+       it exists so the SAME contract the library class is pinned against can be run
+       against it, and the swap becomes a Use-line change rather than a leap. */
+    Object oNewSettings is a cRefactorEditorProperties
+    End_Object
+
+    // The path a bare temp name resolves to, so fixture writes and byte-level checks
+    // agree on the same file. Asks the workspace directly - it never depended on the
+    // settings object.
+    Function SandboxFullPath String sFileName Returns String
+        String sDataPath
+        Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+        Function_Return (vFolderFormat(sDataPath) + sFileName)
+    End_Function
+
+    {Published = True}
+    Procedure EditorSettings_JsonStoreRoundTripPreservesValues
+        Integer iVoid iCount
+        String sJson sVal
+        String[] asBytes
+
+        Get SandboxFullPath "_SetTest.json" to sJson
+        Move (rfDeleteFile(sJson)) to iVoid
+        Set psJsonSettingsFile of oJsonSandbox to sJson
+
+        Send DoInit of oJsonSandbox
+        Send SetIniValue of oJsonSandbox "PSCOLORSCHEMA" 0 0 "JsonSchema"
+        Send SetIniValue of oJsonSandbox "PSLANGUAGES" 0 0 "LangOne"
+        Send SetIniValue of oJsonSandbox "PSLANGUAGES" 0 1 "KwA\nKwB\nKwC"
+        Send SetIniValue of oJsonSandbox "PSLANGUAGES" 1 0 "LangTwo"
+        Send WriteSettingsStore of oJsonSandbox
+
+        // The file exists and is JSON, not ini.
+        Move (rfReadEncodedFileAsStringArray(sJson)) to asBytes
+        Send Assert (SizeOfArray(asBytes) > 0)
+        Send Assert (Left(Trim(asBytes[0]), 1) = "{")
+
+        // Corrupt the store, then prove the read restores the written truth.
+        Send SetIniValue of oJsonSandbox "PSCOLORSCHEMA" 0 0 "Clobbered"
+        Send ReadSettingsStore of oJsonSandbox
+
+        Get IniValue of oJsonSandbox "PSCOLORSCHEMA" 0 to sVal
+        Send AssertSAreEqual "JsonSchema" sVal
+        Get IniValueCount of oJsonSandbox "PSLANGUAGES" to iCount
+        Send Assert (iCount = 2)
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" 0 1 to sVal
+        Send AssertSAreEqual "KwA\nKwB\nKwC" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" 1 0 to sVal
+        Send AssertSAreEqual "LangTwo" sVal
+
+        Move (rfDeleteFile(sJson)) to iVoid
+    End_Procedure
+
+    /* EditorSettings_JsonMigratesFromIni lived here. It pinned the one-time
+       Programs\ScintillaEdit.ini -> JSON migration, and that migration is gone: cutting
+       cEditorProperties cut the ini reader it forwarded to. Nils's call, 2026-07-27 -
+       the alpha testers' editor settings are not worth carrying a legacy-format reader
+       for. A fresh install now starts from the declared defaults, which is what
+       EditorSettings_NewClassUnsetScalarsUseDeclaredDefaults pins. */
+
+    /* COLOR-SCHEMA RESOLUTION (Nils 2026-07-27: selecting Black then Lucas turned the
+       Lucas theme black, and the combo showed TWO Lucas entries). A custom schema may
+       carry the same name as a built-in ("Lucas" is both), and the dialog resolved
+       built-ins FIRST while the workspace had lived on the custom for years. The
+       resolver must prefer the CUSTOM. Self-contained: a temp custom named after the
+       built-in "Black" is added to the live store and removed again - no SaveIni is
+       sent, so nothing reaches disk. */
+    {Published = True}
+    Procedure EditorSettings_ColorSchemaCustomShadowsBuiltin
+        Boolean bFound
+        Integer iC iCount
+        String sSchema sStyles
+
+        // Precondition: no real custom "Black" (would be user data - bail untouched).
+        Get FindColorSchema of ghoEditorProperties CS_ThemeBlack to iC
+        If (iC >= 0) Procedure_Return
+
+        Get psColorSchemas.Count of ghoEditorProperties to iCount
+        Set psColorSchemas                    of ghoEditorProperties Item iCount to CS_ThemeBlack
+        Set psColorSchemas.psSchemaColors     of ghoEditorProperties Item iCount to "CUSTOMCOLORS"
+        Set psColorSchemas.psSchemaFontStyles of ghoEditorProperties Item iCount to "CUSTOMSTYLES"
+
+        Get ResolveColorSchema of (oScintillaParameters_dg(Self)) CS_ThemeBlack (&sSchema) (&sStyles) to bFound
+        Send Assert bFound
+        Send AssertSAreEqual "CUSTOMCOLORS" sSchema
+        Send AssertSAreEqual "CUSTOMSTYLES" sStyles
+
+        Send DeleteColorSchema of ghoEditorProperties CS_ThemeBlack
+
+        // Built-in back in charge once the shadow is gone.
+        Get ResolveColorSchema of (oScintillaParameters_dg(Self)) CS_ThemeBlack (&sSchema) (&sStyles) to bFound
+        Send Assert bFound
+        Send Assert (sSchema <> "CUSTOMCOLORS")
+        Send Assert (sSchema <> "")
+    End_Procedure
+
+    // The combo list shows ONE entry per name: a custom shadows its built-in namesake
+    // (the double-"Lucas" fix), and the list never loses the other built-ins.
+    {Published = True}
+    Procedure EditorSettings_ColorSchemaComboNamesDeduped
+        Integer iC iCount iBlack iWhite
+        String[] asNames
+
+        Get FindColorSchema of ghoEditorProperties CS_ThemeBlack to iC
+        If (iC >= 0) Procedure_Return
+
+        Get psColorSchemas.Count of ghoEditorProperties to iCount
+        Set psColorSchemas                    of ghoEditorProperties Item iCount to CS_ThemeBlack
+        Set psColorSchemas.psSchemaColors     of ghoEditorProperties Item iCount to "X"
+        Set psColorSchemas.psSchemaFontStyles of ghoEditorProperties Item iCount to "Y"
+
+        Get SchemaComboNames of (oScintillaParameters_dg(Self)) to asNames
+        Move 0 to iBlack
+        Move 0 to iWhite
+        For iC from 0 to (SizeOfArray(asNames) - 1)
+            If (asNames[iC] = CS_ThemeBlack) ;
+                Move (iBlack + 1) to iBlack
+            If (asNames[iC] = CS_ThemeWhite) ;
+                Move (iWhite + 1) to iWhite
+        Loop
+        Send Assert (iBlack = 1)
+        Send Assert (iWhite = 1)
+
+        Send DeleteColorSchema of ghoEditorProperties CS_ThemeBlack
+    End_Procedure
+
+    /* An UNSHADOWED built-in still resolves to its shipped palette. The palette comes
+       from cEditorColourScheme now, so this no longer byte-compares against a packed
+       string constant - those lived in THColorer.h, which DFRefactor no longer compiles,
+       and they carried four HTML/XML tag elements and two divider lines the scheme class
+       deliberately dropped. What matters is that the colours arriving here ARE Blue's,
+       so the packed pair is read back and checked against the scheme itself. */
+    {Published = True}
+    Procedure EditorSettings_ColorSchemaBuiltinResolves
+        Boolean bFound
+        String sSchema sStyles
+        Handle hoScheme
+        tEditorStyle Expected Actual
+
+        Get ResolveColorSchema of (oScintillaParameters_dg(Self)) CS_ThemeBlue (&sSchema) (&sStyles) to bFound
+        Send Assert bFound
+        Send Assert (sSchema <> "")
+
+        Get Create (RefClass(cEditorColourScheme)) to hoScheme
+        Send LoadLegacyPacked of hoScheme CS_ThemeBlue sSchema sStyles
+        Get StyleFor of hoScheme eEC_Keywords to Actual
+        Send LoadBuiltIn of hoScheme CS_ThemeBlue
+        Get StyleFor of hoScheme eEC_Keywords to Expected
+        Send AssertIAreEqual Expected.iForeColor Actual.iForeColor
+        Send AssertIAreEqual Expected.iBackColor Actual.iBackColor
+        Send Destroy of hoScheme
+    End_Procedure
+
+    /* LoadSchemaInto is what the Colors page actually calls: the same custom-first rule
+       as ResolveColorSchema, landing in a scheme OBJECT. An unshadowed built-in must
+       arrive as its DECLARATION, not as the packed pair read back - that is the whole
+       reason the two functions are not one. Checked on the element the packed format
+       cannot carry: the selection alpha, which has no slot there at all. */
+    {Published = True}
+    Procedure EditorSettings_LoadSchemaIntoBuiltinKeepsDeclaration
+        Boolean bFound
+        Handle hoLoaded hoDeclared
+        tEditorStyle Loaded Declared
+        String sDeclaredText sLoadedText
+
+        Get Create (RefClass(cEditorColourScheme)) to hoLoaded
+        Get Create (RefClass(cEditorColourScheme)) to hoDeclared
+
+        Get LoadSchemaInto of (oScintillaParameters_dg(Self)) hoLoaded CS_ThemeDataFlex to bFound
+        Send Assert bFound
+        Send LoadBuiltIn of hoDeclared CS_ThemeDataFlex
+
+        Send AssertSAreEqual (psSchemeName(hoDeclared)) (psSchemeName(hoLoaded))
+        Send AssertIAreEqual (piSelectionAlpha(hoDeclared)) (piSelectionAlpha(hoLoaded))
+        Get StyleFor of hoDeclared eEC_Keywords to Declared
+        Get StyleFor of hoLoaded   eEC_Keywords to Loaded
+        Send AssertIAreEqual Declared.iForeColor Loaded.iForeColor
+        Send AssertIAreEqual Declared.iBackColor Loaded.iBackColor
+        // Byte-for-byte, every element: the serialized form IS the whole scheme.
+        Get SerializeScheme of hoDeclared to sDeclaredText
+        Get SerializeScheme of hoLoaded   to sLoadedText
+        Send AssertSAreEqual sDeclaredText sLoadedText
+
+        Send Destroy of hoLoaded
+        Send Destroy of hoDeclared
+    End_Procedure
+
+    /* ...and a CUSTOM of the same name still wins, exactly as it does through
+       ResolveColorSchema. Self-contained: a temp custom named after the built-in
+       "Black", removed again, nothing sent to disk. */
+    {Published = True}
+    Procedure EditorSettings_LoadSchemaIntoPrefersCustom
+        Boolean bFound
+        Handle hoScheme hoBuiltIn
+        Integer iC iCount
+        tEditorStyle Custom BuiltIn
+        String sBuiltInText
+
+        Get FindColorSchema of ghoEditorProperties CS_ThemeBlack to iC
+        If (iC >= 0) Procedure_Return
+
+        Get Create (RefClass(cEditorColourScheme)) to hoScheme
+        Get Create (RefClass(cEditorColourScheme)) to hoBuiltIn
+        // A custom "Black" whose keywords are unmistakably NOT the built-in's.
+        Send LoadBuiltIn of hoBuiltIn CS_ThemeBlack
+        Send SetElementForeColor of hoBuiltIn eEC_Keywords (RGB(1, 2, 3))
+
+        Get psColorSchemas.Count of ghoEditorProperties to iCount
+        Set psColorSchemas                    of ghoEditorProperties Item iCount to CS_ThemeBlack
+        Get SerializeScheme of hoBuiltIn to sBuiltInText
+        Set psColorSchemas.psSchemaColors     of ghoEditorProperties Item iCount to sBuiltInText
+        Set psColorSchemas.psSchemaFontStyles of ghoEditorProperties Item iCount to ""
+
+        Get LoadSchemaInto of (oScintillaParameters_dg(Self)) hoScheme CS_ThemeBlack to bFound
+        Send Assert bFound
+        Get StyleFor of hoScheme eEC_Keywords to Custom
+        Send AssertIAreEqual (RGB(1, 2, 3)) Custom.iForeColor
+
+        Send DeleteColorSchema of ghoEditorProperties CS_ThemeBlack
+
+        // Shadow gone, the built-in is back in charge and its keywords are its own.
+        Get LoadSchemaInto of (oScintillaParameters_dg(Self)) hoScheme CS_ThemeBlack to bFound
+        Send Assert bFound
+        Send LoadBuiltIn of hoBuiltIn CS_ThemeBlack
+        Get StyleFor of hoScheme  eEC_Keywords to Custom
+        Get StyleFor of hoBuiltIn eEC_Keywords to BuiltIn
+        Send AssertIAreEqual BuiltIn.iForeColor Custom.iForeColor
+
+        Send Destroy of hoScheme
+        Send Destroy of hoBuiltIn
+    End_Procedure
+
+    // An unknown name resolves to nothing - the page falls back to White itself.
+    {Published = True}
+    Procedure EditorSettings_LoadSchemaIntoUnknownNameFails
+        Boolean bFound
+        Handle hoScheme
+
+        Get Create (RefClass(cEditorColourScheme)) to hoScheme
+        Get LoadSchemaInto of (oScintillaParameters_dg(Self)) hoScheme "NoSuchThemeAtAll" to bFound
+        Send AssertFalse bFound
+        Send Destroy of hoScheme
+    End_Procedure
+
+    /* The Colors page writes the READABLE form now, and the settings store splits a
+       multi-line value into asParts - so what lands in ScintillaEdit.json is one
+       readable line per element instead of the 504-digit run it used to be. This is
+       that round trip: readable out, same scheme back. */
+    {Published = True}
+    Procedure EditorSettings_ReadableSchemeRoundTrips
+        Handle hoSaved hoRead
+        String sColors sSavedText sReadText
+
+        Get Create (RefClass(cEditorColourScheme)) to hoSaved
+        Get Create (RefClass(cEditorColourScheme)) to hoRead
+        Send LoadBuiltIn of hoSaved CS_ThemeSahara
+        Send SetElementForeColor of hoSaved eEC_Comments (RGB(9, 8, 7))
+        Send SetElementBold      of hoSaved eEC_Comments True
+        Get SerializeScheme of hoSaved to sColors
+
+        Send AssertFalse (LooksPacked(hoRead, sColors))
+        // The empty psFontStyles SaveEntries now writes - the flags travel inline.
+        Send LoadFromSettings of hoRead CS_ThemeSahara sColors ""
+        Get SerializeScheme of hoSaved to sSavedText
+        Get SerializeScheme of hoRead  to sReadText
+        Send AssertSAreEqual sSavedText sReadText
+
+        Send Destroy of hoSaved
+        Send Destroy of hoRead
+    End_Procedure
+
+    /* The hotkey capture can leave a phantom 0 in a binding's VK list - Nils's real
+       FindReplace binding decoded to 3144|0|16|17|72, and the 0 predates the JSON
+       settings (same bytes in the frozen ini). Dispatch ignores it, but the display
+       builder joined it as an empty element: "Ctrl + Shift + + H". This is that exact
+       key list; the shortcut string must carry no doubled joiner. */
+    {Published = True}
+    Procedure EditorSettings_HotkeyStringSkipsPhantomZero
+        Integer[] Keys
+        String sVal
+        Move 0  to Keys[0]
+        Move 16 to Keys[1]
+        Move 17 to Keys[2]
+        Move 72 to Keys[3]
+        Get KeysToString of (oSciCommandHotKeys(Self)) Keys to sVal
+        Send AssertFalse (sVal contains "+ +")
+        Send Assert (sVal contains "H")
+    End_Procedure
+
+    // The LIVE pipeline the ENGINE feeds from: the runner's package load has already
+    // run LoadIni on ghoEditorProperties, and LoadEntries seeds ghoFuncLib's keyword
+    // arrays from the VDF language it holds. Whatever backend the load used, VDF must
+    // exist and its keyword list must contain the language's bread-and-butter words.
+    {Published = True}
+    Procedure EditorSettings_LiveStoreServesEditorLanguage
+        Integer iLang
+        String sKeywords
+        String[] asKw
+
+        If (ghoEditorProperties = 0) ;
+            Procedure_Return
+        Get FindLanguage of ghoEditorProperties CS_EditorLanguage to iLang
+        Send Assert (iLang >= 0)
+        Get psLanguages.szKeywords of ghoEditorProperties iLang to sKeywords
+        Send Assert (sKeywords <> "")
+        Move (StrSplitToArray(sKeywords, "\n")) to asKw
+        Send Assert (SearchArray("Move", asKw, Desktop, RefFunc(DFSTRICMP)) >= 0)
+        // "Procedure" is deliberately NOT asserted in szKeywords: probe 2026-07-26 showed the
+        // scope words live in szScopeKeywords1/2, not the keyword list (264 entries, Move at
+        // 153, no Procedure). Assert it where it actually lives.
+        Get psLanguages.szScopeKeywords1 of ghoEditorProperties iLang to sKeywords
+        Move (StrSplitToArray(sKeywords, "\n")) to asKw
+        Send Assert (SearchArray("Procedure", asKw, Desktop, RefFunc(DFSTRICMP)) >= 0)
+    End_Procedure
+
+    /* ==================================================================================
+       THE PROPERTY CONTRACT (Nils 2026-07-27, for the SciControlLib retirement)
+
+       DFRefactor reads 47 distinct members off ghoEditorProperties, and every one of them
+       is generated at COMPILE TIME by the INI_Property macro in the library's
+       cIniManager.pkg - a 2001-era metaprogramming trick that emits a Set/Get pair per
+       property plus the tag registration the store indexes by. Retiring the library means
+       replacing that macro with hand-written accessors on an app-side class, which is a
+       swap underneath every settings read in the program.
+
+       These tests are the net for that swap. They must pass BEFORE it and AFTER it, and
+       they deliberately pin two different things:
+
+         * the PROPERTY layer  - set it, get it back, same value, right type
+         * the STORAGE layout  - which tag name, and for a multi-row property, which
+                                 SUB-VALUE INDEX each field lands on
+
+       The second is the one that protects users. Sub-value position is assigned by
+       DECLARATION ORDER in cEditorProperties.pkg, and it is what an existing
+       ScintillaEdit.json is written against. A rewrite that round-trips perfectly but
+       numbers the sub-values differently would read every saved language definition
+       shifted by one - keywords arriving as operators - and nothing would fail loudly.
+       ================================================================================== */
+
+    // Scalars: property in, same value out, and stored under the UPPERCASED property
+    // name. Covers both types and a representative slice of the ~20 scalars in the
+    // contract, including the four whose defaults a fresh install depends on.
+    {Published = True}
+    Procedure EditorSettings_ScalarPropertyContract
+        Integer iVal
+        String  sVal
+
+        Set psColors        of oJsonSandbox to "SCHEME-TEXT"
+        Set psColorSchema   of oJsonSandbox to "SchemaName"
+        Set psFontFace      of oJsonSandbox to "11pt; 0; Consolas"
+        Set psLanguage      of oJsonSandbox to CS_EditorLanguage
+        Set piTabSize       of oJsonSandbox to 4
+        Set pbTabExpand     of oJsonSandbox to True
+        Set piLineNumbering of oJsonSandbox to 1
+        Set pbSelectWholeLine of oJsonSandbox to False
+
+        Get psColors        of oJsonSandbox to sVal
+        Send AssertSAreEqual "SCHEME-TEXT" sVal
+        Get psColorSchema   of oJsonSandbox to sVal
+        Send AssertSAreEqual "SchemaName" sVal
+        Get psFontFace      of oJsonSandbox to sVal
+        Send AssertSAreEqual "11pt; 0; Consolas" sVal
+        Get psLanguage      of oJsonSandbox to sVal
+        Send AssertSAreEqual CS_EditorLanguage sVal
+        Get piTabSize       of oJsonSandbox to iVal
+        Send AssertIAreEqual 4 iVal
+        Get pbTabExpand     of oJsonSandbox to iVal
+        Send AssertIAreEqual True iVal
+        Get piLineNumbering of oJsonSandbox to iVal
+        Send AssertIAreEqual 1 iVal
+        Get pbSelectWholeLine of oJsonSandbox to iVal
+        Send AssertIAreEqual False iVal
+
+        // The property-to-tag mapping: a property is stored under its own name in caps,
+        // at row 0 sub 0. This is what makes an existing ScintillaEdit.json readable.
+        Get IniValueEx of oJsonSandbox "PSCOLORS" 0 0 to sVal
+        Send AssertSAreEqual "SCHEME-TEXT" sVal
+        Get IniValueEx of oJsonSandbox "PSFONTFACE" 0 0 to sVal
+        Send AssertSAreEqual "11pt; 0; Consolas" sVal
+        Get IniValueEx of oJsonSandbox "PITABSIZE" 0 0 to sVal
+        Send AssertSAreEqual "4" sVal
+    End_Procedure
+
+    /* psLanguages is the load-bearing one: it is a MULTI property with fifteen
+       sub-values, it is what LoadEntries feeds ghoFuncLib's keyword arrays from, and
+       when it goes wrong nothing throws - the engine just stops recognising DataFlex
+       (65 silent test failures, 2026-07-27).
+
+       Every sub-index below is asserted explicitly. The order is the declaration order
+       in cEditorProperties.pkg: the row's own value is sub 0, then dwStyle, then
+       bIsCaseSensitive, then the twelve string fields. */
+    {Published = True}
+    Procedure EditorSettings_LanguageRowStorageLayout
+        Integer iRow iStart
+        String  sVal
+
+        Get psLanguages.Count of oJsonSandbox to iStart
+        Move iStart to iRow
+
+        Set psLanguages                      of oJsonSandbox Item iRow to "TESTLANG"
+        Set psLanguages.dwStyle              of oJsonSandbox Item iRow to 7
+        Set psLanguages.bIsCaseSensitive     of oJsonSandbox Item iRow to 1
+        Set psLanguages.szKeywords           of oJsonSandbox Item iRow to "KwA\nKwB"
+        Set psLanguages.szOperators          of oJsonSandbox Item iRow to "+-*/"
+        Set psLanguages.szSingleLineComments of oJsonSandbox Item iRow to "//"
+        Set psLanguages.szMultiLineComments1 of oJsonSandbox Item iRow to "/*"
+        Set psLanguages.szMultiLineComments2 of oJsonSandbox Item iRow to "*/"
+        Set psLanguages.szScopeKeywords1     of oJsonSandbox Item iRow to "Procedure"
+        Set psLanguages.szScopeKeywords2     of oJsonSandbox Item iRow to "End_Procedure"
+        Set psLanguages.szStringDelims       of oJsonSandbox Item iRow to "'"
+        Set psLanguages.chEscape             of oJsonSandbox Item iRow to "\"
+        Set psLanguages.chTerminator         of oJsonSandbox Item iRow to ";"
+        Set psLanguages.pszTagElementNames   of oJsonSandbox Item iRow to "TagEl"
+        Set psLanguages.pszTagAttributeNames of oJsonSandbox Item iRow to "TagAttr"
+        Set psLanguages.pszTagEntities       of oJsonSandbox Item iRow to "TagEnt"
+
+        // Property layer: what went in comes back out.
+        Get psLanguages                  of oJsonSandbox Item iRow to sVal
+        Send AssertSAreEqual "TESTLANG" sVal
+        Get psLanguages.szKeywords       of oJsonSandbox Item iRow to sVal
+        Send AssertSAreEqual "KwA\nKwB" sVal
+        Get psLanguages.szScopeKeywords1 of oJsonSandbox Item iRow to sVal
+        Send AssertSAreEqual "Procedure" sVal
+        Get psLanguages.szScopeKeywords2 of oJsonSandbox Item iRow to sVal
+        Send AssertSAreEqual "End_Procedure" sVal
+        Get psLanguages.pszTagEntities   of oJsonSandbox Item iRow to sVal
+        Send AssertSAreEqual "TagEnt" sVal
+
+        // Storage layout: the exact sub-index of every field, under tag PSLANGUAGES.
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow  0 to sVal
+        Send AssertSAreEqual "TESTLANG" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow  1 to sVal
+        Send AssertSAreEqual "7" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow  2 to sVal
+        Send AssertSAreEqual "1" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow  3 to sVal
+        Send AssertSAreEqual "KwA\nKwB" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow  4 to sVal
+        Send AssertSAreEqual "+-*/" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow  5 to sVal
+        Send AssertSAreEqual "//" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow  6 to sVal
+        Send AssertSAreEqual "/*" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow  7 to sVal
+        Send AssertSAreEqual "*/" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow  8 to sVal
+        Send AssertSAreEqual "Procedure" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow  9 to sVal
+        Send AssertSAreEqual "End_Procedure" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow 10 to sVal
+        Send AssertSAreEqual "'" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow 11 to sVal
+        Send AssertSAreEqual "\" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow 12 to sVal
+        Send AssertSAreEqual ";" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow 13 to sVal
+        Send AssertSAreEqual "TagEl" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow 14 to sVal
+        Send AssertSAreEqual "TagAttr" sVal
+        Get IniValueEx of oJsonSandbox "PSLANGUAGES" iRow 15 to sVal
+        Send AssertSAreEqual "TagEnt" sVal
+
+        Send psLanguages.DeleteItem of oJsonSandbox iRow
+    End_Procedure
+
+    /* psColorSchemas layout: NOT PINNED YET - deliberately left out, see below.
+
+       The test is written (it is in this file's history at the commit that added the
+       other three) and it FAILS in the runner in a way I have not root-caused: after
+
+           Get psColorSchemas.Count of ghoEditorProperties to iRow      // 0
+           Set psColorSchemas of ghoEditorProperties Item iRow to "ZZTestSchema"
+
+       the very next Get of psColorSchemas.Count returns **-1**, and FindColorSchema -
+       which loops to Count - therefore never sees the row. The row itself is fine: it
+       reads back through both the property and IniValueEx.
+
+       What makes it worth understanding rather than working around: the settings dialog
+       does this EXACT sequence in SaveEntries and it works in the GUI. So either the
+       count behaves differently before the store has been loaded from disk, or the tag
+       is not registered on this object at this point and IniValueCount's unguarded
+       Find_Element (cIniManager ~527 - it indexes oTagTypes with the -1 it gets back)
+       is propagating that. Both are guesses; I got this wrong twice already by
+       reasoning instead of measuring, so it stays a question.
+
+       This is the FIRST thing to instrument when the settings rewrite starts, because
+       "Count disagrees with what is readable" is precisely the behaviour a replacement
+       has to reproduce or deliberately fix. */
+
+    // The MULTI machinery itself: appending grows the count, deleting shrinks it, and a
+    // delete takes the right row out rather than the last one.
+    {Published = True}
+    Procedure EditorSettings_MultiRowCountAndDelete
+        Integer iStart iCount iRow
+        String  sVal
+
+        Get psLanguages.Count of oJsonSandbox to iStart
+        Move iStart to iRow
+        Set psLanguages of oJsonSandbox Item  iRow      to "ZZOne"
+        Set psLanguages of oJsonSandbox Item (iRow + 1) to "ZZTwo"
+        Get psLanguages.Count of oJsonSandbox to iCount
+        Send AssertIAreEqual (iStart + 2) iCount
+
+        Send psLanguages.DeleteItem of oJsonSandbox iRow
+        Get psLanguages.Count of oJsonSandbox to iCount
+        Send AssertIAreEqual (iStart + 1) iCount
+        // The SECOND row survived and moved down into the deleted one's place.
+        Get psLanguages of oJsonSandbox Item iRow to sVal
+        Send AssertSAreEqual "ZZTwo" sVal
+
+        Send psLanguages.DeleteItem of oJsonSandbox iRow
+        Get psLanguages.Count of oJsonSandbox to iCount
+        Send AssertIAreEqual iStart iCount
+    End_Procedure
+
+    /* psColorSchemas: a MULTI with two sub-values, its layout, and the case rule its
+       two lookups do NOT share.
+
+       The sub-values are declared Integer in cEditorProperties.pkg and hold TEXT - the
+       packed digit runs historically, the readable scheme form since 2026-07-27. Not a
+       latent bug: probed directly, a multi-line readable scheme round-trips through them
+       byte for byte, newline included. The store is string-based; the declared type only
+       shapes the generated accessor's signature.
+
+       CASE. FindColorSchema compares with "=", and DataFlex "=" on strings is
+       case-SENSITIVE (measured: "ZZTestSchema" = "zztestschema" is False). So Find is
+       exact-match. DeleteColorSchema, ten lines below it in the same file, uppercases
+       BOTH sides and is case-INSENSITIVE. Two spellings of the same intent, and they
+       disagree.
+
+       That asymmetry has a real consequence, though a narrower one than it first looks:
+       ScintillaParameters.dg's SaveEntries calls FindColorSchema to choose
+       UPDATE-existing versus APPEND-new. If a stored schema's name differs from the
+       combo's only in CASE, Find misses and the save appends a duplicate - while Delete
+       would have matched it. Whichever way a rewrite tidies this, it should tidy both
+       together; pinned here so the choice is deliberate. */
+    {Published = True}
+    Procedure EditorSettings_ColorSchemaRowStorageLayout
+        Integer iRow iCount iFound
+        String  sVal
+
+        If (ghoEditorProperties = 0) ;
+            Procedure_Return
+        Get FindColorSchema of ghoEditorProperties "ZZTestSchema" to iFound
+        If (iFound >= 0) Procedure_Return          // never touch real user data
+
+        Get psColorSchemas.Count of ghoEditorProperties to iRow
+        Set psColorSchemas                    of ghoEditorProperties Item iRow to "ZZTestSchema"
+        Set psColorSchemas.psSchemaColors     of ghoEditorProperties Item iRow to "COLORS-TEXT"
+        Set psColorSchemas.psSchemaFontStyles of ghoEditorProperties Item iRow to "STYLES-TEXT"
+
+        // Appending at index Count grows the count.
+        Get psColorSchemas.Count of ghoEditorProperties to iCount
+        Send AssertIAreEqual (iRow + 1) iCount
+
+        // Property layer.
+        Get psColorSchemas                    of ghoEditorProperties Item iRow to sVal
+        Send AssertSAreEqual "ZZTestSchema" sVal
+        Get psColorSchemas.psSchemaColors     of ghoEditorProperties Item iRow to sVal
+        Send AssertSAreEqual "COLORS-TEXT" sVal
+        Get psColorSchemas.psSchemaFontStyles of ghoEditorProperties Item iRow to sVal
+        Send AssertSAreEqual "STYLES-TEXT" sVal
+
+        // Storage layout: name at sub 0, the two payloads at 1 and 2, under
+        // PSCOLORSCHEMAS. The shape an existing ScintillaEdit.json holds, and the thing
+        // a rewrite must not renumber.
+        Get IniValueEx of ghoEditorProperties "PSCOLORSCHEMAS" iRow 0 to sVal
+        Send AssertSAreEqual "ZZTestSchema" sVal
+        Get IniValueEx of ghoEditorProperties "PSCOLORSCHEMAS" iRow 1 to sVal
+        Send AssertSAreEqual "COLORS-TEXT" sVal
+        Get IniValueEx of ghoEditorProperties "PSCOLORSCHEMAS" iRow 2 to sVal
+        Send AssertSAreEqual "STYLES-TEXT" sVal
+
+        // Find is EXACT-match, both ways. Pinned deliberately - it is the behaviour, and
+        // it is what makes Find and Delete disagree (see the header).
+        Get FindColorSchema of ghoEditorProperties "ZZTestSchema" to iFound
+        Send AssertIAreEqual iRow iFound
+        Get FindColorSchema of ghoEditorProperties "zztestschema" to iFound
+        Send AssertIAreEqual -1 iFound
+        Get FindColorSchema of ghoEditorProperties "NoSuchSchemaName" to iFound
+        Send AssertIAreEqual -1 iFound
+
+        // ...whereas Delete matches case-insensitively and removes the row.
+        Send DeleteColorSchema of ghoEditorProperties "zztestschema"
+        Get FindColorSchema of ghoEditorProperties "ZZTestSchema" to iFound
+        Send AssertIAreEqual -1 iFound
+    End_Procedure
+
+    /* ==================================================================================
+       THE REPLACEMENT, HELD TO THE SAME CONTRACT
+
+       The same assertions as the tests above, against cRefactorEditorProperties instead
+       of the library's macro-generated cEditorProperties. Nothing uses this class yet;
+       these run so that when the swap happens it is a Use-line change and not a leap.
+       Where the library class had a quirk worth keeping, it is reproduced deliberately
+       and asserted here too.
+       ================================================================================== */
+
+    // Scalars: property in, same value out, stored under the UPPERCASED name at row 0
+    // sub 0 - the mapping an existing ScintillaEdit.json is written against.
+    {Published = True}
+    Procedure EditorSettings_NewClassScalarContract
+        Integer iVal
+        String  sVal
+
+        Set psColors          of oNewSettings to "SCHEME-TEXT"
+        Set psColorSchema     of oNewSettings to "SchemaName"
+        Set psFontFace        of oNewSettings to "11pt; 0; Consolas"
+        Set psLanguage        of oNewSettings to CS_EditorLanguage
+        Set piTabSize         of oNewSettings to 4
+        Set pbTabExpand       of oNewSettings to True
+        Set piLineNumbering   of oNewSettings to 1
+        Set pbSelectWholeLine of oNewSettings to False
+
+        Get psColors          of oNewSettings to sVal
+        Send AssertSAreEqual "SCHEME-TEXT" sVal
+        Get psColorSchema     of oNewSettings to sVal
+        Send AssertSAreEqual "SchemaName" sVal
+        Get psFontFace        of oNewSettings to sVal
+        Send AssertSAreEqual "11pt; 0; Consolas" sVal
+        Get psLanguage        of oNewSettings to sVal
+        Send AssertSAreEqual CS_EditorLanguage sVal
+        Get piTabSize         of oNewSettings to iVal
+        Send AssertIAreEqual 4 iVal
+        Get pbTabExpand       of oNewSettings to iVal
+        Send AssertIAreEqual True iVal
+        Get piLineNumbering   of oNewSettings to iVal
+        Send AssertIAreEqual 1 iVal
+        Get pbSelectWholeLine of oNewSettings to iVal
+        Send AssertIAreEqual False iVal
+
+        Get IniValueEx of oNewSettings "PSCOLORS" 0 0 to sVal
+        Send AssertSAreEqual "SCHEME-TEXT" sVal
+        Get IniValueEx of oNewSettings "PSFONTFACE" 0 0 to sVal
+        Send AssertSAreEqual "11pt; 0; Consolas" sVal
+        Get IniValueEx of oNewSettings "PITABSIZE" 0 0 to sVal
+        Send AssertSAreEqual "4" sVal
+    End_Procedure
+
+    // The three settings that default TRUE - the library class got them from the macro
+    // fourth argument, this one supplies them in each getter. A fresh install with these
+    // wrong silently changes how the editor looks.
+    {Published = True}
+    Procedure EditorSettings_NewClassUnsetScalarsUseDeclaredDefaults
+        Integer iVal
+        Handle  hoFresh
+
+        Get Create (RefClass(cRefactorEditorProperties)) to hoFresh
+        Get pbShowMatchingBraces  of hoFresh to iVal
+        Send AssertIAreEqual True iVal
+        Get pbShowIndentGuides    of hoFresh to iVal
+        Send AssertIAreEqual True iVal
+        Get pbSelectWholeLine     of hoFresh to iVal
+        Send AssertIAreEqual True iVal
+        Get pbNormalizeCase       of hoFresh to iVal
+        Send AssertIAreEqual 0 iVal
+        Get piTabSize             of hoFresh to iVal
+        Send AssertIAreEqual 0 iVal
+        Get piLineNumbering       of hoFresh to iVal
+        Send AssertIAreEqual False iVal
+        Send Destroy of hoFresh
+    End_Procedure
+
+    // psLanguages, all sixteen positions - the test that matters most, because this is
+    // what LoadEntries feeds the engine's keyword arrays from and a shifted index is
+    // silent. Byte-identical assertions to the library-class version above.
+    {Published = True}
+    Procedure EditorSettings_NewClassLanguageRowStorageLayout
+        Integer iRow
+        String  sVal
+
+        Get psLanguages.Count of oNewSettings to iRow
+
+        Set psLanguages                        of oNewSettings Item iRow to "TESTLANG"
+        Set psLanguages.dwStyle                of oNewSettings Item iRow to 7
+        Set psLanguages.bIsCaseSensitive       of oNewSettings Item iRow to 1
+        Set psLanguages.szKeywords             of oNewSettings Item iRow to "KwA\nKwB"
+        Set psLanguages.szOperators            of oNewSettings Item iRow to "+-*/"
+        Set psLanguages.szSingleLineComments   of oNewSettings Item iRow to "//"
+        Set psLanguages.szMultiLineComments1   of oNewSettings Item iRow to "/*"
+        Set psLanguages.szMultiLineComments2   of oNewSettings Item iRow to "*/"
+        Set psLanguages.szScopeKeywords1       of oNewSettings Item iRow to "Procedure"
+        Set psLanguages.szScopeKeywords2       of oNewSettings Item iRow to "End_Procedure"
+        Set psLanguages.szStringDelims         of oNewSettings Item iRow to "'"
+        Set psLanguages.chEscape               of oNewSettings Item iRow to "\"
+        Set psLanguages.chTerminator           of oNewSettings Item iRow to ";"
+        Set psLanguages.pszTagElementNames     of oNewSettings Item iRow to "TagEl"
+        Set psLanguages.pszTagAttributeNames   of oNewSettings Item iRow to "TagAttr"
+        Set psLanguages.pszTagEntities         of oNewSettings Item iRow to "TagEnt"
+
+        Get psLanguages                  of oNewSettings Item iRow to sVal
+        Send AssertSAreEqual "TESTLANG" sVal
+        // The joined keyword list must survive VERBATIM - the store splits it into parts
+        // internally so the JSON can hold an array, and joins it back here.
+        Get psLanguages.szKeywords       of oNewSettings Item iRow to sVal
+        Send AssertSAreEqual "KwA\nKwB" sVal
+        Get psLanguages.szScopeKeywords1 of oNewSettings Item iRow to sVal
+        Send AssertSAreEqual "Procedure" sVal
+        Get psLanguages.pszTagEntities   of oNewSettings Item iRow to sVal
+        Send AssertSAreEqual "TagEnt" sVal
+
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow  0 to sVal
+        Send AssertSAreEqual "TESTLANG" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow  1 to sVal
+        Send AssertSAreEqual "7" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow  2 to sVal
+        Send AssertSAreEqual "1" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow  3 to sVal
+        Send AssertSAreEqual "KwA\nKwB" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow  4 to sVal
+        Send AssertSAreEqual "+-*/" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow  5 to sVal
+        Send AssertSAreEqual "//" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow  6 to sVal
+        Send AssertSAreEqual "/*" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow  7 to sVal
+        Send AssertSAreEqual "*/" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow  8 to sVal
+        Send AssertSAreEqual "Procedure" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow  9 to sVal
+        Send AssertSAreEqual "End_Procedure" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow 10 to sVal
+        Send AssertSAreEqual "'" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow 11 to sVal
+        Send AssertSAreEqual "\" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow 12 to sVal
+        Send AssertSAreEqual ";" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow 13 to sVal
+        Send AssertSAreEqual "TagEl" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow 14 to sVal
+        Send AssertSAreEqual "TagAttr" sVal
+        Get IniValueEx of oNewSettings "PSLANGUAGES" iRow 15 to sVal
+        Send AssertSAreEqual "TagEnt" sVal
+
+        Send psLanguages.DeleteItem of oNewSettings iRow
+    End_Procedure
+
+    // Multi-row machinery, and the two lookups with their inherited case disagreement.
+    {Published = True}
+    Procedure EditorSettings_NewClassMultiRowAndLookups
+        Integer iStart iCount iRow iFound
+        String  sVal
+
+        Get psColorSchemas.Count of oNewSettings to iStart
+        Move iStart to iRow
+        Set psColorSchemas                    of oNewSettings Item  iRow      to "ZZAlpha"
+        Set psColorSchemas.psSchemaColors     of oNewSettings Item  iRow      to "COLORS-TEXT"
+        Set psColorSchemas.psSchemaFontStyles of oNewSettings Item  iRow      to "STYLES-TEXT"
+        Set psColorSchemas                    of oNewSettings Item (iRow + 1) to "ZZBeta"
+        Get psColorSchemas.Count of oNewSettings to iCount
+        Send AssertIAreEqual (iStart + 2) iCount
+
+        Get IniValueEx of oNewSettings "PSCOLORSCHEMAS" iRow 1 to sVal
+        Send AssertSAreEqual "COLORS-TEXT" sVal
+        Get IniValueEx of oNewSettings "PSCOLORSCHEMAS" iRow 2 to sVal
+        Send AssertSAreEqual "STYLES-TEXT" sVal
+
+        // Find is EXACT-match, exactly as the library class is.
+        Get FindColorSchema of oNewSettings "ZZAlpha" to iFound
+        Send AssertIAreEqual iRow iFound
+        Get FindColorSchema of oNewSettings "zzalpha" to iFound
+        Send AssertIAreEqual -1 iFound
+        Get FindColorSchema of oNewSettings "NoSuchSchemaName" to iFound
+        Send AssertIAreEqual -1 iFound
+
+        // ...and Delete matches case-INSENSITIVELY, also as before. Deleting the first
+        // of two rows closes the gap.
+        Send DeleteColorSchema of oNewSettings "zzalpha"
+        Get psColorSchemas.Count of oNewSettings to iCount
+        Send AssertIAreEqual (iStart + 1) iCount
+        Get psColorSchemas of oNewSettings Item iRow to sVal
+        Send AssertSAreEqual "ZZBeta" sVal
+
+        Send DeleteColorSchema of oNewSettings "ZZBeta"
+        Get psColorSchemas.Count of oNewSettings to iCount
+        Send AssertIAreEqual iStart iCount
+    End_Procedure
+
+    // A multi-line value - the readable scheme form - through the new store, which
+    // splits on the literal two-character join internally. It has to come back whole.
+    {Published = True}
+    Procedure EditorSettings_NewClassMultiLineValueRoundTrips
+        Integer iRow
+        String  sMulti sVal
+
+        Move ("Scheme=ZZM" + Character(10) + "Text=0,0,0;-;") to sMulti
+        Get psColorSchemas.Count of oNewSettings to iRow
+        Set psColorSchemas                of oNewSettings Item iRow to "ZZMulti"
+        Set psColorSchemas.psSchemaColors of oNewSettings Item iRow to sMulti
+        Get psColorSchemas.psSchemaColors of oNewSettings Item iRow to sVal
+        Send AssertSAreEqual sMulti sVal
+
+        // ...and the literal two-character join, which is what the keyword lists use.
+        Set psColorSchemas.psSchemaFontStyles of oNewSettings Item iRow to "one\ntwo\nthree"
+        Get psColorSchemas.psSchemaFontStyles of oNewSettings Item iRow to sVal
+        Send AssertSAreEqual "one\ntwo\nthree" sVal
+
+        Send DeleteColorSchema of oNewSettings "ZZMulti"
+    End_Procedure
+
+    // DoInit clears the store but must leave the class able to answer for its own
+    // members - registration back in place, so "never written" still reads as the
+    // declared default rather than as "no such setting".
+    {Published = True}
+    Procedure EditorSettings_NewClassDoInitClearsButKeepsRegistration
+        Integer iVal iCount
+        String  sVal
+        Handle  hoFresh
+
+        Get Create (RefClass(cRefactorEditorProperties)) to hoFresh
+        Set psColors    of hoFresh to "SOMETHING"
+        Set piTabSize   of hoFresh to 8
+        Set psLanguages of hoFresh Item 0 to "LangOne"
+
+        Send DoInit of hoFresh
+
+        Get psColors  of hoFresh to sVal
+        Send AssertSAreEqual "" sVal
+        Get psLanguages.Count of hoFresh to iCount
+        Send AssertIAreEqual 0 iCount
+        // ...and the declared defaults are answerable again, not lost with the values.
+        Get pbShowMatchingBraces of hoFresh to iVal
+        Send AssertIAreEqual True iVal
+        Get piTabSize of hoFresh to iVal
+        Send AssertIAreEqual 0 iVal
+        Send Destroy of hoFresh
+    End_Procedure
+
+    /* The unused-lines channel: a tag this build does not register - because a NEWER
+       build wrote it - has to survive a read and a write back. Without it, running an
+       older DFRefactor once would quietly delete the newer one settings. */
+    {Published = True}
+    Procedure EditorSettings_NewClassUnusedLinesSurvive
+        Integer iCount
+        String  sVal
+        Handle  hoFresh
+
+        Get Create (RefClass(cRefactorEditorProperties)) to hoFresh
+        Get UnusedLineCount of hoFresh to iCount
+        Send AssertIAreEqual 0 iCount
+
+        Send AddUnusedLine of hoFresh "SOMEUNKNOWNTAG,kept as-is"
+        Send AddUnusedLine of hoFresh "ANOTHERONE,also kept"
+        Get UnusedLineCount of hoFresh to iCount
+        Send AssertIAreEqual 2 iCount
+        Get UnusedLine of hoFresh 0 to sVal
+        Send AssertSAreEqual "SOMEUNKNOWNTAG,kept as-is" sVal
+        Get UnusedLine of hoFresh 1 to sVal
+        Send AssertSAreEqual "ANOTHERONE,also kept" sVal
+        // Out of range reads as blank rather than raising.
+        Get UnusedLine of hoFresh 9 to sVal
+        Send AssertSAreEqual "" sVal
+
+        Send ClearUnusedLines of hoFresh
+        Get UnusedLineCount of hoFresh to iCount
+        Send AssertIAreEqual 0 iCount
+        Send Destroy of hoFresh
+    End_Procedure
+
+End_Object

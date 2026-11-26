@@ -9,4 +9,4 @@ DDSrcPath=DDSrc
 HelpPath=Help
 ProgramPath=Programs
 FileList=Data\Filelist.cfg
-Description=DFRefactor26.0
+Description=DFRefactorFlexTron

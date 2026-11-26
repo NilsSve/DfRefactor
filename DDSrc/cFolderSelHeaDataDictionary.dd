@@ -7,6 +7,7 @@ Use cFolderSelDtlDataDictionary.dd
 Open SysFile
 Open FolderSelHeaA
 Open FolderSelHea
+Open DFLastID
 
 Set_Attribute DF_FILE_ALIAS  of FolderSelHeaA.File_Number to DF_FILE_IS_ALIAS
 
@@ -19,15 +20,22 @@ Class cFolderSelHeaDataDictionary is a DataDictionary
 
         Property Integer piLastErr 0
         Property Boolean pbErr False
+        // A batch run's folder ticks, and what puts them back (ApplyBatchFolderTicks / RestoreBatchFolderTicks).
+        Property Integer   piBatchHeaderID 0
+        Property Integer[] paiBatchTickedBefore
+        Property Integer[] paiBatchAdded
 
         Set Main_File to FolderSelHea.File_Number
 
         Set Add_Client_File to FolderSelDtl.File_Number
 
         Set Add_System_File to SysFile.File_Number DD_Lock_On_All
+        Set Add_System_File to DFLastID.File_Number DD_Lock_On_All
         Set Foreign_Field_Option DD_KEYFIELD DD_FINDREQ to True
         Set Foreign_Field_Option DD_INDEXFIELD DD_NOPUT to True
         Set Foreign_Field_Option DD_DEFAULT DD_DISPLAYONLY to True
+
+        Set Field_Auto_Increment Field FolderSelHea.ID to File_Field DFLastID.FolderSelHeaID
 
         Set Field_Label_Long Field FolderSelHea.UserName to "User Name"
         Set Field_Label_Short Field FolderSelHea.UserName to "User Name"
@@ -42,7 +50,7 @@ Class cFolderSelHeaDataDictionary is a DataDictionary
         Integer iID
         Forward Send Creating
         Get psUserName of ghoApplication to FolderSelHea.UserName
-        Get AutoCreateNewID File_Field FolderSelHea.ID True to iID
+//        Get AutoCreateNewID File_Field FolderSelHea.ID True to iID
     End_Procedure
 
     Procedure SaveErrorState
@@ -252,6 +260,14 @@ Class cFolderSelHeaDataDictionary is a DataDictionary
             Move sHomeFolder to FolderSelHea.WorkspaceHomeFolder
             Find eq FolderSelHea.WorkspaceHomeFolder
         End
+        // System folders discovered by an OLDER scan (a name that is now in CS_NoFolderList - DfPkg
+        // since 2026-08-18) leave on this explicit re-scan, whatever their tick: they would not be
+        // offered today, and their files are skipped as write-protected anyway.
+        Send RemoveSystemFolders FolderSelHea.ID
+        Clear FolderSelHea
+        Move sUserName   to FolderSelHea.UserName
+        Move sHomeFolder to FolderSelHea.WorkspaceHomeFolder
+        Find eq FolderSelHea.WorkspaceHomeFolder
 
         Get PopulateFolderRecords FolderSelHea.ID sHomeFolder sUserName bLibInclude to bErr
 
@@ -365,6 +381,154 @@ Class cFolderSelHeaDataDictionary is a DataDictionary
 
         Send RestoreErrorState
     End_Procedure
+
+    /* Deletes the FolderSelDtl rows for iHeaderID whose path has a segment in CS_NoFolderList
+       (IsFolderInNoFolderList - the same test RecursiveSearchFolders applies when it discovers
+       folders). Needed because that list GROWS: "dfpkg" joined it 2026-08-18, and Nils's WinServ
+       selection already held E:\WinServ\DfPkg\...\AppSrc from an earlier scan - 249 read-only
+       package files ticked like any other source folder. Runs on the explicit Re-scan Folders,
+       never on load; the caller reports the count. Header counters recomputed as in
+       RemoveLibraryFolders (the alias Delete bypasses the DD's Deleting handler). */
+    { Visibility=Private }
+    Procedure RemoveSystemFolders Integer iHeaderID
+        Integer iTotal iSelected iHomeLen
+        String sFolder sHome sBelowHome
+        String[] asNoFolderList
+        Boolean bSystem
+
+        Get NoFolderListAsArray of ghoApplication False to asNoFolderList
+        Get psHomeTarget of ghoApplication to sHome
+        Move (Lowercase(Trim(sHome))) to sHome
+        If (sHome <> "" and Right(sHome, 1) <> CS_DirSeparator) ;
+            Move (sHome + CS_DirSeparator) to sHome
+        Move (Length(sHome)) to iHomeLen
+
+        Send SaveErrorState
+
+        Constraint_Set Self Clear
+        Constrained_Clear eq FolderSelDtlA by Index.2
+        Constrain FolderSelDtlA.FolderSelHeaID eq iHeaderID
+        Constrained_Find First FolderSelDtlA by Index.2
+        While (Found)
+            Move (Trim(FolderSelDtlA.FolderName)) to sFolder
+            // Only the segments BELOW the workspace home are judged: a home that itself sits under a
+            // folder called Data or Programs (C:\Data\MyApp\...) must not lose its whole list, and a
+            // library outside the home is not this rule's business. DfPkg is always under the home.
+            Move False to bSystem
+            If (iHomeLen > 0 and Left(Lowercase(sFolder), iHomeLen) = sHome) Begin
+                Move (Right(sFolder, (Length(sFolder) - iHomeLen))) to sBelowHome
+                Get IsFolderInNoFolderList of ghoApplication asNoFolderList sBelowHome to bSystem
+            End
+            If (bSystem = True) Begin
+                Lock
+                    Delete FolderSelDtlA
+                Unlock
+            End
+            Constrained_Find Next
+        Loop
+
+        Move 0 to iTotal
+        Move 0 to iSelected
+        Constrained_Find First FolderSelDtlA by Index.2
+        While (Found)
+            Increment iTotal
+            If (FolderSelDtlA.bSelected = True) ;
+                Increment iSelected
+            Constrained_Find Next
+        Loop
+
+        Clear FolderSelHeaA
+        Move iHeaderID to FolderSelHeaA.ID
+        Find eq FolderSelHeaA.ID
+        If (Found = True) Begin
+            Reread FolderSelHeaA
+                Move iTotal    to FolderSelHeaA.TotalFolders
+                Move iSelected to FolderSelHeaA.TotalSelected
+                SaveRecord FolderSelHeaA
+            Unlock
+        End
+
+        Send RestoreErrorState
+    End_Procedure
+
+    /* Drops every selected-folder row AT OR UNDER sRoot, for the current user and workspace, and
+       returns how many went. The counters are recomputed from the rows that survive, exactly as
+       RemoveLibraryFolders and RemoveSystemFolders do.
+
+       WHY A THIRD REMOVER (Nils 2026-09-10). Neither of those two can reach a library folder that a
+       PACKAGE replaced: RemoveLibraryFolders deletes only rows under a declared library root AND
+       outside the home, so a tree in <home>\Libraries fails the second test - and once the .sws
+       stops declaring it, it is not a library root any more either; RemoveSystemFolders takes only
+       CS_NoFolderList names, and Libraries is not one. So the ticks on a folder the build has
+       stopped reading are, today, permanent.
+
+       CALLED ONLY BEHIND THE CONFIRMED RETIRE (MaintainLibrariesFT._RetireLibraryFolders), never on
+       its own: a tick is the user's curation, and dropping one because the tool thinks the folder
+       is stale would be the intent-measuring design rejected on 2026-08-31. It is dropped here
+       because the folder it names has just been renamed out from under it, which is a fact rather
+       than a guess. */
+    Function RemoveSelectedFoldersUnder String sRoot Returns Integer
+        Integer iTotal iSelected iGone iHeaderID
+        String  sUserName sHomeFolder sFolder
+        Boolean bUnder
+
+        Move 0 to iGone
+        Move (Trim(sRoot)) to sRoot
+        If (sRoot = "") ;
+            Function_Return 0
+        Get psUsername   of ghoApplication to sUserName
+        Get psHomeTarget of ghoApplication to sHomeFolder
+        Clear FolderSelHea
+        Move sUserName   to FolderSelHea.UserName
+        Move sHomeFolder to FolderSelHea.WorkspaceHomeFolder
+        Find eq FolderSelHea.WorkspaceHomeFolder
+        If (Found = False) ;
+            Function_Return 0
+        Move FolderSelHea.ID to iHeaderID
+
+        Send SaveErrorState
+
+        Constraint_Set Self Clear
+        Constrained_Clear eq FolderSelDtlA by Index.2
+        Constrain FolderSelDtlA.FolderSelHeaID eq iHeaderID
+        Constrained_Find First FolderSelDtlA by Index.2
+        While (Found)
+            Move (Trim(FolderSelDtlA.FolderName)) to sFolder
+            Get IsFolderUnderRoot sFolder sRoot to bUnder
+            If (bUnder = True) Begin
+                Lock
+                    Delete FolderSelDtlA
+                Unlock
+                Increment iGone
+            End
+            Constrained_Find Next
+        Loop
+
+        // Recompute the header counters from the surviving rows.
+        Move 0 to iTotal
+        Move 0 to iSelected
+        Constrained_Find First FolderSelDtlA by Index.2
+        While (Found)
+            Increment iTotal
+            If (FolderSelDtlA.bSelected = True) ;
+                Increment iSelected
+            Constrained_Find Next
+        Loop
+
+        Clear FolderSelHeaA
+        Move iHeaderID to FolderSelHeaA.ID
+        Find eq FolderSelHeaA.ID
+        If (Found = True) Begin
+            Reread FolderSelHeaA
+                Move iTotal    to FolderSelHeaA.TotalFolders
+                Move iSelected to FolderSelHeaA.TotalSelected
+                SaveRecord FolderSelHeaA
+            Unlock
+        End
+
+        Send RestoreErrorState
+        Function_Return iGone
+    End_Function
 
     // Note: An active header record (FolderSelHea) must be present
     //       in the global record buffer prior calling this:
@@ -487,5 +651,219 @@ Class cFolderSelHeaDataDictionary is a DataDictionary
         Send Request_Assign
         Function_Return iSelected
     End_Function
+
+    /* A BATCH RUN'S FOLDERS, TICKED FOR THE RUN (Nils 2026-10-24). A /bm run scans the folders its command
+       line names - pasSelectedFolders, filled from the INI - and never reads these ticks, but the Start
+       Center's Source folders line does, so it said "None selected" while the run worked on two folders.
+       For the run, this workspace's ticks become exactly asFolders:
+       - a folder list that was never built is built first, the way the folder view does on load;
+       - a folder the list does not have gets a ticked row, as the /folders seed
+         (MarkCmdLineSetSelectedFolders) gives it;
+       - the header's two counters are recounted from the rows.
+       What was ticked before, and which rows were added, stay in this object for RestoreBatchFolderTicks,
+       which ExitBatchWithCode sends - so nothing is left for the next Check or Plan run to inherit. Paths
+       are matched case-blind; a home-relative entry ("AppSrc") is resolved against the workspace home. */
+    Procedure ApplyBatchFolderTicks String[] asFolders
+        String[] asWant asWantLow asNames
+        Integer[] aiIDs aiBefore aiAdded
+        Boolean[] abSel
+        String sUserName sHome sHomeDir sFolder sPath sValue
+        Integer i iLast iRows iHeaderID
+        Boolean bLibInclude bErr bWant
+
+        If (SizeOfArray(asFolders) = 0) ;
+            Procedure_Return
+        Get psUsername of ghoApplication to sUserName
+        Get psHomeTarget of ghoApplication to sHome
+        If (sHome = "") ;
+            Procedure_Return
+
+        // The folder list, built when it never was.
+        Clear FolderSelHeaA
+        Move sUserName to FolderSelHeaA.UserName
+        Move sHome     to FolderSelHeaA.WorkspaceHomeFolder
+        Find eq FolderSelHeaA.WorkspaceHomeFolder
+        If (Found = False) Begin
+            Get ReadString of ghoApplication CS_Settings CS_IncludeLibFoldersKey "1" to sValue
+            Move (sValue <> "0") to bLibInclude
+            Get SaveNewHeaderAndChildRecords sHome bLibInclude to bErr
+            Clear FolderSelHeaA
+            Move sUserName to FolderSelHeaA.UserName
+            Move sHome     to FolderSelHeaA.WorkspaceHomeFolder
+            Find eq FolderSelHeaA.WorkspaceHomeFolder
+        End
+        If (Found = False) ;
+            Procedure_Return
+        Move FolderSelHeaA.ID to iHeaderID
+
+        Send SaveErrorState
+        // The command line's folders the way they are stored: no trailing separator, a home-relative name
+        // made full.
+        Get vFolderFormat sHome to sHomeDir
+        Move (SizeOfArray(asFolders) - 1) to iLast
+        For i from 0 to iLast
+            Move (Trim(asFolders[i])) to sFolder
+            If (sFolder <> "") Begin
+                If (Right(sFolder, 1) = CS_DirSeparator) ;
+                    Move (Left(sFolder, (Length(sFolder) - 1))) to sFolder
+                Get ParseFolderName sFolder to sPath
+                If (sPath = "") ;
+                    Move (sHomeDir + sFolder) to sFolder
+                If (SearchArray(Lowercase(sFolder), asWantLow) = -1) Begin
+                    Move sFolder              to asWant[SizeOfArray(asWant)]
+                    Move (Lowercase(sFolder)) to asWantLow[SizeOfArray(asWantLow)]
+                End
+            End
+        Loop
+
+        // Every row of the list as it is now, and what is ticked - kept for the restore.
+        Constraint_Set (Self + 12) Clear
+        Constrained_Clear eq FolderSelDtlA by Index.1
+        Constrain FolderSelDtlA.FolderSelHeaID eq iHeaderID
+        Constrained_Find First FolderSelDtlA by Index.1
+        Move 0 to iRows
+        While (Found)
+            Move FolderSelDtlA.ID                            to aiIDs[iRows]
+            Move (Lowercase(Trim(FolderSelDtlA.FolderName))) to asNames[iRows]
+            Move FolderSelDtlA.bSelected                     to abSel[iRows]
+            If (FolderSelDtlA.bSelected = True) ;
+                Move FolderSelDtlA.ID to aiBefore[SizeOfArray(aiBefore)]
+            Increment iRows
+            Constrained_Find Next
+        Loop
+
+        // Ticked exactly where the command line names the folder.
+        For i from 0 to (iRows - 1)
+            Move (SearchArray(asNames[i], asWantLow) <> -1) to bWant
+            If (bWant <> abSel[i]) ;
+                Send _SetFolderTick iHeaderID aiIDs[i] bWant
+        Loop
+
+        // A folder the list does not have gets a ticked row - the /folders seed's create, its ID from the
+        // header's ChildID counter (an alias save bypasses the DD's auto-increment).
+        Move (SizeOfArray(asWant) - 1) to iLast
+        For i from 0 to iLast
+            If (SearchArray(asWantLow[i], asNames) = -1) Begin
+                Clear FolderSelHeaA
+                Move iHeaderID to FolderSelHeaA.ID
+                Find eq FolderSelHeaA.ID
+                If (Found) Begin
+                    Reread FolderSelHeaA
+                        Increment FolderSelHeaA.ChildID
+                        SaveRecord FolderSelHeaA
+                        Clear FolderSelDtlA
+                        Move iHeaderID             to FolderSelDtlA.FolderSelHeaID
+                        Move asWant[i]             to FolderSelDtlA.FolderName
+                        Move FolderSelHeaA.ChildID to FolderSelDtlA.ID
+                        Move True                  to FolderSelDtlA.bSelected
+                        SaveRecord FolderSelDtlA
+                    Unlock
+                    Move FolderSelHeaA.ChildID to aiAdded[SizeOfArray(aiAdded)]
+                End
+            End
+        Loop
+        Send _RecountFolderTotals iHeaderID
+
+        Set piBatchHeaderID      to iHeaderID
+        Set paiBatchTickedBefore to aiBefore
+        Set paiBatchAdded        to aiAdded
+        Send RestoreErrorState
+    End_Procedure
+
+    /* Puts back what ApplyBatchFolderTicks changed: the rows it added go, every other row gets its earlier
+       tick, and the counters are recounted. Once only - a second call finds nothing to do. A folder list
+       the apply had to BUILD stays, unticked, the way the folder view would have built it on the next load. */
+    Procedure RestoreBatchFolderTicks
+        Integer[] aiBefore aiAdded aiIDs aiEmpty
+        Boolean[] abSel
+        Integer iHeaderID i iLast iRows
+        Boolean bWant
+
+        Get piBatchHeaderID to iHeaderID
+        If (iHeaderID = 0) ;
+            Procedure_Return
+        Set piBatchHeaderID to 0
+        Get paiBatchTickedBefore to aiBefore
+        Get paiBatchAdded        to aiAdded
+        Set paiBatchTickedBefore to aiEmpty
+        Set paiBatchAdded        to aiEmpty
+
+        Send SaveErrorState
+        Move (SizeOfArray(aiAdded) - 1) to iLast
+        For i from 0 to iLast
+            Clear FolderSelDtlA
+            Move iHeaderID  to FolderSelDtlA.FolderSelHeaID
+            Move aiAdded[i] to FolderSelDtlA.ID
+            Find eq FolderSelDtlA by Index.1
+            If (Found) Begin
+                Reread FolderSelDtlA
+                    Delete FolderSelDtlA
+                Unlock
+            End
+        Loop
+
+        Constraint_Set (Self + 12) Clear
+        Constrained_Clear eq FolderSelDtlA by Index.1
+        Constrain FolderSelDtlA.FolderSelHeaID eq iHeaderID
+        Constrained_Find First FolderSelDtlA by Index.1
+        Move 0 to iRows
+        While (Found)
+            Move FolderSelDtlA.ID        to aiIDs[iRows]
+            Move FolderSelDtlA.bSelected to abSel[iRows]
+            Increment iRows
+            Constrained_Find Next
+        Loop
+        For i from 0 to (iRows - 1)
+            Move (SearchArray(aiIDs[i], aiBefore) <> -1) to bWant
+            If (bWant <> abSel[i]) ;
+                Send _SetFolderTick iHeaderID aiIDs[i] bWant
+        Loop
+        Send _RecountFolderTotals iHeaderID
+        Send RestoreErrorState
+    End_Procedure
+
+    // One row's tick, written through the alias - which bypasses the DD's counting, so the callers recount.
+    { Visibility=Private }
+    Procedure _SetFolderTick Integer iHeaderID Integer iID Boolean bTick
+        Clear FolderSelDtlA
+        Move iHeaderID to FolderSelDtlA.FolderSelHeaID
+        Move iID       to FolderSelDtlA.ID
+        Find eq FolderSelDtlA by Index.1
+        If (Found) Begin
+            Reread FolderSelDtlA
+                Move bTick to FolderSelDtlA.bSelected
+                SaveRecord FolderSelDtlA
+            Unlock
+        End
+    End_Procedure
+
+    // The header's two counters, counted from its rows.
+    { Visibility=Private }
+    Procedure _RecountFolderTotals Integer iHeaderID
+        Integer iTotal iSelected
+
+        Move 0 to iTotal
+        Move 0 to iSelected
+        Constraint_Set (Self + 13) Clear
+        Constrained_Clear eq FolderSelDtlA by Index.1
+        Constrain FolderSelDtlA.FolderSelHeaID eq iHeaderID
+        Constrained_Find First FolderSelDtlA by Index.1
+        While (Found)
+            Increment iTotal
+            If (FolderSelDtlA.bSelected = True) ;
+                Increment iSelected
+            Constrained_Find Next
+        Loop
+        Clear FolderSelHeaA
+        Move iHeaderID to FolderSelHeaA.ID
+        Find eq FolderSelHeaA.ID
+        If (Found) Begin
+            Reread FolderSelHeaA
+                Move iTotal    to FolderSelHeaA.TotalFolders
+                Move iSelected to FolderSelHeaA.TotalSelected
+                SaveRecord FolderSelHeaA
+            Unlock
+        End
+    End_Procedure
 
 End_Class

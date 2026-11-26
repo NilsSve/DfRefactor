@@ -1,0 +1,211 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cFTManualBoard
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-02
+//
+// Description : FlexTron analyzer: the manual-fix board (rows the recipes cannot auto-fix),
+//               its markup and row state.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use FTDashIcons.pkg
+Use cFTTileMarkup.pkg
+Use FTMarkupBuilders.pkg         // the HTML vocabulary - OpenHtml, IconLabel, the builders
+Use RefactorConstants.h.pkg      // the CS_Id* click ids and the markup constants
+
+/*  cFTManualBoard - the MANUAL flow: the column that offers it, and the two actions behind it that
+    are more than a single Send.
+
+    LIFTED OUT OF THE DASHBOARD VIEW (2026-08-02) for the same reason the shared tiles were: a
+    second board wants to paint the manual column, and reaching into oDashboard_vw for it would
+    rebuild the coupling three slices of untangling removed - this time in the very thing meant to
+    make retiring that split board POSSIBLE.
+
+    The markup is pure (reads ghoApplication, returns HTML). The two actions are here because they
+    are not one-liners and duplicating them would let two boards drift: forcing workspace mode before
+    the setup views, and closing the compile dock before the single-file pick, are both hard-won and
+    commented where they are.
+
+    WHAT IS DELIBERATELY *NOT* HERE: "come back to my board and repaint". The old action ended by
+    activating oDashboard_vw and refreshing it, which is exactly the part that differs per caller -
+    so each board does its own return, and the shared half stops at the work.
+*/
+// Tooltips for the manual launcher tiles, moved with the column that splices them into its
+// markup (2026-08-02). Same no-double-quote rule as every other tip: a double quote would close
+// both the Define and the HTML title attribute it lands in.
+Define CS_SingleTileTip for "Refactor one source file on its own: pick the file, choose the refactoring functions, then run them. Click to choose the file."
+Define CS_ManualTileTip for "Choose exactly which refactoring functions to run, and on which source folders. Then run them with the Run Refactoring button below. Click to open Select Functions."
+Define CS_CleanupTileTip for "Open the function grid pre-filtered to the Tidy Up group - the tidy-up and conversion passes. Manual flow - finishes at the Run Refactoring button below. Click to open."
+Define CS_Unicode64TileTip for "Open the function grid pre-filtered to the x64 + Unicode group - the readiness reports and fixes for moving a legacy app to 64-bit + Unicode DataFlex. Manual flow - finishes at the Run Refactoring button below. Click to open."
+// The single-file mode's third pill (2026-09-17): the scan lane pointed at the picked file alone.
+Define CS_ScanFileTip for "Analyze this file for obsolete commands, functions and symbols - no compile needed - and load the findings into the Analyzer grid, where Run Fix Plan applies the matching refactor functions to this file only. Click to analyze."
+
+Class cFTManualBoard is a cObject
+
+    // One Manual launcher tile (2026-07-12 two-column redesign): a compact path-style tile that takes its OWN
+    // data-ServerOnClick id (single / manual / cleanup / unicode64) and carries NO corner flow badge (the
+    // column header names the flow). Disabled (no workspace) -> inert dash-tile-off with no carrier.
+    Function ManualTileHtml String sId String sTitle String sSub String sIcon String sAccent String sTip Boolean bEnabled Returns String
+        /* ElemHtml IS this tile: class + data-ServerOnClick + title when enabled, the "-off" class
+           and the title alone when not - the same attributes in the same order the two branches
+           below used to build by hand. The label carries ONE CS_DivEnd (for dash-txt); the tile's
+           own closer comes from ElemHtml, which returns a complete element. */
+        Function_Return (ElemHtml("div", ("dash-tile " + sAccent), ("dash-tile-off " + sAccent), sId, "" ;
+            , ((TileIcon(sIcon)) + (DivOpen("dash-txt")) + (TileHeading(sTitle)) + (TileParagraph(sSub)) + CS_DivEnd) ;
+            , sTip, bEnabled))
+    End_Function
+    // THE MANUAL COLUMN (2026-07-12 two-column redesign): one span-6 card = the four launcher tiles (Single /
+    // Manual on top, Tidy Up left / x64 + Unicode right below), the Queued-to-run pills (the old Selection
+    // tile, mode-aware), and the teal Run Refactoring button at the foot. ONE OnClick on oTile_ManualCol
+    // routes every id (single / manual / cleanup / unicode64 / folders / functions / file / startrefactor).
+    // Greyed until a workspace loads (tiles inert, no pills/run). Seeds its own design-time psHtml and is
+    // re-rendered by EnablePathTiles / RefreshSelection.
+    Function ManualColumnHtml Returns String
+        String  sWS sCard sTiles sQueued sRun sFile sFileBase sRunOffTip sScanPill
+        Integer iFolders iFuncs iPos
+        Boolean bEnabled bWsMode bStart
+
+        Get psSWSFile of ghoApplication to sWS
+        Move (sWS <> "") to bEnabled
+        If (bEnabled) ;
+            Move "dash-manual" to sCard
+        Else ;
+            Move "dash-manual dash-manual-off" to sCard
+        Move           (ManualTileHtml(Self, "single",    "Single file",      "Refactor one source file",        (DashIcon(CS_GlyphFile)),      "t-single",    CS_SingleTileTip,    bEnabled)) to sTiles
+        Move (sTiles + (ManualTileHtml(Self, "manual",    "Workspace mode",   "Pick folders &amp; functions",     (DashIcon(CS_GlyphListcheck)), "t-manual",    CS_ManualTileTip,    bEnabled))) to sTiles
+        // COMMENTED OUT (Nils 2026-07-13): the Tidy Up + x64 + Unicode launcher tiles don't belong here - those
+        // groups are just entries in the Select Functions list. Left in place (not deleted) for easy revert; the
+        // "cleanup"/"unicode64" OnClick ids still route (the Guided column's "then" band uses them).
+        // Move (sTiles + (ManualTileHtml(Self, "cleanup",   "Tidy Up",          "Tidy-up passes by group",         (DashIcon("sparkles")),  "t-cleanup",   CS_CleanupTileTip,   bEnabled))) to sTiles
+        // Move (sTiles + (ManualTileHtml(Self, "unicode64", "x64 + Unicode",    "Migration readiness &amp; fixes", (DashIcon("cpu")),       "t-unicode64", CS_Unicode64TileTip, bEnabled))) to sTiles
+        Move "" to sQueued
+        Move "" to sRun
+        If (bEnabled) Begin
+            Move SysFile.SelectedFunctionTotal to iFuncs
+            Get pbWorkspaceMode of ghoApplication to bWsMode
+            If (bWsMode = True) Begin
+                Get TotalSelectedFolders of (phoFolderSelHeaDD(ghoApplication)) to iFolders
+                Move ((DivOpen("dash-queued")) ;
+                    + (SpanOpen("dash-label")) + (DashIcon(CS_GlyphFoldercheck)) + 'Queued to run' + CS_SpanEnd ;
+                    + (DivOpen("dash-queued-pills")) ;
+                    + (SpanOpenClick("dash-sel-pill", CS_IdSelFolders, "", "")) ;
+                    + (SpanOpen("dash-sel-ico s-fold")) + (DashIcon(CS_GlyphFolder)) + CS_SpanEnd ;
+                    + (BoldText(String(iFolders))) + ' Folders selected' + CS_SpanEnd ;
+                    + (SpanOpenClick("dash-sel-pill", CS_IdSelFunctions, "", "")) ;
+                    + (SpanOpen("dash-sel-ico s-func")) + (DashIcon(CS_GlyphStack)) + CS_SpanEnd ;
+                    + (BoldText(String(iFuncs))) + ' Functions selected' + CS_SpanEnd ;
+                    + CS_DivEnd + CS_DivEnd) to sQueued
+                Move (iFuncs > 0 and iFolders <> 0) to bStart
+            End
+            Else Begin
+                Get psCurrentSourceFileName of ghoApplication to sFile
+                Move (RightPos("\", sFile)) to iPos
+                If (iPos > 0) ;
+                    Move (Right(sFile, (Length(sFile) - iPos))) to sFileBase
+                Else ;
+                    Move sFile to sFileBase
+                If (sFileBase = "") ;
+                    Move "(no file loaded)" to sFileBase
+                /* ANALYZE THIS FILE (Nils 2026-09-17): a very legacy file cannot be included in a
+                   program, so the guided Check is closed to it, and "which of the functions apply?"
+                   is exactly the question the picker leaves open. The scan lane answers it for one
+                   file: RunDeepScan reads single-file mode and scans the picked file alone, the
+                   findings load into the Analyzer grid, and Run Fix Plan runs on that file only.
+                   Only with a file loaded, and only while the scan lane ships (CB_DeepScanEnabled).
+
+                   HIDDEN FOR NOW (Nils 2026-10-12: "Yes, hide the pill for now."). Its last step, Run
+                   Fix Plan, is the Run Plan button of the Test Compile bar, and that button is hidden
+                   (CB_TestCompilePlanButtons): the click would end with findings on the grid and no
+                   button to turn them into a plan. So the pill follows the same switch, and comes back
+                   with the button. */
+                Move "" to sScanPill
+                If (sFile <> "" and CB_DeepScanEnabled = True and CB_TestCompilePlanButtons = True) ;
+                    Move ((SpanOpenClick("dash-sel-pill", CS_IdScanFile, "", CS_ScanFileTip)) ;
+                        + (SpanOpen("dash-sel-ico s-file")) + (DashIcon("scan")) + CS_SpanEnd ;
+                        + (BoldText("Analyze this file")) + ' for a fix plan' + CS_SpanEnd) to sScanPill
+                // BoldText escapes, which the hand-built <b> did not - and this one holds a FILE NAME.
+                // "R&D.src" is an ordinary name and an unescaped & is an HTML bug wherever it lands.
+                Move ((DivOpen("dash-queued")) ;
+                    + (SpanOpen("dash-label")) + (DashIcon(CS_GlyphFile)) + 'Queued to run' + CS_SpanEnd ;
+                    + (DivOpen("dash-queued-pills")) ;
+                    + (SpanOpenClick("dash-sel-pill", CS_IdSelFile, "", "")) ;
+                    + (SpanOpen("dash-sel-ico s-file")) + (DashIcon(CS_GlyphFile)) + CS_SpanEnd ;
+                    + (BoldText(sFileBase)) + CS_SpanEnd ;
+                    + (SpanOpenClick("dash-sel-pill", CS_IdSelFunctions, "", "")) ;
+                    + (SpanOpen("dash-sel-ico s-func")) + (DashIcon(CS_GlyphStack)) + CS_SpanEnd ;
+                    + (BoldText(String(iFuncs))) + ' Functions selected' + CS_SpanEnd ;
+                    + sScanPill ;
+                    + CS_DivEnd + CS_DivEnd) to sQueued
+                Move (iFuncs > 0) to bStart
+            End
+            If (bStart) ;
+                Move ((ClickableHtml("div", "dash-mrun", "startrefactor", "", ((DivOpen("dash-ico")) + (DashIcon(CS_GlyphPlaycircleline))), (CS_ActStartTip))) + (((DivOpen("dash-mrun-txt")) + (CS_SpanOpen + 'Run Refactoring')) + CS_SpanEnd + ((SpanOpen("dash-mrun-flow")) + 'Manual') + CS_SpanEnd + CS_DivEnd + CS_DivEnd)) to sRun
+            Else Begin
+                // Mode-aware enabling tip: single-file mode has NO folders to pick, only functions
+                // (the old shared tip wrongly told single-file users to "select source folders").
+                If (bWsMode = True) ;
+                    Move "Select source folders + refactoring functions above to enable Run Refactoring." to sRunOffTip
+                // The second way is named only while its pill is on the card.
+                Else If (sScanPill <> "") ;
+                    Move "Select refactoring functions above to enable Run Refactoring on the loaded file - or click Analyze this file and let the fix plan pick them." to sRunOffTip
+                Else ;
+                    Move "Select refactoring functions above to enable Run Refactoring on the loaded file." to sRunOffTip
+                Move ((DivOpenTip("dash-mrun-off", sRunOffTip)) + (TileIcon((DashIcon(CS_GlyphPlaycircleline)))) + (((DivOpen("dash-mrun-txt")) + (CS_SpanOpen + 'Run Refactoring')) + CS_SpanEnd + ((SpanOpen("dash-mrun-flow")) + 'Manual') + CS_SpanEnd + CS_DivEnd + CS_DivEnd)) to sRun
+            End
+        End
+        Function_Return ((DivOpen(sCard)) ;
+            + (DivOpen("dash-flow-head")) ;
+            + (SpanOpen("dash-flow-name")) + 'Manual' + CS_SpanEnd ;
+            + (SpanOpen("dash-flow-sub")) + 'you pick the folders &amp; functions yourself' + CS_SpanEnd ;
+            + CS_DivEnd ;
+            + (DivOpen("dash-m-tiles")) + sTiles + CS_DivEnd ;
+            + sQueued + sRun + CS_DivEnd)
+    End_Function
+
+    /* The Single File pick, minus the return. Closes the compile dock first (it belongs to the
+       compile loop and only confuses this flow), then realizes the editor BEFORE SelectSourceFile
+       so its LoadFile lands in a paged-in control - the first open showed empty otherwise.
+
+       The caller activates its own board afterwards and repaints the queued card; see the class
+       note. (Nils 2026-07-13 for the two orderings, 2026-08-02 for the split.) */
+    Procedure PickSingleFile
+        Send CloseCompileErrorDialog of (Client_Id(ghoCommandBars))
+        Send Activate_oEditorView_vw of (Client_Id(phoMainPanel(ghoApplication)))
+        Send SelectSourceFile of ghoApplication
+    End_Procedure
+
+    /* Open the manual setup pair for a function group.
+
+       Manual workspace / Tidy Up / x64 + Unicode are ALWAYS workspace-mode passes - they run across
+       the SELECTED SOURCE FOLDERS - so workspace mode is forced first: a prior single-file action
+       leaves pbWorkspaceMode False, which would skip the Folders step AND make the engine ask the
+       single-file question at Run (Nils 2026-07-13: "Manual workspace opened Select Functions, and
+       Run asked the single-file question").
+
+       Functions is activated FIRST so it is realized for the group pre-filter, Folders LAST so the
+       user LANDS on Folders - pick folders, then switch to functions. */
+    // Parameter is eGroup, NOT eFnGroup: that name is already Define eFnGroup for 7 (a meta-tag
+    // TYPE constant), and a parameter shadowing it is error 4332 "Symbol already defined |CI7".
+    Procedure OpenManualSetup Integer eGroup
+        Set pbWorkspaceMode of ghoApplication to True
+        Send Activate_oSelectFoldersView of (Client_Id(phoMainPanel(ghoApplication)))
+        Send Activate_oSelectFunctionsView of (Client_Id(phoMainPanel(ghoApplication)))
+        Send SetFnGroupFilter of oSelectFunctionsView eGroup
+        Send Switch_Next_View of (Client_Id(phoMainPanel(ghoApplication)))
+    End_Procedure
+
+End_Class
+
+// One instance. Both boards paint the manual column and run its actions through this handle.
+#IFNDEF ghoManualBoard
+    Global_Variable Handle ghoManualBoard
+    Move 0 to ghoManualBoard
+#ENDIF
+
+Object oManualBoard is a cFTManualBoard
+    Move Self to ghoManualBoard
+End_Object

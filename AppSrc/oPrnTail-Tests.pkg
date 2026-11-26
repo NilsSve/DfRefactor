@@ -1,0 +1,374 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oPrnTail-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-03
+//
+// Description : Unit tests for the PrnTail refactor function.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use CompileErrorParser.pkg
+Use CompileErrorParser.pkg       // the .err parser
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+    // Unit tests for the incremental .prn tail (the live-compile diagnostics harvest):
+    //   rfPrnDiagnosticKind / rfPrnTailConsume / rfPrnTailFlushCarry (CompileErrorParser.pkg)
+    //   rfReadFileSliceBytes (RefactorFileIO.pkg)
+    // All pure global functions - no app/engine state needed.
+    Object oPrnTail is a cTestFixture
+        Set psFunctionName to "PrnTailParser"
+
+        // Line classification: exactly ReadCompilerMessages' filter semantics.
+        { Published = True }
+        Procedure PrnTail_DiagnosticKind
+            Integer iKind
+
+            Get rfPrnDiagnosticKind "WARNING: 4533 Obsolete command: Sub. Use ..." to iKind
+            Send AssertIAreEqual 1 iKind
+            Get rfPrnDiagnosticKind "ERROR: 54 Argument must be an existing class name ..." to iKind
+            Send AssertIAreEqual 2 iKind
+            Get rfPrnDiagnosticKind "LINK ERROR: UNABLE TO ADD THE MANIFEST" to iKind
+            Send AssertIAreEqual 2 iKind
+            // A listing source-echo line and prose are NOT diagnostics.
+            Get rfPrnDiagnosticKind "75270>>>>>SYSDATE4 dDagensDatum" to iKind
+            Send AssertIAreEqual 0 iKind
+            Get rfPrnDiagnosticKind "End_Object" to iKind
+            Send AssertIAreEqual 0 iKind
+        End_Procedure
+
+        // One chunk holding listing noise + two diagnostics: only the diagnostics are harvested,
+        // trimmed, with the warn/err tallies split correctly.
+        { Published = True }
+        Procedure PrnTail_SingleChunkFilters
+            UChar[] ucaChunk ucaCarry
+            String[] asMsgs
+            Integer iWarn iErr iAdded
+            String sListing
+
+            Move ("75269>>>>>Some source echo" + (Character(13) + Character(10))) to sListing
+            Move (sListing + "WARNING: 4533 Obsolete command: Sysdate4. ON LINE: 1 (2) OF FILE: C:\x.vw" + (Character(13) + Character(10))) to sListing
+            Move (sListing + "    more listing noise" + (Character(13) + Character(10))) to sListing
+            Move (sListing + "ERROR: 54 Something ON LINE: 9 (9) OF FILE: C:\y.vw" + (Character(13) + Character(10))) to sListing
+            Get rfStringToUtf8Bytes sListing to ucaChunk
+            Move 0 to iWarn
+            Move 0 to iErr
+            Get rfPrnTailConsume (&ucaChunk) (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+            Send AssertIAreEqual 2 iAdded
+            Send AssertIAreEqual 2 (SizeOfArray(asMsgs))
+            Send AssertIAreEqual 1 iWarn
+            Send AssertIAreEqual 1 iErr
+            Send Assert (asMsgs[0] contains "WARNING: 4533")
+            Send Assert (asMsgs[1] contains "ERROR: 54")
+            Send AssertIAreEqual 0 (SizeOfArray(ucaCarry))
+        End_Procedure
+
+        // A diagnostic line SPLIT across two chunks reassembles via the byte carry - the seam is
+        // invisible to the harvest (this is the per-tick reality: chunks cut lines arbitrarily).
+        { Published = True }
+        Procedure PrnTail_LineSplitAcrossChunks
+            UChar[] ucaAll ucaA ucaB ucaCarry
+            String[] asMsgs
+            Integer iWarn iErr iAdded iSize iCut iIdx
+            String sListing
+
+            Move ("noise line" + (Character(13) + Character(10))) to sListing
+            Move (sListing + "WARNING: 4531 Obsolete String command: Ascii. Use Ascii() Function ON LINE: 7 (8) OF FILE: C:\z.rv" + (Character(13) + Character(10))) to sListing
+            Get rfStringToUtf8Bytes sListing to ucaAll
+            Move (SizeOfArray(ucaAll)) to iSize
+            // Cut INSIDE the WARNING line (30 bytes in = mid-word).
+            Move 30 to iCut
+            Move (ResizeArray(ucaA, iCut)) to ucaA
+            For iIdx from 0 to (iCut - 1)
+                Move ucaAll[iIdx] to ucaA[iIdx]
+            Loop
+            Move (ResizeArray(ucaB, (iSize - iCut))) to ucaB
+            For iIdx from iCut to (iSize - 1)
+                Move ucaAll[iIdx] to ucaB[iIdx - iCut]
+            Loop
+            Move 0 to iWarn
+            Move 0 to iErr
+            Get rfPrnTailConsume (&ucaA) (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+            Send Assert (SizeOfArray(ucaCarry) > 0)          // mid-line: the partial is carried as bytes
+            Get rfPrnTailConsume (&ucaB) (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+            Send AssertIAreEqual 1 (SizeOfArray(asMsgs))
+            Send AssertIAreEqual 1 iWarn
+            Send Assert (asMsgs[0] contains "command: Ascii")
+            Send AssertIAreEqual 0 (SizeOfArray(ucaCarry))
+        End_Procedure
+
+        // A listing that does NOT end with a line break: the final line sits in the carry until
+        // rfPrnTailFlushCarry (the DrainPrnTail end-of-compile step) processes it.
+        { Published = True }
+        Procedure PrnTail_FlushCarryLastLine
+            UChar[] ucaChunk ucaCarry
+            String[] asMsgs
+            Integer iWarn iErr iAdded
+            String sListing
+
+            Move ("noise" + (Character(13) + Character(10)) + "ERROR: 98 Illegal message ON LINE: 3 (4) OF FILE: C:\q.pkg") to sListing
+            Get rfStringToUtf8Bytes sListing to ucaChunk
+            Move 0 to iWarn
+            Move 0 to iErr
+            Get rfPrnTailConsume (&ucaChunk) (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+            Send AssertIAreEqual 0 (SizeOfArray(asMsgs))     // the ERROR line has no LF yet
+            Send Assert (SizeOfArray(ucaCarry) > 0)
+            Get rfPrnTailFlushCarry (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+            Send AssertIAreEqual 1 iAdded
+            Send AssertIAreEqual 1 iErr
+            Send Assert (asMsgs[0] contains "ERROR: 98")
+            Send AssertIAreEqual 0 (SizeOfArray(ucaCarry))
+        End_Procedure
+
+        // The shared parse (ExtractData) on a REAL DF25 listing WARNING line: typed bError=False AND
+        // the display text is prefixed "Warning <n>:" - the .err rows are all errors, so a hardcoded
+        // "Error" prefix went unnoticed until cached .prn warnings flowed through the same parser
+        // (they all rendered "Error 4536: ..." with the error glyph in the compiler output grid).
+        { Published = True }
+        Procedure PrnTail_WarningParsesAsWarning
+            tCompileError Parsed
+            Get ExtractData "WARNING: 4536 Obsolete Package Obsolete Package: Std_help.pkg. Use cHtmlHelp.pkg ON LINE: 6 (73817) OF FILE: C:\Program Files\DataFlex 25.0\Pkg\Std_help.pkg" to Parsed
+            Send Assert (Parsed.bError = False)
+            Send AssertIAreEqual 4536 Parsed.iErrorNo
+            Send AssertIAreEqual 6 Parsed.iLine
+            Send Assert (Left(Parsed.sText, 13) = "Warning 4536:")
+            // And an ERROR line keeps its prefix.
+            Get ExtractData "ERROR: 4332 Symbol already defined Attempt to redefine ON LINE: 22 (73981) OF FILE: C:\x.pkg" to Parsed
+            Send Assert (Parsed.bError = True)
+            Send Assert (Left(Parsed.sText, 11) = "Error 4332:")
+        End_Procedure
+
+        // The slice reader: offset + length honoured; a read past EOF truncates; a missing file = empty.
+        // ABSOLUTE path via phoWorkspace (the oEncodingHelpers-Tests convention): a relative name can
+        // resolve differently between the DataFlex channel that writes and the CreateFileW that reads.
+        { Published = True }
+        Procedure PrnTail_ReadFileSliceBytes
+            String sFile sDataPath
+            Integer iCh iVoid
+            UChar[] ucaSlice
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (sDataPath + "_PrnSliceTest.tmp") to sFile
+            Move (Seq_New_Channel()) to iCh
+            Send Assert (iCh >= 0)
+            Direct_Output channel iCh ("binary:" + sFile)
+            Write channel iCh "0123456789ABCDEF"
+            Close_Output channel iCh
+            Send Seq_Release_Channel iCh
+            // Middle slice.
+            Move (rfReadFileSliceBytes(sFile, 4, 6)) to ucaSlice
+            Send AssertIAreEqual 6 (SizeOfArray(ucaSlice))
+            Send AssertIAreEqual 52 ucaSlice[0]              // '4'
+            Send AssertIAreEqual 57 ucaSlice[5]              // '9'
+            // Past-EOF read truncates to what exists.
+            Move (rfReadFileSliceBytes(sFile, 10, 100)) to ucaSlice
+            Send AssertIAreEqual 6 (SizeOfArray(ucaSlice))   // "ABCDEF"
+            // Fully past EOF / missing file = empty.
+            Move (rfReadFileSliceBytes(sFile, 999, 10)) to ucaSlice
+            Send AssertIAreEqual 0 (SizeOfArray(ucaSlice))
+            Move (rfReadFileSliceBytes("no_such_file_xyz.tmp", 0, 10)) to ucaSlice
+            Send AssertIAreEqual 0 (SizeOfArray(ucaSlice))
+            Move (rfDeleteFile(sFile)) to iVoid
+        End_Procedure
+
+
+        // END-TO-END on a real file, because ReadCompilerMessages no longer walks a line array - it
+        // drives the same byte-chunk filter the live tail uses. That rewrite is why an Analyze went from
+        // 67 seconds to negligible on a 59 MB listing (Nils 2026-07-22), and the ONLY thing that matters
+        // is that it still returns exactly the diagnostics and nothing else. A listing interleaves the
+        // full source echo with the diagnostics, so the echo lines here must all be discarded - including
+        // one that MENTIONS a diagnostic word without starting with it.
+        {Published = True}
+        Procedure PrnTail_ReadCompilerMessages_FiltersListingToDiagnostics
+            Boolean bOk
+            Integer iVoid
+            String sDataPath sTempFile
+            String[] asWrite
+            tCompileError[] aMsgs
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (sDataPath + "_PrnTest.tmp") to sTempFile
+            Move "DataFlex 25.0 (64-bit) Command Line Compiler"                              to asWrite[0]
+            Move "     1>>>Use Windows.pkg"                                                  to asWrite[1]
+            Move "WARNING: 4534 Not Unicode safe ON LINE: 12 (99) OF FILE: C:\a.pkg"         to asWrite[2]
+            Move "     2>>>Move (Value(oX)) to i"                                            to asWrite[3]
+            Move "     3>>>// this line says ERROR: but is only an echo"                     to asWrite[4]
+            Move "ERROR: 4544 Ambiguous function in expression ON LINE: 20 (120) OF FILE: C:\b.pkg" to asWrite[5]
+            Move "     4>>>End_Object"                                                       to asWrite[6]
+            Get rfWriteEncodedFileFromStringArray (&asWrite) sTempFile C_NewLine False to bOk
+            Send Assert bOk
+            Get ReadCompilerMessages sTempFile to aMsgs
+            // Two diagnostics out of seven lines; the source echo, the banner and the line that merely
+            // contains "ERROR:" partway through are all discarded.
+            Send Assert (SizeOfArray(aMsgs) = 2)
+            Send Assert (aMsgs[0].iErrorNo = 4534)
+            Send Assert (aMsgs[1].iErrorNo = 4544)
+            Send AssertSAreEqual "C:\b.pkg" aMsgs[1].sFileName
+            Move (rfDeleteFile(sTempFile)) to iVoid
+        End_Procedure
+
+        // A listing whose last line IS a diagnostic and carries no trailing newline - the carry-flush
+        // path. Dropping it would silently lose the final error of every compile that ends on one.
+        {Published = True}
+        Procedure PrnTail_ReadCompilerMessages_KeepsUnterminatedLastLine
+            Boolean bOk
+            Integer iVoid iCh
+            String sDataPath sTempFile
+            tCompileError[] aMsgs
+
+            Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+            Move (sDataPath + "_PrnTest2.tmp") to sTempFile
+            Get rfOpenOutput sTempFile to iCh
+            Send Assert (iCh >= 0)
+            Write channel iCh ("     1>>>Use Windows.pkg" + Character(13) + Character(10))
+            Write channel iCh "ERROR: 4390 Illegal method name definition ON LINE: 7 (42) OF FILE: C:\c.pkg"
+            Send rfCloseOutput iCh
+            Get ReadCompilerMessages sTempFile to aMsgs
+            Send Assert (SizeOfArray(aMsgs) = 1)
+            Send Assert (aMsgs[0].iErrorNo = 4390)
+            Move (rfDeleteFile(sTempFile)) to iVoid
+        End_Procedure
+
+        /* A LISTING WITH NO BOM, AS THE CLASSIC COMPILER WRITES IT (2026-10-03): the source echo is in
+           the sources' own OEM code page and the diagnostics are in UTF-8. The tests below build such
+           bytes by hand - an OEM a-ring is the single byte 134, a UTF-8 one is Character(229) through
+           rfStringToUtf8Bytes - and hand them to the tail with bUtf8 False, as it reads that listing. */
+
+        // Appends ucaFrom to ucaTo.
+        Procedure _AppendBytes UChar[] ByRef ucaTo UChar[] ByRef ucaFrom
+            Integer i iLast
+            Move (SizeOfArray(ucaFrom) - 1) to iLast
+            For i from 0 to iLast
+                Move ucaFrom[i] to ucaTo[-1]
+            Loop
+        End_Procedure
+
+        // The Swedish 4306 line of a real listing, with its letter as a String (UTF-8 inside).
+        Function _SwedishErrorLine Returns String
+            Function_Return ("ERROR: 4306 Hittar ej fram" + Character(229) + "t referens  MSG_DODELETECURRENTROW ON LINE: 697 (329713) OF FILE: E:\x\SENDMSG.DG")
+        End_Function
+
+        // A diagnostic found mid-chunk, after an echo line carrying an OEM letter: the diagnostic's
+        // letter comes back as that letter - read as OEM it was two box characters on the Check's
+        // findings - and the echo line stays out of the harvest.
+        { Published = True }
+        Procedure PrnTail_Utf8DiagnosticInAnOemListing
+            UChar[] ucaChunk ucaPart ucaCarry
+            String[] asMsgs
+            Integer iWarn iErr iAdded
+            String sCrLf
+
+            Move (Character(13) + Character(10)) to sCrLf
+            Get rfStringToUtf8Bytes "1>// fram" to ucaChunk
+            Move 134 to ucaChunk[-1]
+            Get rfStringToUtf8Bytes ("t" + sCrLf + (_SwedishErrorLine(Self)) + sCrLf) to ucaPart
+            Send _AppendBytes (&ucaChunk) (&ucaPart)
+            Move 0 to iWarn
+            Move 0 to iErr
+            Get rfPrnTailConsume (&ucaChunk) (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+            Send AssertIAreEqual 1 (SizeOfArray(asMsgs))
+            Send AssertIAreEqual 1 iErr
+            If (SizeOfArray(asMsgs) = 1) ;
+                Send AssertSAreEqual (_SwedishErrorLine(Self)) asMsgs[0]
+            // The control: the line as the OEM decode alone leaves it is NOT the line expected, so the
+            // assertion above fails when the re-read goes.
+            Get rfStringToUtf8Bytes (_SwedishErrorLine(Self)) to ucaPart
+            Send Assert ((rfOemBytesToUtf8(ucaPart)) <> (_SwedishErrorLine(Self))) "the OEM decode alone gives a different line"
+        End_Procedure
+
+        // The same line as the FIRST line of a chunk - the region's first line is read on its own path.
+        { Published = True }
+        Procedure PrnTail_Utf8DiagnosticAsTheChunksFirstLine
+            UChar[] ucaChunk ucaCarry
+            String[] asMsgs
+            Integer iWarn iErr iAdded
+
+            Get rfStringToUtf8Bytes ((_SwedishErrorLine(Self)) + Character(13) + Character(10)) to ucaChunk
+            Move 0 to iWarn
+            Move 0 to iErr
+            Get rfPrnTailConsume (&ucaChunk) (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+            Send AssertIAreEqual 1 (SizeOfArray(asMsgs))
+            If (SizeOfArray(asMsgs) = 1) ;
+                Send AssertSAreEqual (_SwedishErrorLine(Self)) asMsgs[0]
+        End_Procedure
+
+        // A chunk that ends between the letter's two bytes: the carried line is put back together as
+        // BYTES, and the joined line reads as UTF-8 too.
+        { Published = True }
+        Procedure PrnTail_Utf8LetterSplitAcrossChunks
+            UChar[] ucaAll ucaA ucaB ucaCarry
+            String[] asMsgs
+            Integer iWarn iErr iAdded iSize iCut iIdx
+
+            Get rfStringToUtf8Bytes ("noise" + Character(13) + Character(10) + (_SwedishErrorLine(Self)) + Character(13) + Character(10)) to ucaAll
+            Move (SizeOfArray(ucaAll)) to iSize
+            // The cut falls after the a-ring's FIRST byte (195): find it, then cut one past it.
+            Move -1 to iCut
+            For iIdx from 0 to (iSize - 1)
+                If (iCut = -1 and ucaAll[iIdx] = 195) ;
+                    Move (iIdx + 1) to iCut
+            Loop
+            Send Assert (iCut > 0) "the test line carries the two-byte letter"
+            If (iCut > 0) Begin
+                For iIdx from 0 to (iCut - 1)
+                    Move ucaAll[iIdx] to ucaA[-1]
+                Loop
+                For iIdx from iCut to (iSize - 1)
+                    Move ucaAll[iIdx] to ucaB[-1]
+                Loop
+                Move 0 to iWarn
+                Move 0 to iErr
+                Get rfPrnTailConsume (&ucaA) (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+                Get rfPrnTailConsume (&ucaB) (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+                Send AssertIAreEqual 1 (SizeOfArray(asMsgs))
+                If (SizeOfArray(asMsgs) = 1) ;
+                    Send AssertSAreEqual (_SwedishErrorLine(Self)) asMsgs[0]
+            End
+        End_Procedure
+
+        // The listing's last line, without a line break, through the flush at the end of a compile.
+        { Published = True }
+        Procedure PrnTail_Utf8DiagnosticInTheFlushedLastLine
+            UChar[] ucaChunk ucaCarry
+            String[] asMsgs
+            Integer iWarn iErr iAdded
+
+            Get rfStringToUtf8Bytes ("noise" + Character(13) + Character(10) + (_SwedishErrorLine(Self))) to ucaChunk
+            Move 0 to iWarn
+            Move 0 to iErr
+            Get rfPrnTailConsume (&ucaChunk) (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+            Get rfPrnTailFlushCarry (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+            Send AssertIAreEqual 1 (SizeOfArray(asMsgs))
+            If (SizeOfArray(asMsgs) = 1) ;
+                Send AssertSAreEqual (_SwedishErrorLine(Self)) asMsgs[0]
+        End_Procedure
+
+        // An older compiler's diagnostic, written in OEM, still reads as OEM: its single extended byte is
+        // not valid UTF-8, so the line keeps the OEM decode. The expected letter comes from the same OEM
+        // decode, so the test holds on any OEM code page.
+        { Published = True }
+        Procedure PrnTail_OemDiagnosticStaysOem
+            UChar[] ucaChunk ucaPart ucaOne
+            UChar[] ucaCarry
+            String[] asMsgs
+            Integer iWarn iErr iAdded
+            String sTail sExpect
+
+            Move " referens  MSG_X ON LINE: 1 (2) OF FILE: E:\x\A.DG" to sTail
+            Get rfStringToUtf8Bytes "ERROR: 4306 Hittar ej fram" to ucaChunk
+            Move 134 to ucaChunk[-1]
+            Get rfStringToUtf8Bytes ("t" + sTail + Character(13) + Character(10)) to ucaPart
+            Send _AppendBytes (&ucaChunk) (&ucaPart)
+            Move 134 to ucaOne[0]
+            Move ("ERROR: 4306 Hittar ej fram" + (rfOemBytesToUtf8(ucaOne)) + "t" + sTail) to sExpect
+            Move 0 to iWarn
+            Move 0 to iErr
+            Get rfPrnTailConsume (&ucaChunk) (&ucaCarry) False (&asMsgs) (&iWarn) (&iErr) to iAdded
+            Send AssertIAreEqual 1 (SizeOfArray(asMsgs))
+            If (SizeOfArray(asMsgs) = 1) ;
+                Send AssertSAreEqual sExpect asMsgs[0]
+        End_Procedure
+
+    End_Object

@@ -1,0 +1,164 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oIndicatorDispatchSequence-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-04
+//
+// Description : THE SHAPE THIS SUITE WAS MISSING. Every other fixture drives ONE function over ONE line:
+//               Get Tokenizer, call the converter, assert. Two real defects lived outside that shape and
+//               all 1850 tests passed over them (Nils, 2026-08-04, one TestBench run over LegacyCode.pkg):
+//
+//                 1. A bare "Indicate <target> as <expr>" produced "Move (<expr>) to Indicate" - the command
+//                    word itself as the assignment target. Eight occurrences, including "Indicate Found as
+//                    True", which is the worked example in ChangeLegacyIndicators' own {Description}.
+//                    Single-function, but no fixture ever fed it a line STARTING with Indicate.
+//                 2. ChangeLegacyIndicators composes a THREE-LINE block into the engine's single-line slot.
+//                    The engine re-tokenizes it as one line, and the next line-by-line converter then reads
+//                    the block as one statement - SplitInlineIfElseLine wrote a ";" after its Begin and
+//                    indented the body twice. That defect exists ONLY in the hand-off between two functions,
+//                    so no single-function fixture can reach it.
+//
+//               RunLineThrough below is the missing instrument: it drives a line through an ORDERED list of
+//               converters the way cRefactorEngine does - re-tokenizing between each, because that
+//               re-tokenize is precisely what turns a composed block into "one line" for the next function.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+    Object oIndicatorDispatchSequence is a cTestFixture
+        Set psFunctionName to "Indicator dispatch sequence"
+
+        /* Mirror of the engine's per-line loop: tokenize, dispatch, re-tokenize, dispatch...
+           Eval("get_" - name) is the same resolution cRefactorEngine.eStandardFunctions uses. */
+        Function RunLineThrough String sLine String[] asFns Returns String
+            Integer i iLast iFunctionID
+            Boolean bChanged
+            tTokenizer TokenizerData
+
+            Move (SizeOfArray(asFns) - 1) to iLast
+            For i from 0 to iLast
+                Get Tokenizer of ghoFuncLib sLine to TokenizerData
+                Move (Eval("get_" - (Lowercase(Trim(asFns[i]))))) to iFunctionID
+                Get iFunctionID of ghoFuncLib (&sLine) "" to bChanged
+            Loop
+            Function_Return sLine
+        End_Function
+
+        // ---- 1. the command word must never become the assignment target ----
+
+        // 'Indicate <target> as <expr>' - the form the function's own {Description} documents.
+        {Published = True}
+        Procedure IndSeq_AsFormTargetsTheIndicatorNotTheCommand
+            String sLine
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Move "    Indicate USE_PO as sOne EQ 'Y'" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeLegacyIndicators of ghoFuncLib (&sLine) "" to bChanged
+            Send Assert (not(Lowercase(sLine) contains "to indicate"))
+            // prefix-agnostic: the indicator may be gb-prefixed, so anchor on the tail
+            Send Assert (Right(RTrim(sLine), 6) = "USE_PO")
+        End_Procedure
+
+        {Published = True}
+        Procedure IndSeq_AsFormWithSystemBoolean
+            String sLine
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Move "    Indicate Found as True" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeLegacyIndicators of ghoFuncLib (&sLine) "" to bChanged
+            Send Assert (not(Lowercase(sLine) contains "to indicate"))
+            Send Assert (Right(RTrim(sLine), 5) = "Found")
+        End_Procedure
+
+        // The no-"as" form: 'Indicate <target> <value>'.
+        {Published = True}
+        Procedure IndSeq_NoAsFormTargetsTheIndicator
+            String sLine
+            Boolean bChanged
+            tTokenizer TokenizerData
+            Move "Indicate Login_Successful False" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeLegacyIndicators of ghoFuncLib (&sLine) "" to bChanged
+            Send Assert (not(Lowercase(sLine) contains "to indicate"))
+        End_Procedure
+
+        // ---- 2. a composed block must survive the NEXT converter ----
+
+        /* The block ChangeLegacyIndicators builds is three lines in one string. Handed to
+           SplitInlineIfElseLine it used to come back as "If (...) Begin;" with the body indented
+           twice - the ";" turns Begin into a line continuation, which is a compile error, not a
+           cosmetic wart. */
+        {Published = True}
+        Procedure IndSeq_ComposedBlockSurvivesTheSplitter
+            String sLine sOut
+            String[] asFns
+            Move "ChangeLegacyIndicators" to asFns[0]
+            Move "SplitInlineIfElseLine"  to asFns[1]
+            Move '        [Found] If (sResult <>"") Indicate Found as Functions.Function_Name eq sData' to sLine
+            Get RunLineThrough sLine asFns to sOut
+            Send Assert (not(sOut contains "Begin;"))
+            Send Assert (not(sOut contains "Begin ;"))
+        End_Procedure
+
+        // Order matters: the splitter alone on the same source line is still free to act.
+        // This pins that the guard keys off the composed BLOCK, not off the line's text.
+        {Published = True}
+        Procedure IndSeq_SplitterAloneStillWorksOnAPlainInlineIf
+            String sLine sOut
+            String[] asFns
+            Move "SplitInlineIfElseLine" to asFns[0]
+            Move "    If (bReady) Send DoIt" to sLine
+            Get RunLineThrough sLine asFns to sOut
+            Send Assert (not(sOut contains "Begin;"))
+        End_Procedure
+
+        /* THE CONDITION THE ENGINE ACTUALLY RUNS UNDER, which no other fixture reproduces.
+
+           _IsListedWord decides "this token is a keyword, so it cannot be a boolean" from the
+           keyword arrays, and those are seeded from the LOADED DataFlex language catalogue. In
+           UnitTests that seed happens to contain "Indicate"; in DFRefactor and TestBench,
+           targeting DF25/26, it does NOT - the catalogue lists 290 keywords and Indicate is not
+           among them, because the command is obsolete. So the funclib answers differently in the
+           two programs, and the bug is invisible to a fixture that trusts the default seed.
+
+           This test strips Indicate from the arrays to recreate a modern catalogue, which is what
+           makes it go red without the parser guard. Restores them afterwards; TearDown's
+           _InitializeFuncLib re-seeds regardless. */
+        {Published = True}
+        Procedure IndSeq_TargetIsRightEvenWhenIndicateIsNotAKeyword
+            String sLine
+            String[] asKeep asStrip asCmdKeep asCmdStrip
+            Boolean bChanged
+            Integer i iLast
+            tTokenizer TokenizerData
+
+            Get pasKeyWords of ghoFuncLib to asKeep
+            Get pasCommands of ghoFuncLib to asCmdKeep
+            Move (SizeOfArray(asKeep) - 1) to iLast
+            For i from 0 to iLast
+                If (Lowercase(Trim(asKeep[i])) <> "indicate") ;
+                    Move asKeep[i] to asStrip[SizeOfArray(asStrip)]
+            Loop
+            Move (SizeOfArray(asCmdKeep) - 1) to iLast
+            For i from 0 to iLast
+                If (Lowercase(Trim(asCmdKeep[i])) <> "indicate") ;
+                    Move asCmdKeep[i] to asCmdStrip[SizeOfArray(asCmdStrip)]
+            Loop
+            Set pasKeyWords of ghoFuncLib to asStrip
+            Set pasCommands of ghoFuncLib to asCmdStrip
+
+            Move "    Indicate USE_PO as sOne EQ 'Y'" to sLine
+            Get Tokenizer of ghoFuncLib sLine to TokenizerData
+            Get ChangeLegacyIndicators of ghoFuncLib (&sLine) "" to bChanged
+
+            Set pasKeyWords of ghoFuncLib to asKeep
+            Set pasCommands of ghoFuncLib to asCmdKeep
+
+            Send Assert (not(Lowercase(sLine) contains "to indicate"))
+            Send Assert (Right(RTrim(sLine), 6) = "USE_PO")
+        End_Procedure
+
+    End_Object

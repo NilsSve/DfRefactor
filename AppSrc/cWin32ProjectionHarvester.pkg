@@ -1,0 +1,1203 @@
+//****************************************************************************
+// $Module type: Class
+// $Module name: cWin32ProjectionHarvester
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-28
+//
+// Description : MAINTAINER TOOL ENGINE - the DataFlex port of Tools\HarvestWin32Projection.py.
+//
+//               Reads a local clone of Win32_DataFlex_Projection (Frank Cheng, MIT - generated
+//               from Microsoft's win32metadata) and merges "DF|"-flavoured rows into
+//               Data\WinAPICatalog.json and Data\WinAPIStructCatalog.json. The Python tool's
+//               contract is ported rule for rule; where a rule has a WHY, it is restated here so
+//               this file stands alone:
+//
+//               INTERSECTION, NOT ALL 18,300. The Deep Scan runs one catalogue lookup per
+//               External_Function declaration, so the working set is the entry points the
+//               corpus scan actually found (AppSrc\WindowsAPI.json); pbHarvestAll opts into
+//               everything, accepting the cost knowingly.
+//
+//               HOW WELL THE PROJECTION FITS REAL LEGACY CODE (measured 2026-08-28, before the
+//               first harvest; kept here because it cannot be re-derived from this repo). About
+//               thirty real legacy workspaces of 1990s-2010s production code were scanned for
+//               every External_Function they declare: 1,310 distinct Windows entry points across
+//               ~17,700 declarations. The projection covers 98% of those entry points and over
+//               99% of the declarations; the only misses were the winspool family and
+//               GlobalDiscard. That number is why this catalogue is worth maintaining at all -
+//               and it is the yardstick for any future claim that some other source would serve
+//               better.
+//
+//               NORMALISATION:
+//                 * Pointer -> Handle where the projection's C comment names a handle type
+//                   (H[A-Z0-9_]+, excluding HRESULT/HFILE which are integers). Legacy code says
+//                   Handle; harvesting Pointer verbatim would make the retyper churn it.
+//                 * VOID returns arrive SPELLED, and are kept that way. Upstream cec3389
+//                   (2026-08-30) made void explicit as "Returns Void_Type" - which is real
+//                   DataFlex, declared that way by Winkern.pkg and MapiDllCalls.Pkg in the
+//                   install - so there is nothing left to infer. An explicit "// void" comment
+//                   normalises to that same spelling, so the catalogue says void exactly one way.
+//                   A bare, uncommented "Returns Pointer" is now left ALONE. It used to mean
+//                   void (verified across all 1,384 bare rows at head 7319adc) and was mapped to
+//                   Returns Integer, after harvesting it verbatim broke every call site storing
+//                   the meaningless result (WinServ KeyStroke, 2026-08-28). That inference is
+//                   retired with the shape it read: at cec3389 there are ZERO bare rows and all
+//                   1,427 pointer returns carry their C type, so a bare row reappearing would be
+//                   a genuine pointer whose comment has not landed yet - and calling it Integer
+//                   would truncate an address on x64, the very defect this tool hunts. Guessing
+//                   wrong toward Pointer merely declines to improve a declaration.
+//                 * Function declarations flatten to ONE line (the consumers' contract);
+//                   struct bodies KEEP their newlines (member boundaries are meaningful).
+//
+//               STRUCT CLOSURE: a harvested function pulls the structs its comments name, and
+//               each struct pulls the struct types among its members - FILETIME arrives because
+//               WIN32_FIND_DATAW carries three of them. Nothing else, without pbHarvestAll.
+//
+//               WITH pbHarvestAll, EVERY NAMED STRUCT (2026-11-04). The closure can never reach what
+//               travels through SendMessage's lParam and WM_NOTIFY: no prototype names NMHDR,
+//               NMLISTVIEW, LVHITTESTINFO or TVITEM. Reaching them takes a clone at 8c132ef or later;
+//               cec3389 (2026-08-29) translated only the structs its APIs needed, 2,892 of them and
+//               none of those. Measured at 8c132ef: 15,206 structs, of which 12,785 named.
+//
+//               A NAME THE PROJECTION MADE UP IS NOT HARVESTED (_IsGeneratedStructName). From
+//               8c132ef on, a union or an anonymous nested struct is a type of its own, numbered
+//               in generation order: _Anonymous_e__Union_2975. No source can name one, the number
+//               moves with every regeneration, and DataFlex ships no twin to emit it as. A row that
+//               has such a member is still harvested, because its name and its first members are
+//               real; the converter cannot write it, so a Type that names it keeps its own member types.
+//
+//               MERGE: a harvested FUNCTION (dll|entry) replaces the existing row. A harvested
+//               STRUCT (NAME) never does, it is only added (_RowsNotCarried): 8c132ef rewrites 331
+//               of the rows this catalogue holds, most of them from a byte block every consumer
+//               can read to one of those numbered types nothing can. To take a newer row on
+//               purpose, delete the old one first. Every identity the harvest does not carry -
+//               the winspool family, hand-added rows - stays untouched. Re-running is idempotent.
+//               Rows are written KEY-sorted (the same order the Python tool wrote, so a re-run
+//               diffs clean); the funclib re-sorts on load anyway, so file order is cosmetic.
+//
+//               ALL PATHS ARE EXPLICIT PARAMETERS so the unit tests never touch the real files,
+//               exactly as cWinAPICatalogStore does.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use vWin32fh.pkg                 // vFolderFormat / vFilePathExists
+Use cEncodingHelpers.pkg         // rfFileSize - RefactorFileIO needs it defined first
+Use RefactorFileIO.pkg           // rfFileSearchRecursive / rfReadEncodedFileAsStringArray / channel I/O
+Use cJsonObject.pkg
+Use JsonEnhancement.pkg          // MemberEnh / MemberValueEnh
+Use cWinAPICatalogStore.pkg      // LoadCatalog - the ONE reader for the catalogue files
+
+/* The one Windows call the alias measurement makes (2026-09-12, see BareAliasRows). GetProcAddress
+   has no A/W twin of its own and takes an ANSI name, so String is right; it answers a CODE ADDRESS,
+   so LongPtr is right on both bitnesses and ONE declaration covers them. LoadLibrary comes from the
+   install (Winkern.pkg); nothing is freed - a system dll that answered once stays mapped for the
+   run, and this is a maintainer tool that exits straight after. */
+External_Function HarvGetProcAddress "GetProcAddress" Kernel32.dll ;
+    Handle hModule String lpProcName Returns LongPtr
+
+// One parsed projection function. Parallel param arrays are written in lockstep by the one
+// parser below and never elsewhere.
+Struct tW32ProjFn
+    String   sName
+    String   sEntry
+    String   sDll
+    String[] asParamType
+    String[] asParamName
+    String[] asParamComment
+    String   sRet
+    String   sRetComment
+End_Struct
+
+Class cWin32ProjectionHarvester is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // --all: harvest every projection function and every named struct, instead of the corpus
+        // intersection and the structs it reaches.
+        Property Boolean pbHarvestAll False
+    End_Procedure
+
+    // Whitespace-split into non-blank tokens (tabs count as whitespace).
+    Procedure _Tokens String sText String[] ByRef asTok
+        String[] asRaw asNone
+        Integer i iLast
+
+        Move asNone to asTok
+        Move (Replaces((Character(9)), sText, " ")) to sText
+        Move (StrSplitToArray(Trim(sText), " ")) to asRaw
+        Move (SizeOfArray(asRaw) - 1) to iLast
+        For i from 0 to iLast
+            If (Trim(asRaw[i]) <> "") ;
+                Move (Trim(asRaw[i])) to asTok[SizeOfArray(asTok)]
+        Loop
+    End_Procedure
+
+    // The C comment names a HANDLE type: 'H' then uppercase letters/digits/underscores, a
+    // trailing '*' tolerated. HRESULT and HFILE look the part and are integers - excluded by
+    // list, not pattern. Case-sensitive on purpose: the projection writes C type names.
+    Function _IsHandleComment String sComment Returns Boolean
+        String sC sCh
+        Integer i iLen iAsc
+
+        Move (Trim(sComment)) to sC
+        While (Right(sC, 1) = "*")
+            Move (Trim(Left(sC, (Length(sC) - 1)))) to sC
+        Loop
+        Move (Length(sC)) to iLen
+        If (iLen < 2) ;
+            Function_Return False
+        If (Ascii(Left(sC, 1)) <> 72) ;                      // 'H', exactly - case-sensitive
+            Function_Return False
+        For i from 2 to iLen
+            Move (Mid(sC, 1, i)) to sCh
+            Move (Ascii(sCh)) to iAsc
+            If (not((iAsc >= 65 and iAsc <= 90) or (iAsc >= 48 and iAsc <= 57) or sCh = "_")) ;
+                Function_Return False
+        Loop
+        If (sC = "HRESULT" or sC = "HFILE") ;
+            Function_Return False
+        Function_Return True
+    End_Function
+
+    Function NormaliseType String sType String sComment Returns String
+        If (sType = "Pointer" and _IsHandleComment(Self, sComment)) ;
+            Function_Return "Handle"
+        Function_Return sType
+    End_Function
+
+    // Void is SPELLED upstream now, not inferred from a bare Pointer (see the header). An
+    // explicit "// void" comment - one of the two remedies the 2026-08-28 issue proposed, and
+    // not the one Frank took - normalises to the same Void_Type the generator emits, so the
+    // catalogue never carries two spellings of one fact for _IsVoidApiReturn to have to know.
+    Function NormaliseReturn String sType String sComment Returns String
+        If (Lowercase(Trim(sComment)) = "void") ;
+            Function_Return "Void_Type"
+        Function_Return (NormaliseType(Self, sType, sComment))
+    End_Function
+
+    // Tokens iFrom.. joined with single spaces (the multi-token parameter-name case).
+    Function JoinTokensFrom String[] ByRef asTok Integer iFrom Returns String
+        String sOut
+        Integer i iLast
+
+        Move "" to sOut
+        Move (SizeOfArray(asTok) - 1) to iLast
+        For i from iFrom to iLast
+            If (sOut = "") ;
+                Move asTok[i] to sOut
+            Else ;
+                Move (sOut + " " + asTok[i]) to sOut
+        Loop
+        Function_Return sOut
+    End_Function
+
+    // Word-shaped, the original tool's \w+ : letters, digits and underscores only. The clone
+    // holds exactly one ordinal-named declaration ('External_Function #660 "#660" SHELL32.dll',
+    // FileIconInit, still there at cec3389) - the original tool rejected it and so does this.
+    //
+    // NOT because it fails to compile. It was long assumed "#660 cannot be a DataFlex
+    // identifier"; measured 2026-08-30, DataFlex 26 accepts it in BOTH the declaration and the
+    // call site ("Move (#660(1)) to iX" builds), with a deliberate bad symbol in the same file
+    // still raising Error 4328 - so the compile really was exercised. The skip stands on its own
+    // merit: an ordinal-only export has no name for a legacy declaration to match against, which
+    // is the only thing this catalogue is for.
+    Function _IsWordName String sName Returns Boolean
+        String sCh
+        Integer i iLen iAsc
+
+        Move (Length(sName)) to iLen
+        If (iLen = 0) ;
+            Function_Return False
+        For i from 1 to iLen
+            Move (Mid(sName, 1, i)) to sCh
+            Move (Ascii(sCh)) to iAsc
+            If (not((iAsc >= 65 and iAsc <= 90) or (iAsc >= 97 and iAsc <= 122) or (iAsc >= 48 and iAsc <= 57) or sCh = "_")) ;
+                Function_Return False
+        Loop
+        Function_Return True
+    End_Function
+
+    // Linear exact-match contains (small arrays; the sorted variant serves the big ones).
+    Function _PlainContains String[] ByRef asList String sKey Returns Boolean
+        Integer i iLast
+        Move (SizeOfArray(asList) - 1) to iLast
+        For i from 0 to iLast
+            If (asList[i] = sKey) ;
+                Function_Return True
+        Loop
+        Function_Return False
+    End_Function
+
+    /* A struct name the projection generated rather than Windows declaring it: "_Anonymous_e__Union_2975",
+       "_BitField_1843", "__DummyPinType__". Windows' own names with a leading underscore (_URB_HEADER, __UPV)
+       are not. PURE. */
+    Function _IsGeneratedStructName String sName Returns Boolean
+        String sTail
+        Integer iAt i iLast
+
+        If (Left(sName, 1) <> "_") ;
+            Function_Return False
+        If (Pos("_e__", Lowercase(sName)) > 0) ;
+            Function_Return True
+        If (Left(sName, 2) = "__" and Right(sName, 2) = "__") ;
+            Function_Return True
+        Move (RightPos("_", sName)) to iAt
+        Move (Right(sName, (Length(sName) - iAt))) to sTail
+        Move (Length(sTail)) to iLast
+        If (iLast = 0) ;
+            Function_Return False
+        For i from 1 to iLast
+            If (Pos(Mid(sTail, 1, i), "0123456789") = 0) ;
+                Function_Return False
+        Loop
+        Function_Return True
+    End_Function
+
+    // The asAllNames element index whose name matches sNameLC case-insensitively, or -1.
+    Function _StructIndexOf String[] ByRef asAllNames String sNameLC Returns Integer
+        Integer i iLast
+        Move (SizeOfArray(asAllNames) - 1) to iLast
+        For i from 0 to iLast
+            If (Lowercase(asAllNames[i]) = sNameLC) ;
+                Function_Return i
+        Loop
+        Function_Return -1
+    End_Function
+
+    /* Parse one projection function file (Win32API-NN.pkg) into aFns - APPENDED, so one array
+       collects a whole clone. The generated shape, ported from the Python parser rule for rule:
+       a head line 'External_Function <name> "<entry>" <dll> [;]' with NOTHING else on it, then
+       body lines '<type> <name> [; // comment]' until 'Returns <type>' or a blank line. A
+       declaration without a Returns is procedure-shaped and out of scope. When two files
+       declare the same (dll,entry), the LAST parsed wins - dict semantics in the original. The
+       last-wins is enforced at lookup (see _FindProjFn), not here. */
+    Procedure ParseFunctionFile String[] ByRef asLines tW32ProjFn[] ByRef aFns
+        tW32ProjFn Fn EmptyFn
+        String[] asTok asBodyTok
+        String sLine sBody sComment
+        Integer i iLast iPos iTok
+        Boolean bGotRet
+
+        Move (SizeOfArray(asLines) - 1) to iLast
+        Move 0 to i
+        While (i <= iLast)
+            Send _Tokens asLines[i] (&asTok)
+            Move (SizeOfArray(asTok)) to iTok
+            If (iTok >= 4 and iTok <= 5 and Lowercase(asTok[0]) = "external_function" and ;
+                _IsWordName(Self, asTok[1]) and ;
+                Length(asTok[2]) >= 2 and Left(asTok[2], 1) = '"' and Right(asTok[2], 1) = '"' and ;
+                (iTok = 4 or asTok[4] = ";")) Begin
+                Move EmptyFn to Fn
+                Move asTok[1] to Fn.sName
+                Move (Mid(asTok[2], (Length(asTok[2]) - 2), 2)) to Fn.sEntry
+                Move asTok[3] to Fn.sDll
+                If (Right(Fn.sDll, 1) = ";") ;
+                    Move (Left(Fn.sDll, (Length(Fn.sDll) - 1))) to Fn.sDll
+                Move False to bGotRet
+                Increment i
+                While (i <= iLast)
+                    Move asLines[i] to sLine
+                    Increment i
+                    If (Trim(sLine) = "") ;
+                        Break
+                    Move (Pos("//", sLine)) to iPos
+                    Move "" to sComment
+                    If (iPos > 0) Begin
+                        Move (Trim(Mid(sLine, (Length(sLine)), (iPos + 2)))) to sComment
+                        Move (Left(sLine, (iPos - 1))) to sBody
+                    End
+                    Else Begin
+                        Move sLine to sBody
+                    End
+                    Move (Replaces((Character(9)), sBody, " ")) to sBody
+                    Move (Trim(sBody)) to sBody
+                    While (Right(sBody, 1) = ";")
+                        Move (Trim(Left(sBody, (Length(sBody) - 1)))) to sBody
+                    Loop
+                    If (sBody <> "") Begin
+                        Send _Tokens sBody (&asBodyTok)
+                        If (Lowercase(asBodyTok[0]) = "returns") Begin
+                            If (SizeOfArray(asBodyTok) >= 2) Begin
+                                Move asBodyTok[1] to Fn.sRet
+                                Move sComment     to Fn.sRetComment
+                                Move True to bGotRet
+                            End
+                            Break
+                        End
+                        Else Begin
+                            Move asBodyTok[0] to Fn.asParamType[SizeOfArray(Fn.asParamType)]
+                            If (SizeOfArray(asBodyTok) >= 2) Begin
+                                Move (JoinTokensFrom(Self, &asBodyTok, 1)) to Fn.asParamName[SizeOfArray(Fn.asParamName)]
+                            End
+                            Else Begin
+                                Move ("arg" + String(SizeOfArray(Fn.asParamName))) to Fn.asParamName[SizeOfArray(Fn.asParamName)]
+                            End
+                            Move sComment to Fn.asParamComment[SizeOfArray(Fn.asParamComment)]
+                        End
+                    End
+                Loop
+                If (bGotRet = True) ;
+                    Move Fn to aFns[SizeOfArray(aFns)]
+            End
+            Else Begin
+                Increment i
+            End
+        Loop
+    End_Procedure
+
+    /* Parse one projection struct file (Win32Struct-NN.pkg): 'Struct <name>' ... 'End_Struct',
+       comment-only lines dropped, each member line collapsed to '<type> <rest>  // <c-type>'
+       with the SAME Pointer->Handle rule as parameters. FIRST declaration of a name wins -
+       dict-with-guard semantics in the original. asNames/asBodies are appended in lockstep;
+       bodies are the member lines joined with LF.
+
+       Within this file only: walking every name so far is quadratic, and 15,206 structs make that a
+       matter of minutes. Across files _KeepFirstStructs settles it once, after the last file. */
+    Procedure ParseStructFile String[] ByRef asLines String[] ByRef asNames String[] ByRef asBodies
+        String[] asTok
+        String sLine sName sBody sMember sComment
+        Integer i iLast iPos j jLast iFirst
+        Boolean bKnown
+
+        Move (SizeOfArray(asNames)) to iFirst
+        Move (SizeOfArray(asLines) - 1) to iLast
+        Move "" to sName
+        For i from 0 to iLast
+            Move (Trim(Replaces((Character(9)), asLines[i], " "))) to sLine
+            Send _Tokens sLine (&asTok)
+            If (SizeOfArray(asTok) = 2 and Lowercase(asTok[0]) = "struct") Begin
+                Move asTok[1] to sName
+                Move "" to sBody
+            End
+            Else Begin
+                If (Lowercase(sLine) = "end_struct") Begin
+                    If (sName <> "") Begin
+                        Move False to bKnown
+                        Move (SizeOfArray(asNames) - 1) to jLast
+                        For j from iFirst to jLast
+                            If (Lowercase(asNames[j]) = Lowercase(sName)) ;
+                                Move True to bKnown
+                        Loop
+                        If (bKnown = False) Begin
+                            Move sName to asNames[SizeOfArray(asNames)]
+                            Move sBody to asBodies[SizeOfArray(asBodies)]
+                        End
+                    End
+                    Move "" to sName
+                End
+                Else Begin
+                    If (sName <> "" and sLine <> "" and Left(sLine, 2) <> "//") Begin
+                        Move (Pos("//", sLine)) to iPos
+                        Move "" to sComment
+                        Move sLine to sMember
+                        If (iPos > 0) Begin
+                            Move (Trim(Mid(sLine, (Length(sLine)), (iPos + 2)))) to sComment
+                            Move (Left(sLine, (iPos - 1))) to sMember
+                        End
+                        Send _Tokens sMember (&asTok)
+                        If (SizeOfArray(asTok) >= 2) Begin
+                            Move (NormaliseType(Self, asTok[0], sComment)) to asTok[0]
+                            Move (JoinTokensFrom(Self, &asTok, 0)) to sMember
+                            If (sComment <> "") ;
+                                Move (sMember + "  // " + sComment) to sMember
+                        End
+                        Else Begin
+                            Move (Trim(sMember)) to sMember
+                        End
+                        If (sMember <> "") Begin
+                            If (sBody = "") ;
+                                Move sMember to sBody
+                            Else ;
+                                Move (sBody + (Character(10)) + sMember) to sBody
+                        End
+                    End
+                End
+            End
+        Loop
+    End_Procedure
+
+    // Identifier runs ([A-Za-z0-9_]+) in sText - the ref-token walk over C comments.
+    Procedure _IdentTokens String sText String[] ByRef asToks
+        String[] asNone
+        String sCh sCur
+        Integer i iLen iAsc
+
+        Move asNone to asToks
+        Move (Length(sText)) to iLen
+        Move "" to sCur
+        For i from 1 to iLen
+            Move (Mid(sText, 1, i)) to sCh
+            Move (Ascii(sCh)) to iAsc
+            If ((iAsc >= 65 and iAsc <= 90) or (iAsc >= 97 and iAsc <= 122) or (iAsc >= 48 and iAsc <= 57) or sCh = "_") Begin
+                Move (sCur + sCh) to sCur
+            End
+            Else Begin
+                If (sCur <> "") ;
+                    Move sCur to asToks[SizeOfArray(asToks)]
+                Move "" to sCur
+            End
+        Loop
+        If (sCur <> "") ;
+            Move sCur to asToks[SizeOfArray(asToks)]
+    End_Procedure
+
+    // Lower-bound binary search over asSorted (lowercased entries, DFSTRICMP-sorted) for an
+    // EXACT lowercase match. Returns True when present.
+    Function _SortedContains String[] ByRef asSorted String sKey Returns Boolean
+        String sMid
+        Integer iLo iHi iMid
+
+        Move (Lowercase(Trim(sKey))) to sKey
+        Move 0 to iLo
+        Move (SizeOfArray(asSorted) - 1) to iHi
+        While (iLo <= iHi)
+            Move ((iLo + iHi) / 2) to iMid
+            Move asSorted[iMid] to sMid
+            If (sMid = sKey) ;
+                Function_Return True
+            If (sMid < sKey) ;
+                Move (iMid + 1) to iLo
+            Else ;
+                Move (iMid - 1) to iHi
+        Loop
+        Function_Return False
+    End_Function
+
+    /* The struct a parameter's C comment says it POINTS AT, spelled as the comment spells it - "" when
+       it says no such thing. One star only: "MENUITEMINFOA*" is what a caller hands a buffer to, while
+       "ITEMIDLIST**" is a pointer to somebody else's pointer. asStructNamesLC as in FunctionRow. */
+    Function _PointedAtStruct String sComment String[] ByRef asStructNamesLC Returns String
+        String sName
+
+        Move (Trim(sComment)) to sName
+        If (Right(sName, 1) <> "*") ;
+            Function_Return ""
+        Move (Left(sName, (Length(sName) - 1))) to sName
+        If (Pos("*", sName) > 0 or Pos(" ", sName) > 0) ;
+            Function_Return ""
+        If (_SortedContains(Self, &asStructNamesLC, sName)) ;
+            Function_Return sName
+        Function_Return ""
+    End_Function
+
+    /* One "dll|entry|DF|<declaration>" row. The declaration flattens to one line; the trailing
+       "// refs: ..." names the structs its comments mention (WinAPIStructForApi's scan reads
+       that tail; the emitters cut it). asStructNamesLC must be lowercased and sorted.
+
+       "// args: 4=MENUITEMINFOA" follows it and says the same per PARAMETER, counted from 1. refs is
+       about the whole function, so it cannot say which argument a struct belongs to: a thread-id buffer
+       handed to CreateThread looked like a SECURITY_ATTRIBUTES, which is the FIRST parameter
+       (2026-11-03). The converter reads this tail: _WinAPIArgStructOf.
+
+       "// ptrs: 1=PSTR 2=UInteger*" comes FIRST, on an ...A or ...W row only, and keeps the C type of
+       every parameter the declaration hands over as raw memory (a bare Pointer). It is what tells
+       GetComputerNameA from GetComputerNameW: both declare "Pointer lpBuffer", so the DataFlex types
+       agree, but one writes 8-bit text there and the other UTF-16. _AnsiWideRefusalReason compares
+       the two rows' tails (2026-11-21). It goes before refs: all three readers stop at the next tail
+       now, but the args reader once read to the end of the row, and an older build still does. */
+    Function FunctionRow tW32ProjFn Fn String[] ByRef asStructNamesLC Returns String
+        String[] asToks asRefs
+        String sDecl sTok sArgs sPtrs sLast
+        Integer i iLast j jLast k kLast
+        Boolean bHave
+
+        Move ('External_Function ' + Fn.sName + ' "' + Fn.sEntry + '" ' + Fn.sDll) to sDecl
+        Move (SizeOfArray(Fn.asParamType) - 1) to iLast
+        For i from 0 to iLast
+            Move (sDecl + " " + NormaliseType(Self, Fn.asParamType[i], Fn.asParamComment[i]) + " " + Fn.asParamName[i]) to sDecl
+        Loop
+        Move (sDecl + " Returns " + NormaliseReturn(Self, Fn.sRet, Fn.sRetComment)) to sDecl
+
+        // ptrs: the C type behind each raw-memory parameter of an A/W entry. Case-sensitive on purpose:
+        // the projection spells the suffix in capitals, and a lowercase "a" ends ordinary words.
+        Move (Right(Fn.sEntry, 1)) to sLast
+        If (sLast = "A" or sLast = "W") Begin
+            Move "" to sPtrs
+            For i from 0 to iLast
+                If (NormaliseType(Self, Fn.asParamType[i], Fn.asParamComment[i]) = "Pointer") Begin
+                    Move (Trim(Replaces((Character(9)), Fn.asParamComment[i], " "))) to sTok
+                    If (sTok <> "" and Pos(" ", sTok) = 0) ;
+                        Move (sPtrs + " " + String(i + 1) + "=" + sTok) to sPtrs
+                End
+            Loop
+            If (sPtrs <> "") ;
+                Move (sDecl + " // ptrs:" + sPtrs) to sDecl
+        End
+
+        // refs: every identifier in the comments (params + return) naming a projection struct,
+        // deduped in first-seen order, ORIGINAL casing kept.
+        For i from 0 to (iLast + 1)
+            If (i <= iLast) ;
+                Send _IdentTokens Fn.asParamComment[i] (&asToks)
+            Else ;
+                Send _IdentTokens Fn.sRetComment (&asToks)
+            Move (SizeOfArray(asToks) - 1) to jLast
+            For j from 0 to jLast
+                Move asToks[j] to sTok
+                If (_SortedContains(Self, &asStructNamesLC, sTok)) Begin
+                    Move False to bHave
+                    Move (SizeOfArray(asRefs) - 1) to kLast
+                    For k from 0 to kLast
+                        If (asRefs[k] = sTok) ;
+                            Move True to bHave
+                    Loop
+                    If (bHave = False) ;
+                        Move sTok to asRefs[SizeOfArray(asRefs)]
+                End
+            Loop
+        Loop
+        Move (SizeOfArray(asRefs) - 1) to kLast
+        If (kLast >= 0) Begin
+            Move (sDecl + " // refs:") to sDecl
+            For k from 0 to kLast
+                Move (sDecl + " " + asRefs[k]) to sDecl
+            Loop
+            Move "" to sArgs
+            For i from 0 to iLast
+                Get _PointedAtStruct Fn.asParamComment[i] (&asStructNamesLC) to sTok
+                If (sTok <> "") ;
+                    Move (sArgs + " " + String(i + 1) + "=" + sTok) to sArgs
+            Loop
+            If (sArgs <> "") ;
+                Move (sDecl + " // args:" + sArgs) to sDecl
+        End
+        Function_Return (Lowercase(Fn.sDll) + "|" + Lowercase(Fn.sEntry) + "|DF|" + sDecl)
+    End_Function
+
+    // One "NAME|DF|Struct ...\n...\nEnd_Struct" row; the NAME key uppercased, the body verbatim.
+    Function StructRow String sName String sBody Returns String
+        Function_Return (Uppercase(sName) + "|DF|" + "Struct " + sName + (Character(10)) + sBody + (Character(10)) + "End_Struct")
+    End_Function
+
+    /* The first declaration of each struct name across all files, the others dropped, the order kept.
+       Sorted on "<lowercase name> <index>" with the index zero-padded so equal names sort by it; a space
+       because DataFlex compares through its collation table, where a control character would not order
+       below a digit (Hrv_IndexFindsPrefixFamilyBase). */
+    Procedure _KeepFirstStructs String[] ByRef asNames String[] ByRef asBodies
+        String[] asPack asOutNames asOutBodies
+        Boolean[] abDrop
+        String sThis sPrev sIdx
+        Integer i iLast iPos
+
+        Move (SizeOfArray(asNames) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(asNames[i]) + " " + Right("0000000" + String(i), 7)) to asPack[i]
+            Move False to abDrop[i]
+        Loop
+        Move (SortArray(asPack, Desktop, RefFunc(DFSTRICMP))) to asPack
+        Move "" to sPrev
+        For i from 0 to iLast
+            Move (Pos(" ", asPack[i])) to iPos
+            Move (Left(asPack[i], (iPos - 1))) to sThis
+            If (sThis = sPrev) Begin
+                Move (Right(asPack[i], 7)) to sIdx
+                Move True to abDrop[Integer(sIdx)]
+            End
+            Move sThis to sPrev
+        Loop
+        For i from 0 to iLast
+            If (abDrop[i] = False) Begin
+                Move asNames[i]  to asOutNames[SizeOfArray(asOutNames)]
+                Move asBodies[i] to asOutBodies[SizeOfArray(asOutBodies)]
+            End
+        Loop
+        Move asOutNames  to asNames
+        Move asOutBodies to asBodies
+    End_Procedure
+
+    // The rows of asNew whose identity asExisting does not hold yet, for a merge that may only add.
+    Procedure _RowsNotCarried String[] ByRef asExisting String[] ByRef asNew Integer iKeyFields String[] ByRef asOut
+        String[] asKeys asNone
+        Integer i iLast
+
+        Move asNone to asOut
+        Move (SizeOfArray(asExisting) - 1) to iLast
+        For i from 0 to iLast
+            Move (WinApiRowKey(asExisting[i], iKeyFields)) to asKeys[i]
+        Loop
+        Move (SortArray(asKeys, Desktop, RefFunc(DFSTRICMP))) to asKeys
+        Move (SizeOfArray(asNew) - 1) to iLast
+        For i from 0 to iLast
+            If (_SortedContains(Self, &asKeys, WinApiRowKey(asNew[i], iKeyFields)) = False) ;
+                Move asNew[i] to asOut[SizeOfArray(asOut)]
+        Loop
+    End_Procedure
+
+    /* Merge: harvested identity replaces, everything else stays, output KEY-sorted. The sort
+       packs key + CS_S + index so that a key which is a PREFIX of another still sorts
+       before it (a full-row compare would put "getdc|..." AFTER "getdcex|..." because '|'
+       outranks 'e' - the Python tool sorted by key alone, and the file should diff clean). */
+    Procedure MergeRows String[] ByRef asExisting String[] ByRef asNew Integer iKeyFields String[] ByRef asOut Integer ByRef iKept
+        String[] asNewKeys asAll asPack asNone
+        String sKey
+        Integer i iLast iPos
+
+        Move asNone to asOut
+        Move 0 to iKept
+        Move (SizeOfArray(asNew) - 1) to iLast
+        For i from 0 to iLast
+            Move (WinApiRowKey(asNew[i], iKeyFields)) to asNewKeys[SizeOfArray(asNewKeys)]
+        Loop
+        Move (SortArray(asNewKeys, Desktop, RefFunc(DFSTRICMP))) to asNewKeys
+
+        Move (SizeOfArray(asExisting) - 1) to iLast
+        For i from 0 to iLast
+            Move (WinApiRowKey(asExisting[i], iKeyFields)) to sKey
+            If (_SortedContains(Self, &asNewKeys, sKey) = False) Begin
+                Move asExisting[i] to asAll[SizeOfArray(asAll)]
+                Increment iKept
+            End
+        Loop
+        Move (SizeOfArray(asNew) - 1) to iLast
+        For i from 0 to iLast
+            Move asNew[i] to asAll[SizeOfArray(asAll)]
+        Loop
+
+        Move (SizeOfArray(asAll) - 1) to iLast
+        For i from 0 to iLast
+            Move (WinApiRowKey(asAll[i], iKeyFields) + (CS_S) + String(i)) to asPack[SizeOfArray(asPack)]
+        Loop
+        Move (SortArray(asPack, Desktop, RefFunc(DFSTRICMP))) to asPack
+        For i from 0 to iLast
+            Move asPack[i] to sKey
+            Move (RightPos((CS_S), sKey)) to iPos
+            Move (Right(sKey, (Length(sKey) - iPos))) to sKey
+            Move asAll[Integer(sKey)] to asOut[SizeOfArray(asOut)]
+        Loop
+    End_Procedure
+
+    /* The projection lookup index: "dll|entry" + Chr(1) + element-index, sorted. Duplicate
+       (dll,entry) pairs are legal in the clone (one API in two topic folders); the ORIGINAL
+       tool's dict made the LAST parsed win, so _FindProjFn walks equal keys and answers the
+       highest index. */
+    Procedure BuildFnIndex tW32ProjFn[] ByRef aFns String[] ByRef asIdx
+        String[] asNone
+        Integer i iLast
+
+        Move asNone to asIdx
+        Move (SizeOfArray(aFns) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(aFns[i].sDll) + "|" + Lowercase(aFns[i].sEntry) + (CS_S) + String(i)) to asIdx[SizeOfArray(asIdx)]
+        Loop
+        Move (SortArray(asIdx, Desktop, RefFunc(DFSTRICMP))) to asIdx
+    End_Procedure
+
+    // The aFns element index for "dll|entry" (lowercased), or -1. Last-parsed wins (see above).
+    Function _FindProjFn String[] ByRef asIdx String sKey Returns Integer
+        String sMid sPre
+        Integer iLo iHi iMid iBest iPos iLen
+
+        Move (Lowercase(Trim(sKey)) + (CS_S)) to sPre
+        Move (Length(sPre)) to iLen
+        Move 0 to iLo
+        Move (SizeOfArray(asIdx) - 1) to iHi
+        // lower-bound on the prefix...
+        While (iLo < iHi)
+            Move ((iLo + iHi) / 2) to iMid
+            Move (Lowercase(Left(asIdx[iMid], iLen))) to sMid
+            If (sMid < sPre) ;
+                Move (iMid + 1) to iLo
+            Else ;
+                Move iMid to iHi
+        Loop
+        Move -1 to iBest
+        // ...then walk the equal-key run, keeping the HIGHEST element index (last-parsed wins).
+        While (iLo <= (SizeOfArray(asIdx) - 1))
+            Move asIdx[iLo] to sMid
+            If (Lowercase(Left(sMid, iLen)) <> sPre) ;
+                Break
+            Move (RightPos((CS_S), sMid)) to iPos
+            Move (Right(sMid, (Length(sMid) - iPos))) to sMid
+            If (Integer(sMid) > iBest) ;
+                Move (Integer(sMid)) to iBest
+            Increment iLo
+        Loop
+        Function_Return iBest
+    End_Function
+
+    /* The corpus intersection: for each entry point the workspace scan found
+       (AppSrc\WindowsAPI.json "functions"), try the name itself, then name+w, then name+a -
+       EVERY candidate the projection covers is taken (that is how both ShellExecuteW and
+       ShellExecuteA arrive from one corpus name), each (dll,entry) at most once. Returns False
+       with sErr set when the corpus file cannot be read. */
+    Function CorpusSelect String sCorpusJson tW32ProjFn[] ByRef aFns String[] ByRef asIdx tW32ProjFn[] ByRef aChosen String ByRef sErr Returns Boolean
+        Handle hoJson hoFuncs hoOne
+        String[] asChosenKeys
+        String sName sDll sCand sKey
+        UChar[] ucData
+        Integer i iMax iCh c iHit
+        Boolean bOK
+
+        Move "" to sErr
+        Get vFilePathExists sCorpusJson to bOK
+        If (bOK = False) Begin
+            Move ("Corpus file not found: " + sCorpusJson) to sErr
+            Function_Return False
+        End
+        Get rfOpenInput sCorpusJson to iCh
+        If (iCh < 0) Begin
+            Move ("Corpus file could not be opened: " + sCorpusJson) to sErr
+            Function_Return False
+        End
+        Read_Block channel iCh ucData -1
+        Move (rfStripUtf8Bom(ucData)) to ucData
+        Send rfCloseInput iCh
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Set pbRequireAllMembers of hoJson to False
+        Get ParseUtf8 of hoJson ucData to bOK
+        If (bOK = False) Begin
+            Send Destroy of hoJson
+            Move ("Corpus file did not parse as JSON: " + sCorpusJson) to sErr
+            Function_Return False
+        End
+        Get MemberEnh of hoJson "functions" to hoFuncs
+        If (hoFuncs = 0) Begin
+            Send Destroy of hoJson
+            Move ("Corpus file has no 'functions' member: " + sCorpusJson) to sErr
+            Function_Return False
+        End
+        Set pbRequireAllMembers of hoFuncs to False
+        Get MemberCount of hoFuncs to iMax
+        Decrement iMax
+        For i from 0 to iMax
+            Get MemberNameByIndex of hoFuncs i to sName
+            Get MemberEnh of hoFuncs sName to hoOne
+            Move "" to sDll
+            If (hoOne <> 0) Begin
+                Set pbRequireAllMembers of hoOne to False
+                Get MemberValueEnh of hoOne "dll" to sDll
+                Send Destroy of hoOne
+            End
+            If (Trim(sDll) <> "") Begin
+                Move (Lowercase(Trim(sDll))) to sDll
+                If (not(sDll contains ".")) ;
+                    Move (sDll + ".dll") to sDll
+                For c from 0 to 2
+                    Move (Lowercase(Trim(sName))) to sCand
+                    If (c = 1) ;
+                        Move (sCand + "w") to sCand
+                    If (c = 2) ;
+                        Move (sCand + "a") to sCand
+                    Move (sDll + "|" + sCand) to sKey
+                    Get _FindProjFn (&asIdx) sKey to iHit
+                    If (iHit >= 0) Begin
+                        If (_PlainContains(Self, &asChosenKeys, sKey) = False) Begin
+                            Move sKey to asChosenKeys[SizeOfArray(asChosenKeys)]
+                            Move aFns[iHit] to aChosen[SizeOfArray(aChosen)]
+                        End
+                    End
+                Loop
+            End
+        Loop
+        Send Destroy of hoFuncs
+        Send Destroy of hoJson
+        Function_Return True
+    End_Function
+
+    /* The struct closure: every struct a chosen function's comments name, then every struct
+       type among THOSE structs' members, to a fixed point. asNamesLC is the sorted lowercase
+       name index over ALL projection structs; asNeededLC comes back lowercase. */
+    Procedure StructClosure tW32ProjFn[] ByRef aChosen String[] ByRef asNamesLC String[] ByRef asAllNames String[] ByRef asAllBodies String[] ByRef asNeededLC
+        String[] asToks asBodyLines asNone
+        String sTok sT0
+        Integer i iLast j jLast k kLast n nLast iGrow iPos
+
+        Move asNone to asNeededLC
+        Move (SizeOfArray(aChosen) - 1) to iLast
+        For i from 0 to iLast
+            Move (SizeOfArray(aChosen[i].asParamComment) - 1) to jLast
+            For j from 0 to (jLast + 1)
+                If (j <= jLast) ;
+                    Send _IdentTokens aChosen[i].asParamComment[j] (&asToks)
+                Else ;
+                    Send _IdentTokens aChosen[i].sRetComment (&asToks)
+                Move (SizeOfArray(asToks) - 1) to kLast
+                For k from 0 to kLast
+                    Move (Lowercase(asToks[k])) to sTok
+                    If (_SortedContains(Self, &asNamesLC, sTok)) Begin
+                        If (_PlainContains(Self, &asNeededLC, sTok) = False) ;
+                            Move sTok to asNeededLC[SizeOfArray(asNeededLC)]
+                    End
+                Loop
+            Loop
+        Loop
+        // frontier expansion: member TYPES that are themselves projection structs
+        Move 1 to iGrow
+        While (iGrow > 0)
+            Move 0 to iGrow
+            Move (SizeOfArray(asNeededLC) - 1) to iLast
+            For i from 0 to iLast
+                Move (_StructIndexOf(Self, &asAllNames, asNeededLC[i])) to j
+                If (j >= 0) Begin
+                    Move (StrSplitToArray(asAllBodies[j], (Character(10)))) to asBodyLines
+                    Move (SizeOfArray(asBodyLines) - 1) to nLast
+                    For n from 0 to nLast
+                        Send _Tokens asBodyLines[n] (&asToks)
+                        If (SizeOfArray(asToks) >= 1) Begin
+                            Move (Lowercase(asToks[0])) to sT0
+                            Move (Pos("[", sT0)) to iPos
+                            If (iPos > 0) ;
+                                Move (Left(sT0, (iPos - 1))) to sT0
+                            If (_SortedContains(Self, &asNamesLC, sT0)) Begin
+                                If (_PlainContains(Self, &asNeededLC, sT0) = False) Begin
+                                    Move sT0 to asNeededLC[SizeOfArray(asNeededLC)]
+                                    Increment iGrow
+                                End
+                            End
+                        End
+                    Loop
+                End
+            Loop
+        Loop
+    End_Procedure
+
+    // The clone's short commit sha + today's date, via .git plumbing (no git.exe needed):
+    // HEAD holds "ref: <path>" -> that file's first line is the sha; a detached HEAD holds it
+    // directly. "" when the clone has no readable .git.
+    Function GitStamp String sCloneRoot Returns String
+        String[] asLines
+        String sHead sSha sToday
+        DateTime dtNow
+        Date dNow
+
+        Move (rfReadEncodedFileAsStringArray(vFolderFormat(sCloneRoot) + ".git\HEAD")) to asLines
+        If (SizeOfArray(asLines) = 0) ;
+            Function_Return ""
+        Move (Trim(asLines[0])) to sHead
+        If (Lowercase(Left(sHead, 4)) = "ref:") Begin
+            Move (Trim(Mid(sHead, (Length(sHead)), 5))) to sHead
+            Move (Replaces("/", sHead, "\")) to sHead
+            Move (rfReadEncodedFileAsStringArray(vFolderFormat(sCloneRoot) + ".git\" + sHead)) to asLines
+            If (SizeOfArray(asLines) = 0) ;
+                Function_Return ""
+            Move (Trim(asLines[0])) to sHead
+        End
+        Move (Left(sHead, 7)) to sSha
+        Move (CurrentDateTime()) to dtNow
+        Move dtNow to dNow
+        Move (String(DateGetYear(dNow)) + "-" + Right("0" + String(DateGetMonth(dNow)), 2) + "-" + Right("0" + String(DateGetDay(dNow)), 2)) to sToday
+        Function_Return (sSha + " " + sToday)
+    End_Function
+
+    /* Write one catalogue JSON: {iVersion, asRows, _meta_harvest{source, sourceCommit,
+       harvested, kept}} - the same shape and key names the Python tool wrote, so nothing
+       reading the file can tell the tools apart. Attribution is a condition of taking the
+       data. Returns False when the file cannot be written. */
+    Function WriteCatalogWithMeta String sPath String[] ByRef asRows Integer iHarvested Integer iKept String sSourceCommit Returns Boolean
+        Handle hoDoc hoMeta
+        UChar[] ucJson
+        Integer iCh
+        tWinAPICatalogFile TheFile
+
+        Move CI_WinAPICatalogVersion to TheFile.iVersion
+        Move asRows to TheFile.asRows
+        Get Create (RefClass(cJsonObject)) to hoDoc
+        Send DataTypeToJson of hoDoc TheFile
+        Get Create (RefClass(cJsonObject)) to hoMeta
+        Send InitializeJsonType of hoMeta jsonTypeObject
+        Send SetMemberValue of hoMeta "source" jsonTypeString "Win32_DataFlex_Projection (Frank Cheng, MIT) - generated from Microsoft win32metadata"
+        Send SetMemberValue of hoMeta "sourceCommit" jsonTypeString sSourceCommit
+        Send SetMemberValue of hoMeta "harvested" jsonTypeInteger iHarvested
+        Send SetMemberValue of hoMeta "kept" jsonTypeInteger iKept
+        Send SetMember of hoDoc "_meta_harvest" hoMeta
+        Set peWhiteSpace of hoDoc to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoDoc to ucJson
+        Send Destroy of hoDoc
+        Get rfOpenOutput sPath to iCh
+        If (iCh < 0) ;
+            Function_Return False
+        Write channel iCh ucJson
+        Send rfCloseOutput iCh
+        Function_Return True
+    End_Function
+
+    /* THE WHOLE HARVEST, paths explicit. Reads the clone (Win32API-*.pkg / Win32Struct-*.pkg,
+       recursively), selects (corpus intersection, or everything when pbHarvestAll), closes over
+       the structs (pbHarvestAll: takes them all), merges into the two catalogue files, and reports. Returns False with the
+       report carrying the reason when nothing could be done; True with the counts otherwise. */
+    Function HarvestClone String sCloneRoot String sCorpusJson String sFnJson String sStructJson String ByRef sReport Returns Boolean
+        tW32ProjFn[] aFns aChosen
+        tRFSearchResult[] aFiles
+        String[] asLines asIdx asStNames asStBodies asStNamesLC asNeededLC asFnRows asStRows asExisting asMerged
+        String[] asAliasRows asStAdded
+        String sErr sStamp sCRLF sAliasNote
+        Handle hoStore
+        Integer i iLast iKept1 iKept2 iIdx iKeptA iGenerated
+        Boolean bOK bAll
+
+        Move (Character(13) + Character(10)) to sCRLF
+        Move "" to sReport
+        Get pbHarvestAll to bAll
+        If (rfDirectoryExists(sCloneRoot) = False) Begin
+            Move ("Clone folder not found: " + sCloneRoot) to sReport
+            Function_Return False
+        End
+
+        // parse the clone
+        Move (rfFileSearchRecursive((vFolderFormat(sCloneRoot) + "Win32API-*.pkg"), DIRMODE_FILES_ONLY, False)) to aFiles
+        Move (SizeOfArray(aFiles) - 1) to iLast
+        For i from 0 to iLast
+            Move (rfReadEncodedFileAsStringArray(aFiles[i].sFilename)) to asLines
+            Send ParseFunctionFile (&asLines) (&aFns)
+        Loop
+        Move (rfFileSearchRecursive((vFolderFormat(sCloneRoot) + "Win32Struct-*.pkg"), DIRMODE_FILES_ONLY, False)) to aFiles
+        Move (SizeOfArray(aFiles) - 1) to iLast
+        For i from 0 to iLast
+            Move (rfReadEncodedFileAsStringArray(aFiles[i].sFilename)) to asLines
+            Send ParseStructFile (&asLines) (&asStNames) (&asStBodies)
+        Loop
+        Send _KeepFirstStructs (&asStNames) (&asStBodies)
+        If (SizeOfArray(aFns) = 0) Begin
+            Move ("No Win32API-*.pkg declarations found under: " + sCloneRoot) to sReport
+            Function_Return False
+        End
+        Move ("projection: " + String(SizeOfArray(aFns)) + " functions, " + String(SizeOfArray(asStNames)) + " structs") to sReport
+
+        // sorted lowercase struct-name index
+        Move (SizeOfArray(asStNames) - 1) to iLast
+        For i from 0 to iLast
+            Move (Lowercase(asStNames[i])) to asStNamesLC[SizeOfArray(asStNamesLC)]
+        Loop
+        Move (SortArray(asStNamesLC, Desktop, RefFunc(DFSTRICMP))) to asStNamesLC
+
+        // selection
+        Send BuildFnIndex (&aFns) (&asIdx)
+        If (bAll = True) Begin
+            Move aFns to aChosen
+        End
+        Else Begin
+            Get CorpusSelect sCorpusJson (&aFns) (&asIdx) (&aChosen) (&sErr) to bOK
+            If (bOK = False) Begin
+                Move (sReport + sCRLF + sErr) to sReport
+                Function_Return False
+            End
+        End
+        Move (sReport + sCRLF + "chosen: " + String(SizeOfArray(aChosen)) + " function(s)") to sReport
+
+        // struct closure + rows
+        Move (SizeOfArray(aChosen) - 1) to iLast
+        For i from 0 to iLast
+            Move (FunctionRow(Self, aChosen[i], &asStNamesLC)) to asFnRows[SizeOfArray(asFnRows)]
+        Loop
+        Move 0 to iGenerated
+        If (bAll = True) Begin
+            Move (SizeOfArray(asStNames) - 1) to iLast
+            For i from 0 to iLast
+                If (_IsGeneratedStructName(Self, asStNames[i])) ;
+                    Increment iGenerated
+                Else ;
+                    Move (StructRow(Self, asStNames[i], asStBodies[i])) to asStRows[SizeOfArray(asStRows)]
+            Loop
+            Move (sReport + sCRLF + "all structs: " + String(SizeOfArray(asStRows)) + " named, " + String(iGenerated) + " generated left out") to sReport
+        End
+        Else Begin
+            Send StructClosure (&aChosen) (&asStNamesLC) (&asStNames) (&asStBodies) (&asNeededLC)
+            Move (sReport + sCRLF + "struct closure: " + String(SizeOfArray(asNeededLC)) + " struct(s)") to sReport
+            Move (SizeOfArray(asNeededLC) - 1) to iLast
+            For i from 0 to iLast
+                Move (_StructIndexOf(Self, &asStNames, asNeededLC[i])) to iIdx
+                If (iIdx >= 0) Begin
+                    If (_IsGeneratedStructName(Self, asStNames[iIdx]) = False) ;
+                        Move (StructRow(Self, asStNames[iIdx], asStBodies[iIdx])) to asStRows[SizeOfArray(asStRows)]
+                End
+            Loop
+        End
+
+        // merge + write, with provenance
+        Get GitStamp sCloneRoot to sStamp
+        Get Create (RefClass(cWinAPICatalogStore)) to hoStore
+        Get LoadCatalog of hoStore sFnJson to asExisting
+        Send MergeRows (&asExisting) (&asFnRows) 2 (&asMerged) (&iKept1)
+        /* THE BARE ALIASES RIDE WITH THE HARVEST (2026-09-12) - measured on the MERGED set, so a
+           bare row the projection carries is seen and left alone, and merged by the same rule, so a
+           re-run finds its own rows and adds nothing. See BareAliasRows. */
+        Get BareAliasRows (&asMerged) (&sAliasNote) to asAliasRows
+        If (SizeOfArray(asAliasRows) > 0) Begin
+            Move asMerged to asExisting
+            Send MergeRows (&asExisting) (&asAliasRows) 2 (&asMerged) (&iKeptA)
+        End
+        Get WriteCatalogWithMeta sFnJson (&asMerged) (SizeOfArray(asFnRows)) iKept1 sStamp to bOK
+        If (bOK = False) Begin
+            Send Destroy of hoStore
+            Move (sReport + sCRLF + "COULD NOT WRITE: " + sFnJson) to sReport
+            Function_Return False
+        End
+        Move (sReport + sCRLF + "functions: " + String(SizeOfArray(asFnRows)) + " harvested + " + String(iKept1) + " kept -> " + sFnJson) to sReport
+        Move (sReport + sCRLF + sAliasNote) to sReport
+        Get LoadCatalog of hoStore sStructJson to asExisting
+        Send _RowsNotCarried (&asExisting) (&asStRows) 1 (&asStAdded)
+        Send MergeRows (&asExisting) (&asStAdded) 1 (&asMerged) (&iKept2)
+        Get WriteCatalogWithMeta sStructJson (&asMerged) (SizeOfArray(asStAdded)) iKept2 sStamp to bOK
+        Send Destroy of hoStore
+        If (bOK = False) Begin
+            Move (sReport + sCRLF + "COULD NOT WRITE: " + sStructJson) to sReport
+            Function_Return False
+        End
+        Move (sReport + sCRLF + "structs  : " + String(SizeOfArray(asStAdded)) + " added + " + String(iKept2) + " kept as they were -> " + sStructJson) to sReport
+        Move (sReport + sCRLF + "source commit: " + sStamp) to sReport
+        Function_Return True
+    End_Function
+
+    // The module handle for one dll, loaded once per run. asDll / ahMod are the caller's cache and
+    // move in lockstep; a dll that will not load is remembered as 0, so it is not retried per row.
+    Function _AliasModule String sDll String[] ByRef asDll Handle[] ByRef ahMod Returns Handle
+        String sLow
+        Handle hMod
+        Integer iAt
+
+        Move (Lowercase(Trim(sDll))) to sLow
+        Move (SearchArray(sLow, asDll)) to iAt
+        If (iAt <> -1) ;
+            Function_Return ahMod[iAt]
+        Move (LoadLibrary(sLow)) to hMod
+        Move sLow to asDll[SizeOfArray(asDll)]
+        Move hMod to ahMod[SizeOfArray(ahMod)]
+        Function_Return hMod
+    End_Function
+
+    /* WHICH TWIN A BARE EXPORT IS - "a", "w", or "" for neither. Windows answers it itself: the bare
+       name and a twin resolve to the SAME ADDRESS when the bare name is an alias of that twin, and
+       to different ones when the bare export is a function in its own right (PlaySound, the tapi32
+       family). "" also covers a bare name the dll does not export at all - a declaration naming one
+       cannot bind, and DataFlex raises Error 4355 on the first call.
+
+       THE NAME MUST CARRY ITS REAL CASE: GetProcAddress matches export names byte for byte, and the
+       catalogue's key field is lowercased - so the caller passes the spelling from the declaration.
+
+       AND IT MUST BE THE LOADER'S ANSWER, not the export table's. A cross-check that read the export
+       RVAs directly disagreed on one name: sfc.dll forwards SRSetRestorePoint and SRSetRestorePointA
+       both to sfc_os.SRSetRestorePointA, so their forwarder STRINGS differ while the function does
+       not. GetProcAddress resolves the forwarder, which is exactly what binding a declaration does. */
+    Function _BareExportTwin Handle hMod String sBareCased Returns String
+        LongPtr lpBare lpTwin
+
+        If (hMod = 0) ;
+            Function_Return ""
+        If (Trim(sBareCased) = "") ;
+            Function_Return ""
+        Move (HarvGetProcAddress(hMod, sBareCased)) to lpBare
+        If (lpBare = 0) ;
+            Function_Return ""
+        Move (HarvGetProcAddress(hMod, (sBareCased + "A"))) to lpTwin
+        If (lpBare = lpTwin) ;
+            Function_Return "a"
+        Move (HarvGetProcAddress(hMod, (sBareCased + "W"))) to lpTwin
+        If (lpBare = lpTwin) ;
+            Function_Return "w"
+        Function_Return ""
+    End_Function
+
+    // The entry point as the row SPELLS it - the text between the row's first pair of quotes, which
+    // is the declaration's own entry. "" when the row carries no quoted entry.
+    Function _RowEntryCased String sRow Returns String
+        Integer iOpen iClose
+
+        Move (Pos('"', sRow)) to iOpen
+        If (iOpen = 0) ;
+            Function_Return ""
+        Move (Pos('"', sRow, (iOpen + 1))) to iClose
+        If (iClose <= iOpen) ;
+            Function_Return ""
+        Function_Return (Mid(sRow, (iClose - iOpen - 1), (iOpen + 1)))
+    End_Function
+
+    // The same row under the BARE key: the flavour and the declaration ride along verbatim, so the
+    // body still names the function that is really bound. The retyper reads only types from it, and
+    // keeps the local declaration's own name and entry (_ApiDeclWithSdkTypes: "positions 0-3 are
+    // the head, verbatim"), so nothing rewrites the caller's spelling.
+    Function _AliasRowOf String sRow String sBareLower Returns String
+        Integer i1 i2
+
+        Move (Pos("|", sRow)) to i1
+        If (i1 = 0) ;
+            Function_Return ""
+        Move (Pos("|", sRow, (i1 + 1))) to i2
+        If (i2 <= i1) ;
+            Function_Return ""
+        Function_Return (Left(sRow, i1) + sBareLower + Right(sRow, (Length(sRow) - i2 + 1)))
+    End_Function
+
+    /* THE BARE ALIAS ROWS, MEASURED (Nils 2026-09-12, asking why a bare External_Function was
+       offered no fix).
+
+       Windows exports a text API as ...A and ...W; the bare name is a C macro, not an export - except
+       where a dll keeps a bare ALIAS for compatibility, and that is exactly what legacy DataFlex code
+       declares (Shell_NotifyIcon, ShellExecuteEx, lstrcpy). The catalogue is harvested under the SDK
+       spellings, so the lookup answered a bare name by APPENDING "a", then "w": a spelling rule, not
+       a fact. Measured against the dlls, that rule is wrong for real exports - kernel32's bare
+       ReplaceFile IS ReplaceFileW, shell32's ILCreateFromPath and IsLFNDrive are W as well, and
+       PlaySound and the tapi32 family are functions of their own. Every such declaration was being
+       judged against the A prototype, silently.
+
+       So the catalogue carries the answer instead: a row under the bare key when - and only when -
+       the bare export resolves to the SAME ADDRESS as the ...A entry. The body is the A row verbatim,
+       because that IS the function being bound. A bare export that turns out to be the W twin gets NO
+       row: a declaration of it then finds nothing and is left alone, which is right, because moving a
+       call to wide marshalling is a separate decision and not the retyper's. Nor does one the dll
+       does not export at all - that declaration cannot bind in the first place.
+
+       ONLY WHERE THE CATALOGUE IS SILENT. A bare row the projection already carries is left exactly
+       as it is: 157 of those exist and 27 carry types matching NEITHER twin, so copying a twin over
+       them would destroy harvested data. Re-running adds nothing - the second run finds its own rows.
+
+       THE ADDRESSES ARE THIS MACHINE'S. Only equality is stored, never an address, and these aliases
+       are decades-old compatibility exports - but re-measuring means running a harvest on the other
+       Windows build, not editing a row by hand. */
+    Function BareAliasRows String[] ByRef asExisting String ByRef sReport Returns String[]
+        String[] asOut asKeys asDll asWide
+        Handle[] ahMod
+        String sRow sDll sEntry sBareLow sBareCased sTwin
+        Integer i iLast i1 i2 iHave iNone
+        Handle hMod
+
+        Move "" to sReport
+        Move (SizeOfArray(asExisting) - 1) to iLast
+        For i from 0 to iLast
+            Move (WinApiRowKey(asExisting[i], 2)) to asKeys[i]
+        Loop
+        // Plain sort, plain compare: the keys are lowercase by construction, which is the one
+        // ordering _SortedContains reads them with.
+        Move (SortArray(asKeys)) to asKeys
+        Move 0 to iHave
+        Move 0 to iNone
+        For i from 0 to iLast
+            Move asExisting[i] to sRow
+            Move (Pos("|", sRow)) to i1
+            Move (Pos("|", sRow, (i1 + 1))) to i2
+            If (i1 > 1) Begin
+                If (i2 > (i1 + 1)) Begin
+                    Move (Left(sRow, (i1 - 1))) to sDll
+                    Move (Lowercase(Mid(sRow, (i2 - i1 - 1), (i1 + 1)))) to sEntry
+                    Move "" to sBareLow
+                    If (Right(sEntry, 1) = "a") ;
+                        Move (Left(sEntry, (Length(sEntry) - 1))) to sBareLow
+                    If (sBareLow <> "") Begin
+                        If (_SortedContains(Self, &asKeys, (sDll + "|" + sBareLow + "|")) = True) ;
+                            Increment iHave
+                        Else If (_SortedContains(Self, &asKeys, (sDll + "|" + sBareLow + "w|")) = True) Begin
+                            Move (_RowEntryCased(Self, sRow)) to sBareCased
+                            If (sBareCased <> "") ;
+                                Move (Left(sBareCased, (Length(sBareCased) - 1))) to sBareCased
+                            Move (_AliasModule(Self, sDll, &asDll, &ahMod)) to hMod
+                            Move (_BareExportTwin(Self, hMod, sBareCased)) to sTwin
+                            If (sTwin = "a") ;
+                                Move (_AliasRowOf(Self, sRow, sBareLow)) to asOut[SizeOfArray(asOut)]
+                            Else If (sTwin = "w") ;
+                                Move (sDll + "|" + sBareLow) to asWide[SizeOfArray(asWide)]
+                            Else ;
+                                Increment iNone
+                        End
+                    End
+                End
+            End
+        Loop
+        Move ("bare aliases: " + String(SizeOfArray(asOut)) + " measured and added; " ;
+            + String(SizeOfArray(asWide)) + " bare exports are the WIDE twin (left out on purpose); " ;
+            + String(iNone) + " not exported bare, or their own code; " ;
+            + String(iHave) + " already carried a row of their own") to sReport
+        Function_Return asOut
+    End_Function
+
+End_Class

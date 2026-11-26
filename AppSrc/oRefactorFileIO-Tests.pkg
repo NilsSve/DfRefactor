@@ -1,0 +1,547 @@
+﻿//****************************************************************************
+// $Module type: Test fixture
+// $Module name: oRefactorFileIO-Tests
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-19
+//
+// Description : THE READ-ONLY PIN (2026-08-18). Direct_Output raises nothing on a target it cannot open (only
+//               SeqEof), so every writer's "did it land?" answer rests on the helpers below and on the encoded
+//               writer returning False - which is what let a plan run over a read-only DfPkg file report "1 of 1
+//               files changed, Process completed OK" while the file never moved (see the note above
+//               rfIsFileReadOnly in RefactorFileIO.pkg). These tests set the attribute on a scratch file in the
+//               Data folder (the DFUnit runner is built on cApplication, so phoWorkspace - not pOrgWS) and pin:
+//               - rfIsFileReadOnly / rfClearFileReadOnly round-trip, and the missing-file answer;
+//               - rfWriteFailureReason names the READ-ONLY attribute, then the missing folder;
+//               - rfPackageManagedPathNote fires on the DfPkg and package-cache shapes and stays "" elsewhere;
+//               - rfWriteEncodedFileFromStringArray returns False on a read-only target and LEAVES ITS BYTES
+//               (the writer must refuse, not corrupt - and must say so through its return value).
+//               Every test clears the attribute again before deleting, so a failed assertion cannot leave a
+//               read-only orphan in Data.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorFileIO.pkg           // rfOpenOutput / rfCloseOutput - channel file I/O
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+Object oRefactorFileIO is a cTestFixture
+    Set psFunctionName to "RefactorFileIO"
+
+    Function ScratchFile String sStem Returns String
+        String sDataPath
+        Get psDataPath of (phoWorkspace(ghoApplication)) to sDataPath
+        Function_Return (sDataPath + sStem)
+    End_Function
+
+    // Writes a one-line file and marks it READ-ONLY. Returns the path.
+    Function MakeReadOnlyScratch String sStem Returns String
+        String sFile
+        String[] asLine
+        Boolean bOk
+        Integer iAttr iOk
+        Get ScratchFile sStem to sFile
+        Move "original" to asLine[0]
+        Move (rfClearFileReadOnly(sFile)) to bOk          // a previous failed run may have left it
+        Get rfWriteEncodedFileFromStringArray (&asLine) sFile C_NewLine False to bOk
+        Send Assert bOk
+        Move (rfGetFileAttributesW(sFile)) to iAttr
+        Move (rfSetFileAttributesW(sFile, (iAttr ior FILE_ATTRIBUTE_READONLY))) to iOk
+        Send Assert (iOk <> 0)
+        Function_Return sFile
+    End_Function
+
+    Procedure DropScratch String sFile
+        Boolean bVoid
+        Move (rfClearFileReadOnly(sFile)) to bVoid
+        Move (rfDeleteFile(sFile)) to bVoid
+    End_Procedure
+
+    /* rfRenameFile - the primitive the board's "Rename them" rests on. What is pinned here is not
+       that a rename works, but the three answers that make it SAFE to automate: it refuses to
+       overwrite (so an earlier retire is never destroyed), it reports a missing source instead of
+       silently doing nothing, and it leaves the original in place whenever it returns a reason. */
+    {Published = True}
+    Procedure rfRenameFile_RenamesAndReportsEmpty
+        String sFrom sTo sWhy
+        String[] asLine
+        Boolean bOk
+        Get ScratchFile "_RnTest1.tmp" to sFrom
+        Get ScratchFile "_RnTest1.tmp.shadowed" to sTo
+        Send DropScratch sFrom
+        Send DropScratch sTo
+        Move "original" to asLine[0]
+        Get rfWriteEncodedFileFromStringArray (&asLine) sFrom C_NewLine False to bOk
+        Send Assert bOk
+        Move (rfRenameFile(sFrom, sTo)) to sWhy
+        Send Assert (sWhy = "")
+        Send Assert (rfGetFileAttributesW(sFrom) = INVALID_FILE_ATTRIBUTES)   // gone from the old name
+        Send Assert (rfGetFileAttributesW(sTo) <> INVALID_FILE_ATTRIBUTES)    // ...and present at the new one
+        Send DropScratch sTo
+    End_Procedure
+
+    // THE GUARD THAT MAKES THE UNDO REAL: a second retire must not clobber the first one's file,
+    // because that file is the only copy the user can rename back.
+    {Published = True}
+    Procedure rfRenameFile_RefusesToOverwriteAndKeepsBoth
+        String sFrom sTo sWhy
+        String[] asLine
+        Boolean bOk
+        Get ScratchFile "_RnTest2.tmp" to sFrom
+        Get ScratchFile "_RnTest2.tmp.shadowed" to sTo
+        Send DropScratch sFrom
+        Send DropScratch sTo
+        Move "newer" to asLine[0]
+        Get rfWriteEncodedFileFromStringArray (&asLine) sFrom C_NewLine False to bOk
+        Move "the copy already retired" to asLine[0]
+        Get rfWriteEncodedFileFromStringArray (&asLine) sTo C_NewLine False to bOk
+        Move (rfRenameFile(sFrom, sTo)) to sWhy
+        Send Assert (sWhy contains "already exists")
+        Send Assert (rfGetFileAttributesW(sFrom) <> INVALID_FILE_ATTRIBUTES)  // source untouched
+        Send Assert (rfGetFileAttributesW(sTo) <> INVALID_FILE_ATTRIBUTES)    // destination untouched
+        Send DropScratch sFrom
+        Send DropScratch sTo
+    End_Procedure
+
+    {Published = True}
+    Procedure rfRenameFile_MissingSourceSaysSo
+        String sFrom sTo sWhy
+        Get ScratchFile "_RnTest_DoesNotExist.tmp" to sFrom
+        Get ScratchFile "_RnTest_DoesNotExist.tmp.shadowed" to sTo
+        Move (rfRenameFile(sFrom, sTo)) to sWhy
+        Send Assert (sWhy contains "no longer there")
+    End_Procedure
+
+    {Published = True}
+    Procedure rfIsFileReadOnly_RoundTrip
+        String sFile
+        Boolean bOk
+        Get MakeReadOnlyScratch "_RoTest1.tmp" to sFile
+        Send Assert (rfIsFileReadOnly(sFile) = True)
+        Move (rfClearFileReadOnly(sFile)) to bOk
+        Send Assert bOk
+        Send Assert (rfIsFileReadOnly(sFile) = False)
+        Send DropScratch sFile
+    End_Procedure
+
+    // A missing file is not "read-only" - that distinction belongs to rfWriteFailureReason.
+    {Published = True}
+    Procedure rfIsFileReadOnly_MissingFileIsFalse
+        String sFile
+        Get ScratchFile "_RoTest_DoesNotExist.tmp" to sFile
+        Send Assert (rfIsFileReadOnly(sFile) = False)
+        Send Assert (rfClearFileReadOnly(sFile) = False)
+    End_Procedure
+
+    {Published = True}
+    Procedure rfWriteFailureReason_NamesTheAttribute
+        String sFile sReason
+        Get MakeReadOnlyScratch "_RoTest2.tmp" to sFile
+        Move (rfWriteFailureReason(sFile)) to sReason
+        Send Assert (sReason contains "READ-ONLY")
+        Send DropScratch sFile
+    End_Procedure
+
+    {Published = True}
+    Procedure rfWriteFailureReason_NamesTheMissingFolder
+        String sFile sReason
+        Get ScratchFile "_NoSuchSubFolder_RoTest\x.tmp" to sFile
+        Move (rfWriteFailureReason(sFile)) to sReason
+        Send Assert (sReason contains "folder does not exist")
+    End_Procedure
+
+    // Nothing visibly wrong from the outside -> the lock / access clause, never "".
+    {Published = True}
+    Procedure rfWriteFailureReason_WritableFileGetsTheLockClause
+        String sFile sReason
+        String[] asLine
+        Boolean bOk
+        Get ScratchFile "_RoTest3.tmp" to sFile
+        Move "x" to asLine[0]
+        Get rfWriteEncodedFileFromStringArray (&asLine) sFile C_NewLine False to bOk
+        Move (rfWriteFailureReason(sFile)) to sReason
+        Send Assert (sReason contains "locked")
+        Send DropScratch sFile
+    End_Procedure
+
+    {Published = True}
+    Procedure rfPackageManagedPathNote_DfPkgShape
+        String sNote
+        Move (rfPackageManagedPathNote("E:\WinServ\DfPkg\DataFlexCode_VDFQuery20-5b1a6941\AppSrc\vWin32fh.pkg")) to sNote
+        Send Assert (sNote contains "DfPkg")
+        // Case-insensitive: the path is whatever the .prn / the folder tick delivered.
+        Move (rfPackageManagedPathNote("e:\winserv\DFPKG\x\y.pkg")) to sNote
+        Send Assert (sNote contains "DfPkg")
+    End_Procedure
+
+    {Published = True}
+    Procedure rfPackageManagedPathNote_CacheShape
+        String sNote
+        Move (rfPackageManagedPathNote("C:\ProgramData\DataFlex\Packages\Cache\DataFlex-dev_Web UI-1.0.44\AppSrc\cWebApp.pkg")) to sNote
+        Send Assert (sNote contains "package cache")
+    End_Procedure
+
+    // An ordinary workspace path - and a folder merely NAMED like a package - gets no note.
+    {Published = True}
+    Procedure rfPackageManagedPathNote_OrdinaryPathIsBlank
+        Send AssertSAreEqual "" (rfPackageManagedPathNote("E:\WinServ\AppSrc\WinServ.src"))
+        Send AssertSAreEqual "" (rfPackageManagedPathNote("C:\Projects\MyDfPkgTools\AppSrc\a.pkg"))
+        Send AssertSAreEqual "" (rfPackageManagedPathNote(""))
+    End_Procedure
+
+    // THE PIN: the encoded writer refuses a read-only target - False back, bytes untouched.
+    {Published = True}
+    Procedure rfWriteEncodedFileFromStringArray_ReadOnlyTargetRefusedAndIntact
+        String sFile
+        String[] asNew asRead
+        Boolean bOk
+        Get MakeReadOnlyScratch "_RoTest4.tmp" to sFile
+        Move "overwritten" to asNew[0]
+        Move "second line" to asNew[1]
+        Get rfWriteEncodedFileFromStringArray (&asNew) sFile C_NewLine False to bOk
+        Send Assert (bOk = False)
+        Move (rfReadEncodedFileAsStringArray(sFile)) to asRead
+        Send AssertIAreEqual 1 (SizeOfArray(asRead))
+        Send AssertSAreEqual "original" asRead[0]
+        Send DropScratch sFile
+    End_Procedure
+
+    /* THE ENGINE'S WRITE-PROTECTED GATE (Nils 2026-08-18: "if the files are write protected ...
+       handled just like the other DataFlex system files under Program Files"). A read-only file
+       leaves the run list at InitializeEngine - whatever built the list - and is NAMED in
+       pasReadOnlySkipped so StartWarning / CollectSummary can say so. Writable neighbours stay,
+       in order. */
+    {Published = True}
+    Procedure DropWriteProtectedFiles_TakesReadOnlyOutAndNamesIt
+        String sRo sRw
+        String[] asLine asSkipped
+        Boolean bOk
+        Integer iDropped
+        tRefactorFiles RFiles
+
+        Get MakeReadOnlyScratch "_RoTest6.tmp" to sRo
+        Get ScratchFile "_RoTest7.tmp" to sRw
+        Move "x" to asLine[0]
+        Get rfWriteEncodedFileFromStringArray (&asLine) sRw C_NewLine False to bOk
+        Move sRw to RFiles.asFullFileNames[0]
+        Move sRo to RFiles.asFullFileNames[1]
+        Move sRw to RFiles.asFullFileNames[2]
+        Get DropWriteProtectedFiles of ghoEngine (&RFiles) to iDropped
+        Send AssertIAreEqual 1 iDropped
+        Send AssertIAreEqual 2 (SizeOfArray(RFiles.asFullFileNames))
+        Send AssertSAreEqual sRw RFiles.asFullFileNames[0]
+        Send AssertSAreEqual sRw RFiles.asFullFileNames[1]
+        Get pasReadOnlySkipped of ghoEngine to asSkipped
+        Send AssertIAreEqual 1 (SizeOfArray(asSkipped))
+        Send AssertSAreEqual sRo asSkipped[0]
+        Send DropScratch sRo
+        Send DropScratch sRw
+    End_Procedure
+
+    // Nothing read-only -> the list is untouched and the skip list is EMPTY (a stale list from a
+    // previous run would make the next summary lie).
+    {Published = True}
+    Procedure DropWriteProtectedFiles_NothingReadOnlyLeavesListAndClearsSkips
+        String sRw
+        String[] asLine asSkipped
+        Boolean bOk
+        Integer iDropped
+        tRefactorFiles RFiles
+        Get ScratchFile "_RoTest8.tmp" to sRw
+        Move "x" to asLine[0]
+        Get rfWriteEncodedFileFromStringArray (&asLine) sRw C_NewLine False to bOk
+        Move sRw to RFiles.asFullFileNames[0]
+        Get DropWriteProtectedFiles of ghoEngine (&RFiles) to iDropped
+        Send AssertIAreEqual 0 iDropped
+        Send AssertIAreEqual 1 (SizeOfArray(RFiles.asFullFileNames))
+        Get pasReadOnlySkipped of ghoEngine to asSkipped
+        Send AssertIAreEqual 0 (SizeOfArray(asSkipped))
+        Send DropScratch sRw
+    End_Procedure
+
+    /* THE MISSING-FILE GATE (2026-09-05). A list can be older than the disk - a saved plan names
+       files as they stood at the Check, and [Rename them] retired two FlexCOM proxies before the
+       run reached them. Such names leave the list at InitializeEngine, in order, and are NAMED in
+       pasMissingSkipped; MissingSkippedText says what happened and the likely reason. */
+    {Published = True}
+    Procedure DropMissingFiles_TakesVanishedOutAndNamesIt
+        String sRw sGone sText
+        String[] asLine asSkipped
+        Boolean bOk
+        Integer iDropped
+        tRefactorFiles RFiles
+
+        Get ScratchFile "_MissTest1.tmp" to sRw
+        Get ScratchFile "_MissTest_NoSuchFile.tmp" to sGone
+        Move "x" to asLine[0]
+        Get rfWriteEncodedFileFromStringArray (&asLine) sRw C_NewLine False to bOk
+        Send DropScratch sGone                         // make sure it is NOT there
+        Move sRw   to RFiles.asFullFileNames[0]
+        Move sGone to RFiles.asFullFileNames[1]
+        Move sRw   to RFiles.asFullFileNames[2]
+        Get DropMissingFiles of ghoEngine (&RFiles) to iDropped
+        Send AssertIAreEqual 1 iDropped
+        Send AssertIAreEqual 2 (SizeOfArray(RFiles.asFullFileNames))
+        Send AssertSAreEqual sRw RFiles.asFullFileNames[0]
+        Send AssertSAreEqual sRw RFiles.asFullFileNames[1]
+        Get pasMissingSkipped of ghoEngine to asSkipped
+        Send AssertIAreEqual 1 (SizeOfArray(asSkipped))
+        Send AssertSAreEqual sGone asSkipped[0]
+        Get MissingSkippedText of ghoEngine "Skipped:" 10 "   " to sText
+        Send Assert (sText contains "1 file(s) no longer on disk") sText
+        Send Assert (sText contains sGone) sText
+        Send Assert (sText contains "Rename them") sText
+        Send DropScratch sRw
+    End_Procedure
+
+    // Nothing missing -> the list is untouched, the skip list is EMPTY and the paragraph is "".
+    {Published = True}
+    Procedure DropMissingFiles_NothingMissingLeavesListAndClearsSkips
+        String sRw sText
+        String[] asLine asSkipped
+        Boolean bOk
+        Integer iDropped
+        tRefactorFiles RFiles
+        Get ScratchFile "_MissTest2.tmp" to sRw
+        Move "x" to asLine[0]
+        Get rfWriteEncodedFileFromStringArray (&asLine) sRw C_NewLine False to bOk
+        Move sRw to RFiles.asFullFileNames[0]
+        Get DropMissingFiles of ghoEngine (&RFiles) to iDropped
+        Send AssertIAreEqual 0 iDropped
+        Send AssertIAreEqual 1 (SizeOfArray(RFiles.asFullFileNames))
+        Get pasMissingSkipped of ghoEngine to asSkipped
+        Send AssertIAreEqual 0 (SizeOfArray(asSkipped))
+        Get MissingSkippedText of ghoEngine "Skipped:" 10 "   " to sText
+        Send AssertSAreEqual "" sText
+        Send DropScratch sRw
+    End_Procedure
+
+    /* A FOLDER IS NOT A FILE (2026-10-05). The list held "E:\Lib\AppSrc\" - the file of a compiler message
+       cut off mid-line by a compiler crash - and vFilePathExists answers True for a folder, so it stayed in
+       the run. It leaves with the missing names and is named with them, with or without its last
+       separator. */
+    {Published = True}
+    Procedure DropMissingFiles_AFolderLeavesToo
+        String sRw sFolder
+        String[] asLine asSkipped
+        Boolean bOk
+        Integer iDropped
+        tRefactorFiles RFiles
+
+        Get ScratchFile "_MissTest3.tmp" to sRw
+        Move "x" to asLine[0]
+        Get rfWriteEncodedFileFromStringArray (&asLine) sRw C_NewLine False to bOk
+        Get psDataPath of (phoWorkspace(ghoApplication)) to sFolder      // a folder that is there
+        Move (vFolderFormat(sFolder)) to RFiles.asFullFileNames[0]       // "...\Data\"
+        Move sRw                      to RFiles.asFullFileNames[1]
+        Move (Left(vFolderFormat(sFolder), (Length(vFolderFormat(sFolder)) - 1))) to RFiles.asFullFileNames[2]   // "...\Data"
+        Get DropMissingFiles of ghoEngine (&RFiles) to iDropped
+        Send AssertIAreEqual 2 iDropped
+        Send AssertIAreEqual 1 (SizeOfArray(RFiles.asFullFileNames))
+        Send AssertSAreEqual sRw RFiles.asFullFileNames[0]
+        Get pasMissingSkipped of ghoEngine to asSkipped
+        Send AssertIAreEqual 2 (SizeOfArray(asSkipped))
+        Send DropScratch sRw
+    End_Procedure
+
+    // The COM-proxy gate answers "do not process" for a name with nothing behind it - and raises
+    // nothing (until 2026-09-05 it raised DfErr_Program, which is what put four dialogs on one run).
+    {Published = True}
+    Procedure ComProxyGate_MissingFileIsSkippedQuietly
+        String sGone
+        Boolean bSkip
+        Get ScratchFile "_MissTest_NoSuchProxy.pkg" to sGone
+        Send DropScratch sGone
+        Get _IsDataFlexCOMProxyClassesFile of ghoFuncLib sGone to bSkip
+        Send Assert (bSkip = True)
+    End_Procedure
+
+    /* THE REPORT EXEMPTION (Nils 2026-08-19). The gate applies to a run that CHANGES source; a report
+       reads, and the declarations a 4544 report exists to name often live in exactly the read-only
+       third-party library the gate would remove. Dry runs and the count-source-lines run read too. */
+    {Published = True}
+    Procedure RunWritesSource_OnlyForRunsThatChangeSource
+        tRefactorSettings RS
+
+        // A report-only run: the total IS the report count -> reads everything.
+        Move 2 to RS.iSelectedFunctionTotal
+        Move 1 to RS.iSelectedReportFunctions
+        Move 1 to RS.iSelectedReportAllFunctions
+        Send Assert (RunWritesSource(ghoEngine, RS) = False) "a report-only run must not drop files"
+        // One converter alongside the two reports -> the run writes.
+        Move 3 to RS.iSelectedFunctionTotal
+        Send Assert (RunWritesSource(ghoEngine, RS) = True) "a run with a converter must drop write-protected files"
+        // A dry run changes nothing, whatever is selected.
+        Move True to RS.bReadOnly
+        Send Assert (RunWritesSource(ghoEngine, RS) = False) "a bReadOnly run must not drop files"
+        Move False to RS.bReadOnly
+        // Count-source-lines runs in solitude and only reads.
+        Move True to RS.bCountSourceLines
+        Send Assert (RunWritesSource(ghoEngine, RS) = False) "counting source lines must not drop files"
+    End_Procedure
+
+    /* rfFileAsDataUri - the package icon, inlined (2026-08-19). An <img src="file:///..."> is refused
+       by the WebView that renders the Libraries dialog, so the bytes go into the page instead. The
+       first cut used CString() on the Pointer Base64Encode returns and died with err 4381 "Illegal
+       Datatype Conversion" the moment the dialog opened; PointerToString is the conversion DataFlex's
+       own Base64EncodeToStr uses. Deterministic fixture: base64("Hi") is "SGk=", so the whole URI is
+       predictable and a broken encoder cannot pass by accident. */
+    {Published = True}
+    Procedure DataUri_EncodesFileBytes
+        String sFile sUri
+        String[] asOne
+        Boolean bOk
+        Get ScratchFile "_IconTest.png" to sFile
+        Move "Hi" to asOne[0]
+        Get rfWriteEncodedFileFromStringArray (&asOne) sFile C_NewLine False to bOk
+        Send Assert bOk
+        Move (rfFileAsDataUri(sFile)) to sUri
+        Send AssertSAreEqual "data:image/png;base64,SGk=" sUri
+        Send DropScratch sFile
+    End_Procedure
+
+    // The MIME type follows the extension, so the browser is told what it is being handed.
+    {Published = True}
+    Procedure DataUri_MimeFollowsTheExtension
+        String sFile sUri
+        String[] asOne
+        Boolean bOk
+        Get ScratchFile "_IconTest.svg" to sFile
+        Move "Hi" to asOne[0]
+        Get rfWriteEncodedFileFromStringArray (&asOne) sFile C_NewLine False to bOk
+        Move (rfFileAsDataUri(sFile)) to sUri
+        Send Assert (sUri contains "data:image/svg+xml;base64,")
+        Send DropScratch sFile
+    End_Procedure
+
+    // A missing file answers "" - the caller then keeps its own fallback (the letter tile).
+    {Published = True}
+    Procedure DataUri_MissingFileIsEmpty
+        String sFile
+        Get ScratchFile "_IconTest_DoesNotExist.png" to sFile
+        Send AssertSAreEqual "" (rfFileAsDataUri(sFile))
+        Send AssertSAreEqual "" (rfFileAsDataUri(""))
+    End_Procedure
+
+    /* rfReadEncodedFileHead - the bounded reader behind the findings render's cause attribution.
+       The contract that matters is that a line read from the HEAD is byte-identical to the same line
+       read by the full reader; if the two ever disagree the cause attribution silently changes. */
+    {Published = True}
+    Procedure Head_MatchesFullReaderLineForLine
+        String sFile
+        String[] asWrite asFull asHead
+        Integer i iMax
+        Boolean bOk
+
+        Get ScratchFile "_HeadRead.pkg" to sFile
+        For i from 0 to 199
+            Move ("Line " + String(i) + " - some indented DataFlex text here") to asWrite[i]
+        Loop
+        Get rfWriteEncodedFileFromStringArray (&asWrite) sFile C_NewLine False to bOk
+        Send Assert bOk
+        Move (rfReadEncodedFileAsStringArray(sFile)) to asFull
+        Move (rfReadEncodedFileHead(sFile, 24576)) to asHead
+        // 200 short lines fit well inside 24 KB, so the head IS the whole file here.
+        Send AssertIAreEqual (SizeOfArray(asFull)) (SizeOfArray(asHead))
+        Move (SizeOfArray(asFull) - 1) to iMax
+        For i from 0 to iMax
+            Send AssertSAreEqual asFull[i] asHead[i]
+        Loop
+        Send DropScratch sFile
+    End_Procedure
+
+    // A cap SHORTER than the file: whole lines only, every one matching the full read, and the
+    // array simply ends early - which is what the caller's fallback keys off.
+    {Published = True}
+    Procedure Head_StopsOnAWholeLineWhenCapped
+        String sFile
+        String[] asWrite asFull asHead
+        Integer i iMax
+        Boolean bOk
+
+        Get ScratchFile "_HeadCap.pkg" to sFile
+        For i from 0 to 499
+            Move ("Line " + String(i) + " - padding to make the file comfortably exceed the cap") to asWrite[i]
+        Loop
+        Get rfWriteEncodedFileFromStringArray (&asWrite) sFile C_NewLine False to bOk
+        Move (rfReadEncodedFileAsStringArray(sFile)) to asFull
+        Move (rfReadEncodedFileHead(sFile, 2048)) to asHead
+        Send Assert ((SizeOfArray(asHead)) > 0)
+        Send Assert ((SizeOfArray(asHead)) < (SizeOfArray(asFull)))
+        Move (SizeOfArray(asHead) - 1) to iMax
+        For i from 0 to iMax
+            Send AssertSAreEqual asFull[i] asHead[i]
+        Loop
+        Send DropScratch sFile
+    End_Procedure
+
+    // A missing file answers an empty array, never a fault.
+    {Published = True}
+    Procedure Head_MissingFileIsEmpty
+        String sFile
+        String[] asHead
+        Get ScratchFile "_HeadNope.pkg" to sFile
+        Move (rfReadEncodedFileHead(sFile, 4096)) to asHead
+        Send AssertIAreEqual 0 (SizeOfArray(asHead))
+    End_Procedure
+
+    // The text both dialogs print: count, the names (capped), "... and N more", the package note.
+    {Published = True}
+    Procedure ReadOnlySkippedText_CountsNamesAndCaps
+        String sRo1 sRo2 sText
+        String[] asLine
+        Integer iDropped
+        tRefactorFiles RFiles
+
+        Get MakeReadOnlyScratch "_RoTest9.tmp"  to sRo1
+        Get MakeReadOnlyScratch "_RoTest10.tmp" to sRo2
+        Move sRo1 to RFiles.asFullFileNames[0]
+        Move sRo2 to RFiles.asFullFileNames[1]
+        Get DropWriteProtectedFiles of ghoEngine (&RFiles) to iDropped
+        Send AssertIAreEqual 2 iDropped
+        Get ReadOnlySkippedText of ghoEngine "NOTE:" 1 "   " to sText
+        Send Assert (sText contains "NOTE: 2 write-protected file(s)")
+        Send Assert (sText contains sRo1)
+        Send Assert (not(sText contains sRo2))         // capped at 1 name ...
+        Send Assert (sText contains "... and 1 more.")   // ... and the rest counted
+        Send Assert (not(sText contains "DfPkg"))       // scratch files are not package files
+        Send DropScratch sRo1
+        Send DropScratch sRo2
+        // and "" once nothing was skipped
+        Move sRo1 to RFiles.asFullFileNames[0]           // now writable + deleted -> not read-only
+        Get DropWriteProtectedFiles of ghoEngine (&RFiles) to iDropped
+        Get ReadOnlySkippedText of ghoEngine "NOTE:" 3 "   " to sText
+        Send AssertSAreEqual "" sText
+    End_Procedure
+
+    // Same refusal for the UTF-8 (BOM) flavour of the writer.
+    {Published = True}
+    Procedure rfWriteEncodedFileFromStringArray_ReadOnlyTargetRefusedUtf8
+        String sFile
+        String[] asNew
+        Boolean bOk
+        Get MakeReadOnlyScratch "_RoTest5.tmp" to sFile
+        Move "overwritten" to asNew[0]
+        Get rfWriteEncodedFileFromStringArray (&asNew) sFile C_NewLine True to bOk
+        Send Assert (bOk = False)
+        Send Assert (rfFileHasBOM(sFile) = False)     // no BOM = the UTF-8 write never landed
+        Send DropScratch sFile
+    End_Procedure
+
+    // THE INSTALL PREFIX TEST (2026-09-20) behind IsCompilerNamedFileWritable - the one rule that
+    // decides whether a compiler-named file is the workspace's to write. Case-blind, either
+    // separator, the folder with or without its trailing separator, and never a partial component.
+    {Published = True}
+    Procedure rfIsPathUnderFolder_InsideAndOutside
+        Send Assert (rfIsPathUnderFolder("C:\DF26\Pkg\Winkern.pkg", "C:\DF26\Pkg") = True)
+        Send Assert (rfIsPathUnderFolder("C:\DF26\Pkg\Winkern.pkg", "C:\DF26\Pkg\") = True)
+        Send Assert (rfIsPathUnderFolder("c:\df26\pkg\sub\x.pkg", "C:\DF26\PKG") = True)
+        Send Assert (rfIsPathUnderFolder("C:/DF26/Pkg/Winkern.pkg", "C:\DF26\Pkg") = True)
+        Send Assert (rfIsPathUnderFolder("E:\App\AppSrc\Main.src", "C:\DF26\Pkg") = False)
+        // a folder NAME that merely starts the same is not the folder
+        Send Assert (rfIsPathUnderFolder("C:\DF26\Pkg2\x.pkg", "C:\DF26\Pkg") = False)
+        Send Assert (rfIsPathUnderFolder("C:\DF26\Pkg", "C:\DF26\Pkg") = False)
+        Send Assert (rfIsPathUnderFolder("", "C:\DF26\Pkg") = False)
+        Send Assert (rfIsPathUnderFolder("C:\DF26\Pkg\x.pkg", "") = False)
+    End_Procedure
+
+End_Object

@@ -8,7 +8,7 @@ Use dfTabDlg.pkg
 
 //Use cRefactorDbView.pkg
 Use cRDCDbView.pkg
-Use cRefactorDbCJGrid.pkg  
+Use cRDCDbCJGrid.pkg
 Use cRDCDbCJGridColumn.pkg
 Use cRDCDbComboForm.pkg
 Use RefactorConstants.h.pkg
@@ -49,20 +49,29 @@ Object oSelectFoldersView is a cRDCDbView
         Set DDO_Server to oFolderSelHea_DD
         Set Constrain_File to FolderSelHea.File_Number
 
+        // Flush the cmd-line folder seed (/folders flag or the CmdLine INI [Folders] section) into the
+        // FolderSelDtl table the first time this DD relates with the workspace DDs current. Keyed off
+        // pasCmdLineFolders - NOT the pasSelectedFolders live cache - so ordinary interactive saves
+        // (a checkbox tick, Select All) never re-run the cmd-line marking (which mis-resolved deep
+        // paths and faulted err-28 duplicate creates). The Forward always runs: relating is what
+        // keeps FolderSelHeaID correct on saved rows.
         Procedure Relate_Main_File
             String[] asFolders asEmpty
             Integer iIDa iIDb
-            Get pasCmdLineSetSelectedFolders of ghoApplication to asFolders
+
+            Forward Send Relate_Main_File
+            Get pasCmdLineFolders of ghoApplication to asFolders
             If (SizeOfArray(asFolders) = 0) Begin
                 Procedure_Return
             End
-            Forward Send Relate_Main_File
             Get Field_Current_Value Field FolderSelDtl.FolderSelHeaID to iIDa
             Get Field_Current_Value Field FolderSelDtl.ID             to iIDb
             If (iIDa <> 0 and iIDb <> 0) Begin
-                Send CmdLineSetSelectedFolders asFolders 
-                // Reset ghoApplication property to only update database once on startup.
-                Set pasCmdLineSetSelectedFolders of ghoApplication to asEmpty
+                Send MarkCmdLineSetSelectedFolders asFolders
+                // Consume the one-shot seed, and drop the live cache so the next reader
+                // re-syncs it from the now-updated table.
+                Set pasCmdLineFolders  of ghoApplication to asEmpty
+                Set pasSelectedFolders of ghoApplication to asEmpty
             End
         End_Procedure
     End_Object
@@ -81,7 +90,7 @@ Object oSelectFoldersView is a cRDCDbView
         Set Border_Style to Border_None
         Set piMinSize to 126 490
 
-        Object oDbFolders_grd is a cRefactorDbCJGrid
+        Object oDbFolders_grd is a cRDCDbCJGrid
             Set Server to oFolderSelDtl_DD
             Set Size to 157 620
             Set Location to 27 10
@@ -282,6 +291,7 @@ Object oSelectFoldersView is a cRDCDbView
                 Handle hoFolderSelHeaDD
                 String sMsg
                 Boolean bLibInclude
+
                 Get phoFolderSelHeaDD of ghoApplication to hoFolderSelHeaDD
                 Get Checked_State of oIncludeLibFolders_cb to bLibInclude
                 Get RefreshFolderRecords of hoFolderSelHeaDD bLibInclude to iNew
@@ -295,7 +305,7 @@ Object oSelectFoldersView is a cRDCDbView
                     Move (String(iNew) * "folder(s) added to the list.") to sMsg
                 End
                 Else If (iNew < 0) Begin
-                    Move (String(0 - iNew) * "library folder(s) removed from the list.") to sMsg
+                    Move (String(0 - iNew) * "folder(s) removed from the list (library folders, or system folders such as a DfPkg package checkout).") to sMsg
                 End
                 Else Begin
                     Move "No changes to the folder list." to sMsg

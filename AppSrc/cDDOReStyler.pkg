@@ -55,7 +55,8 @@
 //   - include files,
 //   - source files with incorrect DDOs already in there
 //       (eg. declare o<table>_DD but later on use <table>_DD)
-//   - references to DDO's not declared in the source file (non autonomous usage)
+//   - references to DDO's not declared in the source file (non autonomous usage) - except by object path,
+//     <DDO>(<parent object>(...)), which is renamed with the DDO in every file of the run (2026-11-01)
 //
 //*****************************************************************************************
 Use seq_chnl.pkg
@@ -63,6 +64,9 @@ Use vwin32fh.pkg
 Use RefactorConstants.h.pkg
 Use cEncodingHelpers.pkg
 Use RefactorStatusPanel.pkg
+
+// The function library's write-time guard (cRefactorFuncLib), which this package is compiled before.
+Register_Function _GuardedWriteEncodedFile String sFile String[] ByRef asNew Boolean bIsUtf8 Returns Boolean
 
 Declare_Datafile SysFile
 
@@ -80,6 +84,7 @@ Struct tDDO
     Integer iLine         // source line where the DDO is declared
     Integer iFileNum      // Not needed at this stage, but we got the data, so stick it in
     String  sTableName    // Just as easy to have
+    String  sContainer    // the object it is declared in, lowercase ("" at the top): another file reaches it through that
 End_Struct
 
 Class cDataFiles is a cObject
@@ -131,6 +136,11 @@ Class cDDOReStyler is a cObject
         Property String[] pasAllFiles
         Property Integer piFileCount
         Property Boolean pbLastFileWasUtf8 False
+        // The DDOs another file can reach by object path (CollectPathRenames): "<old ddo>(<parent object>", lowercase,
+        // the new name for each, and the keys sorted for the lookup.
+        Property String[] pasPathRenameKeys
+        Property String[] pasPathRenameNew
+        Property String[] pasPathRenameSorted
 
         Object oDataFiles is a cDataFiles
         End_Object
@@ -138,7 +148,7 @@ Class cDDOReStyler is a cObject
     End_Procedure
 
     Function StartDDORestyler Returns Integer
-        Boolean bOk bStop bSwapped
+        Boolean bOk bStop bSwapped bCancel
         Integer iCount iSize
         String[] asAllFiles
         String sSWSFile
@@ -164,20 +174,27 @@ Class cDDOReStyler is a cObject
         If (bSwapped) Begin
             Send RestoreActiveFilelist of ghoApplication
         End
+        // A DDO another file reaches by its object path is renamed there too.
+        Send CollectPathRenames asAllFiles (peDDOStyle(Self))
 
         For iCount from 0 to iSize
             Send RestyleDDObjects asAllFiles[iCount] (peDDOStyle(Self))
             If (Active_State(ghoStatusPanel) = True) Begin
                 // File-No counter in the CAPTION (consistent with the engine + the other whole-file
-                // functions); the Action line now shows the file being processed instead.
+                // functions); the full path goes to the multi-line TableName line (panel field
+                // conventions - see RefactorStatusPanel.pkg).
                 Set Caption_Text of ghoStatusPanel to ("DD restyle - File No:" * String(iCount + 1) * "of:" * String(iSize + 1))
-                Send Update_StatusPanel of ghoStatusPanel (asAllFiles[iCount])
+                Set TableName_Text of ghoStatusPanel to asAllFiles[iCount]
             End
-            // Inner Cancel_Check removed: same bug as cRemoveUnusedLocals -
-            // Cancel_Check's End_Status deactivates the panel, swallowing
-            // the cancel signal so the engine's outer Cancel_Check at the
-            // eOtherFunctionsAll loop boundary never sees it. Cancel now
-            // fires at that boundary instead.
+            // Mid-run cancel: the old inner Cancel_Check was REMOVED (its End_Status
+            // deactivates the panel, swallowing the signal - same bug as
+            // cRemoveUnusedLocals). Poll the side-effect-free accessor instead and bail;
+            // the engine's outer Cancel_Check at the eOtherFunctionsAll boundary then
+            // runs the confirm pipeline once. Files already restyled stay restyled,
+            // like any engine cancel.
+            Get pbUserCancelRequested of ghoEngine to bCancel
+            If (bCancel = True) ;
+                Move iSize to iCount
         Loop
         
         Function_Return (piFileCount(Self))
@@ -187,8 +204,8 @@ Class cDDOReStyler is a cObject
         String[] asSource
 
         Set psFileName        to sFileName
-        Set pbLastFileWasUtf8 to (RFFileHasBOM(sFileName))
-        Move (RFReadEncodedFileAsStringArray(sFileName)) to asSource
+        Set pbLastFileWasUtf8 to (rfFileHasBOM(sFileName))
+        Move (rfReadEncodedFileAsStringArray(sFileName)) to asSource
         Set pasSource to asSource
     End_Procedure
 
@@ -205,9 +222,10 @@ Class cDDOReStyler is a cObject
             Procedure_Return
         End
         Get pasSource to asSource
-        // Append empty sentinel so the last real line gets a trailing line break (matching Writeln behaviour).
-        Move "" to asSource[SizeOfArray(asSource)]
-        Get RFWriteEncodedFileFromStringArray asSource sFileName CS_CRLF bIsUtf8 to bOK
+        // Through the write-time guard, like every pass that writes its own files: macro code, a multi-line
+        // string's text and #HEADER lines are never refactored. It also keeps the file's own line breaks and
+        // whether it ended with one.
+        Get _GuardedWriteEncodedFile of ghoFuncLib sFileName (&asSource) bIsUtf8 to bOK
     End_Procedure
 
     // Scans the whole file and locates the declared datadictionary objects based on that
@@ -218,10 +236,12 @@ Class cDDOReStyler is a cObject
     // Example line that will be detected:
     //  Object oCustomer_DD is a Customer_DataDictionary
     //
+    // Each DDO also gets the object it is declared in (sContainer): another file reaches it through that name -
+    // Customer_DD(Invoice_vw(...)) - see CollectPathRenames.
     Procedure FindCurrentDDObjects
         Integer iCount iLine iPos iSpaceChars iDDO
-        String  sLine sDDObject sNline   // normalized line, lowercase and trimmed
-        String[] asSource
+        String  sLine sDDObject sNline sName sParent   // sNline: the line normalized, lowercase and trimmed
+        String[] asSource asParents
         tDDO[] DDObjects
 
         Move 0 to iDDO
@@ -233,7 +253,16 @@ Class cDDOReStyler is a cObject
             For iLine from 0 to iCount
                 Move asSource[iLine] to sLine
                 Move (Lowercase(Trim(sLine))) to sNline
+                If (Left(sNline, 10) = "end_object" and SizeOfArray(asParents) > 0) ;
+                    Move (ResizeArray(asParents, (SizeOfArray(asParents) - 1))) to asParents
                 If (Pos("object ", sNline) = 1) Begin
+                    Move "" to sParent
+                    If (SizeOfArray(asParents) > 0) ;
+                        Move asParents[SizeOfArray(asParents) - 1] to sParent
+                    Move (Trim(Right(sNline, (Length(sNline) - 7)))) to sName
+                    If (Pos(" ", sName) > 0) ;
+                        Move (Left(sName, (Pos(" ", sName) - 1))) to sName
+                    Move sName to asParents[SizeOfArray(asParents)]
                     Move (Pos("_datadictionary", sNline)) to iPos
                     If (iPos > 0) Begin
                         Move (Replace("object ", sNline, "")) to sNline
@@ -247,6 +276,7 @@ Class cDDOReStyler is a cObject
                             Move iLine      to DDObjects[iDDO].iLine
                             Move False      to DDObjects[iDDO].bVerified
                             Move eDDUnknown to DDObjects[iDDO].eDDOStyle
+                            Move sParent    to DDObjects[iDDO].sContainer
                             Increment iDDO
                         End
                     End
@@ -433,68 +463,202 @@ Class cDDOReStyler is a cObject
         End
     End_Procedure
 
+    // Does ApplyNewStyle rename this DDO to eStyle? Strict (the default) renames only a DDO verified against the
+    // filelist: an unverified one is skipped quietly, not raised as an Error - those fired during the (former)
+    // filelist redirect and on a re-run cascaded into an error storm and a corrupt run summary. Never a DDO whose
+    // style was not recognised, nor one already in the style asked for. Non strict needs DDObject.sTableName filled
+    // in still.
+    Function WillRestyle tDDO DDObject Integer eStyle Returns Boolean
+        If (pbStrict(Self) = True and DDObject.bVerified = False) ;
+            Function_Return False
+        If (DDObject.eDDOStyle = eDDUnknown or DDObject.eDDOStyle = eStyle) ;
+            Function_Return False
+        Function_Return True
+    End_Function
+
     Function ApplyNewStyle Returns Integer
-        Boolean bStrict bReplace
         Integer iFile iCount eStyle iFileCount
-        String  sFileName
         tDDO[]  DDObjects
 
         Move 0 to iFileCount
-        Get peDDOStyle to eStyle              
+        Get peDDOStyle to eStyle
 
         If (eStyle <> eDDUnknown) Begin
-            Get pbStrict to bStrict   // Default is to only rename DDO's that exist in filelist
-            Get ParseFileName (psFileName(Self)) to sFileName
             Get pDDObjects to DDObjects
             Move (SizeOfArray(DDObjects) - 1) to iCount
-            
-            If (iCount >= 0) Begin
-                For iFile from 0 to iCount
-                    Move False to bReplace
-                    If (bStrict) Begin
-                        If (DDObjects[iFile].bVerified=True) Begin
-                            Move True to bReplace
-                        End
-                        // else: DDO not found in the filelist - cannot be
-                        // verified, so skip it. Do NOT raise a runtime Error:
-                        // these fire during the (former) filelist redirect and
-                        // on a re-run cascade into an error storm + corrupt the
-                        // run summary. "Skip" is the correct, safe behaviour.
-                    End
-                    Else Begin
-                        // if you want to do non strict, you need to fill in ddobject.sTableName still!
-                        Move True to bReplace
-                    End
-                    If (DDObjects[iFile].eDDOStyle = eDDUnknown) Begin
-                        // Style not recognised - skip quietly (not an error).
-                        Move False to bReplace
-                    End
-                    If (DDObjects[iFile].eDDOStyle = eStyle) Begin
-                        // Already in the requested style - nothing to do.
-                        Move False to bReplace
-                    End
-                    If (bReplace) Begin
-                        Send ApplyNewStyleForTable DDObjects[iFile]
-                        Increment iFileCount
-                    End
-                Loop
-            End
-        End     
+            For iFile from 0 to iCount
+                If (WillRestyle(Self, DDObjects[iFile], eStyle) = True) Begin
+                    Send ApplyNewStyleForTable DDObjects[iFile]
+                    Increment iFileCount
+                End
+            Loop
+        End
         Function_Return iFileCount
+    End_Function
+
+    /* A DDO ANOTHER FILE REACHES BY ITS OBJECT PATH (2026-11-01). A program, a lookup or another view reaches a
+       view's DDO by naming it with its parent - 'Send Request_Assign to (Customer_DD(Invoice_vw(Client_Area(Main))))'
+       - and the rename reached only the file that declares the DDO, so in a whole-workspace run each such line named
+       an object that no longer existed: 17 errors in 8 files of one workspace. This first pass over all the files
+       finds every DDO the restyle renames, with the object it is declared in (AddPathRenames); each file then renames
+       '<old>(<parent>' as well (ApplyPathRenames). Only that form: a file that reaches the DDO another way - an
+       include, delegation - is still not followed, and nor is a file outside the run. */
+    Procedure CollectPathRenames String[] asAllFiles Integer eStyle
+        String[] asNone asMasked
+        tWholeFileMask Mask Empty
+        Integer iFile iLast iMacro
+        Boolean bCancel
+
+        Set pasPathRenameKeys   to asNone
+        Set pasPathRenameNew    to asNone
+        Set pasPathRenameSorted to asNone
+        If (eStyle = eDDUnknown) ;
+            Procedure_Return
+        Move (SizeOfArray(asAllFiles) - 1) to iLast
+        For iFile from 0 to iLast
+            If (Active_State(ghoStatusPanel) = True) ;
+                Set Caption_Text of ghoStatusPanel to ("DD restyle - finding the DDOs, File No:" * String(iFile + 1) * "of:" * String(iLast + 1))
+            Send ReadFile asAllFiles[iFile]
+            Get pasSource to asMasked
+            Move Empty to Mask
+            Get MaskForTransform of ghoFuncLib (&asMasked) (&Mask) to iMacro
+            Set pasSource to asMasked
+            Send FindCurrentDDObjects
+            Send ClassifyDDObjects
+            Send AddPathRenames eStyle
+            Get pbUserCancelRequested of ghoEngine to bCancel
+            If (bCancel = True) ;
+                Move iLast to iFile
+        Loop
+    End_Procedure
+
+    // The current file's DDOs (pDDObjects) that the restyle renames and another file can reach by object path - one
+    // declared in an object - added to pasPathRenameKeys as "<old>(<parent>", lowercase, with the new name in
+    // pasPathRenameNew; pasPathRenameSorted is the keys sorted, for the lookup. A "rename" to the same name - an
+    // o<table>_DD counts as the Studio style, and the new style writes it the same - is left out.
+    Procedure AddPathRenames Integer eStyle
+        String[] asKeys asNew asSorted
+        String sKey sOld sNew
+        tDDO[] DDObjects
+        Integer iDDO iLast
+
+        Get pasPathRenameKeys to asKeys
+        Get pasPathRenameNew  to asNew
+        Get pDDObjects to DDObjects
+        Move (SizeOfArray(DDObjects) - 1) to iLast
+        For iDDO from 0 to iLast
+            If (DDObjects[iDDO].sContainer <> "" and WillRestyle(Self, DDObjects[iDDO], eStyle) = True) Begin
+                Move (Lowercase(Trim(DDObjects[iDDO].sDDO))) to sOld
+                Move (NewStyleName(Self, DDObjects[iDDO].sTableName, eStyle)) to sNew
+                Move (sOld + "(" + DDObjects[iDDO].sContainer) to sKey
+                If (Lowercase(sNew) <> sOld and SearchArray(sKey, asKeys) = -1) Begin
+                    Move sKey to asKeys[SizeOfArray(asKeys)]
+                    Move sNew to asNew[SizeOfArray(asNew)]
+                End
+            End
+        Loop
+        Move (SortArray(asKeys)) to asSorted
+        Set pasPathRenameKeys   to asKeys
+        Set pasPathRenameNew    to asNew
+        Set pasPathRenameSorted to asSorted
+    End_Procedure
+
+    // Can sChar be part of an object name?
+    Function IsNameChar String sChar Returns Boolean
+        If (sChar = "") ;
+            Function_Return False
+        Function_Return (Pos(Lowercase(sChar), "abcdefghijklmnopqrstuvwxyz0123456789_@#$") > 0)
+    End_Function
+
+    // Renames, in the current file (pasSource), every "<old>(<parent>" CollectPathRenames found - a DDO of another
+    // file, reached by its object path - to the DDO's new name. Returns how many.
+    Function ApplyPathRenames Returns Integer
+        String[] asSource asKeys asNew asSorted
+        String sLine sKey
+        Integer iLine iLast iParen iB iEnd iA iStart iAt iLen iCount
+
+        Get pasPathRenameSorted to asSorted
+        If (SizeOfArray(asSorted) = 0) ;
+            Function_Return 0
+        Get pasPathRenameKeys to asKeys
+        Get pasPathRenameNew  to asNew
+        Get pasSource to asSource
+        Move 0 to iCount
+        Move (SizeOfArray(asSource) - 1) to iLast
+        For iLine from 0 to iLast
+            Move asSource[iLine] to sLine
+            Move 0 to iParen
+            If (Pos("(", sLine) > 0) ;
+                Move (Length(sLine)) to iParen
+            // Right to left, so a rename leaves the positions still to visit where they were.
+            While (iParen > 0)
+                If (Mid(sLine, 1, iParen) = "(") Begin
+                    // the name before the parenthesis...
+                    Move (iParen - 1) to iEnd
+                    While (iEnd > 0 and Mid(sLine, 1, iEnd) = " ")
+                        Decrement iEnd
+                    Loop
+                    Move iEnd to iB
+                    While (iB > 0 and IsNameChar(Self, Mid(sLine, 1, iB)) = True)
+                        Decrement iB
+                    Loop
+                    // ...and the name after it
+                    Move (Length(sLine)) to iLen
+                    Move (iParen + 1) to iStart
+                    While (iStart <= iLen and Mid(sLine, 1, iStart) = " ")
+                        Increment iStart
+                    Loop
+                    Move iStart to iA
+                    While (iA <= iLen and IsNameChar(Self, Mid(sLine, 1, iA)) = True)
+                        Increment iA
+                    Loop
+                    If (iEnd > iB and iA > iStart) Begin
+                        Move (Lowercase(Mid(sLine, (iEnd - iB), (iB + 1))) + "(" + Lowercase(Mid(sLine, (iA - iStart), iStart))) to sKey
+                        If (BinarySearchArray(sKey, asSorted) > -1) Begin
+                            Move (SearchArray(sKey, asKeys)) to iAt
+                            Move (Left(sLine, iB) + asNew[iAt] + Mid(sLine, iLen, (iEnd + 1))) to sLine
+                            Increment iCount
+                        End
+                    End
+                    // A name holds no parenthesis: go on before it.
+                    Move (iB + 1) to iParen
+                End
+                Decrement iParen
+            Loop
+            Move sLine to asSource[iLine]
+        Loop
+        If (iCount > 0) ;
+            Set pasSource to asSource
+        Function_Return iCount
     End_Function
 
     // Code that handles the restyle on the DD Object in the source filename supplied
     // and changes it to the new style eDDStyle
     Procedure RestyleDDObjects String sFileName Integer eDDStyle
-        Integer iChangedFiles iVoid
-        String[] asBefore asAfter
+        Integer iChangedFiles iVoid iMacro iLost iPath
+        String[] asBefore asAfter asMasked
+        tWholeFileMask Mask
+
         Send ReadFile sFilename
+        /* A block comment's, a report image's and a string's text and the macro code are masked away while the DDOs
+           are found and renamed, and put back after (cRefactorFuncLib's MaskForTransform, 2026-10-30): a commented-out
+           DDO is no DDO, and comment text is never refactored. */
+        Get pasSource to asBefore
+        Move asBefore to asMasked
+        Get MaskForTransform of ghoFuncLib (&asMasked) (&Mask) to iMacro
+        Set pasSource to asMasked
         Send FindCurrentDDObjects
         Send ClassifyDDObjects
         Set peDDOStyle to eDDStyle
-        Get pasSource to asBefore
         Get ApplyNewStyle to iVoid
+        Get ApplyPathRenames to iPath
+        If (iPath > 0) ;
+            Send AddRunNote of ghoFuncLib (psExecutionContext(ghoFuncLib)) (sFileName + ":" * String(iPath) * "reference(s) to a DDO of another file, by its object path, renamed with it.")
         Get pasSource to asAfter
+        Get UnmaskAfterTransform of ghoFuncLib (&asAfter) (&Mask) to iLost
+        Set pasSource to asAfter
+        If (iLost > 0) ;
+            Send AddRunNote of ghoFuncLib (psExecutionContext(ghoFuncLib)) (sFileName + ":" * String(iLost) * "line(s) of comment, image or string text or macro code the conversion had removed were put back where they were - check the file.")
         // ApplyNewStyle's replace counter also counts NO-OP replacements - e.g.
         // a DDO already in the target style but classified as a different enum
         // (o<table>_DD is eDDStudioStyle, yet target eDDNewStyle also emits

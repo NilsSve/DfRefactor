@@ -2,7 +2,7 @@
 Use cRefactorApplication.pkg
 Use cRefactorDbView.pkg
 Use cRefactorScintillaEditor.pkg
-Use oEditorProperties.pkg
+Use cRefactorEditorSettings.pkg
 Use vWin32fh.pkg
 Use cFunctionsDataDictionary.dd
 Use dfClient.pkg
@@ -11,7 +11,7 @@ Activate_View Activate_oEditorView_vw For oEditorView_vw
 Object oEditorView_vw is a cRefactorDbView
     Set Size to 263 492
     Set Maximize_Icon to True
-    Set Label to "Refactoring Editor"
+    Set Label to "Editor"
     Set Icon to "Editor.ico"
     Set pbAutoActivate to False
     Set pbAcceptDropFiles to True
@@ -85,7 +85,7 @@ Object oEditorView_vw is a cRefactorDbView
 
             Procedure Deactivating
                 Set pbEnabled of oIdleHandler to False
-                Forward Send DeActivating 
+                Forward Send Deactivating 
             End_Procedure
 
             // This short-cut key will keep the UI consistent, as the editor was "grabbing" this

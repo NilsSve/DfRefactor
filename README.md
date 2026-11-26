@@ -28,20 +28,22 @@ and paste the path from above. Finally select your local path to install to, and
 
 ### First-time setup (libraries)
 
-DFRefactor uses three libraries — **DFUnit**, **DUF** and **SciControlLib** — that live under `Libraries\` as *git submodules*. They are not copied into the main repository; git only records which version of each to use.
+DFRefactor uses five libraries — **DFUnit**, **DUF**, **RDCToolsLib**, **DFAbout** and **vwin32fh** — that live under `Libraries\` as *git submodules*. They are not copied into the main repository; git only records which version of each to use.
 
-After cloning, **double-click `setup.bat` in the repository root once.** It will:
+After cloning, run this once from the repository root to download the libraries at the exact versions DFRefactor expects:
 
-1. Download/initialise the library submodules at the exact versions DFRefactor expects.
-2. Configure that clone so a normal **Pull** (in GitHub Desktop or `git pull`) keeps the libraries in sync automatically from then on — no extra steps later.
+```
+git submodule update --init --recursive
+git config submodule.recurse true
+```
 
-`setup.bat` is safe to run any time: it never deletes anything. Re-run it if the `Libraries\` folders ever look empty or out of date, or whenever a new library is added to DFRefactor.
+The second line configures the clone so a normal **Pull** (in GitHub Desktop or `git pull`) keeps the libraries in sync automatically from then on. Re-run the first line if the `Libraries\` folders ever look empty or out of date, or whenever a new library is added to DFRefactor.
 
-> Cloning from the command line instead? Use `git clone --recurse-submodules https://github.com/NilsSve/DfRefactor.git`, then run `setup.bat` once to enable automatic library updates on future pulls.
+> Cloning from the command line instead? `git clone --recurse-submodules <this repository's URL>` initialises the libraries in the same step — you only need the `git config` line afterwards.
 
 DFRefactor is a powerful and free tool written in DataFlex that assists with refactoring legacy DataFlex code. It specifically targets code that uses syntax that is no longer supported or recommended. Refactoring is the process of improving the structure and readability of existing code without altering its external behavior.
 
-The only supported versions of DataFlex Studio are the latest two: currently, DataFlex 2024 and 2025. While this means you need one of these two versions installed to compile and run the refactoring programs, it does not prevent you from using the tool on projects or workspaces created with earlier versions of DataFlex. An older version of the tool, compatible with versions prior to 2023, is available as a separate branch. However, please note that this branch is not maintained, so you would need to use it at your own risk.
+The only supported versions of DataFlex Studio are the latest two: currently, DataFlex 2025 and 2026. While this means you need one of these two versions installed to compile and run the refactoring programs, it does not prevent you from using the tool on projects or workspaces created with earlier versions of DataFlex. An older version of the tool, compatible with versions prior to 2023, is available as a separate branch. However, please note that this branch is not maintained, so you would need to use it at your own risk.
 
 To refactor source code with DFRefactor, simply select the desired functions and click "Start Refactoring" for the chosen workspace.
 
@@ -51,7 +53,7 @@ There are various types of refactoring functions, and the source code is general
 
 The workspace consists of three important programs:
 - **TestBench.src**: A test bench used for developing and testing your custom refactoring functions.
-- **DFUnit_Testrunner.src**: A series of unit tests. You will need to add several unit tests for each new refactoring function included in the function repository.
+- **UnitTests.src**: A series of unit tests. You will need to add several unit tests for each new refactoring function included in the function repository.
 - **DFRefactor.src**: The main refactoring program that can be utilized once all functions have been tested and confirmed to work as intended.
 
 To use DFRefactor, you will need DataFlex Studio version 24.0 or later.
@@ -64,7 +66,7 @@ To use DFRefactor, you will need DataFlex Studio version 24.0 or later.
 
 ## Command-line and batch mode
 
-Both `DFRefactor.exe` and `DFUnit_TestRunner.exe` can run unattended from the command line, which makes them usable in scripts and CI pipelines.
+Both `DFRefactor.exe` and `UnitTests.exe` can run unattended from the command line, which makes them usable in scripts and CI pipelines.
 
 ### DFRefactor
 
@@ -96,14 +98,14 @@ Common flags:
 
 Flag and value are a space-separated pair; flags may appear in any order; paths must be quoted; flag spelling is case-insensitive. Run `DFRefactor.exe /help` for the authoritative list, or see the **Command-Line Usage** help topic.
 
-### DFUnit_TestRunner
+### UnitTests
 
 Run the unit tests headless (for CI):
 
 ```
-DFUnit_TestRunner.exe -c
+UnitTests.exe -c
 ```
 
 Writes results to the console and exits `0` if all tests pass or `-1` on any failure. Without `-c` (or `--console`) the runner starts in UI mode.
 
-> Note: `-c` / `--console` means *use a config ini-file* for `DFRefactor.exe`, but *console / CI mode* for `DFUnit_TestRunner.exe`. They are different programs with different argument handling.
+> Note: `-c` / `--console` means *use a config ini-file* for `DFRefactor.exe`, but *console / CI mode* for `UnitTests.exe`. They are different programs with different argument handling.

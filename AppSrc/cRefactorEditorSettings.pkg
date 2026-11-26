@@ -1,0 +1,149 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cRefactorEditorSettings
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-26
+//
+// Description : JSON-backed editor settings (Nils green-lit 2026-07-26: "please start the json
+//               conversion now"). Subclasses cEditorProperties and overrides ONLY the two
+//               ReadSettingsStore / WriteSettingsStore seam procedures (submodule f488dd1), so every
+//               override layered on LoadIni / SaveIni - hotkeys, language registration, macros -
+//               runs untouched. The store lives at Data\ScintillaEdit.json beside the other JSON
+//               configs; Programs\ScintillaEdit.ini is only ever READ, once, as migration source.
+//
+//               WHY a subclass + handle repoint, not a class swap inside the lib: SciControlLib's
+//               Use graph is CYCLIC, and whichever package enters it first fixes the compile order
+//               of everything inside (see oEditorSettings-Tests.pkg for the Error-98 story). So the
+//               lib package builds its object exactly as always, and the object below - created
+//               AFTER the lib package has loaded - simply takes over the ghoEditorProperties handle.
+//               Every consumer reads the handle at runtime, so all of them get the JSON object; the
+//               lib's own object stays parked on its already-loaded ini data and is never used again.
+//
+//               The JSON is a GENERIC serialization of the tag store (tRefEdSetFile in
+//               RefactorConstants.h.pkg): no per-property code, nothing to maintain when a property
+//               is added, and the "\n"-joined keyword lists become real JSON arrays - the
+//               readability win the conversion exists for. Unknown tags met on load (a NEWER
+//               build's settings read by an older build) are preserved through the unused-lines
+//               channel, the same forward-compatibility contract the ini system had.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use cRefactorEditorProperties.pkg   // the settings CONTRACT and the store under it
+Use cRefactorHotKeys.pkg    // SetEditorHotKeys - applied once the bindings are loaded
+Use cJsonObject.pkg
+Use RefactorFileIO.pkg      // rfOpenInput / rfOpenOutput / rfStripUtf8Bom - the settings file's channel I/O
+
+Class cRefactorEditorSettings is a cRefactorEditorProperties
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        // Test seam: a full path here overrides the real location. "" = production
+        // (Data\ScintillaEdit.json - ONE path, computed in ONE place, no mode flags).
+        Property String psJsonSettingsFile ""
+    End_Procedure
+
+    Function JsonSettingsFile Returns String
+        Handle hoWS
+        String sFile sPath
+        Get psJsonSettingsFile to sFile
+        If (sFile <> "") ;
+            Function_Return sFile
+        Get phoWorkspace of ghoApplication to hoWS
+        Get psDataPath of hoWS to sPath
+        Function_Return (vFolderFormat(sPath) + CS_ScintillaSettingsJson)
+    End_Function
+
+    /* THE SEAM. The store IS tRefEdSetFile now (see cRefactorSettingsStore), so both
+       directions are a parse or a stringify and nothing else - the ~120 lines of
+       StoreAsStruct / LoadStoreFromStruct that used to walk the library's
+       Array-of-Array-handles into this struct and back have gone with the store they
+       walked.
+
+       The one-time ini migration has gone too. This used to fall back to
+       "Forward Send ReadSettingsStore" - the library reader for
+       Programs\ScintillaEdit.ini - when no JSON existed. Nils's call, 2026-07-27: the
+       alpha testers' editor settings are not worth carrying a legacy-format reader for,
+       and it is unlikely any of them changed a setting. A fresh install now starts from
+       the declared defaults, which is what the property getters are for. */
+    Procedure ReadSettingsStore
+        Handle  hoJson
+        String  sFile
+        tRefEdSetFile TheFile
+
+        Get JsonSettingsFile to sFile
+        // Unreadable or unparseable: keep what is already in the store rather than
+        // replacing it with nothing. The same never-lose-settings bias as before.
+        Get rfParseJsonFile sFile to hoJson
+        If (hoJson = 0) ;
+            Procedure_Return
+        Get JsonToDataType of hoJson to TheFile
+        Send Destroy of hoJson
+        Set pTheStore to TheFile
+    End_Procedure
+
+    Procedure WriteSettingsStore
+        Integer iCh
+        Handle  hoJson
+        String  sFile
+        UChar[] ucJson
+        tRefEdSetFile TheFile
+
+        Get pTheStore to TheFile
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson TheFile
+        Set peWhiteSpace of hoJson to jpWhitespace_Pretty
+        Get StringifyUtf8 of hoJson to ucJson
+        Send Destroy of hoJson
+
+        Get JsonSettingsFile to sFile
+        Get rfOpenOutput sFile to iCh
+        If (iCh < 0) ;
+            Procedure_Return
+        Write channel iCh ucJson       // pretty UTF-8, NO BOM - a BOM breaks ParseUtf8
+        Send rfCloseOutput iCh
+    End_Procedure
+
+    // The one thing the library's LoadIni did that DFRefactor still needs. It lives here
+    // rather than on cRefactorEditorProperties so that class stays free of any
+    // SciControlLib dependency; this one is compiled after the hotkey support anyway.
+    /* The language was called "VDF" until 2026-07-28 and is called "DF" now. That name
+       is DATA - it is psLanguages row 0's own value and the psLanguage setting, and the
+       editor does FindLanguage on it - so renaming the constant without renaming the
+       stored value would make every lookup miss, leaving ghoFuncLib with no keywords and
+       nothing failing loudly.
+
+       Idempotent and self-healing: it runs on every load, does nothing once the settings
+       already say DF, and refuses to act if a DF row somehow already exists alongside a
+       VDF one rather than guessing which to keep. Nothing is deleted - the row is
+       renamed in place, so its keyword lists travel with it. */
+    Procedure MigrateLanguageName
+        Integer iOld iNew
+
+        Get FindLanguage CS_EditorLanguage to iNew
+        Get FindLanguage CS_EditorLanguageWas to iOld
+        If (iOld >= 0 and iNew < 0) ;
+            Set psLanguages Item iOld to CS_EditorLanguage
+        If (Uppercase(Trim(psLanguage(Self))) = CS_EditorLanguageWas) ;
+            Set psLanguage to CS_EditorLanguage
+    End_Procedure
+
+    Procedure LoadIni
+        Integer iRet
+        Forward Send LoadIni
+        Send MigrateLanguageName
+        Get SetEditorHotKeys (psEditorHotKeys(Self)) to iRet
+    End_Procedure
+
+End_Class
+
+/* The settings object. It no longer "takes over" anything: the library's
+   oEditorProperties object is out of DFRefactor's build, and so are the two mode flags
+   that used to configure this one (piLoadSaveMode / psSourceFile pointed at the ini).
+   One object, one path, computed in one place - JsonSettingsFile above. */
+Object oRefactorEditorSettings is a cRefactorEditorSettings
+    Move Self to ghoEditorProperties
+End_Object
+
+Send LoadIni to ghoEditorProperties

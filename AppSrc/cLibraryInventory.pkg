@@ -1,0 +1,3272 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cLibraryInventory
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-07-31
+//
+// Description : Shared-library inventory and .sws ground truth: which libraries a workspace
+//               declares, path resolution from Config.ws, and SwsFormatOf - the INI-vs-JSON
+//               format decision made from file CONTENT, never from names or versions.
+//               Base class of cWorkspaceFile.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use RefactorFileIO.pkg
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+Use JsonEnhancement.pkg          // MemberEnh / MemberValueEnh - the .sws.lock and a package's .sws
+
+/*  cLibraryInventory - what shared libraries does a workspace use, and where do they stand
+    against the DataFlex version we are moving it to?
+
+    A workspace's [Libraries] entries point at OTHER workspaces - vwin32fh, VDFQuery, SigCJ, DUF,
+    RDCToolsLib, DFAbout - which are maintained upstream and must never be refactored in place. A
+    copy inside a workspace is downstream of a repo, so editing it forks the library: the next
+    update either clobbers the edits or conflicts with them. That holds for RDC's OWN libraries
+    too - RDCToolsLib is fixed in Library-RDCToolsLib and re-released, not in a customer's copy.
+
+    A STANDALONE CLASS, deliberately, not more functions on cRefactorApplication (2026-07-31).
+    UnitTests declares "Object oApplication is a cApplication" - it does NOT use
+    cRefactorApplication - so anything living there is unreachable from the suite: every
+    "Get <fn> of ghoApplication" silently returns nothing and the tests pass or fail for reasons
+    that have nothing to do with the logic. cDeepScanner is the pattern to copy: created on
+    demand, tested directly.
+
+    Local facts only. Whether upstream has something newer is a separate (network) question and
+    deliberately not asked here, so this stays fast, offline and unit-testable.
+*/
+/*  A pinned dependency's identity: the .sws file stem, folder and extension removed.
+
+    ONE SPELLING, because two things must agree on it - the Libraries dialog labels its rows with
+    this and WorkspaceUpdateScan labels its findings with it, and a row whose key does not match
+    the scan's shows an Update chip that never lights. It was _PackageKeyOf on the dialog until
+    2026-09-10; it lives HERE, beside tSwsDependency, rather than beside the scan, because the
+    scan's file drags the whole FlexTron chain and a pure function behind that is one no console
+    test can call.
+
+    Forward slashes first: a dependency records "StudioLibrary/vWin32fh-Library-DF26.0.sws" the
+    JSON way, and a workspace on disk says the same thing with a backslash. */
+Function SwsDependencyKey Global tSwsDependency Dep Returns String
+    String sStem
+    Integer iPos
+
+    Move (Trim(Dep.sSws)) to sStem
+    Move (Replaces("/", sStem, "\")) to sStem
+    Move (RightPos("\", sStem)) to iPos
+    If (iPos > 0) ;
+        Move (Right(sStem, (Length(sStem) - iPos))) to sStem
+    If (Right(Lowercase(sStem), 4) = ".sws") ;
+        Move (Left(sStem, Length(sStem) - 4)) to sStem
+    Function_Return sStem
+End_Function
+
+/* ---- WHAT KIND OF PIN A GIT DEPENDENCY HOLDS (2026-09-25) --------------------------------------
+
+   The RDC libraries moved from commit pins to version tags, and a git dependency's "version" is
+   now one of three things, each with its own answer to "is something newer?":
+
+     a COMMIT       40 hex characters. Newer means the branch head has moved past it.
+     a VERSION TAG  "1.0.0". Newer means the repository has published a later tag. A LIBRARY asks
+                    for a range ("^1.0.0") and an APPLICATION pins the exact tag, listed before the
+                    libraries that use it - so this is what an application's Update Check meets.
+     anything else  a range ("^1.0.0", ">=1.0.0 <2.0.0") or a branch. There is no one pinned version
+                    to compare it with, so the check leaves it alone rather than guess.
+
+   Measured with df-cli 1.0.0 against a local tag fixture: a later range accepts an installed tag
+   that satisfies it, an exact pin must equal it, and ONE commit pin anywhere on a tagged package
+   breaks the workspace - a commit is not a version, so no range can accept it. That last fact is
+   why the Libraries dialog must never write a commit where a tag was. */
+Function IsGitCommitPin Global String sVersion Returns Boolean
+    String sV sCh
+    Integer i
+
+    Move (Lowercase(Trim(sVersion))) to sV
+    If (Length(sV) <> 40) ;
+        Function_Return False
+    For i from 1 to 40
+        Move (Mid(sV, 1, i)) to sCh
+        If (Pos(sCh, "0123456789abcdef") = 0) ;
+            Function_Return False
+    Loop
+    Function_Return True
+End_Function
+
+/*  "1.2.3" -> 1, 2 and 3, answering True. PLAIN MAJOR.MINOR.PATCH ONLY: no "v" in front, no
+    pre-release or build part after. That is how the RDC libraries tag a release and what df-cli
+    matches a caret range against; a tag of any other shape ("Autumn2024", "0.1", "v1.0.0") is not a
+    release this code offers, and a pin of that shape is not one it compares. */
+Function VersionTagParts Global String sTag Integer ByRef iMajor Integer ByRef iMinor Integer ByRef iPatch Returns Boolean
+    String[] asParts
+    Integer[] aiPart
+    String sPart sCh
+    Integer i j iLen
+
+    Move 0 to iMajor
+    Move 0 to iMinor
+    Move 0 to iPatch
+    Move (StrSplitToArray((Trim(sTag)), ".")) to asParts
+    If (SizeOfArray(asParts) <> 3) ;
+        Function_Return False
+    For i from 0 to 2
+        Move asParts[i] to sPart
+        Move (Length(sPart)) to iLen
+        // Nine digits at most, so no part can overflow an Integer.
+        If ((iLen = 0) or (iLen > 9)) ;
+            Function_Return False
+        For j from 1 to iLen
+            Move (Mid(sPart, 1, j)) to sCh
+            If (Pos(sCh, "0123456789") = 0) ;
+                Function_Return False
+        Loop
+        Move sPart to aiPart[i]
+    Loop
+    Move aiPart[0] to iMajor
+    Move aiPart[1] to iMinor
+    Move aiPart[2] to iPatch
+    Function_Return True
+End_Function
+
+// A pin on one release, "1.0.0" - VersionTagParts says what counts.
+Function IsVersionTagPin Global String sVersion Returns Boolean
+    Integer iMajor iMinor iPatch
+    Function_Return (VersionTagParts(sVersion, &iMajor, &iMinor, &iPatch))
+End_Function
+
+/*  The newest published release a caret on the pinned one still accepts - or "" when there is none
+    above the pin, or the pin is not a version tag.
+
+    THE CARET, NOT THE NEWEST: the same major version, and for a 0.x pin the same minor too (0.x
+    releases promise nothing). That is narrower than the newest tag on purpose. The libraries that
+    use a package ask for "^<version>", so a pin moved to the NEXT major is one they refuse, and
+    df-cli then reports the whole workspace BROKEN. Measured 2026-09-25: `package upgrade` with
+    nothing in its way took a "1.0.0" pin straight to 2.0.0; with a library's ^1.0.0 in the way it
+    stopped at 1.0.1. Moving to a new major is a decision somebody makes, not an update to offer.
+    Versions compare as NUMBERS - 1.10.0 is above 1.2.0. */
+Function NewestCompatibleVersionTag Global String sPinned String[] asTags Returns String
+    String sBest
+    Integer iPinMajor iPinMinor iPinPatch iMajor iMinor iPatch iBestMajor iBestMinor iBestPatch
+    Integer i iMax
+    Boolean bInside bAbove
+
+    If ((VersionTagParts(sPinned, &iPinMajor, &iPinMinor, &iPinPatch)) = False) ;
+        Function_Return ""
+    Move ""        to sBest
+    Move iPinMajor to iBestMajor
+    Move iPinMinor to iBestMinor
+    Move iPinPatch to iBestPatch
+    Move (SizeOfArray(asTags) - 1) to iMax
+    For i from 0 to iMax
+        If (VersionTagParts(asTags[i], &iMajor, &iMinor, &iPatch)) Begin
+            // Inside the caret: the same major; for 0.x the same minor; a 0.0.x pin cannot move.
+            Move (iMajor = iPinMajor) to bInside
+            If ((bInside = True) and (iPinMajor = 0)) ;
+                Move ((iMinor = iPinMinor) and ((iPinMinor > 0) or (iPatch = iPinPatch))) to bInside
+            Move ((iMajor > iBestMajor) or ((iMajor = iBestMajor) and ((iMinor > iBestMinor) or ((iMinor = iBestMinor) and (iPatch > iBestPatch))))) to bAbove
+            If ((bInside = True) and (bAbove = True)) Begin
+                Move (Trim(asTags[i])) to sBest
+                Move iMajor to iBestMajor
+                Move iMinor to iBestMinor
+                Move iPatch to iBestPatch
+            End
+        End
+    Loop
+    Function_Return sBest
+End_Function
+
+/*  The tag names out of `git ls-remote --tags --refs <url>`, one "<sha><TAB>refs/tags/<name>" a line.
+
+    True when the output is that shape throughout - and an EMPTY output is a real answer: the
+    repository has no tags. False when anything else is there (a "fatal:" line, a credential
+    prompt, a proxy's error page), and False means UNKNOWN, never "nothing newer" - a failed
+    question must not come back as "up to date". A peeled "^{}" line is skipped in case --refs was
+    not honoured. Pure, so the console runner tests it without a network. */
+Function GitTagsFromLsRemote Global String[] asLines String[] ByRef asTags Returns Boolean
+    String[] asOut asNone
+    String sLine sRef
+    Integer i iMax iPos
+
+    Move asNone to asTags
+    Move (SizeOfArray(asLines) - 1) to iMax
+    For i from 0 to iMax
+        Move (Trim(asLines[i])) to sLine
+        If (sLine <> "") Begin
+            // A space instead of the tab, if a shell normalised it.
+            Move (Pos(Character(9), sLine)) to iPos
+            If (iPos = 0) ;
+                Move (Pos(" ", sLine)) to iPos
+            If (iPos <> 41) ;
+                Function_Return False
+            If ((IsGitCommitPin(Left(sLine, 40))) = False) ;
+                Function_Return False
+            Move (Trim(Right(sLine, (Length(sLine) - iPos)))) to sRef
+            If (Left(sRef, 10) <> "refs/tags/") ;
+                Function_Return False
+            Move (Right(sRef, (Length(sRef) - 10))) to sRef
+            If ((sRef <> "") and (Right(sRef, 3) <> "^{}")) ;
+                Move sRef to asOut[SizeOfArray(asOut)]
+        End
+    Loop
+    Move asOut to asTags
+    Function_Return True
+End_Function
+
+/* ---- THE PROGRAMS AN INI .sws LISTS -------------------------------------------------------------
+
+   Nils 2026-09-11: after a workspace was converted to the DataFlex 26 JSON format, its most
+   important program was missing from the Compile program list.
+
+   Its [Projects] section had TWO lines keyed Project1 and none keyed Project0. Nothing enforces
+   the numbering - a .sws is hand-editable, and this one had been edited - and every reader that
+   asks for a KEY loses one of the two. A first-wins reader keeps the first line; df-cli's convert
+   keeps the LAST and drops the other without a word. Measured 2026-09-11 on a scratch copy of that
+   file: the dropped program is not even among the ones df-cli reports it could not find, and the
+   same list with its keys renumbered Project0..N converts whole.
+
+   So these read LINES, never keys, and both INI writers renumber the section before anything
+   key-based sees it: the copy step (NewSwsLinesDropping) and the Libraries dialog's conversion
+   (oConvertWorkspace_dg). GetWorkspaceProjects reads its list through them, and both df-cli
+   conversions check afterwards that every program arrived (SwsProgramsMissing).
+
+   GLOBAL rather than methods, for two reasons: the console runner calls a global with nothing to
+   create, and GetWorkspaceProjects is reachable from a web combo's OnFill, where creating an object
+   hangs the WebView2 pump. Defined in calling order - a function used in an expression must already
+   be known to the compiler. */
+
+// The number in a "Project<n>" key, or -1 for any other key. Case-insensitive, and only digits
+// after the word: "ProjectPath", or "Project" alone, is not a program slot.
+Function SwsIniProjectKeyNumber Global String sKey Returns Integer
+    String sLow sDigits
+    Integer iChar iMax iNum
+
+    Move (Lowercase(Trim(sKey))) to sLow
+    If (Left(sLow, 7) <> "project" or Length(sLow) < 8) ;
+        Function_Return -1
+    Move (Right(sLow, (Length(sLow) - 7))) to sDigits
+    Move (Length(sDigits)) to iMax
+    For iChar from 1 to iMax
+        If (Pos(Mid(sDigits, 1, iChar), "0123456789") = 0) ;
+            Function_Return -1
+    Loop
+    // No workspace has a slot past nine digits. One that claims to is CLAMPED, not dropped, so its
+    // program still sorts - last - rather than vanishing.
+    If (iMax > 9) ;
+        Function_Return 999999999
+    Move sDigits to iNum
+    Function_Return iNum
+End_Function
+
+/* Per LINE of an INI .sws: the slot number when the line is a Project<n> entry inside [Projects],
+   else -1 - with that entry's trimmed value in asValues at the same index. ONE classification, so
+   the list, the "is it in order?" test and the rewrite cannot disagree about which lines are
+   program lines. Blank lines, ";" and "//" comments, any other key, and every line outside
+   [Projects] are -1. CR and tabs are stripped before trimming, as SwsSectionEntries does, because
+   Trim removes spaces only. */
+Function SwsIniProjectSlots Global String[] asLines String[] ByRef asValues Returns Integer[]
+    Integer[] aiSlots
+    String sLine
+    Integer i iMax iPos
+    Boolean bIn
+
+    Move (ResizeArray(asValues, 0)) to asValues
+    Move False to bIn
+    Move (SizeOfArray(asLines) - 1) to iMax
+    For i from 0 to iMax
+        Move -1 to aiSlots[i]
+        Move "" to asValues[i]
+        Move (Replaces(Character(13), asLines[i], "")) to sLine
+        Move (Replaces(Character(9), sLine, " ")) to sLine
+        Move (Trim(sLine)) to sLine
+        If (Left(sLine, 1) = "[") ;
+            Move (Lowercase(sLine) = "[projects]") to bIn
+        Else If (bIn = True and Left(sLine, 1) <> ";" and Left(sLine, 2) <> "//") Begin
+            Move (Pos("=", sLine)) to iPos
+            If (iPos > 1) Begin
+                Move (SwsIniProjectKeyNumber(Left(sLine, (iPos - 1)))) to aiSlots[i]
+                If (aiSlots[i] <> -1) ;
+                    Move (Trim(Right(sLine, (Length(sLine) - iPos)))) to asValues[i]
+            End
+        End
+    Loop
+    Function_Return aiSlots
+End_Function
+
+/* The PROGRAMS an INI .sws lists, every one, in the order a numbered reader shows them: by slot
+   number, and a REPEATED number keeps both entries in the order they were written - the case every
+   key-based reader gets wrong. The same program under two slots is listed once, compared
+   case-insensitively because these are Windows file names; a slot with no value is no program. */
+Function SwsIniProjectsFromLines Global String[] asLines Returns String[]
+    Integer[] aiSlots
+    String[] asValues asKeyed asSeenLow asOut
+    String sValue sLow
+    Integer i iMax
+
+    Move (SwsIniProjectSlots(asLines, &asValues)) to aiSlots
+    Move (SizeOfArray(aiSlots) - 1) to iMax
+    For i from 0 to iMax
+        // The sort key: nine digits of slot number, then seven of line position, then the value.
+        // The sort is decided by that fixed-width prefix alone, so a tie keeps its written order.
+        If (aiSlots[i] <> -1 and asValues[i] <> "") ;
+            Move (Right(("000000000" + String(aiSlots[i])), 9) + Right(("0000000" + String(i)), 7) + asValues[i]) to asKeyed[SizeOfArray(asKeyed)]
+    Loop
+    Move (SortArray(asKeyed)) to asKeyed
+    Move (SizeOfArray(asKeyed) - 1) to iMax
+    For i from 0 to iMax
+        Move (Right(asKeyed[i], (Length(asKeyed[i]) - 16))) to sValue
+        Move (Lowercase(sValue)) to sLow
+        If (SearchArray(sLow, asSeenLow) = -1) Begin
+            Move sLow   to asSeenLow[SizeOfArray(asSeenLow)]
+            Move sValue to asOut[SizeOfArray(asOut)]
+        End
+    Loop
+    Function_Return asOut
+End_Function
+
+/* Does [Projects] need rewriting? False when its program lines, in file order, are already slots
+   0, 1, 2 ... holding exactly SwsIniProjectsFromLines' list - which is every healthy file, and every
+   file with no [Projects] at all, a JSON .sws included. Spacing inside a line does not count: a
+   healthy file is never rewritten for looks. */
+Function SwsIniProjectsNeedRenumbering Global String[] asLines Returns Boolean
+    Integer[] aiSlots
+    String[] asValues asPrograms
+    Integer i iMax iNext
+
+    Move (SwsIniProjectSlots(asLines, &asValues)) to aiSlots
+    Move (SwsIniProjectsFromLines(asLines)) to asPrograms
+    Move 0 to iNext
+    Move (SizeOfArray(aiSlots) - 1) to iMax
+    For i from 0 to iMax
+        If (aiSlots[i] <> -1) Begin
+            If (aiSlots[i] <> iNext or iNext >= SizeOfArray(asPrograms)) ;
+                Function_Return True
+            If (asValues[i] <> asPrograms[iNext]) ;
+                Function_Return True
+            Increment iNext
+        End
+    Loop
+    Function_Return False
+End_Function
+
+/* The .sws LINES with every program slot in [Projects] rewritten Project0..N, in the order
+   SwsIniProjectsFromLines gives, where the first slot line stood. Every other line - other keys,
+   comments, blank lines, every other section - passes through exactly as it was read, and lines
+   that need no renumbering come back untouched. */
+Function SwsIniLinesWithProjectsRenumbered Global String[] asLines Returns String[]
+    Integer[] aiSlots
+    String[] asValues asPrograms asOut
+    Integer i iMax iProg iProgMax
+    Boolean bPlaced
+
+    If (SwsIniProjectsNeedRenumbering(asLines) = False) ;
+        Function_Return asLines
+    Move (SwsIniProjectSlots(asLines, &asValues)) to aiSlots
+    Move (SwsIniProjectsFromLines(asLines)) to asPrograms
+    Move (SizeOfArray(asPrograms) - 1) to iProgMax
+    Move False to bPlaced
+    Move (SizeOfArray(asLines) - 1) to iMax
+    For i from 0 to iMax
+        If (aiSlots[i] = -1) ;
+            Move asLines[i] to asOut[SizeOfArray(asOut)]
+        Else If (bPlaced = False) Begin
+            For iProg from 0 to iProgMax
+                Move ("Project" + String(iProg) + "=" + asPrograms[iProg]) to asOut[SizeOfArray(asOut)]
+            Loop
+            Move True to bPlaced
+        End
+    Loop
+    Function_Return asOut
+End_Function
+
+/* Renumber [Projects] in the INI .sws sSwsFile, in place, when it needs it. False only when a
+   needed write failed; nothing to do - a healthy file, a JSON one, a missing one - answers True and
+   the file is not touched. The file keeps its shape: its BOM, its line breaks and its final line
+   break are read and written back as they were. */
+Function SwsIniRenumberProjectsInFile Global String sSwsFile Returns Boolean
+    String[] asLines asOut
+    String sLineBreak
+    Boolean bTrailing bUtf8
+
+    If (Trim(sSwsFile) = "") ;
+        Function_Return True
+    If (vFilePathExists(sSwsFile) = 0) ;
+        Function_Return True
+    Move (rfReadEncodedFileLines(sSwsFile, False, &bTrailing)) to asLines
+    If (SwsIniProjectsNeedRenumbering(asLines) = False) ;
+        Function_Return True
+    Move (SwsIniLinesWithProjectsRenumbered(asLines)) to asOut
+    Move (rfFileHasBOM(sSwsFile)) to bUtf8
+    Move (rfDetectFileLineBreak(sSwsFile)) to sLineBreak
+    Function_Return (rfWriteEncodedFileFromStringArrayEx(&asOut, sSwsFile, sLineBreak, bUtf8, bTrailing))
+End_Function
+
+/* The programs in asListed that asNow does not list, in asListed's order - compared
+   case-insensitively, as file names are. What a conversion is checked with: the list the old file
+   carried against the list the new one answers. */
+Function SwsProgramsMissing Global String[] asListed String[] asNow Returns String[]
+    String[] asNowLow asOut
+    String sLow
+    Integer i iMax
+
+    Move (SizeOfArray(asNow) - 1) to iMax
+    For i from 0 to iMax
+        Move (Lowercase(Trim(asNow[i]))) to asNowLow[i]
+    Loop
+    Move (SizeOfArray(asListed) - 1) to iMax
+    For i from 0 to iMax
+        Move (Lowercase(Trim(asListed[i]))) to sLow
+        If (sLow <> "" and SearchArray(sLow, asNowLow) = -1) ;
+            Move asListed[i] to asOut[SizeOfArray(asOut)]
+    Loop
+    Function_Return asOut
+End_Function
+
+// The words for SwsProgramsMissing's answer, "" when nothing is missing - one wording for both
+// conversions, the Libraries dialog's and the migration copy's.
+Function SwsProgramsMissingNote Global String[] asLost Returns String
+    String sList
+    Integer i iMax
+
+    Move (SizeOfArray(asLost) - 1) to iMax
+    If (iMax < 0) ;
+        Function_Return ""
+    Move "" to sList
+    For i from 0 to iMax
+        If (i > 0) ;
+            Move (sList + ", ") to sList
+        Move (sList + asLost[i]) to sList
+    Loop
+    Function_Return (String(iMax + 1) + " program(s) the old workspace file listed did not survive the conversion: " + sList + ". Add them back to the " + '"projects"' + " list in the .sws, or they will be missing from Compile program.")
+End_Function
+
+/*  The last iMaxLines non-blank lines of a captured tool run as one indented block - "" when it
+    said nothing - for a report that quotes df-cli under its own verdict (the copy step, 2026-09-14).
+    The LAST lines, because df-cli states its decision at the end and can spend the lines before it
+    dumping a file it choked on. iMaxLines 0 = all of them. Pure; lives beside the other report
+    wording so the test runner can reach it.
+
+    THE .cfg NOTES ARE LEFT OUT AND COUNTED (Nils 2026-10-29, LegacyApp5_20). df-cli opens a package
+    command with "Config file for project 'X' could not be found in workspace '...', using defaults."
+    for every listed program that has no .cfg - thirteen of them on that workspace. They are not
+    errors, df-cli carries on with the defaults; but the Libraries dialog quoted the FIRST fifteen
+    lines, so they filled the box and the real reason (an incompatible vWin32fh ref) was cut off.
+    Dropped from the quote, and one line says how many, so a run that printed nothing else still
+    does not read as silent. */
+Function DfCliOutputNote Global String[] ByRef asLines Integer iMaxLines Returns String
+    String[] asKeep
+    String sOut sLine
+    Integer i iFirst iCfgNotes
+
+    Move 0 to iCfgNotes
+    For i from 0 to (SizeOfArray(asLines) - 1)
+        Move (Trim(asLines[i])) to sLine
+        If (Pos("Config file for project ", sLine) = 1 and Pos("using defaults.", sLine) > 0) ;
+            Increment iCfgNotes
+        Else If (sLine <> "") ;
+            Move sLine to asKeep[SizeOfArray(asKeep)]
+    Loop
+    If (SizeOfArray(asKeep) = 0 and iCfgNotes = 0) ;
+        Function_Return ""
+    Move 0 to iFirst
+    If (iMaxLines > 0 and SizeOfArray(asKeep) > iMaxLines) ;
+        Move (SizeOfArray(asKeep) - iMaxLines) to iFirst
+    Move "" to sOut
+    For i from iFirst to (SizeOfArray(asKeep) - 1)
+        Move (sOut + Character(10) + "   " + asKeep[i]) to sOut
+    Loop
+    If (iCfgNotes > 0) ;
+        Move (sOut + Character(10) + "   (" + String(iCfgNotes) + " line(s) left out that only say a program has no .cfg file - df-cli uses the defaults for it, so they are not the problem.)") to sOut
+    Function_Return sOut
+End_Function
+
+/*  df-cli's "Incompatible ref for <package>: <a> does not match <b>", taken apart - False when the
+    output has no such line. Shared by the plain-words hint below and by StaleLockPin, which needs
+    the same three values to decide whether the lock file is where the conflict comes from. */
+Function DfCliIncompatibleRef Global String[] ByRef asLines String ByRef sPkg String ByRef sAsked String ByRef sOther Returns Boolean
+    String sLine
+    Integer i iAt iColon iMatch
+
+    For i from 0 to (SizeOfArray(asLines) - 1)
+        Move (Trim(asLines[i])) to sLine
+        Move (Pos("Incompatible ref for ", sLine)) to iAt
+        If (iAt > 0) Begin
+            // "Incompatible ref for " is 21 characters, " does not match " 16.
+            Move (Right(sLine, Length(sLine) - iAt - 20)) to sLine
+            Move (Pos(": ", sLine)) to iColon
+            Move (Pos(" does not match ", sLine)) to iMatch
+            If (iColon > 1 and iMatch > (iColon + 2)) Begin
+                Move (Left(sLine, iColon - 1)) to sPkg
+                Move (Mid(sLine, iMatch - iColon - 2, iColon + 2)) to sAsked
+                Move (Trim(Right(sLine, Length(sLine) - iMatch - 15))) to sOther
+                If (sOther <> "") ;
+                    Function_Return True
+            End
+        End
+    Loop
+    Function_Return False
+End_Function
+
+/*  One plain paragraph for df-cli's "Incompatible ref for <package>: <a> does not match <b>" - ""
+    when the output has no such line (Nils 2026-10-29, LegacyApp5_20). Two routes through the workspace
+    ask for one package by different refs, and df-cli treats a version and a git commit as
+    different even when the tag sits on that very commit. On LegacyApp5_20 the commit was a leftover in
+    the .sws.lock from an earlier DUF pin - nothing in the dependency chain asked for it any more.
+    Which of the two is the old one is not said: df-cli's line does not say either. Pure, beside
+    DfCliOutputNote for the same reason. */
+Function DfCliIncompatibleRefHint Global String[] ByRef asLines Returns String
+    String sPkg sAsked sOther
+    Boolean bFound
+
+    Get DfCliIncompatibleRef (&asLines) (&sPkg) (&sAsked) (&sOther) to bFound
+    If (bFound = False) ;
+        Function_Return ""
+    Function_Return ("Why: two parts of this workspace ask for " + sPkg + " in different ways - as " + sAsked + " and as " + sOther + ". df-cli treats a version number and a git commit as different, even when both are the same code. One of the two can be a leftover in the workspace's .sws.lock file from an earlier version of a dependency.")
+End_Function
+
+/*  Does a .sws.lock key name the package df-cli calls sPkgName ("NilsSve/vWin32fh-Library-DF26.0")?
+    A git key is "<host>/<owner>/<repo>.git/<.sws path without .sws>" -
+    github.com/NilsSve/Library-vwin32fh.git/StudioLibrary/vWin32fh-Library-DF26.0 - and df-cli's name
+    is the owner and the .sws stem. A registry key ("DataFlex-dev/Web UI") has no ".git/" and is
+    never a match: df-cli's incompatible REF is about a git package. Case-blind, as URLs are. */
+Function LockKeyNamesPackage Global String sKey String sPkgName Returns Boolean
+    String sOwner sStem
+    Integer iPos
+
+    Move (Lowercase(Trim(sKey))) to sKey
+    Move (Lowercase(Trim(sPkgName))) to sPkgName
+    Move (Pos("/", sPkgName)) to iPos
+    If ((iPos < 2) or (iPos = Length(sPkgName)) or (Pos(".git/", sKey) = 0)) ;
+        Function_Return False
+    Move (Left(sPkgName, iPos - 1)) to sOwner
+    Move (Right(sPkgName, Length(sPkgName) - iPos)) to sStem
+    Function_Return ((Right(sKey, Length(sStem) + 1) = ("/" + sStem)) and (Pos(("/" + sOwner + "/"), sKey) > 0))
+End_Function
+
+/*  The entries of a .sws.lock's text, in file order: each key and its "ref" - the full transitive
+    set df-cli resolved, which the .sws itself never lists. Returns how many; 0 for "" or a lock
+    without a dependencies member. */
+Function LockFileEntries Global String sLockJson String[] ByRef asKeys String[] ByRef asRefs Returns Integer
+    Handle hoJson hoDeps hoDep
+    String[] asNone
+    String sKey sRef
+    Integer i iMax
+    Boolean bOk
+
+    Move asNone to asKeys
+    Move asNone to asRefs
+    If (Trim(sLockJson) = "") ;
+        Function_Return 0
+    Get Create (RefClass(cJsonObject)) to hoJson
+    Get ParseString of hoJson sLockJson to bOk
+    If (bOk = True) Begin
+        Set pbRequireAllMembers of hoJson to False
+        Get MemberEnh of hoJson "dependencies" to hoDeps
+        If (hoDeps <> 0) Begin
+            Get MemberCount of hoDeps to iMax
+            For i from 0 to (iMax - 1)
+                Get MemberNameByIndex of hoDeps i to sKey
+                Move "" to sRef
+                Get MemberEnh of hoDeps sKey to hoDep
+                If (hoDep <> 0) Begin
+                    Set pbRequireAllMembers of hoDep to False
+                    Get MemberValueEnh of hoDep "ref" to sRef
+                    Send Destroy of hoDep
+                End
+                Move sKey         to asKeys[SizeOfArray(asKeys)]
+                Move (Trim(sRef)) to asRefs[SizeOfArray(asRefs)]
+            Loop
+            Send Destroy of hoDeps
+        End
+    End
+    Send Destroy of hoJson
+    Function_Return (SizeOfArray(asKeys))
+End_Function
+
+/*  Does this JSON .sws text ask for sPkgName at exactly sRef? Each "dependencies" object is read:
+    its source names the owner, its "sws" the stem (SwsDependencyKey), and its "version" must be
+    sRef as written. A range ("^1.0.0") is NOT an ask for the tag or commit it happens to resolve
+    to - that difference is the conflict being looked at. */
+Function SwsJsonAsksForRef Global String sSwsJson String sPkgName String sRef Returns Boolean
+    Handle hoJson hoDeps hoItem
+    tSwsDependency Dep
+    String sOwner sStem
+    Integer i iMax iPos iType
+    Boolean bOk bHit
+
+    Move (Lowercase(Trim(sPkgName))) to sPkgName
+    Move (Lowercase(Trim(sRef))) to sRef
+    Move (Pos("/", sPkgName)) to iPos
+    If ((iPos < 2) or (sRef = "") or (Trim(sSwsJson) = "")) ;
+        Function_Return False
+    Move (Left(sPkgName, iPos - 1)) to sOwner
+    Move (Right(sPkgName, Length(sPkgName) - iPos)) to sStem
+    Move False to bHit
+    Get Create (RefClass(cJsonObject)) to hoJson
+    Get ParseString of hoJson sSwsJson to bOk
+    If (bOk = True) Begin
+        Set pbRequireAllMembers of hoJson to False
+        Get MemberEnh of hoJson "dependencies" to hoDeps
+        If (hoDeps <> 0) Begin
+            Get MemberCount of hoDeps to iMax
+            For i from 0 to (iMax - 1)
+                Get MemberJsonTypeEnh of hoDeps i to iType
+                If ((bHit = False) and (iType = jsonTypeObject)) Begin
+                    Get MemberEnh of hoDeps i to hoItem
+                    If (hoItem <> 0) Begin
+                        Set pbRequireAllMembers of hoItem to False
+                        Get MemberValueEnh of hoItem "source"  to Dep.sSource
+                        Get MemberValueEnh of hoItem "sws"     to Dep.sSws
+                        Get MemberValueEnh of hoItem "version" to Dep.sVersion
+                        Send Destroy of hoItem
+                        If ((Lowercase(SwsDependencyKey(Dep)) = sStem) and (Pos(("/" + sOwner + "/"), Lowercase(Dep.sSource)) > 0) ;
+                            and (Lowercase(Trim(Dep.sVersion)) = sRef)) ;
+                            Move True to bHit
+                    End
+                End
+            Loop
+            Send Destroy of hoDeps
+        End
+    End
+    Send Destroy of hoJson
+    Function_Return bHit
+End_Function
+
+Class cLibraryInventory is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+    End_Procedure
+
+    /* Raw "key=value" lines of one INI section, read as TEXT.
+
+       Not cIniFile: this class must work in every host program including the console test
+       runner, and a .sws is a handful of short lines - reading it with the file I/O the rest of
+       the codebase already uses costs nothing and keeps the logic testable.
+
+       Section match is case-insensitive; blank lines and ';' / '//' comments are skipped;
+       reading stops at the next '[' header. CR and tabs are stripped before trimming because
+       DataFlex's Trim removes spaces only. */
+    Function SwsSectionEntries String sSwsFile String sSection Returns String[]
+        String[] asLines asEntries
+        String sLine sLow sWant
+        Integer i iMax
+        Boolean bIn
+
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return asEntries
+
+        Move (rfReadEncodedFileAsStringArray(sSwsFile)) to asLines
+        Move (Lowercase("[" + Trim(sSection) + "]")) to sWant
+        Move False to bIn
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move (Replaces(Character(13), asLines[i], "")) to sLine
+            Move (Replaces(Character(9), sLine, " ")) to sLine
+            Move (Trim(sLine)) to sLine
+            Move (Lowercase(sLine)) to sLow
+            If (Left(sLine, 1) = "[") Begin
+                // A header either opens the section we want or closes it.
+                Move (sLow = sWant) to bIn
+            End
+            Else Begin
+                If (bIn = True and sLine <> "" and Left(sLine, 1) <> ";" and Left(sLine, 2) <> "//") Begin
+                    If (Pos("=", sLine) > 0) ;
+                        Move sLine to asEntries[SizeOfArray(asEntries)]
+                End
+            End
+        Loop
+        Function_Return asEntries
+    End_Function
+
+    // The value of one key in one INI section, "" when absent. Case-insensitive on the key.
+    Function SwsSectionValue String sSwsFile String sSection String sKey Returns String
+        String[] asEntries
+        String sEntry sName
+        Integer i iMax iPos
+
+        Get SwsSectionEntries sSwsFile sSection to asEntries
+        Move (Lowercase(Trim(sKey))) to sKey
+        Move (SizeOfArray(asEntries) - 1) to iMax
+        For i from 0 to iMax
+            Move asEntries[i] to sEntry
+            Move (Pos("=", sEntry)) to iPos
+            Move (Lowercase(Trim(Left(sEntry, (iPos - 1))))) to sName
+            If (sName = sKey) ;
+                Function_Return (Trim(Mid(sEntry, (Length(sEntry) - iPos), (iPos + 1))))
+        Loop
+        Function_Return ""
+    End_Function
+
+    /* ---- .sws / .ws PATH PLUMBING ---------------------------------------------------------------
+       Moved down here from cWorkspaceCopyPlan (2026-08-06) so every subclass inherits ONE
+       implementation. They are all facts about reading a workspace file, which is this class's job;
+       leaving them one level up meant cWorkspaceFile could not fill its Paths without either a
+       second copy or an upward dependency. Defined ABOVE their callers - a class function used in
+       EXPRESSION form must already be known to the compiler. */
+
+    // Is sPath already absolute ("C:\..." or a "\\server\share" UNC)?
+    Function _IsAbsolutePath String sPath Returns Boolean
+        If (sPath = "") ;
+            Function_Return False
+        If (Mid(sPath, 1, 2) = ":") ;
+            Function_Return True
+        If (Left(sPath, 2) = "\\") ;
+            Function_Return True
+        Function_Return False
+    End_Function
+
+    // Local copy of cRefactorApplication.RemoveFolderSeperator - these classes must work in the
+    // console test runner, which has no cRefactorApplication to send to.
+    Function RemoveFolderSeperator String sPath Returns String
+        If (Right(sPath, 1) = "\") ;
+            Function_Return (Left(sPath, Length(sPath) - 1))
+        Function_Return sPath
+    End_Function
+
+    // The folder holding sFile, WITH its trailing separator. Deliberately local rather than
+    // RDCToolsLib's global ParseFolderName, for the same runner reason.
+    Function _FolderOf String sFile Returns String
+        Integer iPos
+        Move (RightPos("\", sFile)) to iPos
+        If (iPos > 0) ;
+            Function_Return (Left(sFile, iPos))
+        Function_Return ""
+    End_Function
+
+    /* Collapses "." and ".." segments ANYWHERE in a path, so two strings naming the same folder
+       compare equal as strings.
+
+       WHY THIS IS NOT COSMETIC. Windows resolves ".." itself when it opens a file, which is
+       exactly why its absence hid for so long: "C:\Proj\LegacyApp10\..\Libraries\vdfquery" opens the right
+       folder every single time. It then fails every prefix comparison against
+       "C:\Proj\Libraries\..." - silently, because a prefix test that returns False looks just like
+       a path that genuinely is not underneath - and prints itself to the user verbatim. It reached
+       a dialog as "E:\LegacyApp10\..\Libraries\vdfquery" on 2026-08-06, which is how it was finally caught.
+
+       The root prefix is held aside so ".." can never eat a drive letter or a UNC server\share. A
+       leading ".." on a RELATIVE path has nothing to pop and is KEPT: that is the only honest
+       answer, since the caller has not given us enough to resolve it. */
+    Function NormalizePath String sPath Returns String
+        String[] asParts asOut
+        String sPrefix sRest sSeg sJoined
+        Integer i iMax iPos iKeep
+        Boolean bAppend
+
+        Move (Trim(sPath)) to sPath
+        If (sPath = "") ;
+            Function_Return ""
+        Move (Replaces("/", sPath, "\")) to sPath
+
+        Move "" to sPrefix
+        Move sPath to sRest
+        If (Left(sPath, 2) = "\\") Begin
+            // UNC: "\\server\share" is the root, and both halves must survive intact.
+            Move (Mid(sPath, (Length(sPath) - 2), 3)) to sRest
+            Move (Pos("\", sRest)) to iPos
+            If (iPos = 0) ;
+                Function_Return sPath
+            Move ("\\" + Left(sRest, iPos - 1)) to sPrefix
+            Move (Mid(sRest, (Length(sRest) - iPos), (iPos + 1))) to sRest
+            Move (Pos("\", sRest)) to iPos
+            If (iPos > 0) Begin
+                Move (sPrefix + "\" + Left(sRest, iPos - 1)) to sPrefix
+                Move (Mid(sRest, (Length(sRest) - iPos), (iPos + 1))) to sRest
+            End
+            Else Begin
+                Move (sPrefix + "\" + sRest) to sPrefix
+                Move "" to sRest
+            End
+        End
+        Else If (Mid(sPath, 1, 2) = ":") Begin
+            Move (Left(sPath, 2)) to sPrefix
+            Move (Mid(sPath, (Length(sPath) - 2), 3)) to sRest
+            If (Left(sRest, 1) = "\") ;
+                Move (Mid(sRest, (Length(sRest) - 1), 2)) to sRest
+        End
+
+        Move (StrSplitToArray(sRest, "\")) to asParts
+        Move (SizeOfArray(asParts) - 1) to iMax
+        For i from 0 to iMax
+            Move (Trim(asParts[i])) to sSeg
+            If (sSeg <> "" and sSeg <> ".") Begin
+                If (sSeg = "..") Begin
+                    Move True to bAppend
+                    Move (SizeOfArray(asOut)) to iKeep
+                    If (iKeep > 0) Begin
+                        // Only pop a real folder name. Popping a ".." would turn "..\..\X" into
+                        // "X", quietly moving the path two levels DOWN from where it belongs.
+                        If (asOut[iKeep - 1] <> "..") Begin
+                            Move (ResizeArray(asOut, iKeep - 1)) to asOut
+                            Move False to bAppend
+                        End
+                    End
+                    // There is nothing above a ROOT - Windows resolves "C:\A\..\..\B" to "C:\B" -
+                    // so a ".." with nothing left to pop is discarded. On a RELATIVE path it is
+                    // kept instead, because we have not been told what it is relative to.
+                    If (sPrefix <> "" and SizeOfArray(asOut) = 0) ;
+                        Move False to bAppend
+                    If (bAppend = True) ;
+                        Move sSeg to asOut[SizeOfArray(asOut)]
+                End
+                Else Begin
+                    Move sSeg to asOut[SizeOfArray(asOut)]
+                End
+            End
+        Loop
+
+        Move "" to sJoined
+        Move (SizeOfArray(asOut) - 1) to iMax
+        For i from 0 to iMax
+            If (sJoined = "") Begin
+                Move asOut[i] to sJoined
+            End
+            Else Begin
+                Move (sJoined + "\" + asOut[i]) to sJoined
+            End
+        Loop
+        If (sPrefix = "") ;
+            Function_Return sJoined
+        If (sJoined = "") ;
+            Function_Return (sPrefix + "\")
+        Function_Return (sPrefix + "\" + sJoined)
+    End_Function
+
+    // Resolve sRelative against sBase, collapsing any leading "..\" and ".\" segments. DataFlex
+    // workspace files use both ("Home=..\", "AppSrcPath=.\AppSrc"), and the two are anchored to
+    // DIFFERENT bases - see WorkspaceHomeFromConfig.
+    Function _ResolvePath String sBase String sRelative Returns String
+        String sPath sRest
+        Integer iPos
+
+        Move (Trim(sRelative)) to sRest
+        If (sRest = "") ;
+            Function_Return ""
+        If (_IsAbsolutePath(Self, sRest)) ;
+            Function_Return (NormalizePath(Self, sRest))
+
+        Move (vFolderFormat(sBase)) to sPath
+        // Walk off the leading "..\" / ".\" segments, stepping sPath up one folder per "..".
+        Move True to iPos
+        While (iPos > 0)
+            If (Left(sRest, 3) = "..\") Begin
+                Move (Mid(sRest, (Length(sRest)), 4)) to sRest
+                Move (RemoveFolderSeperator(Self, sPath)) to sPath
+                Move (RightPos("\", sPath)) to iPos
+                If (iPos > 0) ;
+                    Move (Left(sPath, iPos)) to sPath
+            End
+            Else If (Left(sRest, 2) = ".\") Begin
+                Move (Mid(sRest, (Length(sRest)), 3)) to sRest
+            End
+            Else Begin
+                Move 0 to iPos
+            End
+        Loop
+        Move (vFolderFormat(sPath) + sRest) to sPath
+        // Normalise on the way out, not just the leading segments walked off above: an entry may
+        // carry ".." in the MIDDLE ("Libraries\..\Shared\X.sws"), and an ABSOLUTE entry skips the
+        // walk entirely, so without this the two paths that name one folder still differ.
+        Function_Return (NormalizePath(Self, RemoveFolderSeperator(Self, sPath)))
+    End_Function
+
+    // The legacy .ws config file the .sws delegates its folder paths to, or "" when the .sws
+    // declares none (a JSON workspace carries its paths inline). Relative to the .sws's own folder.
+    Function WorkspaceConfigFile String sSwsFile Returns String
+        String sValue sHome sPath
+
+        If (sSwsFile = "") ;
+            Function_Return ""
+        Get SwsSectionValue sSwsFile "WorkspacePaths" "ConfigFile" to sValue
+        If (sValue = "") ;
+            Function_Return ""
+        Get _FolderOf sSwsFile to sHome
+        Get _ResolvePath sHome sValue to sPath
+        Function_Return sPath
+    End_Function
+
+    /* The workspace HOME, from the .ws [Workspace] Home key.
+
+       ANCHORING, which is easy to get wrong: "Home" is relative to the .ws FILE's own folder (the
+       .ws sits in Programs\, so "Home=..\" means the folder above Programs\), while every other
+       path key is relative to HOME. Resolving both against the same base puts AppSrc inside
+       Programs. */
+    Function WorkspaceHomeFromConfig String sWsFile Returns String
+        String sValue sBase sHome
+
+        If (sWsFile = "") ;
+            Function_Return ""
+        Get SwsSectionValue sWsFile "Workspace" "Home" to sValue
+        Get _FolderOf sWsFile to sBase
+        If (sValue = "") ;
+            Function_Return (RemoveFolderSeperator(Self, sBase))
+        Get _ResolvePath sBase sValue to sHome
+        Function_Return sHome
+    End_Function
+
+    /* Which on-disk shape a .sws has - eSwsIni or eSwsJson; eSwsMissing for no file at all, and
+       eSwsConflict for a file carrying git conflict markers - decided from its CONTENT.
+
+       Lives here, on the class that already parses .sws files, so every subclass inherits one
+       answer. Format is a fact about the FILE and nothing else: not its name, not its extension
+       (".sws" either way), and not the DataFlex version. The DF26 Studio converts a WORKSPACE .sws
+       to JSON when it migrates one but leaves LIBRARY .sws files as INI - verified 2026-08-05, 1
+       JSON against 103 INI under DF26 - so a single workspace routinely references files of both
+       shapes at once, and any per-version guess would be wrong half the time.
+
+       A JSON document's first non-blank character is "{"; an INI .sws opens with a "[Section]"
+       header. Only the first few lines are read: this is asked before every read of a .sws, and
+       parsing a whole document to learn how to parse it would be a poor trade. */
+    Function SwsFormatOf String sSwsFile Returns Integer
+        String[] asLines
+        String sLine
+        Integer i iMax
+
+        // Missing is its OWN answer - see eSwsMissing. Returning eSwsIni here made
+        // "no workspace" indistinguishable from "old workspace" at every call site.
+        If (Trim(sSwsFile) = "" or vFilePathExists(sSwsFile) = 0) ;
+            Function_Return eSwsMissing
+        Move (rfReadEncodedFileAsStringArray(sSwsFile)) to asLines
+        Move (SizeOfArray(asLines) - 1) to iMax
+        // CONFLICT MARKERS FIRST, over the whole file (a .sws is a handful of lines): an unfinished
+        // merge is neither format whatever its first line says - see eSwsConflict (2026-09-14).
+        For i from 0 to iMax
+            If (Left(asLines[i], 8) = "<<<<<<< ") ;
+                Function_Return eSwsConflict
+        Loop
+        If (iMax > 12) ;
+            Move 12 to iMax
+        For i from 0 to iMax
+            Move (Trim(Replaces(Character(13), asLines[i], ""))) to sLine
+            If (sLine <> "") Begin
+                If (Left(sLine, 1) = "{") ;
+                    Function_Return eSwsJson
+                Function_Return eSwsIni
+            End
+        Loop
+        Function_Return eSwsIni
+    End_Function
+
+    /* The DFRefactor-OWN .sws candidate in sHome, PREFERRING the format the caller can read as
+       its own (eWantFormat = eSwsJson / eSwsIni). THE AMBIGUITY WAS REAL, not hypothetical:
+       until this repo went DataFlex 26 only, home held DFRefactor25.0.sws (INI, for the DF25
+       Studio) NEXT TO DFRefactorFlexTron.sws (JSON, DF26) - and "the first DFRefactor* found"
+       picked the DF25 file on the DF26 build (an
+       alphabetical accident), handing TestBench's Test Compile a workspace with no projects
+       array and a version the DF26 toolchain refuses (Nils 2026-08-28: "always says the program
+       compiled clean"). A PREFERENCE, not a filter: when only an other-format candidate exists
+       it is still returned - the caller's own parse guards decide what to do with it - and a
+       folder holding exactly ONE .sws returns that file whatever its name or format, exactly as
+       before. eWantFormat is a parameter rather than an #IF here so the rule is testable from
+       the DFUnit runner, whatever version that happens to be built with. */
+    Function OwnSwsCandidateInFolder String sHome Integer eWantFormat Returns String
+        tRFSearchResult[] aFiles
+        String sOnly sPreferred sOther sLeaf sFull
+        Integer i iMax iPos iCount iFormat
+
+        Move (rfFileSearch((vFolderFormat(sHome) + "*.sws"), DIRMODE_FILES_ONLY, False)) to aFiles
+        Move (SizeOfArray(aFiles) - 1) to iMax
+        Move 0 to iCount
+        Move "" to sOnly
+        Move "" to sPreferred
+        Move "" to sOther
+        For i from 0 to iMax
+            Move aFiles[i].sFilename to sLeaf
+            Move (RightPos("\", sLeaf)) to iPos
+            If (iPos > 0) ;
+                Move (Right(sLeaf, (Length(sLeaf) - iPos))) to sLeaf
+            Move (vFolderFormat(sHome) + sLeaf) to sFull
+            Increment iCount
+            Move sFull to sOnly
+            If (Uppercase(Left(sLeaf, 10)) = "DFREFACTOR") Begin
+                Get SwsFormatOf sFull to iFormat
+                If (iFormat = eWantFormat) Begin
+                    If (sPreferred = "") ;
+                        Move sFull to sPreferred
+                End
+                Else Begin
+                    If (sOther = "") ;
+                        Move sFull to sOther
+                End
+            End
+        Loop
+        If (iCount = 1) ;
+            Function_Return sOnly
+        If (sPreferred <> "") ;
+            Function_Return sPreferred
+        Function_Return sOther
+    End_Function
+
+    /* The DataFlex version a .sws declares for ITSELF, e.g. "19.1", from its [Properties] block.
+
+       This is the ONLY reliable way to version a .sws. The 2026-07-30 survey found four
+       incompatible filename schemes across four libraries - DFUnit-25.0, DFAbout25.0,
+       vWin32fh-Library-DF191 (undotted), VDFQuery182 - and libraries that CHANGE their own scheme
+       between releases (vwin32fh DF191 -> DF25.0; DbUpdateFramework 19.1 -> DUFLibrary25.0). The
+       [Properties] block is uniform everywhere. Never parse the filename.
+
+       JSON-format .sws (DF26+) carry the same fact elsewhere; ReadSwsJsonFile lives on
+       cRefactorApplication and is asked for it in the real app via SwsJsonVersion below. */
+    Function SwsDataFlexVersion String sSwsFile Returns String
+        String sVersion
+
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return ""
+        Get SwsJsonVersion sSwsFile to sVersion
+        If (sVersion <> "") ;
+            Function_Return sVersion
+        Get SwsSectionValue sSwsFile "Properties" "Version" to sVersion
+        Function_Return (Trim(sVersion))
+    End_Function
+
+    /* HOOK for JSON-format .sws (DataFlex 26+), which carry the version as JSON rather than an
+       INI [Properties] block. Returns "" today, so SwsDataFlexVersion falls through to the INI
+       reader.
+
+       Deliberately NOT wired to cRefactorApplication.ReadSwsJsonFile: that would put a
+       ghoApplication reference inside this class, which reintroduces exactly the coupling this
+       class exists to avoid - and a compile-order dependency besides. Every workspace and library
+       .sws on this machine is INI-format today (the 2026-07-30 survey read 235 of them), and
+       vwin32fh's own DF26 support arrived as a commit titled "Adding a df26 sws file (ini
+       format)". Override this in a subclass, or pass the parsed version in, when a JSON .sws
+       actually turns up. */
+    Function SwsJsonVersion String sSwsFile Returns String
+        Function_Return ""
+    End_Function
+
+    /* A DataFlex version string as a COMPARABLE integer: "19.1" -> 19001, "25.0" -> 25000.
+       0 means "could not read it", which callers must treat as "no answer" rather than as zero.
+
+       Integer parts, never a Number. Converting "19.1" to a Number goes through the locale's
+       decimal separator, so on a machine set to Swedish the dot is not a decimal point and the
+       value that comes back is not the one in the file - and every comparison built on it is
+       quietly wrong ([[feedback_dataflex_locale_decimal_separator]]). Two integers around the dot
+       have no separator to disagree about.
+
+       Only the leading digits of each part are read, so a "25.0 RC1" or a stray space cannot make
+       the whole version unreadable. */
+    { Visibility=Private }
+    Function _VersionKey String sVersion Returns Integer
+        String sMajor sMinor sCh
+        Integer i iPos iLen
+
+        Move (Trim(sVersion)) to sVersion
+        If (sVersion = "") ;
+            Function_Return 0
+        Move (Pos(".", sVersion)) to iPos
+        If (iPos > 0) Begin
+            Move (Left(sVersion, (iPos - 1))) to sMajor
+            Move (Mid(sVersion, (Length(sVersion) - iPos), (iPos + 1))) to sMinor
+        End
+        Else Begin
+            Move sVersion to sMajor
+            Move "0" to sMinor
+        End
+
+        // Keep the leading digits of each part and drop whatever follows.
+        Move "" to sCh
+        Move (Length(sMajor)) to iLen
+        For i from 1 to iLen
+            If (Mid(sMajor, 1, i) >= "0" and Mid(sMajor, 1, i) <= "9") ;
+                Move (sCh + Mid(sMajor, 1, i)) to sCh
+            Else ;
+                Move iLen to i
+        Loop
+        Move sCh to sMajor
+        Move "" to sCh
+        Move (Length(sMinor)) to iLen
+        For i from 1 to iLen
+            If (Mid(sMinor, 1, i) >= "0" and Mid(sMinor, 1, i) <= "9") ;
+                Move (sCh + Mid(sMinor, 1, i)) to sCh
+            Else ;
+                Move iLen to i
+        Loop
+        Move sCh to sMinor
+
+        If (sMajor = "") ;
+            Function_Return 0
+        If (sMinor = "") ;
+            Move "0" to sMinor
+        Function_Return ((Integer(sMajor) * 1000) + Integer(sMinor))
+    End_Function
+
+    /* Is sVersion OLDER than sTarget? The one place that question is answered, so the report, the
+       maintenance dialog and anything later all mean the same thing by "behind".
+
+       NUMERIC, because the strings do not sort: "9.0" compares GREATER than "19.1" as text, which
+       is the exact shape of a library copy that predates the two-digit era and would be reported as
+       up to date.
+
+       FALSE WHENEVER THERE IS NO ANSWER - a blank version, a blank target, or something neither
+       side can parse. "Behind" is a claim about the user's workspace and it drives a colour they
+       will act on; making it on a version nobody could read would be a guess wearing a fact's
+       clothes. A version AHEAD of the target (DFUnit ships the sentinel "99.0") is not behind
+       either, which is what keeps that sentinel from needing a guard of its own. */
+    /* Does sTarget fall inside the [sMin, sMax] release range a package declares?
+
+       BOTH ENDS ARE OPTIONAL and an absent end means "no bound that way", not zero: a package
+       stating only df-min supports everything from there on. A range with neither end says nothing
+       and cannot answer - which is why the caller has to ask HasRange first rather than reading
+       False as a refusal.
+
+       Inclusive at both ends: "df-min 26.0, df-max 26.0" is DataFlex 26's package, and the whole
+       point of a max is to include the release it names.
+
+       Numeric through _VersionKey, for the same reason IsVersionBelow is - "9.0" sorts above "19.1"
+       as text. Unreadable input at either end is treated as "no bound", never as a limit that
+       happens to exclude everything. */
+    Function VersionInRange String sTarget String sMin String sMax Returns Boolean
+        Integer iTarget iMin iMax
+
+        Get _VersionKey sTarget to iTarget
+        If (iTarget = 0) ;
+            Function_Return False
+        Get _VersionKey sMin to iMin
+        Get _VersionKey sMax to iMax
+        If (iMin > 0 and iTarget < iMin) ;
+            Function_Return False
+        If (iMax > 0 and iTarget > iMax) ;
+            Function_Return False
+        Function_Return True
+    End_Function
+
+    // Is there a usable range at all? "No range" and "a range that excludes you" are different
+    // answers and only one of them is a verdict about the package.
+    Function HasVersionRange String sMin String sMax Returns Boolean
+        Integer iMin iMax
+        Get _VersionKey sMin to iMin
+        Get _VersionKey sMax to iMax
+        Function_Return (iMin > 0 or iMax > 0)
+    End_Function
+
+    /* HOOK: the df-min / df-max a PACKAGE declares in its own cached df.sws.
+
+       Stubbed to "" here for the same reason the other JSON hooks are - reading it needs
+       cJsonObject through cRefactorApplication.ReadSwsJsonFile, and a ghoApplication reference in
+       this class would make it unusable from the console runner. cLibraryInventoryApp fills it in.
+
+       A host without that subclass sees no range, and every package row correctly falls back to
+       "managed by df-cli" with no verdict. */
+    Procedure SwsPackageDfRange String sSwsFile String ByRef sMin String ByRef sMax
+        Move "" to sMin
+        Move "" to sMax
+    End_Procedure
+
+    Function IsVersionBelow String sVersion String sTarget Returns Boolean
+        Integer iVer iTarget
+
+        Get _VersionKey sVersion to iVer
+        Get _VersionKey sTarget  to iTarget
+        If (iVer = 0 or iTarget = 0) ;
+            Function_Return False
+        Function_Return (iVer < iTarget)
+    End_Function
+
+    /* HOOK for a JSON-format .sws (DataFlex 26+), whose libraries are its "dependencies" array.
+
+       Returns "" here, exactly like SwsJsonVersion above and for the same reason: parsing JSON
+       needs cJsonObject and the workspace reader that owns it (cRefactorApplication.ReadSwsJsonFile,
+       which already handles both dependency shapes), and reaching for ghoApplication from this class
+       would break the console test runner - it declares a plain cApplication, so every
+       "of ghoApplication" would silently return nothing.
+
+       cLibraryInventoryApp (cFTLibraryReport.pkg) overrides this where the app object exists. Any
+       host without that subclass sees a JSON workspace as having no libraries, which is why
+       SwsLibraryEntries below is the ONLY caller - one place to be wrong, and one place to fix. */
+    Function SwsJsonLibraryEntries String sSwsFile Returns String[]
+        String[] asNone
+        Function_Return asNone
+    End_Function
+
+    /* How many dependencies are the OBJECT form ({source, version, sws}) - a git or file dependency
+       that SwsJsonLibraryEntries deliberately leaves out, because it has no path to resolve and no
+       version to read off disk.
+
+       Counted rather than ignored. Dropping rows without saying so is precisely how the old library
+       report came to describe a six-library workspace as having four; a caller can now state the
+       omission instead of quietly shortening its own list. Same hook rule as the two above - 0 here,
+       answered by cLibraryInventoryApp where the JSON reader lives. */
+    Function SwsJsonObjectDependencyCount String sSwsFile Returns Integer
+        Function_Return 0
+    End_Function
+
+    /* THE OBJECT DEPENDENCIES THEMSELVES, not just how many (2026-08-14).
+
+       Counting them was enough while nothing here could act on one. Now that a package can be
+       ADDED (AddPackageFT) and removed (df-cli package uninstall), a count is the wrong shape of
+       answer - the Libraries dialog has to show each one and let it be selected.
+
+       Same hook rule as its neighbours: empty here, answered by cLibraryInventoryApp where the
+       JSON reader lives, so the console test runner is not dragged into needing ghoApplication. */
+    Function SwsJsonObjectDependencies String sSwsFile Returns tSwsDependency[]
+        tSwsDependency[] aNone
+        Function_Return aNone
+    End_Function
+
+    /* The workspace OVERRIDES - what this workspace says a dependency should really be.
+
+       DataFlex 26 lets a workspace override a version or an alternate .sws for something one of
+       its LIBRARIES declares, and "only root-workspace overrides take effect" (tSwsFile.aOverrides).
+       That matters on screen: a card can otherwise state the version a library declares while the
+       build uses another one entirely, which is a readout quietly disagreeing with the compiler.
+
+       Same hook rule as its neighbours - empty here, answered by cLibraryInventoryApp. */
+    Function SwsJsonOverrides String sSwsFile Returns tSwsOverride[]
+        tSwsOverride[] aNone
+        Function_Return aNone
+    End_Function
+
+    /* The RAW library entries of a .sws, in file order - the paths as written, unresolved.
+
+       FORMAT-BLIND at the call site (2026-08-12). Every screen and every resolver asks this one
+       question; whether the answer comes from an INI [Libraries] section or a JSON "dependencies"
+       array is this function's business, not theirs. Before, an INI-only reader meant a JSON
+       workspace reported no libraries at all - true of nothing, and the shape of answer that reads
+       as "you have none" rather than "I cannot tell". */
+    Function SwsLibraryEntries String sSwsFile Returns String[]
+        String[] asEntries asRaw
+        String sEntry
+        Integer i iMax iPos
+
+        If (SwsFormatOf(Self, sSwsFile) = eSwsJson) ;
+            Function_Return (SwsJsonLibraryEntries(Self, sSwsFile))
+
+        Get SwsSectionEntries sSwsFile CS_Libraries to asEntries
+        Move (SizeOfArray(asEntries) - 1) to iMax
+        For i from 0 to iMax
+            Move asEntries[i] to sEntry
+            Move (Pos("=", sEntry)) to iPos
+            Move (Trim(Mid(sEntry, (Length(sEntry) - iPos), (iPos + 1)))) to sEntry
+            If (sEntry <> "") ;
+                Move sEntry to asRaw[SizeOfArray(asRaw)]
+        Loop
+        Function_Return asRaw
+    End_Function
+
+    /* How an [Libraries] entry SHOULD be WRITTEN for a workspace whose home is sHomeFolder:
+       relative when the library sits inside that home or beside it, absolute only when it is
+       somewhere else entirely.
+
+       NOT cosmetic, and not a preference. A relative entry is what makes a workspace PORTABLE -
+       it survives being copied, cloned or junctioned, which is the whole premise of the migration
+       flow this dialog sits in and of the shared library pool ("..\Libraries\X" resolves against
+       the copy exactly as it did against the original). An absolute entry written for a library
+       that is in fact enclosed would silently tie the copy back to the machine it was made on, and
+       the failure is invisible until someone else opens it.
+
+       THREE cases, in order:
+         inside home              -> "Libraries\vwin32fh\StudioLibrary\vWin32fh-Library-DF25.0.sws"
+         beside home (same parent)-> "..\Libraries\vwin32fh\...\...sws"   (the pool shape)
+         anywhere else            -> the absolute path, unchanged - the honest answer, since
+                                     nothing shorter would resolve.
+       Comparison is on NORMALIZED, lower-cased strings (a raw "C:\P\LegacyApp10\..\Libraries" fails every
+       prefix test while opening the right folder), but the RETURNED text keeps the caller's case. */
+    Function RelativeLibraryEntry String sLibSwsFile String sHomeFolder Returns String
+        String sLib sHome sParent sLibLow sHomeLow sParentLow
+        Integer iPos
+
+        Move (Trim(sLibSwsFile)) to sLib
+        If (sLib = "") ;
+            Function_Return ""
+        Get NormalizePath sLib to sLib
+        Get NormalizePath sHomeFolder to sHome
+        Get RemoveFolderSeperator sHome to sHome
+        If (sHome = "") ;
+            Function_Return sLib
+
+        Move (Lowercase(sLib))  to sLibLow
+        Move (Lowercase(sHome)) to sHomeLow
+        If (Left(sLibLow, (Length(sHomeLow) + 1)) = (sHomeLow + "\")) ;
+            Function_Return (Mid(sLib, (Length(sLib) - Length(sHome) - 1), (Length(sHome) + 2)))
+
+        // The folder holding home. A home AT a drive root has none, so the sibling case simply
+        // does not apply and the absolute path stands.
+        Move (RightPos("\", sHome)) to iPos
+        If (iPos > 1) Begin
+            Move (Left(sHome, (iPos - 1))) to sParent
+            Move (Lowercase(sParent)) to sParentLow
+            If (Left(sLibLow, (Length(sParentLow) + 1)) = (sParentLow + "\")) ;
+                Function_Return ("..\" + Mid(sLib, (Length(sLib) - Length(sParent) - 1), (Length(sParent) + 2)))
+        End
+
+        Function_Return sLib
+    End_Function
+
+    /* REWRITE a .sws file's [Libraries] section to exactly asEntries, renumbered Lib1..LibN.
+
+       The one WRITER against a .sws in this class, and the only place the Library Maintenance
+       dialog's OK lands. Everything outside [Libraries] passes through byte-for-byte: this is
+       surgery on one section, not a re-serialisation, so a workspace file keeps every key, comment
+       and section this tool has never heard of.
+
+       A JSON .sws GOES TO ITS OWN WRITER (_WriteSwsJsonDependencies), never through the INI logic
+       below: that logic finds an INI section header and appends INI lines when it finds none, so
+       run against a JSON document it would bolt "[Libraries]" onto the end and produce a file
+       neither the Studio nor this tool can read. The two formats share this entry point and nothing
+       else. Both splice ONE thing and pass every other byte through; either can still return False,
+       and a caller must treat that as "not saved" rather than assume it wrote.
+
+       THE SECTION HEADER IS WRITTEN WHEN IT IS ABSENT - the silent-failure case found on
+       DataFolderSelector25.0.sws, where Lib1..Lib3 sat directly under [Projects] with no
+       [Libraries] header: the Studio parses by section, so those lines were never loaded as
+       libraries and the dependencies failed to resolve with no error anywhere. Adding entries to
+       such a file without the header would reproduce exactly that bug. (Stray Lib lines already
+       sitting under another section are LEFT ALONE - they are ignored by the Studio today and will
+       go on being ignored; deleting keys out of a section we do not own is not this function's
+       business.)
+
+       An EMPTY asEntries keeps the [Libraries] header and empties it, rather than removing the
+       section: "this workspace uses no libraries" is a statement worth being able to read in the
+       file, and re-adding one then needs no structural change. */
+    /* One entry as a JSON string literal, quotes included.
+
+       Escapes what JSON requires and nothing else: backslash and double-quote. A Windows path is
+       ALL backslashes, so an unescaped entry is not merely wrong - "C:\Proj" carries \P, an invalid
+       escape, and the document stops parsing. Forward slashes (what df-cli itself writes) need no
+       escaping and are left alone, so a hand-added absolute path and a df-cli-written relative one
+       both survive.
+
+       Backslash FIRST, or the backslashes introduced by the quote escape get escaped again. */
+    { Visibility=Private }
+    Function _JsonQuoted String sText Returns String
+        String s
+        Move (Replaces("\", sText, "\\")) to s
+        Move (Replaces('"', s, '\"')) to s
+        Function_Return ('"' + s + '"')
+    End_Function
+
+    /* REWRITE a JSON .sws file's "dependencies" array to exactly asEntries.
+
+       TEXT SURGERY ON ONE KEY, not a parse-and-restringify - the same decision as the INI path above
+       and for a stronger reason. A round trip through tSwsFile would re-serialise the whole
+       document from a struct that models what this tool happens to know about, so every key it does
+       not model is silently DROPPED and every one it does is reformatted. A .sws carries the
+       Studio's class preferences, project debug arguments, overrides, package metadata - things this
+       tool has no business rewriting to change a library list. Splicing one array leaves every other
+       byte identical.
+
+       The array is located by its KEY and closed by bracket DEPTH, so it copes with the object form
+       of a dependency ({source, version, sws}, which spans lines) as well as plain path strings. It
+       is deliberately conservative: anything it cannot recognise returns False, and the caller
+       reports that the save did not happen rather than writing something it guessed at.
+
+       INDENTATION is taken from the line the key sits on, so the rewritten array matches the
+       document it lands in instead of announcing itself.
+
+       NO "dependencies" KEY AT ALL is a legitimate file (a workspace with no libraries), so one is
+       inserted after the opening brace when there are entries to write - and when there are none,
+       there is nothing to do and the file is left exactly as it was. */
+    { Visibility=Private }
+    Function _WriteSwsJsonDependencies String sSwsFile String[] asEntries Returns Boolean
+        String[] asLines asOut asElem asBlk asBLines
+        String sLine sTrim sIndent sEntry sPad sNorm
+        Integer i iMax iN iOut iKeyAt iOpenAt iCloseAt iDepth iPos iCh
+        Integer e iElemMax b iBlkMax k iBLMax
+        Boolean bOk bStringsDone
+
+        Move (rfReadEncodedFileAsStringArray(sSwsFile)) to asLines
+        Move (SizeOfArray(asLines) - 1) to iMax
+        If (iMax < 0) ;
+            Function_Return False
+        Move (SizeOfArray(asEntries) - 1) to iN
+
+        // ---- locate the key line -----------------------------------------------------------
+        // Matched on the quoted KEY, then a colon - so both '"dependencies":' and the legal
+        // '"dependencies" :' are found, and a "dependencies" appearing as a VALUE somewhere is not.
+        Move -1 to iKeyAt
+        For i from 0 to iMax
+            If (iKeyAt = -1) Begin
+                Move (Trim(Replaces(Character(9), (Replaces(Character(13), asLines[i], "")), " "))) to sTrim
+                If (Left(sTrim, 14) = '"dependencies"') Begin
+                    Move (Trim(Mid(sTrim, (Length(sTrim) - 14), 15))) to sLine
+                    If (Left(sLine, 1) = ":") ;
+                        Move i to iKeyAt
+                End
+            End
+        Loop
+
+        If (iKeyAt = -1) Begin
+            /* Absent. Nothing to remove means nothing to do; something to add means inserting the
+               key immediately after the opening brace, which is a position no other key depends on
+               (JSON objects are unordered) and which keeps the diff to the lines added. */
+            If (iN < 0) ;
+                Function_Return True
+            Move 0 to iOpenAt
+            For i from 0 to iMax
+                Move (Trim(Replaces(Character(13), asLines[i], ""))) to sTrim
+                If (iOpenAt = 0 and Left(sTrim, 1) = "{") ;
+                    Move (i + 1) to iOpenAt
+            Loop
+            If (iOpenAt = 0 or iOpenAt > iMax) ;
+                Function_Return False
+            /* The inserted block ends with a comma, which is only correct when a member follows it.
+               An object with nothing else in it would get a trailing comma and stop parsing, so a
+               .sws that is an empty object is refused rather than damaged - it is not a workspace
+               file this tool has any business writing libraries into. */
+            Move (Trim(Replaces(Character(13), asLines[iOpenAt], ""))) to sTrim
+            If (Left(sTrim, 1) = "}") ;
+                Function_Return False
+            For i from 0 to (iOpenAt - 1)
+                Move asLines[i] to asOut[SizeOfArray(asOut)]
+            Loop
+            Move '    "dependencies": [' to asOut[SizeOfArray(asOut)]
+            For iOut from 0 to iN
+                Move (Trim(asEntries[iOut])) to sEntry
+                If (sEntry <> "") Begin
+                    Move ('        ' + _JsonQuoted(Self, sEntry)) to sLine
+                    If (iOut < iN) ;
+                        Move (sLine + ",") to sLine
+                    Move sLine to asOut[SizeOfArray(asOut)]
+                End
+            Loop
+            Move '    ],' to asOut[SizeOfArray(asOut)]
+            For i from iOpenAt to iMax
+                Move asLines[i] to asOut[SizeOfArray(asOut)]
+            Loop
+            Get rfWriteEncodedFileFromStringArray (&asOut) sSwsFile C_NewLine False to bOk
+            Function_Return bOk
+        End
+
+        // ---- find the closing bracket by DEPTH ---------------------------------------------
+        // Counted across the whole span rather than assuming one element per line: an object-form
+        // dependency spans several lines and carries its own braces.
+        Move 0 to iDepth
+        Move -1 to iCloseAt
+        For i from iKeyAt to iMax
+            Move (Replaces(Character(13), asLines[i], "")) to sLine
+            Move (Length(sLine)) to iPos
+            For iCh from 1 to iPos
+                If (Mid(sLine, 1, iCh) = "[") ;
+                    Increment iDepth
+                If (Mid(sLine, 1, iCh) = "]") Begin
+                    Move (iDepth - 1) to iDepth
+                    If (iDepth = 0 and iCloseAt = -1) ;
+                        Move i to iCloseAt
+                End
+            Loop
+            If (iCloseAt <> -1) ;
+                Move iMax to i
+        Loop
+        // An unbalanced or inline-but-unrecognisable array is refused rather than guessed at.
+        If (iCloseAt = -1 or iDepth <> 0) ;
+            Function_Return False
+
+        /* GIT / CLOUD DEPENDENCIES ARE CARRIED OVER VERBATIM (Nils 2026-08-14).
+
+           A DF26 dependency is either a PATH STRING or an OBJECT ({source, version, sws}) - a git
+           or cloud package. SwsLibraryEntries only ever returns the strings, so asEntries can only
+           ever describe the strings, and rebuilding the array from it alone would silently delete
+           every package. This used to REFUSE the write for exactly that reason, which was honest
+           but useless: the first workspace Nils converted to JSON has two git packages, so the
+           Libraries dialog could not save it at all - every removal reported "not saved".
+
+           So the array is taken apart into its top-level elements and put back together with the
+           object elements copied out CHARACTER FOR CHARACTER, internal line breaks and all.
+           Nothing this tool does not understand is reformatted, let alone dropped.
+
+           The replacement strings go where the FIRST string element was, so a hand-ordered file
+           keeps its shape; if there were no strings at all they go last. Order carries no meaning
+           to the package handler - dependencies is a union - but a small diff is a readable one. */
+        Get _JsonArrayElements (&asLines) iKeyAt iCloseAt to asElem
+
+        // The key line's own indentation, so the rewritten block matches the document.
+        Move asLines[iKeyAt] to sLine
+        Move "" to sIndent
+        Move (Length(sLine)) to iPos
+        For iCh from 1 to iPos
+            If (Mid(sLine, 1, iCh) = " " or Mid(sLine, 1, iCh) = Character(9)) ;
+                Move (sIndent + Mid(sLine, 1, iCh)) to sIndent
+            Else ;
+                Move iPos to iCh
+        Loop
+        Move (sIndent + "    ") to sPad
+
+        // ---- the blocks to emit, in order ---------------------------------------------------
+        Move False to bStringsDone
+        Move (SizeOfArray(asElem) - 1) to iElemMax
+        For e from 0 to iElemMax
+            // Line breaks folded to spaces for the TEST only - asElem[e] itself stays raw.
+            Move (Trim(Replaces(Character(10), (Replaces(Character(9), asElem[e], " ")), " "))) to sNorm
+            If (Left(sNorm, 1) = "{") ;
+                Move asElem[e] to asBlk[SizeOfArray(asBlk)]
+            Else Begin
+                // A string element: the WHOLE run of them is replaced by asEntries, once, here.
+                If (bStringsDone = False) Begin
+                    If (iN >= 0) Begin
+                        For iOut from 0 to iN
+                            Move (Trim(asEntries[iOut])) to sEntry
+                            If (sEntry <> "") ;
+                                Move (_JsonQuoted(Self, sEntry)) to asBlk[SizeOfArray(asBlk)]
+                        Loop
+                    End
+                    Move True to bStringsDone
+                End
+            End
+        Loop
+        // Nothing to replace means the entries are new: they go after whatever was there.
+        If (bStringsDone = False and iN >= 0) Begin
+            For iOut from 0 to iN
+                Move (Trim(asEntries[iOut])) to sEntry
+                If (sEntry <> "") ;
+                    Move (_JsonQuoted(Self, sEntry)) to asBlk[SizeOfArray(asBlk)]
+            Loop
+        End
+
+        // ---- rebuild: everything before, the new array, everything after --------------------
+        For i from 0 to (iKeyAt - 1)
+            Move asLines[i] to asOut[SizeOfArray(asOut)]
+        Loop
+        // A trailing comma on the CLOSING line survives, because the key may not be the last member
+        // of its object - and a JSON document with a missing or doubled comma is unreadable.
+        Move (Trim(Replaces(Character(13), asLines[iCloseAt], ""))) to sTrim
+        Move (SizeOfArray(asBlk) - 1) to iBlkMax
+        If (iBlkMax < 0) Begin
+            Move (sIndent + '"dependencies": []') to sLine
+            If (Right(sTrim, 1) = ",") ;
+                Move (sLine + ",") to sLine
+            Move sLine to asOut[SizeOfArray(asOut)]
+        End
+        Else Begin
+            Move (sIndent + '"dependencies": [') to asOut[SizeOfArray(asOut)]
+            For b from 0 to iBlkMax
+                Get _SplitOnLf asBlk[b] to asBLines
+                Move (SizeOfArray(asBLines) - 1) to iBLMax
+                For k from 0 to iBLMax
+                    // The first line is placed at OUR indent; the rest go out untouched, so a
+                    // multi-line object keeps the internal shape it had in the file.
+                    If (k = 0) ;
+                        Move (sPad + Trim(asBLines[k])) to sLine
+                    Else ;
+                        Move asBLines[k] to sLine
+                    // The separator belongs on the LAST line of a block, not on every line of one.
+                    If (k = iBLMax and b < iBlkMax) ;
+                        Move (sLine + ",") to sLine
+                    Move sLine to asOut[SizeOfArray(asOut)]
+                Loop
+            Loop
+            Move (sIndent + "]") to sLine
+            If (Right(sTrim, 1) = ",") ;
+                Move (sLine + ",") to sLine
+            Move sLine to asOut[SizeOfArray(asOut)]
+        End
+
+        For i from (iCloseAt + 1) to iMax
+            Move asLines[i] to asOut[SizeOfArray(asOut)]
+        Loop
+
+        Get rfWriteEncodedFileFromStringArray (&asOut) sSwsFile C_NewLine False to bOk
+        Function_Return bOk
+    End_Function
+
+    /* THE TOP-LEVEL ELEMENTS OF A JSON ARRAY, RAW.
+
+       A DF26 dependency may be an object spanning several lines, so the elements cannot be found by
+       splitting lines on commas - that cuts an object in half, and the halves look like two broken
+       dependencies. This walks CHARACTERS and breaks only at a comma that is outside every brace,
+       bracket and string literal.
+
+       Each element comes back with its internal line breaks intact as Character(10), which is what
+       lets the writer copy an object back out unchanged. Whitespace BETWEEN elements is separation
+       and is dropped; nothing inside one is touched - trailing whitespace is held in sPend and only
+       committed when a later non-blank character proves it was interior.
+
+       iFrom/iTo span the key line to the array's closing bracket. Scanning starts after the first
+       "[", so the key itself contributes nothing. */
+    Function _JsonArrayElements String[] asLines Integer iFrom Integer iTo Returns String[]
+        String[] asElem
+        String sAll sCh sCur sPend
+        Integer i iLen iCh iBrace iBrack
+        Boolean bInStr bEsc bStarted bInElem
+
+        Move "" to sAll
+        For i from iFrom to iTo
+            If (i > iFrom) ;
+                Move (sAll + Character(10)) to sAll
+            Move (sAll + Replaces(Character(13), asLines[i], "")) to sAll
+        Loop
+
+        Move "" to sCur
+        Move "" to sPend
+        Move 0 to iBrace
+        Move 0 to iBrack
+        Move False to bInStr
+        Move False to bEsc
+        Move False to bStarted
+        Move False to bInElem
+        Move (Length(sAll)) to iLen
+        For iCh from 1 to iLen
+            Move (Mid(sAll, 1, iCh)) to sCh
+            If (bStarted = False) Begin
+                // Everything up to the array's own "[" belongs to the key.
+                If (sCh = "[") ;
+                    Move True to bStarted
+            End
+            Else If (bInStr = True) Begin
+                // Inside a literal every character is content, including a comma or a brace.
+                Move (sCur + sCh) to sCur
+                If (bEsc = True) ;
+                    Move False to bEsc
+                Else If (sCh = "\") ;
+                    Move True to bEsc
+                Else If (sCh = '"') ;
+                    Move False to bInStr
+            End
+            Else If (sCh = " " or sCh = Character(9) or sCh = Character(10)) Begin
+                If (bInElem = True) ;
+                    Move (sPend + sCh) to sPend
+            End
+            Else If (sCh = "," and iBrace = 0 and iBrack = 0) Begin
+                If (bInElem = True) ;
+                    Move sCur to asElem[SizeOfArray(asElem)]
+                Move "" to sCur
+                Move "" to sPend
+                Move False to bInElem
+            End
+            Else If (sCh = "]" and iBrace = 0 and iBrack = 0) Begin
+                // The array's OWN closer: stop, and let the flush below take the last element.
+                Move iLen to iCh
+            End
+            Else Begin
+                If (sCh = '"') ;
+                    Move True to bInStr
+                If (sCh = "{") ;
+                    Increment iBrace
+                If (sCh = "}") ;
+                    Move (iBrace - 1) to iBrace
+                If (sCh = "[") ;
+                    Increment iBrack
+                If (sCh = "]") ;
+                    Move (iBrack - 1) to iBrack
+                Move (sCur + sPend + sCh) to sCur
+                Move "" to sPend
+                Move True to bInElem
+            End
+        Loop
+        If (bInElem = True) ;
+            Move sCur to asElem[SizeOfArray(asElem)]
+        Function_Return asElem
+    End_Function
+
+    // Split on Character(10). Deliberately not a general-purpose splitter: the pieces are written
+    // straight back to the file, so nothing may be trimmed, folded or re-spaced on the way through.
+    Function _SplitOnLf String sText Returns String[]
+        String[] asOut
+        Integer iPos
+        Move (Pos(Character(10), sText)) to iPos
+        While (iPos > 0)
+            Move (Left(sText, (iPos - 1))) to asOut[SizeOfArray(asOut)]
+            Move (Right(sText, (Length(sText) - iPos))) to sText
+            Move (Pos(Character(10), sText)) to iPos
+        Loop
+        Move sText to asOut[SizeOfArray(asOut)]
+        Function_Return asOut
+    End_Function
+
+    /* Repoint ONE git dependency at a different commit, in place.
+
+       Line-level on purpose, exactly like WriteSwsLibraryEntries above: the whole file goes back
+       out unchanged except the one value, so key order, indentation and every property this reader
+       does not model survive untouched. Rebuilding the JSON from a parsed view would drop whatever
+       the parse does not carry - the mistake [[feedback_writer_must_not_rebuild_from_a_partial_view]]
+       exists to prevent.
+
+       WHY THIS EXISTS AT ALL: `df-cli package upgrade` cannot move a git dependency. Measured
+       2026-08-21 - asked to upgrade one pinned to an exact SHA it answers "Library <name> is up to
+       date." and exits 0, because the pin IS the requested version and there is no range for it to
+       resolve. Upgrading a git package therefore means rewriting the pin ourselves and then letting
+       df-cli reconcile the installed set to it.
+
+       Matches on the OLD 40-character SHA, which is unique in a .sws, so no dependency other than
+       the intended one can be touched. Returns False when the old value is not present. */
+    /* EVERY package the workspace ends up with - the ones it names, and the ones THOSE pull in.
+
+       A workspace file records only what the user asked for; whatever those dependencies require is
+       installed but never written there. Measured on E:\OrderEntry 2026-08-21: asking for DUF alone
+       produced FOUR checkouts under DfPkg - DUF, RDCToolsLib, DFAbout and vWin32fh - against a
+       single line in the .sws.
+
+       ONE HOME FOR THE WALK, because two callers need it and they must not disagree: the Libraries
+       dialog lists these as rows, and the dashboard tile counts them. The tile has been wrong this
+       way before - it once said "1" over a workspace carrying five libraries, "a number that matched
+       no other count on screen, least of all the Libraries dialog's own list" - and a second copy of
+       this loop is how that happens again.
+
+       A WORK LIST, not recursion: the graph is deeper than one level (vWin32fh arrives under
+       RDCToolsLib, which arrives under DUF). Each entry is expanded in turn and anything new is
+       appended, so the walk reaches whatever depth exists. Bounded at CI_PackageGraphMaxWalk
+       expansions - two manifests naming each other would otherwise spin here.
+
+       Identity for de-duplication is the SOURCE URL, lower-cased: a package reached twice by
+       different routes is one package, and the URL is the only field that is certainly the same both
+       times (the .sws sub-path and the pinned commit need not be).
+
+       aOut carries the dependencies in walk order, DIRECT ONES FIRST; asVia[i] is the repo that
+       required entry i, "" for a direct one; aiDepth[i] is 0 for direct, 1 for its dependency, and
+       so on. Returns SizeOfArray(aOut). */
+    Function ExpandPackageGraph String sSwsFile String sHomeFolder tSwsDependency[] ByRef aOut ;
+                                String[] ByRef asVia Integer[] ByRef aiDepth Returns Integer
+        tSwsDependency[] aDirect aNested aEmpty
+        String[] asSeen asViaOut asEmptyS
+        Integer[] aiDepthOut aiEmptyI
+        String sManifest sVia sSrc
+        Integer i iMax iAt iGuard iFound
+
+        Move aEmpty   to aOut
+        Move asEmptyS to asVia
+        Move aiEmptyI to aiDepth
+        If (sSwsFile = "") ;
+            Function_Return 0
+
+        Get SwsJsonObjectDependencies sSwsFile to aDirect
+        Move (SizeOfArray(aDirect) - 1) to iMax
+        For i from 0 to iMax
+            Move aDirect[i] to aOut[SizeOfArray(aOut)]
+            Move ""         to asViaOut[SizeOfArray(asViaOut)]
+            Move 0          to aiDepthOut[SizeOfArray(aiDepthOut)]
+            Move (Lowercase(Trim(aDirect[i].sSource))) to asSeen[SizeOfArray(asSeen)]
+        Loop
+
+        Move 0 to iAt
+        Move 0 to iGuard
+        While (iAt < SizeOfArray(aOut) and iGuard < CI_PackageGraphMaxWalk)
+            Increment iGuard
+            Get ObjectDependencyManifest sHomeFolder aOut[iAt] to sManifest
+            If (sManifest <> "") Begin
+                Get GitRepoFromSource (Trim(aOut[iAt].sSource)) to sVia
+                Get SwsJsonObjectDependencies sManifest to aNested
+                Move (SizeOfArray(aNested) - 1) to iMax
+                For i from 0 to iMax
+                    Move (Lowercase(Trim(aNested[i].sSource))) to sSrc
+                    Move (SearchArray(sSrc, asSeen)) to iFound
+                    If (iFound = -1) Begin
+                        Move sSrc       to asSeen[SizeOfArray(asSeen)]
+                        Move aNested[i] to aOut[SizeOfArray(aOut)]
+                        Move sVia       to asViaOut[SizeOfArray(asViaOut)]
+                        Move (aiDepthOut[iAt] + 1) to aiDepthOut[SizeOfArray(aiDepthOut)]
+                    End
+                Loop
+            End
+            Increment iAt
+        Loop
+
+        Move asViaOut   to asVia
+        Move aiDepthOut to aiDepth
+        Function_Return (SizeOfArray(aOut))
+    End_Function
+
+    /*  MOVE ONE GIT DEPENDENCY'S PIN - found by WHO it is, never by its value alone (2026-09-25).
+
+        Until now this replaced the old value on every line that carried it. That was only safe
+        while every pin was a 40-character commit, which occurs nowhere else in a workspace file. A
+        version TAG is not unique at all: two packages can both be at "1.0.0", the workspace's own
+        package version can be "1.0.0", and a pin "1.0.5" is part of "Web UI FlexTron#1.0.54" -
+        moving it to 1.0.6 by text alone would have made that FlexTron 1.0.64 as well.
+
+        So this walks the JSON. It knows which object each "version" belongs to, reads straight
+        past the inside of every string (a "{" in "${AppSrc}/..." is not a brace), and changes only
+        the "version" of the "dependencies" entry whose "source" is sSource - and whose "sws" is
+        sSws, when one is given, since one repository can hold two packages - while it still says
+        sOldVersion. Exactly one such entry, or nothing is written and the answer is False.
+
+        BYTES IN, BYTES OUT. The old body went through the line reader and the CP850 line writer,
+        which turned an LF file (the Studio writes .sws files that way) into CRLF, took the final
+        newline off a file that had one, and would have mangled any non-ASCII character in a
+        description. Everything the walk looks for is ASCII, and no byte of a UTF-8 multi-byte
+        character is, so it cannot misread one - and every byte outside the one value goes back
+        exactly as it came. */
+    Function SetSwsDependencyVersion String sSwsFile String sSource String sSws String sOldVersion String sNewVersion Returns Boolean
+        UChar[] ucaFile ucaNew ucaOut
+        String[] asType asKey asSource asSws asVersion
+        Integer[] aiVerAt aiVerLen
+        String sStr sWantSource sWantSws sHaveSws
+        Integer iSize i j iDepth iByte iStrStart iHits iHitAt iHitLen iOut iNew iChannel
+        Boolean bInStr bAfterColon
+
+        Move (Trim(sOldVersion)) to sOldVersion
+        Move (Trim(sNewVersion)) to sNewVersion
+        Move (Lowercase(Trim(sSource))) to sWantSource
+        Move (Lowercase(Replaces("\", (Trim(sSws)), "/"))) to sWantSws
+        If ((sSwsFile = "") or (sWantSource = "") or (sOldVersion = "") or (sNewVersion = "")) ;
+            Function_Return False
+        // The new value is written between the old quotes as it stands, so it must not close them.
+        If ((Pos('"', sNewVersion) > 0) or (Pos("\", sNewVersion) > 0)) ;
+            Function_Return False
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return False
+        If (sOldVersion = sNewVersion) ;
+            Function_Return True
+
+        Move (rfFileSize(sSwsFile)) to iSize
+        If (iSize <= 0) ;
+            Function_Return False
+        Move (rfReadFileSliceBytes(sSwsFile, 0, iSize)) to ucaFile
+        If (SizeOfArray(ucaFile) <> iSize) ;
+            Function_Return False
+
+        // Depth 0 is outside everything; the manifest's own object is 1, "dependencies" 2, an entry 3.
+        Move ""    to asType[0]
+        Move ""    to asKey[0]
+        Move 0     to iDepth
+        Move 0     to iHits
+        Move -1    to iHitAt
+        Move 0     to iHitLen
+        Move False to bInStr
+        Move False to bAfterColon
+        Move 0     to i
+        While (i < iSize)
+            Move ucaFile[i] to iByte
+            If (bInStr = True) Begin
+                If (iByte = 92) Begin
+                    // A backslash escapes the byte after it, whatever it is - a quote included.
+                    Increment i
+                End
+                Else If (iByte = 34) Begin
+                    /* The closing quote: a key, or the value of the key before the colon. Keys and
+                       the values worth reading are short and ASCII; a long string (a description)
+                       is never one of them and is not copied out. */
+                    Move False to bInStr
+                    Move "" to sStr
+                    If ((i - iStrStart) <= 512) Begin
+                        For j from iStrStart to (i - 1)
+                            Move (sStr + (Character(ucaFile[j]))) to sStr
+                        Loop
+                    End
+                    If ((iDepth > 0) and (asType[iDepth] = "{")) Begin
+                        If (bAfterColon = False) ;
+                            Move sStr to asKey[iDepth]
+                        Else Begin
+                            If (asKey[iDepth] = "source") ;
+                                Move sStr to asSource[iDepth]
+                            If (asKey[iDepth] = "sws") ;
+                                Move sStr to asSws[iDepth]
+                            If (asKey[iDepth] = "version") Begin
+                                Move sStr            to asVersion[iDepth]
+                                Move iStrStart       to aiVerAt[iDepth]
+                                Move (i - iStrStart) to aiVerLen[iDepth]
+                            End
+                            Move False to bAfterColon
+                        End
+                    End
+                End
+            End
+            Else Begin
+                If (iByte = 34) Begin
+                    Move True    to bInStr
+                    Move (i + 1) to iStrStart
+                End
+                // { and [ open a level, and its slots start empty.
+                If ((iByte = 123) or (iByte = 91)) Begin
+                    Increment iDepth
+                    Move (If((iByte = 123), "{", "[")) to asType[iDepth]
+                    Move "" to asKey[iDepth]
+                    Move "" to asSource[iDepth]
+                    Move "" to asSws[iDepth]
+                    Move "" to asVersion[iDepth]
+                    Move -1 to aiVerAt[iDepth]
+                    Move 0  to aiVerLen[iDepth]
+                    Move False to bAfterColon
+                End
+                /* } and ] close one. The match is decided as an entry closes: an object, inside an
+                   array, which is the value of "dependencies" one level further up. */
+                If ((iByte = 125) or (iByte = 93)) Begin
+                    If ((iByte = 125) and (iDepth >= 3)) Begin
+                        If ((asType[iDepth] = "{") and (asType[iDepth - 1] = "[") and (asKey[iDepth - 2] = "dependencies")) Begin
+                            Move (Lowercase(Replaces("\", (Trim(asSws[iDepth])), "/"))) to sHaveSws
+                            If ((Lowercase(Trim(asSource[iDepth])) = sWantSource) and ((sWantSws = "") or (sHaveSws = sWantSws)) ;
+                                and (Trim(asVersion[iDepth]) = sOldVersion) and (aiVerAt[iDepth] >= 0)) Begin
+                                Increment iHits
+                                Move aiVerAt[iDepth]  to iHitAt
+                                Move aiVerLen[iDepth] to iHitLen
+                            End
+                        End
+                    End
+                    If (iDepth > 0) ;
+                        Decrement iDepth
+                    Move False to bAfterColon
+                End
+                If (iByte = 58) ;
+                    Move True to bAfterColon
+                If (iByte = 44) ;
+                    Move False to bAfterColon
+            End
+            Increment i
+        Loop
+        If (iHits <> 1) ;
+            Function_Return False
+
+        // Everything before the value, the new value, everything after it - byte for byte.
+        Move (rfStringToUtf8Bytes(sNewVersion)) to ucaNew
+        Move (SizeOfArray(ucaNew)) to iNew
+        Move 0 to iOut
+        For j from 0 to (iHitAt - 1)
+            Move ucaFile[j] to ucaOut[iOut]
+            Increment iOut
+        Loop
+        For j from 0 to (iNew - 1)
+            Move ucaNew[j] to ucaOut[iOut]
+            Increment iOut
+        Loop
+        For j from (iHitAt + iHitLen) to (iSize - 1)
+            Move ucaFile[j] to ucaOut[iOut]
+            Increment iOut
+        Loop
+
+        Move (Seq_New_Channel()) to iChannel
+        If (iChannel < 0) ;
+            Function_Return False
+        Direct_Output Channel iChannel ("binary:" + sSwsFile)
+        // A file that cannot be opened (read-only, locked) raises nothing here - only SeqEof says so.
+        If (SeqEof) Begin
+            Close_Output Channel iChannel
+            Send Seq_Release_Channel iChannel
+            Function_Return False
+        End
+        Write Channel iChannel ucaOut
+        Close_Output Channel iChannel
+        Send Seq_Release_Channel iChannel
+        Function_Return (Err = False)
+    End_Function
+
+    /* A JSON file's text, decoded as the UTF-8 it is (a .sws and its .lock carry no BOM) - "" when
+       it is missing or empty. */
+    Function _JsonFileText String sFile Returns String
+        UChar[] ucaFile
+        Integer iSize
+
+        If (vFilePathExists(sFile) = 0) ;
+            Function_Return ""
+        Move (rfFileSize(sFile)) to iSize
+        If (iSize <= 0) ;
+            Function_Return ""
+        Move (rfReadFileSliceBytes(sFile, 0, iSize)) to ucaFile
+        Move (rfStripUtf8Bom(ucaFile)) to ucaFile
+        Function_Return (rfUtf8BytesToString(ucaFile))
+    End_Function
+
+    /* ucaBytes to sFile as they are - a binary channel, nothing translated. False when the file
+       cannot be opened (read-only, locked): that raises nothing, only SeqEof says so. */
+    Function _WriteFileBytes String sFile UChar[] ucaBytes Returns Boolean
+        Integer iChannel
+
+        Move (Seq_New_Channel()) to iChannel
+        If (iChannel < 0) ;
+            Function_Return False
+        Direct_Output Channel iChannel ("binary:" + sFile)
+        If (SeqEof) Begin
+            Close_Output Channel iChannel
+            Send Seq_Release_Channel iChannel
+            Function_Return False
+        End
+        Write Channel iChannel ucaBytes
+        Close_Output Channel iChannel
+        Send Seq_Release_Channel iChannel
+        Function_Return (Err = False)
+    End_Function
+
+    /* THE LOCK FILE AS THE CAUSE (Nils 2026-10-29, LegacyApp5_20). df-cli refused VDFQuery20 with
+       "Incompatible ref for NilsSve/vWin32fh-Library-DF26.0: 1.0.0 does not match 5432741c...". No
+       dependency of the workspace asked for that commit any more - DUF and RDCToolsLib had both
+       moved to ^1.0.0 - only LegacyApp5_20.sws.lock, which had kept it since an earlier DUF pin. Drop
+       that one entry and df-cli chooses the version again.
+
+       Answers the ref the lock pins the package at when ALL of these hold, else "":
+         - asCliLines carries df-cli's incompatible-ref line, ONE lock entry names that package,
+           and it pins it at one of the line's two refs;
+         - neither the workspace's own .sws nor the .sws of any OTHER git package the lock pins
+           asks for the package at that ref. Each is read from its DfPkg checkout - the folder
+           ending in "-<ref>" that holds its .sws (the key's tail after ".git/"). One that cannot be
+           found answers "": an ask that cannot be read is not an ask that is gone.
+       Registry entries ("DataFlex-dev/Web UI") are passed over - they live in the package cache,
+       not under DfPkg, and do not ask for a git commit. sPkgName gets df-cli's name for the
+       package, sLockKey the entry's key, for RemoveLockEntry. */
+    Function StaleLockPin String sSwsFile String[] asCliLines String ByRef sPkgName String ByRef sLockKey Returns String
+        tRFSearchResult[] aDirs
+        String[] asKeys asRefs
+        String sPkg sA sB sLockRef sText sDfPkg sRel sDir sCandidate
+        Integer i iMax iTarget iPos d
+        Boolean bFound bDirsRead bRead
+
+        Move "" to sPkgName
+        Move "" to sLockKey
+        If (sSwsFile = "") ;
+            Function_Return ""
+        Get DfCliIncompatibleRef (&asCliLines) (&sPkg) (&sA) (&sB) to bFound
+        If (bFound = False) ;
+            Function_Return ""
+        Get _JsonFileText (sSwsFile + ".lock") to sText
+        Get LockFileEntries sText (&asKeys) (&asRefs) to iMax
+        Move -1 to iTarget
+        For i from 0 to (iMax - 1)
+            If (LockKeyNamesPackage(asKeys[i], sPkg) = True) Begin
+                // Two entries for one name: not this function's to choose between.
+                If (iTarget <> -1) ;
+                    Function_Return ""
+                Move i to iTarget
+            End
+        Loop
+        If (iTarget = -1) ;
+            Function_Return ""
+        Move asRefs[iTarget] to sLockRef
+        If ((sLockRef = "") or ((Lowercase(sLockRef) <> Lowercase(sA)) and (Lowercase(sLockRef) <> Lowercase(sB)))) ;
+            Function_Return ""
+
+        // The workspace's own ask.
+        Get _JsonFileText sSwsFile to sText
+        If (SwsJsonAsksForRef(sText, sPkg, sLockRef) = True) ;
+            Function_Return ""
+
+        // Every other git package the lock pins, read from its checkout.
+        Move (Replaces("/", sSwsFile, "\")) to sDfPkg
+        Move (RightPos("\", sDfPkg)) to iPos
+        If (iPos = 0) ;
+            Function_Return ""
+        Move (Left(sDfPkg, iPos) + "DfPkg") to sDfPkg
+        Move False to bDirsRead
+        For i from 0 to (iMax - 1)
+            Move (Pos(".git/", Lowercase(asKeys[i]))) to iPos
+            If ((i <> iTarget) and (iPos > 0)) Begin
+                If (asRefs[i] = "") ;
+                    Function_Return ""
+                If (bDirsRead = False) Begin
+                    If (rfDirectoryExists(sDfPkg) = False) ;
+                        Function_Return ""
+                    Move (rfFileSearch((sDfPkg + "\*"), DIRMODE_DIRECTORIES_ONLY, False)) to aDirs
+                    Move True to bDirsRead
+                End
+                // ".git/" is 5 characters; what follows it is the .sws path inside the checkout.
+                Move (Replaces("/", (Right(asKeys[i], Length(asKeys[i]) - iPos - 4) + ".sws"), "\")) to sRel
+                Move False to bRead
+                For d from 0 to (SizeOfArray(aDirs) - 1)
+                    Move (Trim(aDirs[d].sFilename)) to sDir
+                    If ((bRead = False) and (Lowercase(Right(sDir, Length(asRefs[i]) + 1)) = ("-" + Lowercase(asRefs[i])))) Begin
+                        Move (sDfPkg + "\" + sDir + "\" + sRel) to sCandidate
+                        If (vFilePathExists(sCandidate) <> 0) Begin
+                            Get _JsonFileText sCandidate to sText
+                            Move True to bRead
+                        End
+                    End
+                Loop
+                If (bRead = False) ;
+                    Function_Return ""
+                If (SwsJsonAsksForRef(sText, sPkg, sLockRef) = True) ;
+                    Function_Return ""
+            End
+        Loop
+        Move sPkg to sPkgName
+        Move asKeys[iTarget] to sLockKey
+        Function_Return sLockRef
+    End_Function
+
+    /* Remove ONE entry - the one StaleLockPin named - from a .sws.lock, and hand back the file's
+       bytes as they were, so a retry that still fails can put it back exactly (RestoreFileBytes).
+       Re-written through cJsonObject, pretty-printed: df-cli rewrites the lock on its next run
+       anyway, and a failed retry restores the original bytes. False when the entry is not there or
+       the file cannot be written - then nothing has changed. */
+    Function RemoveLockEntry String sLockFile String sLockKey UChar[] ByRef ucaBefore Returns Boolean
+        Handle hoJson hoDeps
+        UChar[] ucaNone ucaNew
+        Integer iSize
+        Boolean bOk bHas
+
+        Move ucaNone to ucaBefore
+        If ((Trim(sLockKey) = "") or (vFilePathExists(sLockFile) = 0)) ;
+            Function_Return False
+        Move (rfFileSize(sLockFile)) to iSize
+        If (iSize <= 0) ;
+            Function_Return False
+        Move (rfReadFileSliceBytes(sLockFile, 0, iSize)) to ucaBefore
+        If (SizeOfArray(ucaBefore) <> iSize) Begin
+            Move ucaNone to ucaBefore
+            Function_Return False
+        End
+        Move False to bHas
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Get ParseUtf8 of hoJson (rfStripUtf8Bom(ucaBefore)) to bOk
+        If (bOk = True) Begin
+            Set pbRequireAllMembers of hoJson to False
+            Get MemberEnh of hoJson "dependencies" to hoDeps
+            If (hoDeps <> 0) Begin
+                Get HasMember of hoDeps sLockKey to bHas
+                If (bHas = True) Begin
+                    Send RemoveMember of hoDeps sLockKey
+                    // Set back explicitly, whether Member handed out a copy or a reference.
+                    Send SetMember of hoJson "dependencies" hoDeps
+                    Set peWhiteSpace of hoJson to jpWhitespace_Pretty
+                    Get StringifyUtf8 of hoJson to ucaNew
+                End
+                Send Destroy of hoDeps
+            End
+        End
+        Send Destroy of hoJson
+        If ((bHas = False) or (SizeOfArray(ucaNew) = 0)) ;
+            Function_Return False
+        Get _WriteFileBytes sLockFile ucaNew to bOk
+        Function_Return bOk
+    End_Function
+
+    // The other half of RemoveLockEntry: the file back exactly as it was read.
+    Function RestoreFileBytes String sFile UChar[] ucaBytes Returns Boolean
+        Boolean bOk
+
+        If (SizeOfArray(ucaBytes) = 0) ;
+            Function_Return False
+        Get _WriteFileBytes sFile ucaBytes to bOk
+        Function_Return bOk
+    End_Function
+
+    Function WriteSwsLibraryEntries String sSwsFile String[] asEntries Returns Boolean
+        String[] asLines asOut
+        String sLine sTrim sEntry
+        Integer i iMax iFormat iN iOut
+        Boolean bInLibs bEmitted bDrop bOk
+
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return False
+        Get SwsFormatOf sSwsFile to iFormat
+        If (iFormat = eSwsJson) Begin
+            Get _WriteSwsJsonDependencies sSwsFile asEntries to bOk
+            Function_Return bOk
+        End
+
+        Move (rfReadEncodedFileAsStringArray(sSwsFile)) to asLines
+        If (SizeOfArray(asLines) = 0) ;
+            Function_Return False
+
+        Move (SizeOfArray(asEntries) - 1) to iN
+        Move False to bInLibs
+        Move False to bEmitted
+
+        Move (SizeOfArray(asLines) - 1) to iMax
+        For i from 0 to iMax
+            Move asLines[i] to sLine
+            Move (Trim(Replaces(Character(9), (Replaces(Character(13), sLine, "")), " "))) to sTrim
+            // An existing entry inside [Libraries] is DROPPED - asEntries replaces the whole set.
+            // Comments and blank lines in there are not entries and are kept.
+            Move False to bDrop
+            If (bInLibs = True and Left(sTrim, 1) <> "[" and Left(sTrim, 1) <> ";" and Left(sTrim, 2) <> "//") ;
+                Move (Pos("=", sTrim) > 1) to bDrop
+            If (Left(sTrim, 1) = "[") Begin
+                // The section is ENDING (or another one is opening): our block goes in before the
+                // next header, so the entries land inside [Libraries] and not under its successor.
+                If (bInLibs = True and bEmitted = False) Begin
+                    For iOut from 0 to iN
+                        Move (Trim(asEntries[iOut])) to sEntry
+                        If (sEntry <> "") ;
+                            Move ("Lib" + String(iOut + 1) + "=" + sEntry) to asOut[SizeOfArray(asOut)]
+                    Loop
+                    Move True to bEmitted
+                End
+                Move (Lowercase(sTrim) = "[libraries]") to bInLibs
+            End
+            If (bDrop = False) ;
+                Move sLine to asOut[SizeOfArray(asOut)]
+        Loop
+
+        // The section ran to end-of-file, or there was no [Libraries] header at all.
+        If (bEmitted = False) Begin
+            If (bInLibs = False and iN >= 0) ;
+                Move "[Libraries]" to asOut[SizeOfArray(asOut)]
+            If (bInLibs = True or iN >= 0) Begin
+                For iOut from 0 to iN
+                    Move (Trim(asEntries[iOut])) to sEntry
+                    If (sEntry <> "") ;
+                        Move ("Lib" + String(iOut + 1) + "=" + sEntry) to asOut[SizeOfArray(asOut)]
+                Loop
+            End
+        End
+
+        Get rfWriteEncodedFileFromStringArray (&asOut) sSwsFile C_NewLine False to bOk
+        Function_Return bOk
+    End_Function
+
+    /* ---- DF26 DEPENDENCY CLASSIFICATION --------------------------------------------------------
+       Pure string work, no disk, so the whole set is testable from the console runner. */
+
+    /* WHAT KIND OF ENTRY IS THIS? Under DF26 a dependency string is either a DataFlex system package or a
+       path, and telling them apart has to happen BEFORE anything tries to resolve one.
+
+       The object form (eDepGit) never reaches here - it is not a string, and the reader decides it.
+
+       Ordered so that every POSITIVE path signal is tested first and the package answer is what is
+       left over. That is the safe direction: a misread package renders as an odd-looking row, while
+       a misread path silently stops resolving a real library.
+         .sws suffix     - decisive. A package string names no file.
+         absolute        - a drive or UNC.
+         leading "."     - ".\", "..\", "./", "../"
+         any backslash   - no package string contains one; every Windows path does.
+       What remains, and carries a "<repo>/<Name>" slash, is a package. Anything else falls through
+       to eDepPath, which is exactly the pre-DF26 behaviour. */
+    Function DependencyKind String sEntry Returns Integer
+        String sLow
+
+        Move (Trim(sEntry)) to sEntry
+        If (sEntry = "") ;
+            Function_Return eDepPath
+        Move (Lowercase(sEntry)) to sLow
+        If (Right(sLow, 4) = ".sws") ;
+            Function_Return eDepPath
+        If (_IsAbsolutePath(Self, sEntry)) ;
+            Function_Return eDepPath
+        If (Left(sEntry, 1) = ".") ;
+            Function_Return eDepPath
+        If (Pos("\", sEntry) > 0) ;
+            Function_Return eDepPath
+        If (Pos("/", sEntry) > 1) ;
+            Function_Return eDepPackage
+        Function_Return eDepPath
+    End_Function
+
+    // The repository half of "<repo>/<Name>#<version>" - "DataFlex-dev". "" if there is none.
+    Function PackageRepository String sEntry Returns String
+        Integer iPos
+        Move (Trim(sEntry)) to sEntry
+        Move (Pos("/", sEntry)) to iPos
+        If (iPos < 2) ;
+            Function_Return ""
+        Function_Return (Left(sEntry, iPos - 1))
+    End_Function
+
+    /* The package NAME - "Web UI FlexTron". Spaces are ordinary in these names, which is why nothing
+       here splits on whitespace. Falls back to the whole entry so a row is never nameless. */
+    Function PackageName String sEntry Returns String
+        String sRest
+        Integer iPos
+        Move (Trim(sEntry)) to sEntry
+        Move (Pos("/", sEntry)) to iPos
+        If (iPos < 1) ;
+            Move sEntry to sRest
+        Else ;
+            Move (Mid(sEntry, (Length(sEntry) - iPos), (iPos + 1))) to sRest
+        Move (Pos("#", sRest)) to iPos
+        If (iPos > 1) ;
+            Move (Left(sRest, iPos - 1)) to sRest
+        Function_Return (Trim(sRest))
+    End_Function
+
+    // The PINNED version after "#" - "1.0.51", or "" when the entry names no version. Unlike a
+    // library's version this is declared by the CONSUMER, so it is what the workspace asked for.
+    Function PackageVersion String sEntry Returns String
+        Integer iPos
+        Move (Trim(sEntry)) to sEntry
+        Move (Pos("#", sEntry)) to iPos
+        If (iPos < 1) ;
+            Function_Return ""
+        Function_Return (Trim(Mid(sEntry, (Length(sEntry) - iPos), (iPos + 1))))
+    End_Function
+
+    /* Where df-cli puts a package on disk. Packages live in a GLOBAL cache, not in the workspace:
+
+           %ProgramData%\DataFlex\Packages\Cache\<Repo>_<Name>-<version>\
+
+       with "-" and " " folded to "_" in the repo and name halves, verified against real entries
+       ("DataFlex-dev/Web UI FlexTron#1.0.44" -> "DataFlex_dev_Web_UI_FlexTron-1.0.44"). Returns ""
+       for an entry with no pinned version, because the folder name cannot then be derived - the row
+       says "no version pinned" rather than guessing at one. */
+    /* The root of df-cli's global package cache, WITH its trailing separator.
+
+       %ProgramData%\DataFlex\Packages\Cache\ - verified on this machine, and where df-cli's own
+       "cache" command reports its entries.
+
+       WRITTEN OUT rather than asked of the shell. The obvious call, vSHGetFolderPath with
+       vCSIDL_COMMON_APPDATA, is NOT a global function in vwin32fh - so the expression form
+       vSHGetFolderPath(vCSIDL_COMMON_APPDATA) parses as "send to the object whose id is 0x0023"
+       and dies with error 57, receiver Status_Panel. (0x0023 is 35, and object 35 was the status
+       panel: the constant became the receiver and the argument vanished.) Getting that call right
+       needs a receiver this class has no business knowing, and it cannot be exercised from the
+       console runner where the rest of this file is tested.
+
+       The cost of the assumption is bounded and visible: %ProgramData% is relocatable in theory and
+       is C:\ProgramData on a standard install, and a wrong root does not break anything - the
+       package row simply reports "not in the package cache", which is also what it says when a
+       package genuinely is not installed. A crash was the worse trade.
+
+       A separate function so a host that knows better can override it in a subclass, the same
+       escape hatch the JSON hooks use. */
+    Function PackageCacheRoot Returns String
+        Function_Return "C:\ProgramData\DataFlex\Packages\Cache\"
+    End_Function
+
+    Function PackageCacheFolder String sEntry Returns String
+        String sRepo sName sVer sRoot
+
+        Get PackageRepository sEntry to sRepo
+        Get PackageName sEntry to sName
+        Get PackageVersion sEntry to sVer
+        If (sName = "" or sVer = "") ;
+            Function_Return ""
+        Move (Replaces("-", sRepo, "_")) to sRepo
+        Move (Replaces(" ", sRepo, "_")) to sRepo
+        Move (Replaces("-", sName, "_")) to sName
+        Move (Replaces(" ", sName, "_")) to sName
+        Get PackageCacheRoot to sRoot
+        If (sRoot = "") ;
+            Function_Return ""
+        If (sRepo <> "") ;
+            Function_Return (sRoot + sRepo + "_" + sName + "-" + sVer + "\")
+        Function_Return (sRoot + sName + "-" + sVer + "\")
+    End_Function
+
+    /* WHAT A PACKAGE SAYS ABOUT ITSELF (2026-08-19). An installed package carries a df.sws in its
+       cache folder, and that file - not the workspace's dependency array - is where its human-facing
+       metadata lives:
+
+           { "description": "Conversion library to convert values from one format to the other.",
+             "df": 26.0,
+             "package": { "df-max": 26.0, "df-min": 26.0, "icon": "Icon.png", "version": "1.0.0" },
+             "workspaceName": "Conversions" }
+
+       This is the same information the Studio shows and that "df-cli package search" returns in its
+       Description column - so a card can describe a package without spawning df-cli per row.
+
+       Read as TEXT rather than through ghoApplication's JSON reader on purpose: that reader returns a
+       tSwsFile built for dependencies and paths, extending it would touch every caller, and this class
+       is deliberately free of an application reference. df-cli writes the file one key per line, so a
+       per-line scan is enough - and a key that is absent (every INI-era package, and any repo that has
+       not declared one) simply returns "", which the caller renders as nothing.
+
+       sKey is matched WITH its quotes, so "version" cannot match "df-version"; nested keys such as the
+       package object's "icon" are found the same way, since the scan does not care about depth. */
+    /* The scalar reader itself, on ANY JSON .sws - a cached package's df.sws, or a library's own
+       workspace file once it has been converted. Split out from PackageManifestValue on 2026-08-19:
+       the cache is only where a SYSTEM package keeps its manifest, and a library referenced by path
+       never goes near it - so reading only there meant a library could declare a description and the
+       card would still show none. */
+    /* How much this line OPENS or CLOSES, ignoring braces inside a JSON string. It has to ignore them:
+       a real manifest carries "${AppSrc}/FlexTronScriptIncludes.html" as a value, and counting that
+       value's braces would put the scanner permanently out of step with the file. */
+    Function _JsonBraceDelta String sLine Returns Integer
+        Integer i iLen iDelta
+        Boolean bInStr bEsc
+        String sCh
+
+        Move (Length(sLine)) to iLen
+        Move 0 to iDelta
+        Move False to bInStr
+        Move False to bEsc
+        For i from 1 to iLen
+            Move (Mid(sLine, 1, i)) to sCh
+            If (bEsc = True) Begin
+                Move False to bEsc
+            End
+            Else Begin
+                If ((sCh = "\") and (bInStr = True)) Begin
+                    Move True to bEsc
+                End
+                Else Begin
+                    If (sCh = '"') Begin
+                        If (bInStr = True) Begin
+                            Move False to bInStr
+                        End
+                        Else Begin
+                            Move True to bInStr
+                        End
+                    End
+                    Else Begin
+                        If (bInStr = False) Begin
+                            If ((sCh = "{") or (sCh = "[")) ;
+                                Move (iDelta + 1) to iDelta
+                            If ((sCh = "}") or (sCh = "]")) ;
+                                Move (iDelta - 1) to iDelta
+                        End
+                    End
+                End
+            End
+        Loop
+        Function_Return iDelta
+    End_Function
+
+    // The quoted name a line starts with - its key, or "" for a line that carries none.
+    Function _JsonLineKey String sLine Returns String
+        Integer iOpen iClose
+        Move (Pos('"', sLine)) to iOpen
+        If (iOpen = 0) ;
+            Function_Return ""
+        Move (Pos('"', sLine, (iOpen + 1))) to iClose
+        If (iClose <= iOpen) ;
+            Function_Return ""
+        Function_Return (Mid(sLine, (iClose - iOpen - 1), (iOpen + 1)))
+    End_Function
+
+    Function SwsManifestValue String sSwsFile String sKey Returns String
+        String[] asLines
+        String sLine sVal sQuoted sLineKey sSection
+        Integer i iMax iPos iOpen iClose iDepth
+
+        If (Trim(sSwsFile) = "") ;
+            Function_Return ""
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return ""
+        If (SwsFormatOf(Self, sSwsFile) <> eSwsJson) ;
+            Function_Return ""
+        Move (rfReadEncodedFileAsStringArray(sSwsFile)) to asLines
+        Move ('"' + Trim(sKey) + '"') to sQuoted
+        Move (SizeOfArray(asLines) - 1) to iMax
+        Move 0 to iDepth
+        Move "" to sSection
+        For i from 0 to iMax
+            Move asLines[i] to sLine
+            Get _JsonLineKey sLine to sLineKey
+            /* SCOPE, NOT JUST A NAME MATCH (2026-08-19). The first cut took the key from anywhere in
+               the file and said so proudly - "the scan does not care about depth". For "description"
+               that is harmless; for "version" it is a trap, because a workspace's dependency records
+               each carry a "version" of their own holding a 40-character commit. A library that
+               gained one git dependency would have shown THAT dependency's hash as its own version,
+               confidently and wrongly. So a key counts only where df-cli puts a package's own
+               scalars: at the manifest's top level, or inside its "package" object - which is where
+               DataFlex's own packages keep both "version" and "icon". Anything deeper, and
+               "dependencies" above all, is somebody else's answer. */
+            Move (Pos(sQuoted, sLine)) to iPos
+            If ((iPos > 0) and (sLineKey = (Trim(sKey))) ;
+                    and ((iDepth = 1) or ((iDepth = 2) and (sSection = "package")))) Begin
+                // Past the key and its colon, the value is the next quoted run on the line.
+                Move (Pos(":", sLine, (iPos + Length(sQuoted)))) to iPos
+                If (iPos > 0) Begin
+                    Move (Pos('"', sLine, (iPos + 1))) to iOpen
+                    If (iOpen > 0) Begin
+                        Move (Pos('"', sLine, (iOpen + 1))) to iClose
+                        If (iClose > iOpen) Begin
+                            Move (Mid(sLine, (iClose - iOpen - 1), (iOpen + 1))) to sVal
+                            Function_Return sVal
+                        End
+                    End
+                    /* AN UNQUOTED SCALAR still counts. JSON numbers and booleans carry no quotes,
+                       and two of the keys worth reading are numbers: "df-min": 26.0 and
+                       "df-max": 26.0. Before this the quoted branch simply fell through and the
+                       caller got "" - indistinguishable from "the key is absent", which is a
+                       different fact. Everything after the colon, minus a trailing comma. */
+                    Move (Trim(Right(sLine, (Length(sLine) - iPos)))) to sVal
+                    If (Right(sVal, 1) = ",") ;
+                        Move (Trim(Left(sVal, (Length(sVal) - 1)))) to sVal
+                    Function_Return sVal
+                End
+            End
+            /* The section this line NAMES, captured while the scanner is still at the top level: the
+               line that opens "package" is read at depth 1, and only afterwards does depth become 2. */
+            If ((iDepth = 1) and (sLineKey <> "")) ;
+                Move sLineKey to sSection
+            Move (iDepth + (_JsonBraceDelta(Self, sLine))) to iDepth
+            If (iDepth < 2) ;
+                Move "" to sSection
+        Loop
+        Function_Return ""
+    End_Function
+
+    /* A GIT DEPENDENCY'S OWN .sws, inside the workspace's DfPkg checkout - or "" when it is not
+       checked out (2026-08-19). This is the third place a manifest can live, after a library's own
+       file and a DataFlex system package's cache entry, and without it a git dependency was the one kind of
+       row that could describe itself and did not: Nils published a JSON .sws to his repo, df-cli
+       checked it out, and the card still showed the FILE STEM as a title and the 40-character commit
+       as a version.
+
+       The folder is FOUND, not derived. df-cli names it "<Owner>_<sws stem>-<version>" with hyphens
+       and spaces folded to underscores - NilsSve_DFAbout_Library_DF26-8b5158ab... - and rebuilding
+       that string here would be one more place to disagree with df-cli about a name it owns (the
+       standing rule about library filenames, one level down). Instead the checkout that ENDS with
+       this dependency's version and carries its .sws is the one, which stays right however df-cli
+       decides to spell the rest. */
+    Function ObjectDependencyManifest String sHomeFolder tSwsDependency Dep Returns String
+        tRFSearchResult[] aDirs
+        String sDfPkg sVer sSws sCandidate sDir sOnly
+        Integer i iMax iCarriers
+
+        Move (Trim(Dep.sVersion)) to sVer
+        Move (Trim(Dep.sSws)) to sSws
+        If (sHomeFolder = "" or sVer = "" or sSws = "") ;
+            Function_Return ""
+        Move (Replaces("/", sSws, "\")) to sSws
+        Move (vFolderFormat(sHomeFolder) + "DfPkg") to sDfPkg
+        If (rfDirectoryExists(sDfPkg) = False) ;
+            Function_Return ""
+        Move (rfFileSearch((vFolderFormat(sDfPkg) + "*"), DIRMODE_DIRECTORIES_ONLY, False)) to aDirs
+        Move (SizeOfArray(aDirs) - 1) to iMax
+        For i from 0 to iMax
+            Move (Trim(aDirs[i].sFilename)) to sDir
+            If (Right(sDir, (Length(sVer) + 1)) = ("-" + sVer)) Begin
+                Move (vFolderFormat(vFolderFormat(sDfPkg) + sDir) + sSws) to sCandidate
+                If (vFilePathExists(sCandidate) <> 0) ;
+                    Function_Return sCandidate
+            End
+        Loop
+
+        /* A RANGE NAMES NO FOLDER (2026-09-25). A library that asks for "^1.0.0" gets whichever tag
+           df-cli resolved, and the checkout is named after THAT tag ("...-1.0.1"), so the suffix
+           test above can never match it. The one checkout that carries this dependency's .sws is
+           then the answer - but only when it IS one: df-cli leaves the previous version's folder
+           behind after an update, and with two to choose from this answers "" rather than guess.
+           A commit or an exact tag DOES name its folder, so for those a miss above stays a miss. */
+        If ((IsGitCommitPin(sVer) = True) or (IsVersionTagPin(sVer) = True)) ;
+            Function_Return ""
+        Move "" to sOnly
+        Move 0  to iCarriers
+        For i from 0 to iMax
+            Move (vFolderFormat(vFolderFormat(sDfPkg) + (Trim(aDirs[i].sFilename))) + sSws) to sCandidate
+            If (vFilePathExists(sCandidate) <> 0) Begin
+                Move sCandidate to sOnly
+                Increment iCarriers
+            End
+        Loop
+        If (iCarriers = 1) ;
+            Function_Return sOnly
+        Function_Return ""
+    End_Function
+
+    /* WHO AND WHAT, read off the git URL (Nils 2026-08-19). A git dependency's identity is the repo it
+       came from - "https://github.com/NilsSve/Library-DFAbout.git" is owner NilsSve, repo
+       Library-DFAbout - and that is what a reader recognises. Neither the .sws file stem
+       ("DFAbout-Library-DF26", which is a build artefact's name) nor the manifest's workspaceName
+       ("DFAbout", which is what the workspace calls itself) is the thing you went to GitHub for.
+
+       Trailing ".git" and any trailing slash are dropped; an ssh form (git@github.com:Owner/Repo.git)
+       is handled by taking the last two segments after either separator. Anything that does not have
+       two segments answers "", and the caller keeps whatever it had. */
+    Function GitRepoFromSource String sSource Returns String
+        String sS
+        Integer iPos
+        Move (Trim(sSource)) to sS
+        Move (Replaces(":", (Replaces("/", sS, "\")), "\")) to sS
+        If (Right(sS, 1) = "\") ;
+            Move (Left(sS, (Length(sS) - 1))) to sS
+        If (Lowercase(Right(sS, 4)) = ".git") ;
+            Move (Left(sS, (Length(sS) - 4))) to sS
+        Move (RightPos("\", sS)) to iPos
+        If (iPos = 0 or iPos = Length(sS)) ;
+            Function_Return ""
+        Function_Return (Right(sS, (Length(sS) - iPos)))
+    End_Function
+
+    Function GitOwnerFromSource String sSource Returns String
+        String sS
+        Integer iPos
+
+        Move (Trim(sSource)) to sS
+        Move (Replaces(":", (Replaces("/", sS, "\")), "\")) to sS
+        If (Right(sS, 1) = "\") ;
+            Move (Left(sS, (Length(sS) - 1))) to sS
+        If (Lowercase(Right(sS, 4)) = ".git") ;
+            Move (Left(sS, (Length(sS) - 4))) to sS
+        Move (RightPos("\", sS)) to iPos
+        If (iPos < 2) ;
+            Function_Return ""
+        Move (Left(sS, (iPos - 1))) to sS
+        Move (RightPos("\", sS)) to iPos
+        If (iPos = 0 or iPos = Length(sS)) ;
+            Function_Return ""
+        Function_Return (Right(sS, (Length(sS) - iPos)))
+    End_Function
+
+    /* A commit is not a version anybody reads. A 40-character SHA fills the version slot with noise,
+       so it is shortened to the 7 characters git itself shows; anything that is not a bare hex SHA
+       (a real "1.0.0") is left exactly as declared. */
+    Function ShortDependencyVersion String sVersion Returns String
+        String sV sCh
+        Integer i iLen
+        Move (Trim(sVersion)) to sV
+        Move (Length(sV)) to iLen
+        If (iLen < 20) ;
+            Function_Return sV
+        For i from 1 to iLen
+            Move (Lowercase(Mid(sV, 1, i))) to sCh
+            If (Pos(sCh, "0123456789abcdef") = 0) ;
+                Function_Return sV
+        Loop
+        Function_Return (Left(sV, 7))
+    End_Function
+
+    // A SYSTEM package's manifest lives in its cache folder, as df.sws.
+    Function PackageManifestValue String sEntry String sKey Returns String
+        String sFolder
+        Get PackageCacheFolder sEntry to sFolder
+        If (sFolder = "") ;
+            Function_Return ""
+        Function_Return (SwsManifestValue(Self, (sFolder + "df.sws"), sKey))
+    End_Function
+
+    // The package's icon as a full path, or "" when it declares none / is not installed. The file
+    // lives beside its df.sws in the cache folder.
+    Function PackageIconPath String sEntry Returns String
+        String sIcon sFolder
+        Get PackageManifestValue sEntry "icon" to sIcon
+        If (Trim(sIcon) = "") ;
+            Function_Return ""
+        Get PackageCacheFolder sEntry to sFolder
+        If (sFolder = "") ;
+            Function_Return ""
+        Move (sFolder + Trim(sIcon)) to sIcon
+        If (vFilePathExists(sIcon) = 0) ;
+            Function_Return ""
+        Function_Return sIcon
+    End_Function
+
+    /* Joins a workspace-relative [Libraries] path onto the workspace home.
+
+       Delegates to _ResolvePath rather than doing it here, which fixes two defects the hand-rolled
+       version had. It stripped a leading ".\" but never collapsed "..\", so a perfectly ordinary
+       entry - "Lib1=..\Libraries\vdfquery\VDFQuery182.sws", a library ABOVE the workspace, which is
+       how a shared pool is normally referenced - came back as
+       "C:\Projects\LegacyApp10\..\Libraries\vdfquery\VDFQuery182.sws". Windows opens that happily, so the
+       inventory worked and the flaw travelled downstream into tLibraryInfo.sFolder and on into the
+       copy plan's rows (2026-08-06). And it tested absoluteness with (sRawPath contains ":"), which
+       misses a UNC entry entirely and would prepend the home to "\\server\share\X.sws".
+
+       _IsAbsolutePath answers both, and NormalizePath makes the result comparable. */
+    { Visibility=Private }
+    Function ResolveLibraryPath String sRawPath String sHomePath Returns String
+        Move (Trim(sRawPath)) to sRawPath
+        If (sRawPath = "") ;
+            Function_Return ""
+        Function_Return (_ResolvePath(Self, sHomePath, sRawPath))
+    End_Function
+
+    /* Is this .sws file name one a CONSUMER may reference? Excludes the development / demo /
+       sample roles that sit beside it. Nils's own convention is "RDCToolsLibDev25.0.sws" (for
+       developing the library) beside "RDCToolsLibLibrary25.0.sws" (for consuming it), and SigCJ
+       ships Classes / Demo / Wrapper - so matching on version alone picks the right version and
+       the wrong role. Exclusion, not a required "library" marker: DFAbout25.0.sws and
+       DFUnit-25.0.sws carry no role word at all.
+
+       The marker must stand as its own word (bounded by a non-letter or the ends of the stem),
+       or a name like "DevExpress" would be excluded wrongly. */
+    Function IsConsumableLibrarySws String sFileName Returns Boolean
+        String[] asMarkers
+        String sStem sLow sCh
+        Integer i iMax iPos iAfter
+        Boolean bWordStart bWordEnd
+
+        Move (Lowercase(Trim(sFileName))) to sLow
+        If (Right(sLow, 4) <> ".sws") ;
+            Function_Return False
+        Move (Left(sLow, (Length(sLow) - 4))) to sStem
+        Move (StrSplitToArray(CS_LibNonConsumableMarkers, "|")) to asMarkers
+        Move (SizeOfArray(asMarkers) - 1) to iMax
+        For i from 0 to iMax
+            Move (Pos(asMarkers[i], sStem)) to iPos
+            If (iPos > 0) Begin
+                Move True to bWordStart
+                If (iPos > 1) Begin
+                    Move (Mid(sStem, 1, (iPos - 1))) to sCh
+                    Move (sCh < "a" or sCh > "z") to bWordStart
+                End
+                Move True to bWordEnd
+                Move (iPos + Length(asMarkers[i])) to iAfter
+                If (iAfter <= Length(sStem)) Begin
+                    Move (Mid(sStem, 1, iAfter)) to sCh
+                    Move (sCh < "a" or sCh > "z") to bWordEnd
+                End
+                If (bWordStart and bWordEnd) ;
+                    Function_Return False
+            End
+        Loop
+        Function_Return True
+    End_Function
+
+    /* A library's display name: the folder holding its .sws, but skipping generic container
+       folders. vwin32fh's .sws lives in "vwin32fh\StudioLibrary\", so the leaf alone would call
+       every such library "StudioLibrary" - which is exactly what the raw folder count did to 293
+       references in the survey. Walks up at most two levels looking for a non-generic name. */
+    Function LibraryDisplayName String sFolder Returns String
+        String sRoot sLeaf
+        Integer iPos
+        Get LibraryRootFolder sFolder to sRoot
+        If (Right(sRoot, 1) = "\" or Right(sRoot, 1) = "/") ;
+            Move (Left(sRoot, (Length(sRoot) - 1))) to sRoot
+        Move (RightPos("\", sRoot)) to iPos
+        If (iPos = 0) ;
+            Move (RightPos("/", sRoot)) to iPos
+        If (iPos = 0) ;
+            Function_Return sRoot
+        Move (Mid(sRoot, (Length(sRoot) - iPos), (iPos + 1))) to sLeaf
+        Function_Return sLeaf
+    End_Function
+
+    /* The library's ROOT folder - the path whose leaf LibraryDisplayName reports, so the two can
+       never disagree.
+
+       Not the folder holding the .sws. vwin32fh's .sws lives in "vwin32fh\StudioLibrary\" while its
+       packages (vWin32fh.pkg, cvFileDialogs.pkg) sit one level UP in "vwin32fh\" - so a path test
+       anchored on the .sws folder would miss the library's actual source completely. Walks up past
+       the generic container names for exactly that reason. */
+    Function LibraryRootFolder String sFolder Returns String
+        String[] asGeneric
+        String sPath sLeaf
+        Integer iHop iPos
+
+        Move sFolder to sPath
+        Move (StrSplitToArray(CS_LibGenericFolders, "|")) to asGeneric
+        For iHop from 0 to 2
+            If (Right(sPath, 1) = "\" or Right(sPath, 1) = "/") ;
+                Move (Left(sPath, (Length(sPath) - 1))) to sPath
+            Move (RightPos("\", sPath)) to iPos
+            If (iPos = 0) ;
+                Move (RightPos("/", sPath)) to iPos
+            If (iPos = 0) ;
+                Function_Return sPath
+            Move (Mid(sPath, (Length(sPath) - iPos), (iPos + 1))) to sLeaf
+            If (SearchArray(Lowercase(sLeaf), asGeneric) = -1) ;
+                Function_Return sPath
+            Move (Left(sPath, (iPos - 1))) to sPath
+        Loop
+        Function_Return sPath
+    End_Function
+
+    /* The libraries among a set of SELECTED folders - the names of every library whose root folder
+       contains at least one of them.
+
+       Selecting a library folder is allowed (Nils 2026-07-31: "if the user selects a library folder,
+       we act on it. We don't want to prohibit the user from it"), so nothing here excludes anything.
+       This exists only so the pre-run gate can say WHICH libraries are about to be edited: the files
+       are backed up either way, but the next update to the library upstream will overwrite or
+       conflict with the changes, and that is not something a backup protects.
+
+       Prefix test with a trailing separator on both sides, so "...\vwin32fh\" matches
+       "...\vwin32fh\AppSrc" and not "...\vwin32fhExtra". */
+    Function LibrariesInFolders String sSwsFile String[] ByRef asFolders Returns String[]
+        tLibraryInfo[] aLibs
+        String[] asHit
+        String sRoot sSel
+        Integer i iMax j jMax
+
+        Get WorkspaceLibraryInventory sSwsFile "" to aLibs
+        Move (SizeOfArray(aLibs) - 1) to iMax
+        Move (SizeOfArray(asFolders) - 1) to jMax
+        For i from 0 to iMax
+            Get LibraryRootFolder aLibs[i].sFolder to sRoot
+            Move (Lowercase(vFolderFormat(sRoot))) to sRoot
+            For j from 0 to jMax
+                Move (Lowercase(vFolderFormat(asFolders[j]))) to sSel
+                If (Left(sSel, Length(sRoot)) = sRoot) Begin
+                    If (SearchArray(aLibs[i].sName, asHit) = -1) ;
+                        Move aLibs[i].sName to asHit[SizeOfArray(asHit)]
+                End
+            Loop
+        Loop
+        Function_Return asHit
+    End_Function
+
+    /* Where a library's current version lives, or "" for one we have no home for.
+
+       Matched on the library's FOLDER, which the survey showed is the only stable identifier - the
+       .sws filenames use four incompatible schemes and libraries rename their own between releases
+       (DbUpdateFramework 19.1 -> DUFLibrary25.0). Exact match first, then a prefix, because SigCJ's
+       folders carry their version in the name ("SigCodejock Wrapper 18.2.0") while everything else
+       is a plain folder name. Prefix, not "contains": "duf" appears inside plenty of words.
+
+       A SEED, not a settings file. Nine entries that change when a project moves house, which is
+       rare; if customers start needing their own entries it should graduate to a versioned JSON
+       beside DeepScanRules.json rather than grow here.
+
+       Unknown libraries return "" and simply get no link - the report still lists them, which is
+       the honest outcome for a library we cannot place.
+    */
+    Function LibraryHomeUrl String sName Returns String
+        String sLow
+
+        Move (Lowercase(Trim(sName))) to sLow
+        If (sLow = "") ;
+            Function_Return ""
+
+        /* Wil van Antwerpen's project is the SOURCE OF TRUTH for vwin32fh - the releases happen
+           there ("Adding a df26 sws file", rev 50). Nils also keeps a fork at
+           github.com/NilsSve/Library-vwin32fh which is what DFRefactor itself consumes; the report
+           points at upstream because it is answering "where does the current version live", which
+           for a customer workspace is Wil's. Swap this if the fork should be the answer instead. */
+        If (sLow = "vwin32fh") ;
+            Function_Return "https://projects.vdf-guidance.com/projects/vwin32fh-windows-file-handling"
+        /* The DF20 port is the LAST release - author-deprecated, nothing newer is coming. Home is
+           the NilsSve build since 2026-09-05: DataFlexCode's repo bundles a 2003-era vWin32fh.pkg
+           that shadows the vwin32fh package in every workspace carrying both; the build ships no
+           copy and depends on the package instead (see CS_ApExampleVdfQuery in AddPackageFT.dg). */
+        If (sLow = "vdfquery") ;
+            Function_Return "https://github.com/NilsSve/VDFQuery20"
+        If (Left(sLow, 11) = "sigcodejock" or sLow = "sigcj") ;
+            Function_Return "https://subversion.asckey.co.uk/svn/sigcj/trunk/"
+        If (sLow = "duf" or Left(sLow, 18) = "dbupdateframework") ;
+            Function_Return "https://github.com/NilsSve/Library-DUF"
+        If (sLow = "dfabout") ;
+            Function_Return "https://github.com/NilsSve/Library-DFAbout"
+        If (sLow = "rdctoolslib") ;
+            Function_Return "https://github.com/NilsSve/Library-RDCToolsLib"
+        If (sLow = "dfunit") ;
+            Function_Return "https://github.com/NilsSve/Library-DFUnit"
+        If (Left(sLow, 18) = "datafolderselector" or Left(sLow, 20) = "data folder selector") ;
+            Function_Return "https://github.com/NilsSve/Library-DataFolderSelector"
+        If (Left(sLow, 16) = "holidaysfunclib") ;
+            Function_Return "https://github.com/NilsSve/Library-HolidaysFuncLib"
+        Function_Return ""
+    End_Function
+
+    /* ---- THE INVENTORY ---------------------------------------------------------------------
+       One record per library this workspace references, answering: to move to sTargetVersion,
+       what is the state of each library? See tLibraryInfo / the eLib* enum in
+       RefactorConstants.h.pkg.
+
+       sTargetVersion "" (no compiler picked yet) still returns the inventory, with every status
+       eLibUnknown - the caller can list what a workspace uses without pretending to a verdict. */
+    /* EVERY [Libraries] entry of a workspace, in file order - including the ones pointing at a .sws
+       that is not there.
+
+       THE FULL ANSWER, and the one a screen should show. Its filtered sibling
+       WorkspaceLibraryInventory drops unresolvable entries, which is right for a caller that needs
+       a readable .sws (the copy plan's retargeting) and WRONG for anything that reports a count:
+       a workspace declaring six libraries with two missing reported four, and the tile, the report
+       footer and the row list all agreed with each other while disagreeing with the file. Only the
+       ALL-missing case was ever caught (2026-08-05); this is the same lie in its partial form.
+
+       A NOT-FOUND row carries what is knowable and nothing more: sRawEntry (what the file says),
+       sRefSwsFile (where that resolves to, which is the diagnosis), sName from the file stem, and
+       eLibNotFound. Version, available versions and target are left empty rather than guessed -
+       there was nothing to read them from. */
+    Function WorkspaceLibraryEntries String sSwsFile String sTargetVersion Returns tLibraryInfo[]
+        tLibraryInfo[] aLibs
+        String[] asRaw
+        String sHome
+        Integer iPos
+
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return aLibs
+
+        // The workspace's home is the folder its .sws sits in - derived, not read from
+        // psHomeTarget, so this is pure with respect to its argument and testable against a
+        // fixture workspace that is not the loaded one.
+        Move sSwsFile to sHome
+        Move (RightPos("\", sHome)) to iPos
+        If (iPos = 0) ;
+            Move (RightPos("/", sHome)) to iPos
+        If (iPos = 0) ;
+            Function_Return aLibs
+        Move (Left(sHome, iPos)) to sHome
+
+        Get SwsLibraryEntries sSwsFile to asRaw
+        Get LibraryEntriesInfo (&asRaw) sHome sTargetVersion to aLibs
+        Function_Return aLibs
+    End_Function
+
+    /* The same answer for a list of entries held in MEMORY rather than read from a file.
+
+       THE EDITING CASE, and the reason this is split out. The Library Maintenance dialog shows a
+       working list that Add and Remove have changed but OK has not yet written - so re-reading the
+       .sws to describe it would describe the wrong list, and the row the user just added would
+       render as though it were not there.
+
+       Same rules, one implementation: WorkspaceLibraryEntries is now just "read the entries, derive
+       the home, ask this". */
+    Function LibraryEntriesInfo String[] ByRef asRaw String sHome String sTargetVersion Returns tLibraryInfo[]
+        tLibraryInfo[] aLibs
+        tLibraryInfo Lib
+        tRFSearchResult[] aFound
+        String sChildSws sFolder sVer sFileName
+        Integer iChild iChildMax iFile iFileMax iPos iFmt
+
+        Move (SizeOfArray(asRaw) - 1) to iChildMax
+        For iChild from 0 to iChildMax
+            Move (ResizeArray(Lib.asAvailVersions, 0)) to Lib.asAvailVersions
+            Move asRaw[iChild] to Lib.sRawEntry
+            Move "" to Lib.sRefVersion
+            Move "" to Lib.sFolder
+            Move "" to Lib.sTargetSwsFile
+            Get DependencyKind asRaw[iChild] to Lib.eKind
+
+            /* A SYSTEM PACKAGE IS NOT A PATH, and must never be resolved as one. Doing that is
+               how "DataFlex-dev/Web UI FlexTron#1.0.51" came out as a red "not found - nothing is
+               at that path": true of a file that was never meant to exist there.
+
+               What is knowable comes from the entry itself and the global cache:
+                 name    - the package name, spaces and all
+                 version - PINNED BY THE CONSUMER, so it is what this workspace asked for rather
+                           than what some file declares about itself
+                 bFound  - is that exact version in the cache, i.e. is it installed here
+               No target verdict: a package's DataFlex compatibility is the df-min/df-max range in
+               its own package block, which nothing reads yet. eLibPackage says "this is a package"
+               and stops there, which is the honest end of what we know. */
+            If (Lib.eKind = eDepPackage) Begin
+                Get PackageName asRaw[iChild] to Lib.sName
+                Get PackageVersion asRaw[iChild] to Lib.sRefVersion
+                Get PackageCacheFolder asRaw[iChild] to sFolder
+                Move sFolder to Lib.sFolder
+                Move "" to Lib.sRefSwsFile
+                Move False to Lib.bFound
+                If (sFolder <> "") Begin
+                    // The package's own df.sws - its manifest, and where its chain continues.
+                    Move (sFolder + "df.sws") to sChildSws
+                    If (vFilePathExists(sChildSws) <> 0) Begin
+                        Move sChildSws to Lib.sRefSwsFile
+                        Move True to Lib.bFound
+                    End
+                End
+                /* THE VERDICT, and the only sound one available for a package: its OWN declared
+                   df-min / df-max, read from the df.sws inside its cache entry. Everything else
+                   this class knows describes a .sws file, and a package is not one - which is why
+                   the row had no verdict at all until the range could be read.
+
+                   Three outcomes, and they are genuinely different:
+                     not installed        - no file, so nothing to read and nothing claimed
+                     installed, no range  - the package has not said; eLibPackage stands
+                     installed, range     - a real answer, either way
+                   Collapsing the middle into "incompatible" would put words in the package's
+                   mouth. */
+                Move eLibPackage to Lib.eStatus
+                Move "" to Lib.sDfMin
+                Move "" to Lib.sDfMax
+                If (Lib.bFound = True and sTargetVersion <> "") Begin
+                    Send SwsPackageDfRange Lib.sRefSwsFile (&Lib.sDfMin) (&Lib.sDfMax)
+                    If (HasVersionRange(Self, Lib.sDfMin, Lib.sDfMax) = True) Begin
+                        If (VersionInRange(Self, sTargetVersion, Lib.sDfMin, Lib.sDfMax) = False) ;
+                            Move eLibPackageMismatch to Lib.eStatus
+                    End
+                End
+                Move Lib to aLibs[SizeOfArray(aLibs)]
+            End
+            Else Begin
+            Get ResolveLibraryPath asRaw[iChild] sHome to sChildSws
+            Move sChildSws to Lib.sRefSwsFile
+            Move (vFilePathExists(sChildSws) <> 0) to Lib.bFound
+            Move eSwsMissing to iFmt
+            If (Lib.bFound = True) ;
+                Get SwsFormatOf sChildSws to iFmt
+            If (Lib.bFound = False) Begin
+                /* NOT FOUND. The name comes from the entry's own file stem - the folder cannot be
+                   asked, because it may not exist either - and every version field stays empty
+                   rather than being guessed at. eLibNotFound outranks the target verdicts: nothing
+                   can be said about a library that could not be read. */
+                Move (RightPos("\", asRaw[iChild])) to iPos
+                If (iPos > 0) ;
+                    Move (Mid(asRaw[iChild], (Length(asRaw[iChild]) - iPos), (iPos + 1))) to Lib.sName
+                Else ;
+                    Move asRaw[iChild] to Lib.sName
+                Move eLibNotFound to Lib.eStatus
+                Move Lib to aLibs[SizeOfArray(aLibs)]
+            End
+            Else If (iFmt = eSwsConflict) Begin
+                /* THERE, BUT NOT A WORKSPACE FILE: git conflict markers (2026-09-14). Named from its
+                   folder, which does exist; no version, no siblings, no target verdict - nothing read
+                   from a file in that state could be trusted. See eLibUnreadable. */
+                Move (RightPos("\", sChildSws)) to iPos
+                Move (Left(sChildSws, iPos)) to sFolder
+                Move sFolder to Lib.sFolder
+                Get LibraryDisplayName sFolder to Lib.sName
+                Move eLibUnreadable to Lib.eStatus
+                Move Lib to aLibs[SizeOfArray(aLibs)]
+            End
+            Else Begin
+                Get SwsDataFlexVersion sChildSws to Lib.sRefVersion
+                Move (RightPos("\", sChildSws)) to iPos
+                Move (Left(sChildSws, iPos)) to sFolder
+                Move sFolder to Lib.sFolder
+                Get LibraryDisplayName sFolder to Lib.sName
+
+                // Sibling .sws files in the same folder = the versions this copy can offer.
+                Move (rfFileSearch((sFolder + "*.sws"), DIRMODE_FILES_ONLY, False)) to aFound
+                Move (SizeOfArray(aFound) - 1) to iFileMax
+                For iFile from 0 to iFileMax
+                    Move aFound[iFile].sFilename to sFileName
+                    If (IsConsumableLibrarySws(Self, sFileName) = True) Begin
+                        Get SwsDataFlexVersion (sFolder + sFileName) to sVer
+                        If (sVer <> "") Begin
+                            If (SearchArray(sVer, Lib.asAvailVersions) = -1) ;
+                                Move sVer to Lib.asAvailVersions[SizeOfArray(Lib.asAvailVersions)]
+                            If (sVer = sTargetVersion and Lib.sTargetSwsFile = "") ;
+                                Move (sFolder + sFileName) to Lib.sTargetSwsFile
+                        End
+                    End
+                Loop
+
+                Move eLibUnknown to Lib.eStatus
+                If (sTargetVersion <> "") Begin
+                    If (Lib.sRefVersion = sTargetVersion) Begin
+                        Move eLibMatchesTarget to Lib.eStatus
+                    End
+                    Else If (Lib.sTargetSwsFile <> "") Begin
+                        Move eLibRetargetLocal to Lib.eStatus
+                    End
+                    Else Begin
+                        Move eLibNoLocalBuild to Lib.eStatus
+                    End
+                End
+                Move Lib to aLibs[SizeOfArray(aLibs)]
+            End
+            End    // ...of the eDepPath branch - a package took the arm above
+        Loop
+        Function_Return aLibs
+    End_Function
+
+    /* THE WHOLE CHAIN, depth-first, in declaration order - a workspace's libraries, then each of
+       THEIR libraries beneath them.
+
+       WHY THIS EXISTS. A library's [Properties] Version= is a claim about ITSELF and says nothing
+       about what it in turn depends on. E:\WinServ (2026-08-12) is the case that named the problem:
+       one declared library, WebAppSrc-Library-DF250.sws, Version=25.0 - and all seven of ITS
+       dependencies pinned to DF191. The workspace showed a single row reading "25.0", while the
+       build it produces pulls 19.1 library code into DataFlex 26. The sibling header from 2021
+       shows what the convention should be: WebAppSrc-Library-DF141.sws pins all seven to DF141, so
+       a version header is meant to carry a matching chain. That one had its version bumped and its
+       chain left behind.
+
+       A SEPARATE FUNCTION, deliberately - WorkspaceLibraryEntries stays flat. Two callers below it
+       need exactly the workspace's OWN entries and would break silently if the chain appeared:
+       _RetargetedLibraryEntry rewrites the entries of one .sws, and LibrariesInFolders matches
+       selected folders against the libraries a workspace declares. Recursion is opt-in.
+
+       CYCLE-SAFE by resolved path, not by name: two entries can name one file by different routes,
+       and a library that (directly or otherwise) declares one of its own ancestors would otherwise
+       walk forever. Depth-capped as a second belt - a chain deeper than a few levels is a
+       configuration this tool should describe rather than exhaust itself on.
+
+       The roll-up fields are filled from a row's IMMEDIATE children only, which is what makes the
+       parent row able to say "declares 25.0, and its own seven are on 19.1" without the reader
+       having to open the chain. */
+    Function LibraryEntriesTree String[] ByRef asRaw String sHome String sTargetVersion Integer iDepth Integer iMaxDepth String[] ByRef asVisited Returns tLibraryInfo[]
+        tLibraryInfo[] aOut aLevel aKids
+        String[] asChild
+        String sChildHome sKey sOldest
+        Integer i iMax j jMax iAt iCount iBehind iKidVer iOldest
+
+        Get LibraryEntriesInfo (&asRaw) sHome sTargetVersion to aLevel
+        Move (SizeOfArray(aLevel) - 1) to iMax
+        For i from 0 to iMax
+            Move iDepth to aLevel[i].iDepth
+            Move aLevel[i] to aOut[SizeOfArray(aOut)]
+            Move (SizeOfArray(aOut) - 1) to iAt
+
+            // Nothing below an entry that is not there or cannot be read, and nothing below the depth cap.
+            If (aLevel[i].bFound = True and aLevel[i].eStatus <> eLibUnreadable and iDepth < iMaxDepth) Begin
+                // Visited by RESOLVED path, lower-cased: one file reached two ways is one file.
+                Move (Lowercase(aLevel[i].sRefSwsFile)) to sKey
+                If (SearchArray(sKey, asVisited) = -1) Begin
+                    Move sKey to asVisited[SizeOfArray(asVisited)]
+                    Get SwsLibraryEntries aLevel[i].sRefSwsFile to asChild
+                    If (SizeOfArray(asChild) > 0) Begin
+                        Get _FolderOf aLevel[i].sRefSwsFile to sChildHome
+                        Get LibraryEntriesTree (&asChild) sChildHome sTargetVersion (iDepth + 1) iMaxDepth (&asVisited) to aKids
+
+                        /* ROLL UP THE IMMEDIATE CHILDREN onto the row just appended. Only those at
+                           the next depth: a grandchild is the child's business to report, and
+                           counting it here would make one late library look like several. */
+                        Move 0 to iCount
+                        Move 0 to iBehind
+                        Move "" to sOldest
+                        Move 0 to iOldest
+                        Move (SizeOfArray(aKids) - 1) to jMax
+                        For j from 0 to jMax
+                            If (aKids[j].iDepth = (iDepth + 1)) Begin
+                                Increment iCount
+                                If (aKids[j].sRefVersion <> "") Begin
+                                    If (IsVersionBelow(Self, aKids[j].sRefVersion, aLevel[i].sRefVersion) = True) ;
+                                        Increment iBehind
+                                    Get _VersionKey aKids[j].sRefVersion to iKidVer
+                                    If (iKidVer > 0) Begin
+                                        If (iOldest = 0 or iKidVer < iOldest) Begin
+                                            Move iKidVer to iOldest
+                                            Move aKids[j].sRefVersion to sOldest
+                                        End
+                                    End
+                                End
+                            End
+                        Loop
+                        Move iCount   to aOut[iAt].iChainCount
+                        Move iBehind  to aOut[iAt].iChainBehind
+                        Move sOldest  to aOut[iAt].sChainOldest
+
+                        // The children follow their parent immediately, which is what makes the
+                        // flat array render as a tree without anyone having to sort it.
+                        Move (SizeOfArray(aKids) - 1) to jMax
+                        For j from 0 to jMax
+                            // Only the IMMEDIATE children are named by this row; deeper ones were
+                            // already stamped by their own parent one level down.
+                            // Begin/End, not a continuation: two statements, and a ";" would
+                            // attach only the first.
+                            If (aKids[j].iDepth = (iDepth + 1)) Begin
+                                Move aLevel[i].sName       to aKids[j].sDeclaredBy
+                                Move aLevel[i].sRefSwsFile to aKids[j].sDeclaredBySws
+                            End
+                            Move aKids[j] to aOut[SizeOfArray(aOut)]
+                        Loop
+                    End
+                End
+            End
+        Loop
+        Function_Return aOut
+    End_Function
+
+    // The chain for a workspace FILE - LibraryEntriesTree's counterpart to WorkspaceLibraryEntries.
+    Function WorkspaceLibraryTree String sSwsFile String sTargetVersion Integer iMaxDepth Returns tLibraryInfo[]
+        tLibraryInfo[] aLibs
+        String[] asRaw asVisited
+        String sHome
+        Integer iPos
+
+        If (vFilePathExists(sSwsFile) = 0) ;
+            Function_Return aLibs
+        Move sSwsFile to sHome
+        Move (RightPos("\", sHome)) to iPos
+        If (iPos = 0) ;
+            Move (RightPos("/", sHome)) to iPos
+        If (iPos = 0) ;
+            Function_Return aLibs
+        Move (Left(sHome, iPos)) to sHome
+
+        // The workspace itself is the first visited node, so a library declaring it back is a cycle.
+        Move (Lowercase(sSwsFile)) to asVisited[0]
+        Get SwsLibraryEntries sSwsFile to asRaw
+        Get LibraryEntriesTree (&asRaw) sHome sTargetVersion 0 iMaxDepth (&asVisited) to aLibs
+        Function_Return aLibs
+    End_Function
+
+    /* The RESOLVABLE entries only - the original contract, now a filter over WorkspaceLibraryEntries
+       so there is one walk of the .sws and one set of rules.
+
+       KEPT, rather than folded away, because two callers genuinely need a .sws they can read:
+       _RetargetedLibraryEntry rewrites an entry by looking at the versions beside the one it points
+       at, and LibrariesInFolders matches selected folders against a library's root - neither has any
+       use for a row whose folder does not exist. Anything that REPORTS should call
+       WorkspaceLibraryEntries instead, or it will count what it can see rather than what is
+       declared. */
+    Function WorkspaceLibraryInventory String sSwsFile String sTargetVersion Returns tLibraryInfo[]
+        tLibraryInfo[] aAll aFoundOnly
+        Integer i iMax
+
+        Get WorkspaceLibraryEntries sSwsFile sTargetVersion to aAll
+        Move (SizeOfArray(aAll) - 1) to iMax
+        For i from 0 to iMax
+            // ...nor one that is there but cannot be read (git conflict markers, 2026-09-14).
+            If (aAll[i].bFound = True and aAll[i].eStatus <> eLibUnreadable) ;
+                Move aAll[i] to aFoundOnly[SizeOfArray(aFoundOnly)]
+        Loop
+        Function_Return aFoundOnly
+    End_Function
+
+    /* The package a source line USES, lower-cased and always carrying an extension - or "" when the
+       line is not a Use statement. The whole point of pulling this out is that it is PURE: no disk,
+       no workspace, no app, so it can be unit-tested against the awkward forms directly.
+
+       What counts as a Use, and why:
+         - Case-insensitive, and the keyword must be followed by whitespace. "Used" and "UseThing"
+           are not Use statements, and a line starting with "//" is a comment whatever follows.
+         - A trailing "// ..." comment is cut before the name is read - "Use vWin32fh.pkg  // legacy"
+           is one dependency, not a package called "vWin32fh.pkg  // legacy".
+         - Quotes are stripped: both Use vWin32fh.pkg and Use "vWin32fh.pkg" are legal.
+         - A name with NO dot gets ".pkg" appended, because that is what the compiler assumes and
+           what the file on disk is called - so "Use vWin32fh" and "Use vWin32fh.pkg" compare equal.
+           A name that already has one keeps it, which is what makes RefactorConstants.h.pkg match
+           itself rather than a phantom "RefactorConstants.h.pkg.pkg".
+
+       NOT handled, deliberately: a Use inside a block comment. Recognising those needs the lexer's
+       comment state, this runs over raw lines, and a Use commented out with a block is rare enough
+       that carrying a whole lexer here would cost more than the false positive. */
+    Function UsedPackageOnLine String sLine Returns String
+        String sWork sName sSep
+        Integer iPos
+
+        Move (Trim(sLine)) to sWork
+        If (sWork = "") ;
+            Function_Return ""
+        If (Left(sWork, 2) = "//") ;
+            Function_Return ""
+        If (Lowercase(Left(sWork, 3)) <> "use") ;
+            Function_Return ""
+        If (Length(sWork) < 5) ;
+            Function_Return ""
+        // Position 4 must SEPARATE the keyword from its argument - space or tab. Without this test
+        // "UseTheThing" reads as a Use of "TheThing".
+        Move (Mid(sWork, 1, 4)) to sSep
+        If (sSep <> " " and sSep <> (Character(9))) ;
+            Function_Return ""
+        Move (Trim(Mid(sWork, (Length(sWork) - 3), 4))) to sName
+        Move (Pos("//", sName)) to iPos
+        If (iPos > 0) ;
+            Move (Trim(Left(sName, (iPos - 1)))) to sName
+        Move (Replaces('"', sName, "")) to sName
+        Move (Trim(sName)) to sName
+        If (sName = "") ;
+            Function_Return ""
+        // A bare name means the compiler's default extension; make it explicit so the comparison is
+        // filename-to-filename.
+        If (Pos(".", sName) = 0) ;
+            Move (sName + ".pkg") to sName
+        Function_Return (Lowercase(sName))
+    End_Function
+
+    /* Every .pkg FILENAME a library folder offers, lower-cased, recursively - the set a consumer's
+       Use statement has to name to be depending on this library.
+
+       Filenames, not class names: a Use names a file, so comparing filenames is exact, needs no
+       parsing of the library's own source, and cannot be fooled by a class that two libraries both
+       define. Recursive because a library's packages are routinely a folder down (vwin32fh keeps
+       its own under StudioLibrary\). */
+    Function LibraryPackageNames String sLibFolder Returns String[]
+        tRFSearchResult[] aFiles
+        String[] asNames
+        String sMask sBase
+        Integer i iMax iPos
+
+        If (sLibFolder = "") ;
+            Function_Return asNames
+        Move (vFolderFormat(sLibFolder)) to sLibFolder
+        If (rfDirectoryExists(sLibFolder) = False) ;
+            Function_Return asNames
+        Move (sLibFolder + "*.pkg") to sMask
+        Get rfFileSearchRecursive sMask DIRMODE_FILES_ONLY False to aFiles
+        Move (SizeOfArray(aFiles) - 1) to iMax
+        For i from 0 to iMax
+            Move (RightPos("\", aFiles[i].sFilename)) to iPos
+            If (iPos > 0) ;
+                Move (Mid(aFiles[i].sFilename, (Length(aFiles[i].sFilename) - iPos), (iPos + 1))) to sBase
+            Else ;
+                Move aFiles[i].sFilename to sBase
+            Move (Lowercase(Trim(sBase))) to sBase
+            If (sBase <> "" and (SearchArray(sBase, asNames)) = -1) ;
+                Move sBase to asNames[SizeOfArray(asNames)]
+        Loop
+        Function_Return asNames
+    End_Function
+
+End_Class
+
+/*  WHICH INVENTORY CLASS TO CREATE (2026-10-05).
+
+    cLibraryInventory reads no libraries from a JSON workspace file: SwsJsonLibraryEntries is a hook
+    that only an application-side subclass can fill, because it needs the application's reader and
+    this package must also work in the console test runner. Code that is compiled into every
+    program - the analyzer's library roots, the engine's note before a run - cannot name that
+    subclass, created this class by name, and was blind on every DataFlex 26 workspace: no row was
+    ever "a library's", the note never showed, and the Libraries dialog counted no compiler message
+    against any library. Found while a hint for a missing include file would not show (Nils).
+
+    So the class to create is a variable. It holds this class here; the package that defines a
+    subclass able to read a JSON file sets it (cFTLibraryReport.pkg: cLibraryInventoryApp). Wherever
+    a WORKSPACE's libraries are wanted:   Get Create giLibraryInventoryClass to ho
+    A host without such a package - the test runner - gets this class, as before. Code that only
+    needs the path arithmetic or SwsFormatOf can go on creating this class by name. */
+Global_Variable Integer giLibraryInventoryClass
+Move (RefClass(cLibraryInventory)) to giLibraryInventoryClass
+
+/*  The library CHAIN of a workspace, in one call.
+
+    Convenience only - the logic is WorkspaceLibraryTree on the class above, and it stays there on
+    purpose. Nothing here belongs on cRefactorApplication: UnitTests builds a plain
+    cApplication, so a function living on the application object is unreachable from the suite and
+    its tests would pass or fail for reasons unrelated to the logic (see this file's header, and
+    cDeepScanner for the same pattern). This wrapper gives the one-line call site without paying
+    that price - it creates a cLibraryInventory, asks it, and destroys it.
+
+        Get WorkspaceLibraryChain sSws sTargetVersion to aLibs
+
+    Walks to CI_LibraryTreeMaxDepth, the shared depth the Libraries report and the copy plan both
+    use. Pass "" for sTargetVersion when the question is "what does this workspace declare" rather
+    than "is each entry built for the target" - the per-entry verdict (eStatus) needs a version, the
+    structure does not.
+
+    Each row's bFound says whether the .sws it points at is really on disk; rows are returned
+    whether or not they resolve, because a declaration pointing at nothing is usually the very thing
+    the caller wants to know about.
+
+    NOT for a paint path. It re-reads the chain every call - a directory search plus a read of every
+    sibling .sws per library. Callers that render repeatedly should memoise, as
+    cFTLibraryReport.RefreshLibraryCounts does; callers that already ARE a cLibraryInventory (or a
+    subclass) should call WorkspaceLibraryTree on themselves instead of creating a second object.  */
+Function WorkspaceLibraryChain Global String sSwsFile String sTargetVersion Returns tLibraryInfo[]
+    Handle hoInv
+    tLibraryInfo[] aLibs
+
+    Get Create (RefClass(cLibraryInventory)) to hoInv
+    Get WorkspaceLibraryTree of hoInv sSwsFile sTargetVersion CI_LibraryTreeMaxDepth to aLibs
+    Send Destroy of hoInv
+    Function_Return aLibs
+End_Function

@@ -1,0 +1,1092 @@
+﻿// Copyright (c) 2026 Nils Svedmyr, RDC Tools International
+// DFRefactor file-I/O package.
+//
+// Originally a DF26-compatible replacement for cFilesystem functions
+// (some of which crashed the DF26 debugger via the ANSI Win32 file APIs).
+// Now also hosts the channel-based file I/O wrappers that previously
+// lived in DUF's WsGlobalFunctions.pkg, so DFRefactor's core code no
+// longer routes routine file I/O through DUF.
+//
+// DUF remains a dependency for what it was designed for -- database
+// migrations -- but the engine's file plumbing no longer needs it.
+//
+// Author: Nils Svedmyr - RDC Tools International
+//
+Use cWorkspace.pkg    // winFindFirstFile, winFindNextFile, winFindClose,
+                      // INVALID_HANDLE_VALUE, tWin32FindData, tWinFileTime,
+                      // tWinSystemTime, MAX_PATH, MAX_ALTPATH
+Use seq_chnl.pkg      // Seq_New_Channel, Seq_Release_Channel,
+                      // DF_SEQ_CHANNEL_NOT_AVAILABLE
+Use GlobalFunctionsProcedures.pkg   // MemCopy / Alloc / Free (rfReadFileSliceBytes)
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+Use vWin32fh.pkg                 // vFilePathExists (rfParseJsonFile)
+Use cJsonObject.pkg              // rfParseJsonFile
+
+#IFNDEF get_rfFileTimeToSystemTime
+External_Function rfFileTimeToSystemTime "FileTimeToSystemTime" Kernel32.dll ;
+    Pointer lpFiletime ;
+    Pointer lpSystemtime ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfSystemTimeToTzSpecificLocalTime
+External_Function rfSystemTimeToTzSpecificLocalTime "SystemTimeToTzSpecificLocalTime" Kernel32.dll ;
+    Pointer lpTimeZone ;
+    Pointer lpUniversalTime ;
+    Pointer lpLocalTime ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfGetSystemTimeAsFileTime
+External_Function rfGetSystemTimeAsFileTime "GetSystemTimeAsFileTime" Kernel32.dll ;
+    Pointer lpSystemTimeAsFileTime ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfCreateFileW
+External_Function rfCreateFileW "CreateFileW" Kernel32.dll ;
+    WString lpFileName ;
+    DWord   dwDesiredAccess ;
+    DWord   dwShareMode ;
+    Pointer lpSecurityAttributes ;
+    DWord   dwCreationDisposition ;
+    DWord   dwFlagsAndAttributes ;
+    Handle  hTemplateFile ;
+    Returns Handle
+#ENDIF
+
+#IFNDEF get_rfSetFileTime
+External_Function rfSetFileTime "SetFileTime" Kernel32.dll ;
+    Handle  hFile ;
+    Pointer lpCreationTime ;
+    Pointer lpLastAccessTime ;
+    Pointer lpLastWriteTime ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfGetFileSizeEx
+External_Function rfGetFileSizeEx "GetFileSizeEx" Kernel32.dll ;
+    Handle  hFile ;
+    Pointer lpFileSize ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfSetFilePointer
+External_Function rfSetFilePointer "SetFilePointer" Kernel32.dll ;
+    Handle  hFile ;
+    Integer lDistanceToMove ;
+    Pointer lpDistanceToMoveHigh ;
+    DWord   dwMoveMethod ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfReadFile
+External_Function rfReadFile "ReadFile" Kernel32.dll ;
+    Handle  hFile ;
+    Pointer lpBuffer ;
+    DWord   nNumberOfBytesToRead ;
+    Pointer lpNumberOfBytesRead ;
+    Pointer lpOverlapped ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfCloseHandle
+External_Function rfCloseHandle "CloseHandle" Kernel32.dll ;
+    Handle hObject ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfCreateDirectoryW
+External_Function rfCreateDirectoryW "CreateDirectoryW" Kernel32.dll ;
+    WString lpPathName ;
+    Pointer lpSecurityAttributes ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfDeleteFileW
+External_Function rfDeleteFileW "DeleteFileW" Kernel32.dll ;
+    WString lpFileName ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfMoveFileW
+External_Function rfMoveFileW "MoveFileW" Kernel32.dll ;
+    WString lpExistingFileName ;
+    WString lpNewFileName ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfRemoveDirectoryW
+External_Function rfRemoveDirectoryW "RemoveDirectoryW" Kernel32.dll ;
+    WString lpPathName ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfGetDiskFreeSpaceExW
+External_Function rfGetDiskFreeSpaceExW "GetDiskFreeSpaceExW" Kernel32.dll ;
+    WString lpDirectoryName ;
+    Pointer lpFreeBytesAvailableToCaller ;
+    Pointer lpTotalNumberOfBytes ;
+    Pointer lpTotalNumberOfFreeBytes ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF get_rfGetFileAttributesW
+External_Function rfGetFileAttributesW "GetFileAttributesW" Kernel32.dll ;
+    WString lpFileName ;
+    Returns DWord
+#ENDIF
+
+#IFNDEF get_rfSetFileAttributesW
+External_Function rfSetFileAttributesW "SetFileAttributesW" Kernel32.dll ;
+    WString lpFileName ;
+    DWord   dwFileAttributes ;
+    Returns Integer
+#ENDIF
+
+#IFNDEF FILE_ATTRIBUTE_READONLY
+    Define FILE_ATTRIBUTE_READONLY       for |CI$1
+#ENDIF
+#IFNDEF INVALID_FILE_ATTRIBUTES
+    Define INVALID_FILE_ATTRIBUTES       for -1     // as Winkern.pkg defines it: compare via an Integer
+#ENDIF
+#IFNDEF FILE_ATTRIBUTE_DIRECTORY
+    Define FILE_ATTRIBUTE_DIRECTORY      for |CI$10
+#ENDIF
+#IFNDEF FILE_ATTRIBUTE_REPARSE_POINT
+    Define FILE_ATTRIBUTE_REPARSE_POINT  for |CI$00000400
+#ENDIF
+#IFNDEF DIRMODE_FILES_ONLY
+    Define DIRMODE_FILES_ONLY            for 1
+    Define DIRMODE_DIRECTORIES_ONLY      for 2
+    Define DIRMODE_FILES_AND_DIRECTORIES for 3
+#ENDIF
+#IFNDEF GENERIC_READ
+    Define GENERIC_READ                  for |CI$80000000
+    Define GENERIC_WRITE                 for |CI$40000000
+#ENDIF
+#IFNDEF OPEN_EXISTING
+    Define OPEN_EXISTING                 for |CI$00000003
+#ENDIF
+#IFNDEF FILE_ATTRIBUTE_NORMAL
+    Define FILE_ATTRIBUTE_NORMAL         for |CI$00000080
+#ENDIF                 
+#IFNDEF FNULL
+    Define FNULL                         for |CI$0
+#ENDIF
+#IFNDEF FILE_SHARE_READ
+    Define FILE_SHARE_READ               for |CI$1
+#ENDIF
+#IFNDEF FILE_SHARE_WRITE
+    Define FILE_SHARE_WRITE              for |CI$2
+#ENDIF
+#IFNDEF FILE_SHARE_RANDOM
+    Define FILE_SHARE_RANDOM             for (FILE_SHARE_READ + FILE_SHARE_WRITE)
+#ENDIF
+#IFNDEF FILE_SHARE_DELETE
+    Define FILE_SHARE_DELETE             for |CI$4
+#ENDIF
+
+Struct tRFFileTime
+    DWord dwLowDateTime
+    DWord dwHighDateTime
+End_Struct
+
+Struct tRFSearchResult
+    String      sFilename
+    String      sPath
+    DateTime    dtLastWriteDateTime
+End_Struct
+
+Function _rfFileTimeToLocalDateTime Global Pointer pFileTime Returns DateTime
+    tWinSystemTime lsSystemTime lsLocalTime
+    Integer        iVoid
+    DateTime       dtResult
+
+    Move (rfFileTimeToSystemTime(pFileTime, AddressOf(lsSystemTime))) to iVoid
+    If iVoid Begin
+        Move (rfSystemTimeToTzSpecificLocalTime(FNULL, AddressOf(lsSystemTime), AddressOf(lsLocalTime))) to iVoid
+        If iVoid Begin
+            Move (DateSetYear(dtResult,        lsLocalTime.wYear))         to dtResult
+            Move (DateSetMonth(dtResult,       lsLocalTime.wMonth))        to dtResult
+            Move (DateSetDay(dtResult,         lsLocalTime.wDay))          to dtResult
+            Move (DateSetHour(dtResult,        lsLocalTime.wHour))         to dtResult
+            Move (DateSetMinute(dtResult,      lsLocalTime.wMinute))       to dtResult
+            Move (DateSetSecond(dtResult,      lsLocalTime.wSecond))       to dtResult
+            Move (DateSetMillisecond(dtResult, lsLocalTime.wMilliseconds)) to dtResult
+        End
+    End
+    Function_Return dtResult
+End_Function
+
+// DF26-compatible replacement for cFilesystem FileSearch.
+// Returns a tRFSearchResult[] where sFilename is the bare filename (no path).
+Function rfFileSearch Global String sFilePathMask Integer iFileDirMode Boolean bReturnOnlyOne Returns tRFSearchResult[]
+    tWin32FindData    lsFindData
+    tWinFileTime      ftWrite
+    Handle            hFindFile
+    Integer           iSizeNoStrings iCount iAttrib iVoid
+    Boolean           bOk bFound
+    String            sFilename
+    tRFSearchResult[] asResult
+
+    Move (SizeOfType(tWin32FindData) - MAX_PATH - MAX_ALTPATH) to iSizeNoStrings
+    Move (winFindFirstFile(sFilePathMask, AddressOf(lsFindData))) to hFindFile
+    If (hFindFile = INVALID_HANDLE_VALUE) ;
+        Function_Return asResult
+
+    Move True to bOk
+    Move 0 to iCount
+    While bOk
+        Move lsFindData.dwFileAttributes to iAttrib
+        Move (PointerToString(AddressOf(lsFindData) + iSizeNoStrings)) to sFilename
+
+        If (sFilename <> "." and sFilename <> "..") Begin
+            Move False to bFound
+            Case Begin
+                Case (iFileDirMode = DIRMODE_FILES_ONLY)
+                    If ((iAttrib iand FILE_ATTRIBUTE_DIRECTORY) = 0) ;
+                        Move True to bFound
+                    Case Break
+                Case (iFileDirMode = DIRMODE_DIRECTORIES_ONLY)
+                    If ((iAttrib iand FILE_ATTRIBUTE_DIRECTORY) = FILE_ATTRIBUTE_DIRECTORY) ;
+                        Move True to bFound
+                    Case Break
+                Case Else
+                    Move True to bFound
+                    Case Break
+            Case End
+            If (bFound = True) Begin
+                Move sFilename to asResult[iCount].sFilename
+                Move lsFindData.ftLastWriteTime to ftWrite
+                Move (_rfFileTimeToLocalDateTime(AddressOf(ftWrite))) to asResult[iCount].dtLastWriteDateTime
+                Increment iCount
+                If bReturnOnlyOne ;
+                    Move False to bOk
+            End
+        End
+
+        If (bOk = True) Begin
+            Move (winFindNextFile(hFindFile, AddressOf(lsFindData))) to bOk
+        End
+    Loop
+
+    Move (winFindClose(hFindFile)) to iVoid
+    Function_Return asResult
+End_Function
+
+// DF26-compatible replacement for cFilesystem FileSearchRecursive.
+// sFilename in returned results contains the full path.
+Function rfFileSearchRecursive Global String sFilePathMask Integer iFileDirMode Boolean bReturnOnlyOne Returns tRFSearchResult[]
+    tRFSearchResult[] asResult asDirs asFiles
+    Integer           iLast iMax iCnt iFinalMax
+    String            sSearchInDir sFileMask
+    Boolean           bStop
+
+    Move (RightPos("\", sFilePathMask)) to iLast
+    If (iLast > 0) Begin
+        Move (Left(sFilePathMask, iLast - 1)) to sSearchInDir
+        Move (Mid(sFilePathMask, Length(sFilePathMask), iLast + 1)) to sFileMask
+    End
+
+    // Recurse into subdirectories first. The directory listing is ALWAYS exhaustive (False):
+    // passing bReturnOnlyOne through here made the walk follow a single first-subdirectory
+    // chain per level - a match in any sibling branch was never reached (found via
+    // IsBackupFile's backup lookup, 2026-07-05). bReturnOnlyOne means "stop at the first
+    // MATCH", which the bStop checks below still honor.
+    Move (rfFileSearch((sSearchInDir + "\*.*"), DIRMODE_DIRECTORIES_ONLY, False)) to asDirs
+    Move (SizeOfArray(asDirs)) to iMax
+    Move 0 to iCnt
+    While (iCnt < iMax and bStop = False)
+        Move (rfFileSearchRecursive((sSearchInDir + "\" + asDirs[iCnt].sFilename + "\" + sFileMask), iFileDirMode, bReturnOnlyOne)) to asFiles
+        Move (AppendArray(asResult, asFiles)) to asResult
+        Increment iCnt
+        If (bReturnOnlyOne = True and SizeOfArray(asResult) > 0) ;
+            Move True to bStop
+    Loop
+
+    // Collect matching entries in the current directory, prepending the full path.
+    If (bStop = False) Begin
+        Move (rfFileSearch(sFilePathMask, iFileDirMode, bReturnOnlyOne)) to asFiles
+        Move (SizeOfArray(asFiles)) to iMax
+        Move (SizeOfArray(asResult)) to iFinalMax
+        Move 0 to iCnt
+        While (iCnt < iMax and bStop = False)
+            Move asFiles[iCnt] to asResult[iFinalMax]
+            Move (sSearchInDir + "\" + asFiles[iCnt].sFilename) to asResult[iFinalMax].sFilename
+            Increment iFinalMax
+            Increment iCnt
+            If (bReturnOnlyOne = True and SizeOfArray(asResult) > 0) ;
+                Move True to bStop
+        Loop
+    End
+
+    Function_Return asResult
+End_Function
+
+/* How big a folder is, and whether the walk met anything it refused to follow.
+
+   Built for the migration copy-scope view, which has to state a cost BEFORE the copy runs.
+   Sizes come straight out of the directory enumeration (tWin32FindData carries
+   nFileSizeHigh/Low), so this costs one FindFirstFile pass per folder and opens NO file
+   handles - unlike rfFileSizeLive, which is for the "another process is writing it right now"
+   case and would be thousands of CreateFileW calls here. */
+Struct tRFFolderSize
+    Number  nBytes
+    Integer iFiles
+    Integer iFolders
+    Boolean bSkippedLink   // a junction/symlink was met and deliberately NOT descended
+End_Struct
+
+// True when sPath is a junction, symlink or other reparse point. The copy planner needs this:
+// a workspace whose Libraries\ is a junction into a shared pool must not be walked - or copied -
+// through the link, or the pool gets duplicated (and, on a copy, silently forked).
+Function rfIsReparsePoint Global String sPath Returns Boolean
+    tWin32FindData lsFindData
+    Handle         hFindFile
+    Integer        iAttrib iVoid
+    Boolean        bIsLink
+
+    Move (winFindFirstFile(sPath, AddressOf(lsFindData))) to hFindFile
+    If (hFindFile = INVALID_HANDLE_VALUE) ;
+        Function_Return False
+    Move lsFindData.dwFileAttributes to iAttrib
+    Move (winFindClose(hFindFile)) to iVoid
+    Move ((iAttrib iand FILE_ATTRIBUTE_REPARSE_POINT) = FILE_ATTRIBUTE_REPARSE_POINT) to bIsLink
+    Function_Return bIsLink
+End_Function
+
+// Recursive byte + file count for sFolder. Reparse points are counted as ONE folder and not
+// descended (bSkippedLink then True), so a junctioned library pool is reported honestly rather
+// than measured as if it lived inside the workspace.
+Function rfFolderSize Global String sFolder Returns tRFFolderSize
+    tWin32FindData lsFindData
+    tRFFolderSize  lsResult lsSub
+    Handle         hFindFile
+    Integer        iSizeNoStrings iAttrib iVoid
+    Boolean        bOk
+    String         sName sPath
+
+    // Strip any trailing separator inline - RemoveFolderSeperator is a METHOD on
+    // cRefactorApplication, and this file is global functions with no object to send to.
+    Move sFolder to sPath
+    If (Right(sPath, 1) = "\") ;
+        Move (Left(sPath, Length(sPath) - 1)) to sPath
+    Move (SizeOfType(tWin32FindData) - MAX_PATH - MAX_ALTPATH) to iSizeNoStrings
+    Move (winFindFirstFile((sPath + "\*.*"), AddressOf(lsFindData))) to hFindFile
+    If (hFindFile = INVALID_HANDLE_VALUE) ;
+        Function_Return lsResult
+
+    Move True to bOk
+    While bOk
+        Move lsFindData.dwFileAttributes to iAttrib
+        Move (PointerToString(AddressOf(lsFindData) + iSizeNoStrings)) to sName
+
+        If (sName <> "." and sName <> "..") Begin
+            If ((iAttrib iand FILE_ATTRIBUTE_DIRECTORY) = FILE_ATTRIBUTE_DIRECTORY) Begin
+                Increment lsResult.iFolders
+                If ((iAttrib iand FILE_ATTRIBUTE_REPARSE_POINT) = FILE_ATTRIBUTE_REPARSE_POINT) Begin
+                    Move True to lsResult.bSkippedLink
+                End
+                Else Begin
+                    Move (rfFolderSize(sPath + "\" + sName)) to lsSub
+                    Move (lsResult.nBytes + lsSub.nBytes) to lsResult.nBytes
+                    Move (lsResult.iFiles + lsSub.iFiles) to lsResult.iFiles
+                    Move (lsResult.iFolders + lsSub.iFolders) to lsResult.iFolders
+                    If (lsSub.bSkippedLink = True) ;
+                        Move True to lsResult.bSkippedLink
+                End
+            End
+            Else Begin
+                Increment lsResult.iFiles
+                // A Windows file size is 64-bit across two DWords. Rebuild it in a DataFlex
+                // Number (BCD, ample range) rather than an Integer, which would overflow on any
+                // file over 2 GB - and workspace Data folders reach that.
+                Move (lsResult.nBytes + (lsFindData.nFileSizeHigh * 4294967296.0) + lsFindData.nFileSizeLow) to lsResult.nBytes
+            End
+        End
+
+        Move (winFindNextFile(hFindFile, AddressOf(lsFindData))) to bOk
+    Loop
+
+    Move (winFindClose(hFindFile)) to iVoid
+    Function_Return lsResult
+End_Function
+
+// DF26-compatible replacement for cFilesystem CurrentSystemTimeAsFileTime.
+// Returns the current system time as a tRFFileTime value.
+Function rfCurrentSystemTimeAsFileTime Global Returns tRFFileTime
+    tRFFileTime ftCurrentTime
+    Integer     iVoid
+
+    Move (rfGetSystemTimeAsFileTime(AddressOf(ftCurrentTime))) to iVoid
+    Function_Return ftCurrentTime
+End_Function
+
+// DF26-compatible replacement for cFilesystem Set FileLastWriteTime.
+// Sets the last-write timestamp of sFileName to ftLastWrite. Returns 0 on success.
+Function rfSetFileLastWriteTime Global String sFileName tRFFileTime ftLastWrite Returns Integer
+    Handle  hFile
+    Integer iRetVal
+
+    Move (rfCreateFileW(sFileName, (GENERIC_READ ior GENERIC_WRITE), (FILE_SHARE_READ ior FILE_SHARE_WRITE), FNULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, FNULL)) to hFile
+    If (hFile = INVALID_HANDLE_VALUE) Begin
+        Function_Return -1
+    End
+    Move (rfSetFileTime(hFile, FNULL, FNULL, AddressOf(ftLastWrite))) to iRetVal
+    Move (rfCloseHandle(hFile)) to iRetVal
+    Function_Return 0
+End_Function
+
+// DF26-compatible replacement for cFilesystem fsDeleteFile and vwin32fh vDeleteFile.
+// Returns True if the file was successfully deleted.
+Function rfDeleteFile Global String sFileName Returns Boolean
+    Integer iOk
+
+    Move (rfDeleteFileW(sFileName)) to iOk
+    Function_Return (iOk <> 0)
+End_Function
+
+/* THE READ-ONLY ATTRIBUTE, and why every writer of a real file has to ask about it (2026-08-18).
+
+   DataFlex's Direct_Output raises NOTHING when the file cannot be opened for writing. Verified on
+   the DF26 runtime with a scratch program: a target with the READ-ONLY attribute, and a target in a
+   folder that does not exist, both leave Err = False and Error_Report silent - only SeqEof goes True.
+   It is the FIRST Write on that channel that raises (error 32, "Can't open output file"), so a writer
+   that does the right thing - checks SeqEof after the open and returns False - raises nothing at all,
+   and a caller that drops the False has a write that never happened and no trace of it. That is
+   exactly how a plan run over a file in the workspace's DfPkg folder logged "7 lines renamed, 1 of 1
+   files changed, Process completed OK" while the file on disk never changed (Nils, WinServ
+   2026-08-18): the whole DfPkg checkout is read-only, rfWriteEncodedFileFromStringArray returned
+   False, and nobody looked at the False.
+
+   The two helpers below give a writer the WHY, so the report can say "read-only" instead of
+   "write failed". Note for anyone tempted to centralise the SeqEof check in rfOpenOutput: SeqEof is
+   ALSO True after a SUCCESSFUL Direct_Output "Clipboard:" (same probe), so it must stay with the
+   writers of real files - rfSetClipboardText shares rfOpenOutput. */
+
+// True when sFileName exists and carries the READ-ONLY attribute. False for a missing file - "not
+// writable because it is not there" is rfWriteFailureReason's distinction to make.
+Function rfIsFileReadOnly Global String sFileName Returns Boolean
+    Integer iAttr
+
+    Move (rfGetFileAttributesW(sFileName)) to iAttr
+    If (iAttr = INVALID_FILE_ATTRIBUTES) ;
+        Function_Return False
+    Function_Return ((iAttr iand FILE_ATTRIBUTE_READONLY) = FILE_ATTRIBUTE_READONLY)
+End_Function
+
+// True when sPath lies inside sFolder: case-blind, either separator, the folder with or without its
+// trailing separator, and a whole-component match (C:\DF26\Pkg is not inside C:\DF26\Pk). Blank on
+// either side is inside nothing. PURE - the file system is not consulted.
+Function rfIsPathUnderFolder Global String sPath String sFolder Returns Boolean
+    String sPathLow sFolderLow
+
+    Move (Trim(sPath))   to sPathLow
+    Move (Trim(sFolder)) to sFolderLow
+    If (sPathLow = "" or sFolderLow = "") ;
+        Function_Return False
+    Move (Lowercase(Replaces("/", sPathLow, "\")))   to sPathLow
+    Move (Lowercase(Replaces("/", sFolderLow, "\"))) to sFolderLow
+    If (Right(sFolderLow, 1) <> "\") ;
+        Move (sFolderLow + "\") to sFolderLow
+    Function_Return (Left(sPathLow, Length(sFolderLow)) = sFolderLow)
+End_Function
+
+// Clears the READ-ONLY attribute on sFileName. Returns True when the file is (now) writable by
+// attribute; False when it does not exist or the attribute could not be changed. For files DFRefactor
+// OWNS - the backup copies, which vCopyFile creates with the source's attributes - and NEVER for a
+// user's source: a read-only source is read-only for a reason (a package checkout pinned to a commit,
+// a VCS that marks non-checked-out files), and silently un-protecting it would defeat that reason.
+Function rfClearFileReadOnly Global String sFileName Returns Boolean
+    Integer iAttr iOk
+
+    Move (rfGetFileAttributesW(sFileName)) to iAttr
+    If (iAttr = INVALID_FILE_ATTRIBUTES) ;
+        Function_Return False
+    If ((iAttr iand FILE_ATTRIBUTE_READONLY) <> FILE_ATTRIBUTE_READONLY) ;
+        Function_Return True
+    Move (rfSetFileAttributesW(sFileName, (iAttr - FILE_ATTRIBUTE_READONLY))) to iOk
+    Function_Return (iOk <> 0)
+End_Function
+
+/* Renames a file, and is the ONLY way this app retires one (Nils 2026-08-30, on the shadowed
+   system-file overrides: "a button with a [Fix it] type of thing, that renames those offending
+   local copies"). A rename, never a delete: the workspace copy may be a deliberate fork whose
+   value is invisible from here, and the whole safety of an automated retire-and-recompile rests on
+   the undo being a rename back. See [[feedback_no_auto_delete_user_files]].
+
+   Returns "" on success, or the reason it failed. It REFUSES to overwrite: a destination that
+   already exists means an earlier retire is still sitting there, and clobbering it would destroy
+   the one copy the user could restore from - so the caller is handed the name and picks another.
+   MoveFileW fails rather than replacing, which is the behaviour wanted here; MoveFileExW with
+   MOVEFILE_REPLACE_EXISTING is deliberately NOT used. */
+Function rfRenameFile Global String sFrom String sTo Returns String
+    Integer iOk iAttr
+    Boolean bThere
+
+    // Existence via the attribute call this file already declares - RefactorFileIO owes nothing to
+    // another package for a test this small (see "every file declares what it consumes").
+    Move (rfGetFileAttributesW(sFrom)) to iAttr
+    If (iAttr = INVALID_FILE_ATTRIBUTES) ;
+        Function_Return ("the file is no longer there: " + sFrom)
+    Move (rfGetFileAttributesW(sTo)) to iAttr
+    If (iAttr <> INVALID_FILE_ATTRIBUTES) ;
+        Function_Return ("a file of that name already exists: " + sTo)
+    Move (rfMoveFileW(sFrom, sTo)) to iOk
+    If (iOk <> 0) ;
+        Function_Return ""
+    Move (rfIsFileReadOnly(sFrom)) to bThere
+    If (bThere = True) ;
+        Function_Return ("the file is write-protected: " + sFrom)
+    Function_Return ("Windows refused the rename: " + sFrom)
+End_Function
+
+// (rfWriteFailureReason - the WHY for a message - sits below rfDirectoryExists, which it needs.)
+
+/* A file inside a DataFlex 26 PACKAGE checkout is not the user's to edit - and it is read-only by
+   design, which is how the engine meets it. Two shapes:
+     <workspace>\DfPkg\<Owner>_<Name>-<commit>\...      a git-object dependency of the workspace
+                                                        ({source, sws, version} in the JSON .sws,
+                                                        pinned in <ws>.sws.lock)
+     C:\ProgramData\DataFlex\Packages\Cache\<Repo>_<Name>-<version>\...   a DataFlex system package
+   Recognised by PATH SHAPE only - the folder names are df-cli's to derive (see the "never rewrite a
+   library .sws filename" rule), and the message only needs to say what kind of place the file is
+   in. Returns "" for an ordinary path. The wording is a NOTE to append after the failure itself:
+   the fix is upstream (a newer package, a fork, or a vendored copy in the app's own AppSrc), never
+   the attribute. */
+Function rfPackageManagedPathNote Global String sFileName Returns String
+    String sLower
+
+    Move (Lowercase(sFileName)) to sLower
+    If (sLower contains "\dfpkg\") ;
+        Function_Return ("This file is inside the workspace's DfPkg folder - DataFlex 26's checkout of a git package dependency, pinned to one commit by the .sws.lock. Its files are read-only by design and are not the place to refactor: change the package upstream (or vendor a copy into the workspace's AppSrc), then update the dependency.")
+    If (sLower contains "\dataflex\packages\cache\") ;
+        Function_Return ("This file is inside the DataFlex package cache (a DataFlex Package Manager package installed by df-cli). Cache files are read-only by design and are not the place to refactor: take a newer package release, or vendor a copy into the workspace's AppSrc.")
+    Function_Return ""
+End_Function
+
+/* WHY A FILE IS NOT THIS WORKSPACE'S TO REFACTOR - "" when it is. Pure; the two arrays are the
+   recognised library folders (lowercased, separator-normalised, trailing separator) and their
+   display names, resolved once per collection by cRefactorApplication._LibrarySkipFolders.
+
+   THREE TIERS (Nils 2026-09-16: "not packages, but libraries might be local and private and those
+   should also be possible to refactor"):
+
+     DfPkg\ or the DataFlex package cache  never - read-only by design, and a package, which is
+                                            precisely what he excluded
+     a [Libraries] folder we RECOGNISE      skip - LibraryHomeUrl answering non-blank IS "an
+                                            upstream exists", so the fix belongs there; editing the
+                                            copy forks it and the next update clobbers the edits
+     any other [Libraries] folder           KEEP - presumed local and private. No upstream means
+                                            refactoring in place is the only way it is modernised
+
+   Getting the last one backwards is the difference between "we skipped someone else's code" and
+   "we silently refused to refactor yours", which is why the boundary carries its own test.
+
+   GLOBAL, not a method on cRefactorApplication, because the DFUnit runner's ghoApplication is a
+   bare cApplication: a Get of an app-class function through it compiles, answers nothing, and
+   leaves the caller's variable untouched - see [[feedback_test_runner_app_class]]. The two package
+   tiers are tested by PATH rather than through the [Libraries] chain because a DF26 git dependency
+   is not a [Libraries] entry at all: it is a dependencies entry whose checkout lives under DfPkg,
+   and cLibraryInventory gives such a dep no folder to match on. */
+Function rfLibrarySkipReason Global String sFullPath String[] ByRef asSkipFolders String[] ByRef asSkipNames Returns String
+    String sLow
+    Integer i iMax
+
+    Move (Lowercase(sFullPath)) to sLow
+    If (sLow contains "\dfpkg\") ;
+        Function_Return "a git package checkout (DfPkg), read-only by design - refactor it upstream, then move the dependency"
+    If (sLow contains "\dataflex\packages\cache\") ;
+        Function_Return "the DataFlex package cache, read-only by design - take a newer package release instead"
+    Move (SizeOfArray(asSkipFolders) - 1) to iMax
+    For i from 0 to iMax
+        If (Left(sLow, (Length(asSkipFolders[i]))) = asSkipFolders[i]) ;
+            Function_Return ("the " + asSkipNames[i] + " library - refactor it upstream and release it, then update this workspace's copy")
+    Loop
+    Function_Return ""
+End_Function
+
+// GetFileSizeEx result buffer (a Windows LARGE_INTEGER: two DWords, low first).
+Struct tRFLargeInteger
+    DWord dwLow
+    DWord dwHigh
+End_Struct
+
+// The LIVE size of a file - via an OPEN HANDLE (CreateFileW + GetFileSizeEx), so it is correct for a
+// file another process is CURRENTLY WRITING. The metadata read (rfFileSize / GetFileAttributesExW)
+// returns the DIRECTORY entry, which NTFS does not update while the writer holds the file open - it
+// can report 0/stale for the whole write session, which is why the legacy compiler's live .err tail
+// never fired (the poll gated on the stale metadata size; Nils 2026-07-03). dwDesiredAccess 0 =
+// metadata-only query: it succeeds even against a writer that opened the file EXCLUSIVELY (share-mode
+// checks apply only to requested access). Returns 0 when the file does not exist.
+Function rfFileSizeLive Global String sFileName Returns Integer
+    Handle  hFile
+    Integer iOk iVoid
+    tRFLargeInteger liSize
+
+    Move (rfCreateFileW(sFileName, 0, (FILE_SHARE_READ ior FILE_SHARE_WRITE ior FILE_SHARE_DELETE), FNULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, FNULL)) to hFile
+    If (hFile = INVALID_HANDLE_VALUE) ;
+        Function_Return 0
+    Move (rfGetFileSizeEx(hFile, AddressOf(liSize))) to iOk
+    Move (rfCloseHandle(hFile)) to iVoid
+    If (iOk = 0) ;
+        Function_Return 0
+    Function_Return ((liSize.dwHigh * 4294967296) + liSize.dwLow)
+End_Function
+
+// Reads up to iMaxBytes RAW bytes from sFileName STARTING AT iOffset - the tail-read primitive for a
+// file another process is CURRENTLY WRITING (the compiler's growing .prn listing). Open-handle with
+// full sharing so the writer is never disturbed; stateless per call (no channel to hold stale EOF
+// state - DataFlex channels cannot seek and their EOF behaviour on a growing file is undefined).
+// Returns the bytes actually read (shorter than iMaxBytes at end-of-file; empty on error/missing).
+// Files here are < 2 GB (a .prn is tens of MB), so the 32-bit SetFilePointer offset suffices.
+Function rfReadFileSliceBytes Global String sFileName Integer iOffset Integer iMaxBytes Returns UChar[]
+    Handle  hFile
+    Pointer pBuf
+    Integer iOk iVoid iRead
+    Boolean bOk
+    UChar[] ucaBuf ucaEmpty
+
+    If (iMaxBytes <= 0) ;
+        Function_Return ucaEmpty
+    Move (rfCreateFileW(sFileName, GENERIC_READ, (FILE_SHARE_READ ior FILE_SHARE_WRITE ior FILE_SHARE_DELETE), FNULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, FNULL)) to hFile
+    If (hFile = INVALID_HANDLE_VALUE) ;
+        Function_Return ucaEmpty
+    // Read into a RAW Alloc'd buffer, then MemCopy into the UChar[] - the same proven idiom as
+    // cEncodingHelpers' rfUtf8LineToOemBytes (a Win32 API writing directly into AddressOf(<array>)
+    // is not reliable; MemCopy to an array's address is).
+    Move (Alloc(iMaxBytes)) to pBuf
+    If (pBuf = 0) Begin
+        Move (rfCloseHandle(hFile)) to iVoid
+        Function_Return ucaEmpty
+    End
+    Move (rfSetFilePointer(hFile, iOffset, FNULL, 0)) to iOk     // 0 = FILE_BEGIN
+    Move 0 to iRead
+    Move (rfReadFile(hFile, pBuf, iMaxBytes, AddressOf(iRead), FNULL)) to iOk
+    Move (rfCloseHandle(hFile)) to iVoid
+    If (iOk = 0) ;
+        Move 0 to iRead
+    If (iRead > 0) Begin
+        Move (ResizeArray(ucaBuf, iRead)) to ucaBuf
+        Move (MemCopy(AddressOf(ucaBuf), pBuf, iRead)) to bOk
+    End
+    Move (Free(pBuf)) to iVoid
+    Function_Return ucaBuf
+End_Function
+
+// DF26-compatible replacement for cFilesystem FileDate.
+// Returns the last-write DateTime of a file; returns 0 if the file is not found.
+Function rfFileDate Global String sFilename Returns DateTime
+    tWin32FindData lsFindData
+    tWinFileTime   ftWrite
+    Handle         hFindFile
+    Integer        iVoid
+    DateTime       dtResult
+
+    Move (winFindFirstFile(sFilename, AddressOf(lsFindData))) to hFindFile
+    If (hFindFile = INVALID_HANDLE_VALUE) ;
+        Function_Return dtResult
+    Move (winFindClose(hFindFile)) to iVoid
+
+    Move lsFindData.ftLastWriteTime to ftWrite
+    Move (_rfFileTimeToLocalDateTime(AddressOf(ftWrite))) to dtResult
+    Function_Return dtResult
+End_Function
+
+// True if sPath exists and is a directory. Self-contained: uses winFindFirstFile.
+Function rfDirectoryExists Global String sPath Returns Boolean
+    tWin32FindData lsFindData
+    Handle  hFind
+    Integer iVoid iAttrib
+
+    // FindFirstFile fails with a trailing "\" on non-root paths; strip it.
+    If (Right(sPath, 1) = "\") ;
+        Move (Left(sPath, Length(sPath) - 1)) to sPath
+
+    Move (winFindFirstFile(sPath, AddressOf(lsFindData))) to hFind
+    If (hFind = INVALID_HANDLE_VALUE) ;
+        Function_Return False
+    Move lsFindData.dwFileAttributes to iAttrib
+    Move (winFindClose(hFind)) to iVoid
+    Function_Return ((iAttrib iand FILE_ATTRIBUTE_DIRECTORY) = FILE_ATTRIBUTE_DIRECTORY)
+End_Function
+
+// WHY a write to sFileName fails (or would fail), as a short clause for a message - the companion of
+// rfIsFileReadOnly (see the note there). Never "": when nothing looks wrong from the outside it is a
+// lock or a permission, and the clause says so.
+//   "it has the READ-ONLY attribute"                          - a package checkout, a VCS working copy
+//   "its folder does not exist"                               - a moved/renamed workspace, a stale path
+//   "it is locked by another program or access is denied"     - open elsewhere, or an ACL
+Function rfWriteFailureReason Global String sFileName Returns String
+    Integer iPos
+    String  sFolder
+
+    If (rfIsFileReadOnly(sFileName) = True) ;
+        Function_Return "it has the READ-ONLY attribute"
+    Move (RightPos("\", sFileName)) to iPos
+    // A folder to test needs more than the drive ("C:\x.pkg" has none worth asking about).
+    If (iPos > 3) Begin
+        Move (Left(sFileName, iPos - 1)) to sFolder
+        If (rfDirectoryExists(sFolder) = False) ;
+            Function_Return "its folder does not exist"
+    End
+    Function_Return "it is locked by another program or access is denied"
+End_Function
+
+// DF26-compatible replacement for cFilesystem DirectoryCreateEx.
+// Creates sPath plus any missing parent directories. If bPathContainsFileName
+// is True, the trailing filename in sPath is stripped before creation.
+// Returns True if the target directory exists (or was successfully created).
+Function rfDirectoryCreateEx Global String sPath Boolean bPathContainsFileName Returns Boolean
+    Boolean bExists bIsFilePath
+    Integer iPos iVoid
+    String  sCurrentPath
+
+    If (num_arguments > 1) ;
+        Move bPathContainsFileName to bIsFilePath
+
+    // If sPath includes a filename, strip it.
+    If (bIsFilePath) Begin
+        Move (RightPos("\", sPath)) to iPos
+        If (iPos > 0) ;
+            Move (Left(sPath, iPos - 1)) to sPath
+    End
+
+    // Normalize: strip trailing separator.
+    If (Right(sPath, 1) = "\") ;
+        Move (Left(sPath, Length(sPath) - 1)) to sPath
+
+    // Fast path: target already exists.
+    Move (rfDirectoryExists(sPath)) to bExists
+    If bExists ;
+        Function_Return True
+
+    // Re-append a trailing separator so the walk loop processes the final level.
+    Move (sPath + "\") to sPath
+
+    // Find the starting point for the path-walk:
+    //   "C:\..."          -> the "\" after the drive letter
+    //   "\\srv\share\..." -> the "\" after the share name
+    Move (Pos(":\", sPath)) to iPos
+    If (iPos > 0) Begin
+        Increment iPos
+    End
+    Else If (Left(sPath, 2) = "\\") Begin
+        Move (Pos("\", sPath, 3)) to iPos
+        If (iPos > 0) ;
+            Move (Pos("\", sPath, iPos + 1)) to iPos
+    End
+
+    If (iPos = 0) ;
+        Function_Return False
+
+    // Walk each segment; create folders that don't exist yet.
+    While (iPos > 0)
+        Move (Pos("\", sPath, iPos + 1)) to iPos
+        If (iPos > 0) Begin
+            Move (Left(sPath, iPos - 1)) to sCurrentPath
+            Move (rfDirectoryExists(sCurrentPath)) to bExists
+            If (bExists = False) Begin
+                Move (rfCreateDirectoryW(sCurrentPath, FNULL)) to iVoid
+            End
+        End
+    Loop
+
+    // Strip the trailing "\" we appended and verify the final directory exists.
+    Move (Left(sPath, Length(sPath) - 1)) to sPath
+    Move (rfDirectoryExists(sPath)) to bExists
+    Function_Return bExists
+End_Function
+
+/* Channel-based file I/O wrappers
+  
+   Moved here from DUF's WsGlobalFunctions.pkg so DFRefactor's core code no
+   longer pulls in DUF for routine sequential I/O. Each Open* function
+   allocates a fresh channel via Seq_New_Channel; each Close* releases it.
+   rfCloseAppendOutput fixes a long-standing bug in the upstream version,
+   which called Close_Input on a channel opened with Append_Output (it
+   should be Close_Output -- corrected below).
+*/
+  
+/* Remove sFolder and everything in it. Returns True when the folder is gone afterwards.
+   Defined here, after rfDirectoryExists / rfDeleteFile, because a global function must be
+   declared before the one that calls it.
+
+   A reparse point is UNLINKED, never emptied - RemoveDirectory on a junction removes the link and
+   leaves the target alone, which is the only safe behaviour when the target may be a shared
+   library pool. That is why the recursion tests the attribute before descending: deleting THROUGH
+   a junction would destroy the pool it points at. */
+Function rfRemoveFolderTree Global String sFolder Returns Boolean
+    tWin32FindData lsFindData
+    Handle         hFindFile
+    Integer        iSizeNoStrings iAttrib iVoid
+    Boolean        bOk bDummy
+    String         sName sPath
+
+    Move sFolder to sPath
+    If (Right(sPath, 1) = "\") ;
+        Move (Left(sPath, Length(sPath) - 1)) to sPath
+    If (rfDirectoryExists(sPath) = False) ;
+        Function_Return True
+    If (rfIsReparsePoint(sPath) = True) Begin
+        Move (rfRemoveDirectoryW(sPath)) to iVoid
+        Function_Return (rfDirectoryExists(sPath) = False)
+    End
+
+    Move (SizeOfType(tWin32FindData) - MAX_PATH - MAX_ALTPATH) to iSizeNoStrings
+    Move (winFindFirstFile((sPath + "\*.*"), AddressOf(lsFindData))) to hFindFile
+    If (hFindFile <> INVALID_HANDLE_VALUE) Begin
+        Move True to bOk
+        While bOk
+            Move lsFindData.dwFileAttributes to iAttrib
+            Move (PointerToString(AddressOf(lsFindData) + iSizeNoStrings)) to sName
+            If (sName <> "." and sName <> "..") Begin
+                If ((iAttrib iand FILE_ATTRIBUTE_DIRECTORY) = FILE_ATTRIBUTE_DIRECTORY) ;
+                    Move (rfRemoveFolderTree(sPath + "\" + sName)) to bDummy
+                Else ;
+                    Move (rfDeleteFile(sPath + "\" + sName)) to bDummy
+            End
+            Move (winFindNextFile(hFindFile, AddressOf(lsFindData))) to bOk
+        Loop
+        Move (winFindClose(hFindFile)) to iVoid
+    End
+
+    Move (rfRemoveDirectoryW(sPath)) to iVoid
+    Function_Return (rfDirectoryExists(sPath) = False)
+End_Function
+
+/* Bytes free on the volume holding sPath, for the calling user (so a disk quota is respected, not
+   just the raw free space). Returns -1 when it cannot be determined.
+
+   WALKS UP to an existing folder first: the caller is typically asking about a destination that has
+   not been created yet, and GetDiskFreeSpaceEx needs a path that exists. Walking to the parent
+   answers about the same volume, which is the question actually being asked.
+
+   A Number, not an Integer - free space on a modern volume passes 2 GB routinely, and an Integer
+   would wrap. */
+Function rfFreeDiskBytes Global String sPath Returns Number
+    tRFLargeInteger liFree liTotal liTotalFree
+    Integer iOk iPos
+    String  sTry
+
+    Move sPath to sTry
+    If (Right(sTry, 1) = "\") ;
+        Move (Left(sTry, Length(sTry) - 1)) to sTry
+    While (sTry <> "" and rfDirectoryExists(sTry) = False)
+        Move (RightPos("\", sTry)) to iPos
+        If (iPos = 0) Begin
+            Move "" to sTry
+        End
+        Else Begin
+            Move (Left(sTry, iPos - 1)) to sTry
+            // "C:" alone is not a directory - put the separator back so the drive root is testable.
+            If (Right(sTry, 1) = ":") ;
+                Move (sTry + "\") to sTry
+        End
+    Loop
+    If (sTry = "") ;
+        Function_Return -1
+
+    Move (rfGetDiskFreeSpaceExW(sTry, AddressOf(liFree), AddressOf(liTotal), AddressOf(liTotalFree))) to iOk
+    If (iOk = 0) ;
+        Function_Return -1
+    Function_Return ((liFree.dwHigh * 4294967296.0) + liFree.dwLow)
+End_Function
+
+/* A small file as a data: URI, for embedding straight into HTML - "" when it cannot be read.
+
+   WHY NOT JUST POINT AT THE FILE (2026-08-19): an <img src="file:///..."> inside the FlexTron web host
+   never rendered. The page is served from the host's own origin, and a WebView refuses a file:// URL
+   from it - so a package icon sitting in the workspace's DfPkg checkout could not be shown at all.
+   Inlining the bytes sidesteps the origin question entirely: there is no second request to block.
+
+   CAPPED at 256 KB. A data URI is text in the page, so a large image would be pasted into every
+   render of that page; an icon is a few KB and anything much bigger is not an icon. Over the cap the
+   answer is "" and the caller keeps its own fallback rather than bloating the document.
+
+   The MIME type is taken from the extension because that is all an <img> needs, and a wrong guess
+   only affects an image the browser was going to sniff anyway. */
+Function rfFileAsDataUri Global String sFileName Returns String
+    UChar[] ucaBytes
+    Pointer pB64
+    String sB64 sMime sExt
+    Integer iSize iVoid
+
+    If (Trim(sFileName) = "") ;
+        Function_Return ""
+    Move (rfFileSize(sFileName)) to iSize
+    If (iSize <= 0 or iSize > 262144) ;
+        Function_Return ""
+    Move (rfReadFileSliceBytes(sFileName, 0, iSize)) to ucaBytes
+    If (SizeOfArray(ucaBytes) = 0) ;
+        Function_Return ""
+
+    Move (Lowercase(Trim(Right(sFileName, 4)))) to sExt
+    Move "image/png" to sMime
+    If (sExt = ".bmp") ;
+        Move "image/bmp" to sMime
+    If (sExt = ".ico") ;
+        Move "image/x-icon" to sMime
+    If (sExt = ".gif") ;
+        Move "image/gif" to sMime
+    If (sExt = ".jpg" or Lowercase(Right(sFileName, 5)) = ".jpeg") ;
+        Move "image/jpeg" to sMime
+    If (sExt = ".svg") ;
+        Move "image/svg+xml" to sMime
+
+    /* POINTERTOSTRING, not CString - CString expects a string, and handing it a Pointer raised
+       err 4381 "Illegal Datatype Conversion" the moment the Libraries dialog opened (2026-08-19).
+       This is exactly the sequence DataFlex's own cCharTranslate.Base64EncodeToStr uses:
+       Base64Encode -> PointerToString -> Free. Safe here despite the usual PointerToString warning
+       about OEM bytes being re-decoded as UTF-8: base64 output is pure ASCII, so there are no high
+       bytes to misread. */
+    Move (Base64Encode(AddressOf(ucaBytes), SizeOfArray(ucaBytes))) to pB64
+    If (pB64 = 0) ;
+        Function_Return ""
+    Move (PointerToString(pB64)) to sB64
+    Move (Free(pB64)) to iVoid          // Base64Encode allocates; the caller releases it.
+    If (sB64 = "") ;
+        Function_Return ""
+    Function_Return ("data:" + sMime + ";base64," + sB64)
+End_Function
+
+/* Strips a leading UTF-8 byte-order mark (EF BB BF) from a byte array; data
+   without one passes through untouched.
+
+   ParseUtf8 refuses a whole JSON document over the three BOM bytes ahead of
+   it - a hazard this codebase knew on the WRITE side (every own serializer
+   says "pretty, NO BOM") while the READ side stayed unarmored. The files we
+   parse are not all our own: .sws files arrive from the DF26 Studio, df-cli
+   and whatever editor last saved them, and DFRefactorFlexTron.sws itself
+   picked up a BOM mid-2026-08-28, which silently emptied pOwnSws (ParseUtf8
+   returned False, ReadSwsJsonFile handed back the empty struct) and sent
+   TestBench's Test Compile down the wrong df-cli dialect. Every raw
+   Read_Block that feeds ParseUtf8 routes through here first; the
+   encoding-aware readers in cEncodingHelpers handle their own BOMs. */
+Function rfStripUtf8Bom Global UChar[] ucData Returns UChar[]
+    UChar[] ucOut
+    Integer iCount iSize
+
+    Move (SizeOfArray(ucData)) to iSize
+    If (iSize < 3) ;
+        Function_Return ucData
+    If (ucData[0] <> 239 or ucData[1] <> 187 or ucData[2] <> 191) ;
+        Function_Return ucData
+    If (iSize = 3) ;
+        Function_Return ucOut
+    Move (ResizeArray(ucOut, iSize - 3)) to ucOut
+    For iCount from 3 to (iSize - 1)
+        Move ucData[iCount] to ucOut[iCount - 3]
+    Loop
+    Function_Return ucOut
+End_Function
+
+// Opens sFileName for sequential write and returns the channel number, or
+// DF_SEQ_CHANNEL_NOT_AVAILABLE if no channel could be allocated.
+Function rfOpenOutput Global String sFileName Returns Integer
+    Integer iCh
+
+    Get Seq_New_Channel to iCh
+    If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
+        Error DFERR_PROGRAM "DF_SEQ_CHANNEL_NOT_AVAILABLE"
+        Function_Return DF_SEQ_CHANNEL_NOT_AVAILABLE
+    End
+    Direct_Output channel iCh sFileName
+    Function_Return iCh
+End_Function
+
+// Closes a channel previously returned by rfOpenOutput and releases it
+// back to the channel pool.
+Procedure rfCloseOutput Global Integer iCh
+    Close_Output channel iCh
+    Send Seq_Release_Channel iCh
+End_Procedure
+
+// Puts sText on the Windows clipboard, as it is. DataFlex writes the clipboard as a sequential
+// output device ("Clipboard:"), so this takes a channel for a moment - rfOpenOutput, a Write,
+// rfCloseOutput. True when the text was written; False when no channel was free, after
+// rfOpenOutput's error. Every copy in the program comes through here, and a site that has its
+// own words for a copy that did not happen reads the False.
+Function rfSetClipboardText Global String sText Returns Boolean
+    Integer iCh
+
+    Get rfOpenOutput "Clipboard:" to iCh
+    If (iCh < 0) ;
+        Function_Return False
+    Write channel iCh sText
+    Send rfCloseOutput iCh
+    Function_Return True
+End_Function
+
+// Opens sFileName for sequential read and returns the channel number, or
+// DF_SEQ_CHANNEL_NOT_AVAILABLE if no channel could be allocated.
+Function rfOpenInput Global String sFileName Returns Integer
+    Integer iCh
+
+    Get Seq_New_Channel to iCh
+    If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
+        Error DFERR_PROGRAM "DF_SEQ_CHANNEL_NOT_AVAILABLE"
+        Function_Return DF_SEQ_CHANNEL_NOT_AVAILABLE
+    End
+    Direct_Input channel iCh sFileName
+    Function_Return iCh
+End_Function
+
+// Closes a channel previously returned by rfOpenInput and releases it.
+Procedure rfCloseInput Global Integer iCh
+    Close_Input channel iCh
+    Send Seq_Release_Channel iCh
+End_Procedure
+
+/* A JSON FILE, PARSED - the whole of what fifteen readers did each on their own. Is the file there (rfOpenInput
+   does a bare Direct_Input, which RAISES error 33 on a missing file rather than returning a channel below zero);
+   read it whole; drop a BOM (ParseUtf8 refuses a document that starts with one); parse it with
+   pbRequireAllMembers off, so a JsonToDataType into a struct tolerates a member the file lacks. Returns the
+   cJsonObject, which the caller Destroys when done - or 0 when the file is missing, unopenable or not JSON. */
+Function rfParseJsonFile Global String sFileName Returns Handle
+    Handle  hoJson
+    Boolean bExists bOK
+    Integer iCh
+    UChar[] ucData
+
+    Get vFilePathExists sFileName to bExists
+    If (bExists = False) ;
+        Function_Return 0
+    Get rfOpenInput sFileName to iCh
+    If (iCh < 0) ;
+        Function_Return 0
+    Read_Block channel iCh ucData -1
+    Move (rfStripUtf8Bom(ucData)) to ucData
+    Send rfCloseInput iCh
+    Get Create of Desktop (RefClass(cJsonObject)) to hoJson
+    Set pbRequireAllMembers of hoJson to False
+    Get ParseUtf8 of hoJson ucData to bOK
+    If (bOK = False) Begin
+        Send Destroy of hoJson
+        Function_Return 0
+    End
+    Function_Return hoJson
+End_Function
+
+// Opens sFileName for append-write and returns the channel number, or
+// DF_SEQ_CHANNEL_NOT_AVAILABLE if no channel could be allocated.
+Function rfOpenAppendOutput Global String sFileName Returns Integer
+    Integer iCh
+
+    Get Seq_New_Channel to iCh
+    If (iCh = DF_SEQ_CHANNEL_NOT_AVAILABLE) Begin
+        Error DFERR_PROGRAM "DF_SEQ_CHANNEL_NOT_AVAILABLE"
+        Function_Return DF_SEQ_CHANNEL_NOT_AVAILABLE
+    End
+    Append_Output channel iCh sFileName
+    Function_Return iCh
+End_Function
+
+// Closes a channel previously returned by rfOpenAppendOutput and
+// releases it. (The upstream WsGlobalFunctions.pkg version called
+// Close_Input here, which is a bug -- corrected to Close_Output.)
+Procedure rfCloseAppendOutput Global Integer iCh
+    Close_Output channel iCh
+    Send Seq_Release_Channel iCh
+End_Procedure

@@ -1,0 +1,724 @@
+﻿//****************************************************************************
+// $Module type: Class Package
+// $Module name: cDfCliPackages
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+// Created     : 2026-08-12
+//
+// Description : df-cli package plumbing: captured df-cli runs, the Libraries dialog's package
+//               state, and dependency/pool inspection for the current workspace.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//****************************************************************************
+Use RefactorConstants.h.pkg
+Use RefactorFileIO.pkg
+Use RDCRunProgram.pkg          // RDCRunProgramWait - the blocking child-process run
+Use cRDCAsyncProcess.pkg         // RDCRunProgramBounded - bounded, no console, real exit code
+Use cEncodingHelpers.pkg         // rfHtmlEscape and the encoding helpers
+/* cLibraryInventoryApp - the JSON-aware reader used to confirm an install actually landed.
+   It lives in cFTLibraryReport.pkg, which needs OutputDockFT + FTDashIcons, so this file inherits
+   that position in the compile stream. Stated here so moving it too early fails at compile. */
+Use cFTLibraryReport.pkg
+
+/*  df-cli PACKAGE PLUMBING - search and install, for the DataFlex 26 package handler.
+
+    DFRefactor DOES NOT IMPLEMENT PACKAGE MANAGEMENT. It drives df-cli, which is the vendor's own
+    tool and the only thing that may write the package cache. That line matters: a dependency entry
+    naming a package is df-cli's to add and remove, because installing means resolving a version,
+    downloading it, unpacking it into the global cache and only THEN writing the .sws. Adding the
+    string ourselves would produce a workspace referencing a package that is not there.
+
+    It is also the reason this is not a violation of "DFRefactor fetches nothing" (Nils 2026-07-31,
+    about library retargeting): nothing here downloads. df-cli downloads, at the user's request,
+    from the package service DataFlex itself ships pointed at.
+
+    BLOCKING, on purpose. Both calls are short, both happen inside a modal dialog the user just
+    clicked in, and the async machinery (cRDCAsyncProcess + a poll timer) exists for the compile, which
+    is minutes rather than seconds. Its own comment says so.
+
+    Output is captured through a cmd.exe wrapper - the same redirect TestCompileFT uses - because
+    RDCRunProgramWait is ShellExecuteEx and cannot capture a pipe.
+*/
+
+/*  Where df-cli.exe is, or "" when there is none to be had.
+
+    Derived from the SELECTED COMPILER, which is what defines the target DataFlex version in the
+    first place, so the two can never disagree about which release we are talking to. Two shapes:
+    the user may have picked df-cli itself, or the DfCompConsole beside it in the same Bin folder.
+
+    df-cli ships with DataFlex 26 and does not exist before it, so a DF25-or-earlier compiler
+    correctly yields "" and every caller degrades to saying so. */
+Function DfCliPath Global Returns String
+    String sComp sTry
+    Integer iPos
+
+    Get psCompiler of ghoApplication to sComp
+    Move (Trim(sComp)) to sComp
+    If (sComp = "") ;
+        Function_Return ""
+    If (Lowercase(sComp) contains "df-cli") Begin
+        If (vFilePathExists(sComp) <> 0) ;
+            Function_Return sComp
+        Function_Return ""
+    End
+    Move (RightPos("\", sComp)) to iPos
+    If (iPos = 0) ;
+        Function_Return ""
+    Move (Left(sComp, iPos) + "df-cli.exe") to sTry
+    If (vFilePathExists(sTry) <> 0) ;
+        Function_Return sTry
+    Function_Return ""
+End_Function
+
+/*  Runs df-cli with sArgs and returns everything it printed, stdout and stderr together.
+
+    The cmd.exe wrapper is what makes capture possible at all, and its quoting is exact: cmd strips
+    the first and last quote of the /c argument, so the real command has to be wrapped in a second
+    pair - the same construction StartCompile uses and for the same reason.
+
+    The log lands in DFRefactor's OWN Programs folder: always writable, locale-independent, and
+    never inside the workspace being operated on. Overwritten each call. */
+/*  The exit code of the LAST DfCliCaptureIn (or DfCliCapture) run.
+
+    A global, because DfCliCapture is a global function - there is no object to hang a property
+    on. Read it straight after the call that produced it; nothing else writes it. */
+Global_Variable Integer giLastDfCliExit
+
+/*  DfCliCaptureIn: the general form (2026-09-14). sWorkDir is the child's working directory ("" =
+    DFRefactor's own Programs folder, the package form); iTimeoutSecs the deadline. The copy step
+    converts through this with the copy's home and the convert deadline - a BARE run of df-cli, no
+    window and nothing redirected, waits on any failure that would prompt until the deadline kills
+    it (probe-measured: 25 s cap, still running, on a corrupt library and on a missing one alike),
+    while this wrapper's redirected output makes the same failure exit in 200 ms with its reason in
+    the log. DfCliCapture below keeps the package form's signature. */
+Function DfCliCaptureIn Global String sArgs String sWorkDir Integer iTimeoutSecs Returns String[]
+    String[] asOut asNone
+    tSwsFile OwnWS
+    String sDfCli sLog sLaunch sLogFolder
+    // iRunExit, NOT iExit: iExit is a DataDict FIELD MESSAGE and collides wherever DataDict is
+    // in the chain (see the note in cRDCAsyncProcess - this is the second time today).
+    Integer iRunExit
+
+    /* A BAIL HERE IS A FAILURE AND SAYS SO (Nils 2026-08-17). Both early exits below used to
+       return an empty array with giLastDfCliExit untouched - which on a fresh process is 0, the
+       SUCCESS code - so DfCliPackageInstall reported "installed", showed nothing, and Add Package
+       "did nothing at all". The cause that day was pOwnSws unparsed (a relative own-.sws name,
+       see _OwnSwsInFolder), i.e. the second exit. Now each exit stamps the failed-to-start code
+       and returns ONE line naming why, so the caller's "df-cli said:" box carries the reason
+       instead of an empty list. */
+    Get DfCliPath to sDfCli
+    If (sDfCli = "") Begin
+        Move CI_RDCRunToolFailedToStart to giLastDfCliExit
+        Move "df-cli was not started: no df-cli.exe beside the selected compiler." to asNone[0]
+        Function_Return asNone
+    End
+
+    Get pOwnSws of ghoApplication to OwnWS
+    Get PrimaryPrograms of ghoApplication OwnWS to sLogFolder
+    If (sLogFolder = "") Begin
+        Move CI_RDCRunToolFailedToStart to giLastDfCliExit
+        Move "df-cli was not started: DFRefactor could not read its own workspace file (pOwnSws), so it has no folder for the df-cli log. Start DFRefactor from its workspace, or report this." to asNone[0]
+        Function_Return asNone
+    End
+    Move (vFolderFormat(sLogFolder) + "dfrefactor_dfcli.log") to sLog
+    If (vFilePathExists(sLog)) ;
+        Move (rfDeleteFile(sLog)) to sLaunch
+
+    Move ('/c " "' + sDfCli + '" ' + sArgs + ' > "' + sLog + '" 2>&1 "') to sLaunch
+    /* BOUNDED, and the EXIT CODE is the point (2026-08-14).
+
+       RDCRunProgramWait waits for ever and reports nothing. A package install clones from a git
+       server - minutes, on a big repository - and a private one can ask for credentials, which
+       on a hidden console is the deadlock this program spent a day fixing. RDCRunProgramBounded
+       gives the child no console and a deadline.
+
+       The exit code matters because the FILE cannot always answer. df-cli is idempotent: asked
+       to install something already present it says "already installed and valid ... Added to
+       workspace", changes nothing, and is entirely correct - so a caller comparing dependency
+       counts before and after sees no change and calls a success a failure. That is exactly what
+       Nils hit. The exit code distinguishes them; the counts cannot. */
+    // The working directory is the caller's (the copy's own home for a convert - anything df-cli
+    // writes relatively then lands there); "" = DFRefactor's own Programs folder, the package form.
+    If (Trim(sWorkDir) = "") ;
+        Move sLogFolder to sWorkDir
+    Send Cursor_Wait of Cursor_Control
+    Get RDCRunProgramBounded "cmd.exe" sLaunch sWorkDir iTimeoutSecs to iRunExit
+    Send Cursor_Ready of Cursor_Control
+    Move iRunExit to giLastDfCliExit
+
+    // No log after the run: the wrapper never got to redirect (failed to start / timed out before
+    // df-cli printed). Say which; a run that left no output must not read as a clean one.
+    If (vFilePathExists(sLog) = 0) Begin
+        If (iRunExit = CI_RDCRunToolTimedOut) ;
+            Move ("df-cli did not finish within" * String(iTimeoutSecs) * "seconds and was stopped; it wrote no output.") to asNone[0]
+        Else If (iRunExit = CI_RDCRunToolFailedToStart) ;
+            Move "df-cli could not be started (cmd.exe wrapper failed to launch)." to asNone[0]
+        Else ;
+            Move ("df-cli exited with code" * String(iRunExit) * "and left no output at" * sLog) to asNone[0]
+        Function_Return asNone
+    End
+    /* EACH LINE AS ITS BYTES ARE (2026-09-30). df-cli's log is MIXED, and a redirect writes no BOM:
+       the package registry's text is UTF-8 - E2 80 99 (U+2019) turned "security API's" into three
+       mojibake characters when the BOM rule read it as OEM (Browse Packages, Nils 2026-08-21) - but
+       df-cli's own messages are in the Windows code page: a workspace path with "åäö" is E5 E4 F6,
+       which the UTF-8 read this used to assert turned into replacement characters (measured on an
+       Add Package's log, 2026-09-30). rfReadToolOutputLines decodes each line as what it is. The
+       ls-remote log below is read the same way - a SHA is ASCII either way, but the two logs are
+       written the same way. */
+    Move (rfReadToolOutputLines(sLog)) to asOut
+    Function_Return asOut
+End_Function
+
+// The package form: DFRefactor's own Programs folder as the working directory, the package deadline.
+Function DfCliCapture Global String sArgs Returns String[]
+    Function_Return (DfCliCaptureIn(sArgs, "", CI_DfCliPackageTimeoutSecs))
+End_Function
+
+/*  The packages DataFlex offers for THIS workspace, matching sTerm (blank = everything).
+
+    Parsed from the table df-cli prints:
+
+        Name       | Publisher       | Version    | Description
+        DataFlex-dev/Web UI FlexTron | DataFlex-dev    | 1.0.51     | Use Web UI controls ...
+
+    Everything before the header line is skipped - df-cli emits "Config file for project ... using
+    defaults." warnings first for any workspace whose projects it cannot fully resolve, which is
+    normal and not an error. Rows are taken only AFTER the header, so that noise can never be read
+    as a package however it is worded.
+
+    THE SEARCH IS SCOPED BY THE WORKSPACE, not by us: df-cli reads the .sws's own DataFlex version
+    and offers only what is compatible with it. That is why the workspace file is a required
+    argument and why converting the copy to the target version has to happen first - search a 19.1
+    workspace and you correctly get nothing. */
+Function DfCliPackageSearch Global String sSwsFile String sTerm Returns tPackageHit[]
+    tPackageHit[] aOut
+    tPackageHit Hit
+    String[] asLines asCols
+    String sArgs sLine
+    Integer i iMax iRow
+    Boolean bPastHeader
+
+    If (sSwsFile = "") ;
+        Function_Return aOut
+    Move ('package search "' + sSwsFile + '"') to sArgs
+    Move (Trim(sTerm)) to sTerm
+    If (sTerm <> "") ;
+        Move (sArgs + ' "' + sTerm + '"') to sArgs
+
+    Get DfCliCapture sArgs to asLines
+    Move False to bPastHeader
+    Move (SizeOfArray(asLines) - 1) to iMax
+    For i from 0 to iMax
+        Move (Trim(asLines[i])) to sLine
+        If (bPastHeader = False) Begin
+            // The header, recognised by its own columns rather than by position.
+            If (Left(sLine, 4) = "Name" and Pos("|", sLine) > 0 and Pos("Version", sLine) > 0) ;
+                Move True to bPastHeader
+        End
+        Else Begin
+            If (Pos("|", sLine) > 0) Begin
+                Move (StrSplitToArray(sLine, "|")) to asCols
+                If (SizeOfArray(asCols) >= 3) Begin
+                    Move (Trim(asCols[0])) to Hit.sName
+                    Move (Trim(asCols[1])) to Hit.sPublisher
+                    Move (Trim(asCols[2])) to Hit.sVersion
+                    Move "" to Hit.sDescription
+                    If (SizeOfArray(asCols) >= 4) ;
+                        Move (Trim(asCols[3])) to Hit.sDescription
+                    // A row with no name or no version cannot be installed, so it is not offered.
+                    If (Hit.sName <> "" and Hit.sVersion <> "") Begin
+                        Move (SizeOfArray(aOut)) to iRow
+                        Move Hit to aOut[iRow]
+                    End
+                End
+            End
+        End
+    Loop
+    Function_Return aOut
+End_Function
+
+/*  Installs sPackage into sSwsFile through df-cli, which writes the dependency itself.
+
+    THE .sws IS DF-CLI'S TO EDIT HERE, and that is the whole point. Install resolves the version,
+    downloads it, unpacks it into the global cache and then adds the entry - so a caller holding its
+    own in-memory copy of the dependency list must RE-READ the file afterwards rather than write its
+    version over the top. See DoAddPackage, which saves first and reloads after for exactly this
+    reason.
+
+    Verified by re-reading the file, never by an exit code: the question is whether the entry is
+    there now. sOutput carries what df-cli said, so a failure can be shown rather than summarised.
+
+    bAdded (2026-08-17) tells a SUCCESS apart from an ALREADY-THERE: df-cli is idempotent and exits 0
+    for a package the workspace already lists ("already installed and valid ... Added to workspace"),
+    changing nothing - so True with bAdded False is "nothing to do", which the caller must SAY.
+    Nils: re-adding vwin32fh "was silence and nothing happened", and pasting an example that was
+    already installed looked like a dead OK button. Judged by the FILE (did the entry count rise). */
+Function DfCliPackageInstall Global String sSwsFile String sPackage String[] ByRef asOutput Boolean ByRef bAdded Returns Boolean
+    String[] asLines asBefore asAfter
+    String sArgs
+    Handle hoInv
+    Integer iBefore iAfter iObjBefore iObjAfter
+
+    Move False to bAdded
+    Move (Trim(sPackage)) to sPackage
+    If (sSwsFile = "" or sPackage = "") ;
+        Function_Return False
+
+    /* COUNT BOTH KINDS OF DEPENDENCY (Nils 2026-08-17, fresh WinServ copy: the vwin32fh git package
+       was installed - the .sws had it at once - and the dialog said "already in the workspace's
+       dependency list, so nothing was added"). SwsLibraryEntries lists the PATH entries only; a
+       system or git package is an OBJECT entry, so its arrival never moved that count. Sum both. */
+    Get Create (RefClass(cLibraryInventoryApp)) to hoInv
+    Get SwsLibraryEntries of hoInv sSwsFile to asBefore
+    Get SwsJsonObjectDependencyCount of hoInv sSwsFile to iObjBefore
+    Move (SizeOfArray(asBefore) + iObjBefore) to iBefore
+
+    Move ('package install "' + sSwsFile + '" "' + sPackage + '"') to sArgs
+    Get DfCliCapture sArgs to asLines
+    Move asLines to asOutput
+
+    Get SwsLibraryEntries of hoInv sSwsFile to asAfter
+    Get SwsJsonObjectDependencyCount of hoInv sSwsFile to iObjAfter
+    Move (SizeOfArray(asAfter) + iObjAfter) to iAfter
+    Send Destroy of hoInv
+    /* THE EXIT CODE FIRST, the count only as a fallback (2026-08-14).
+
+       df-cli is idempotent: install something already in the workspace and it says "already
+       installed and valid ... Added to workspace", changes nothing, and is right to. Counting
+       dependencies before and after then reads a success as a failure, which is what Nils saw
+       after his first (successful) attempt had already added the package.
+
+       The count is kept as a second opinion for the case where the exit code is unavailable -
+       CI_RDCRunToolFailedToStart or a timeout - because a list that GREW is proof either way. */
+    Move (iAfter > iBefore) to bAdded
+    Function_Return (giLastDfCliExit = 0 or bAdded = True)
+End_Function
+
+/*  Uninstalls sPackage from sSwsFile through df-cli, which removes the dependency itself.
+
+    THE SAME RULE AS INSTALL, and it is the half that is easy to get wrong: dropping the string from
+    the dependency array by hand LOOKS like an uninstall. It is not. The cache entry stays, the
+    package's own transitive dependencies stay, and - the part that actually bites - df-cli's check
+    that nothing else still depends on it never runs.
+
+    NO --force. df-cli refuses when another package depends on this one, and that refusal is the
+    most useful thing it can say; forcing past it by default would turn a protection into a
+    formality. The caller shows df-cli's own words, which name the dependent.
+
+    Verified by re-reading: the entry count has to have gone DOWN. An exit code cannot distinguish
+    "removed" from "there was nothing to remove". */
+Function DfCliPackageUninstall Global String sSwsFile String sPackage String[] ByRef asOutput Returns Boolean
+    String[] asLines asBefore asAfter
+    String sArgs
+    Handle hoInv
+    Integer iBefore iAfter
+
+    Move (Trim(sPackage)) to sPackage
+    If (sSwsFile = "" or sPackage = "") ;
+        Function_Return False
+
+    Get Create (RefClass(cLibraryInventoryApp)) to hoInv
+    Get SwsLibraryEntries of hoInv sSwsFile to asBefore
+    Move (SizeOfArray(asBefore)) to iBefore
+
+    Move ('package uninstall "' + sSwsFile + '" "' + sPackage + '"') to sArgs
+    Get DfCliCapture sArgs to asLines
+    Move asLines to asOutput
+
+    Get SwsLibraryEntries of hoInv sSwsFile to asAfter
+    Move (SizeOfArray(asAfter)) to iAfter
+    Send Destroy of hoInv
+    // Same reasoning as the install: df-cli owns the verdict, the count is the fallback.
+    Function_Return (giLastDfCliExit = 0 or iAfter < iBefore)
+End_Function
+Define CI_GitLsRemoteTimeoutSecs for 20   // one remote head, no clone - short on purpose
+/*  THE AUTOMATIC path gets a much shorter bound than the button. A user who pressed Update Check
+    is waiting on purpose and 20 seconds of a hung remote is tolerable; a check nobody asked for,
+    fired because a workspace was opened, must not be able to sit on the UI thread. Off the network
+    ls-remote does not fail fast - it blocks until the bound - and that cost is per git dependency,
+    serially. Four seconds is comfortably above a normal round trip (measured well under one) and
+    low enough that the worst case is a hesitation rather than a hang. */
+Define CI_GitLsRemoteQuickSecs for 4
+
+/*  Run `git ls-remote <sArgs>` bounded and console-less, and hand back what it printed.
+
+    ONE HOME for the launch since 2026-09-25, when a second question joined the first: the branch
+    head (GitRemoteHeadEx) and the published tags (GitRemoteTagsEx) go out the same way - the same
+    log file in the workspace's Programs folder, the same deadline, the same line-by-line read
+    (rfReadToolOutputLines).
+    Returns RDCRunProgramBounded's answer, git's exit code - and CI_RDCRunToolFailedToStart when no log
+    appeared, so an EMPTY answer (a repository with no tags) and NO answer never look alike. */
+Function GitLsRemoteLines Global String sArgs Integer iTimeoutSecs String[] ByRef asOut Returns Integer
+    String[] asNone
+    String sLog sLaunch sLogFolder
+    tSwsFile OwnWS
+    Integer iRunExit
+
+    Move asNone to asOut
+    Get pOwnSws of ghoApplication to OwnWS
+    Get PrimaryPrograms of ghoApplication OwnWS to sLogFolder
+    If (sLogFolder = "") ;
+        Function_Return CI_RDCRunToolFailedToStart
+    Move (vFolderFormat(sLogFolder) + "dfrefactor_lsremote.log") to sLog
+    If (vFilePathExists(sLog)) ;
+        Move (rfDeleteFile(sLog)) to sLaunch
+
+    Move ('/c " git ls-remote ' + sArgs + ' > "' + sLog + '" 2>&1 "') to sLaunch
+    Send Cursor_Wait of Cursor_Control
+    Get RDCRunProgramBounded "cmd.exe" sLaunch sLogFolder iTimeoutSecs to iRunExit
+    Send Cursor_Ready of Cursor_Control
+
+    If (vFilePathExists(sLog) = 0) ;
+        Function_Return CI_RDCRunToolFailedToStart
+    Move (rfReadToolOutputLines(sLog)) to asOut
+    Function_Return iRunExit
+End_Function
+
+/*  The commit a git remote's HEAD points at, WITHOUT cloning it.
+
+    `git ls-remote <url> HEAD` prints one line - "<40-char sha><TAB>HEAD".
+
+    THIS COMMAND HAS ONLY ONE BRANCH: it always prints the remote head and never reads our pin, so
+    "is the pin stale?" is answered by comparing this to the .sws version IN OUR CODE, not by the
+    command behaving differently. That is the whole reason it is safe where `package update` is not
+    - see feedback_dfcli_package_update_is_not_a_check: `update` says it "checks", but on a
+    workspace whose pins differ it AUTO-INSTALLS and can leave the workspace BROKEN (exit 15).
+    Proven read-only 2026-08-20 against a 297-entry fingerprint of the whole workspace: ls-remote
+    takes no workspace argument and wrote nothing.
+
+    Bounded and console-less for the reason df-cli is: a PRIVATE repo can ask for credentials, and a
+    hidden console with a prompt is a deadlock. A repo that asks returns "" here - which the caller
+    must read as UNKNOWN, never as "up to date". */
+/*  The remote branch head, with the caller naming its own patience.
+
+    Split out 2026-09-10 for the tile's automatic check: same body, and the four-argument name
+    below still passes CI_GitLsRemoteTimeoutSecs, so the Libraries dialog and every other caller
+    are untouched. Same shape as rfReadEncodedFileLines / rfWriteEncodedFileFromStringArrayEx -
+    an Ex form carries the new argument and the old name keeps the old default. */
+Function GitRemoteHeadEx Global String sUrl Integer iTimeoutSecs Returns String
+    String[] asOut
+    String sLine
+    Integer iRunExit iPos
+
+    Move (Trim(sUrl)) to sUrl
+    If (sUrl = "") ;
+        Function_Return ""
+    Get GitLsRemoteLines ('"' + sUrl + '" HEAD') iTimeoutSecs (&asOut) to iRunExit
+    If (SizeOfArray(asOut) = 0) ;
+        Function_Return ""
+
+    Move (Trim(asOut[0])) to sLine
+    // "<sha><TAB>HEAD". Cut at the tab (or a space, if the shell normalised it). A git ERROR
+    // message has neither shape, and the length test below rejects it.
+    Move (Pos(Character(9), sLine)) to iPos
+    If (iPos = 0) ;
+        Move (Pos(" ", sLine)) to iPos
+    If (iPos > 1) ;
+        Move (Left(sLine, iPos - 1)) to sLine
+    If (Length(sLine) <> 40) ;
+        Function_Return ""
+    Function_Return (Lowercase(sLine))
+End_Function
+
+/*  The version tags a git remote has published, WITHOUT cloning it (2026-09-25).
+
+    `git ls-remote --tags --refs <url>`: the tags alone, without their peeled "^{}" twins, read by
+    GitTagsFromLsRemote (cLibraryInventory.pkg, where the console runner can test it). It is the
+    question a TAG pin needs answered, as GitRemoteHeadEx answers it for a commit.
+
+    False is UNKNOWN - git missing, the network down, the deadline passed, a remote asking for
+    credentials, or output of any other shape - and must never be read as "nothing newer". True
+    with no tags is a real answer: the repository has published none. Same bounds as the head
+    question, and just as read-only: ls-remote takes no workspace and writes nothing but its log. */
+Function GitRemoteTagsEx Global String sUrl Integer iTimeoutSecs String[] ByRef asTags Returns Boolean
+    String[] asOut asNone
+    Integer iRunExit
+
+    Move asNone to asTags
+    Move (Trim(sUrl)) to sUrl
+    If (sUrl = "") ;
+        Function_Return False
+    Get GitLsRemoteLines ('--tags --refs "' + sUrl + '"') iTimeoutSecs (&asOut) to iRunExit
+    // Git's own words on a failure are in asOut - they are not tags, and not "no tags" either.
+    If (iRunExit <> 0) ;
+        Function_Return False
+    Function_Return (GitTagsFromLsRemote(asOut, &asTags))
+End_Function
+/*  ASK WHAT IS NEWER, AND CHANGE NOTHING. The one implementation behind both the Libraries
+    dialog's Update Check button and the Libraries tile's automatic check (2026-09-10).
+
+    ONE HOME, because two callers need it and they must not disagree - the same reason
+    ExpandPackageGraph has one. A tile saying "up to date" while the dialog's chips say otherwise
+    is the exact failure a second copy of this loop produces, and this codebase has had that bug
+    before with the library counts.
+
+    Two sources, because the two kinds of dependency answer to different things:
+
+      system  -> DfCliPackageSearch, which df-cli scopes BY THE WORKSPACE'S DataFlex version.
+                  `package details` also reports a version but is UNSCOPED - measured, it offered
+                  1.1.0 for a theme whose compatible newest was 1.0.4 - so an Update badge driven
+                  by details would point the user at an incompatible release.
+      git     -> by what the pin IS (2026-09-25): a commit against the branch head, a version tag
+                  against the newest tag a caret on it accepts. A range or a branch is not asked.
+
+    NEVER `package update`. Its help says "Checks for an update" and it takes no --yes, which reads
+    as safe; measured 2026-08-20 it AUTO-INSTALLS whenever the pins differ from what is installed,
+    and left a probe workspace BROKEN at exit 15. Doing that to a workspace because the user merely
+    OPENED it would be far worse than doing it from a button labelled "check".
+
+    iAnswered IS NOT A COUNT OF PROBLEMS, it is how many dependencies gave a definite answer. It
+    exists so a caller can tell "checked, nothing behind" from "could not check" - which look
+    identical in the return value and must never read the same on screen. GitRemoteHeadEx returns
+    "" for a missing git, a down network or a remote asking for credentials, and that is UNKNOWN,
+    never up-to-date. search EXITS 15 on a workspace whose pins have drifted: safe, but no rows.
+
+    Returns the number of dependencies with something newer. Local path libraries are not counted
+    in either figure - they have no remote to ask. */
+Function WorkspaceUpdateScan Global String sSwsFile Integer iTimeoutSecs String[] ByRef asKey ;
+                             String[] ByRef asLatest Integer ByRef iCliExit ;
+                             Integer ByRef iAnswered Returns Integer
+    tPackageHit[] aHits
+    tSwsDependency[] aObjDeps
+    String[] asEntries asKeyOut asLatestOut asEmpty asTags
+    String sEntry sName sPinned sHead sNewer sRepo
+    Boolean bTags
+    Integer i j iMax jMax iFound iAns iPkgRows
+    Handle hoInv
+
+    Move asEmpty to asKey
+    Move asEmpty to asLatest
+    Move 0 to iCliExit
+    Move 0 to iAnswered
+    Move 0 to iFound
+    Move 0 to iAns
+    If (Trim(sSwsFile) = "" or DfCliPath() = "") ;
+        Function_Return 0
+
+    Get Create (RefClass(cLibraryInventoryApp)) to hoInv
+    Get SwsLibraryEntries of hoInv sSwsFile to asEntries
+    Get SwsJsonObjectDependencies of hoInv sSwsFile to aObjDeps
+
+    /* THE REGISTRY SEARCH IS SKIPPED WHEN NOTHING NEEDS IT. A df-cli run is a process spawn plus a
+       call to the registry, and the everyday workspace this tool opens declares only path libraries
+       and git dependencies - for those the search can answer nothing and would be pure cost. */
+    Move 0 to iPkgRows
+    Move (SizeOfArray(asEntries) - 1) to iMax
+    For i from 0 to iMax
+        Get PackageVersion of hoInv (Trim(asEntries[i])) to sPinned
+        If (sPinned <> "") ;
+            Increment iPkgRows
+    Loop
+
+    If (iPkgRows > 0) Begin
+        Get DfCliPackageSearch sSwsFile "" to aHits
+        Move giLastDfCliExit to iCliExit
+        For i from 0 to iMax
+            Move (Trim(asEntries[i])) to sEntry
+            Get PackageVersion of hoInv sEntry to sPinned
+            If (sPinned <> "") Begin
+                Get PackageRepository of hoInv sEntry to sRepo
+                If (sRepo <> "") ;
+                    Move (sRepo + "/") to sRepo
+                Get PackageName of hoInv sEntry to sName
+                Move (sRepo + sName) to sName
+                Move (SizeOfArray(aHits) - 1) to jMax
+                For j from 0 to jMax
+                    If (Uppercase(Trim(aHits[j].sName)) = Uppercase(sName)) Begin
+                        Increment iAns
+                        If (Trim(aHits[j].sVersion) <> sPinned) Begin
+                            Move sEntry                    to asKeyOut[iFound]
+                            Move (Trim(aHits[j].sVersion)) to asLatestOut[iFound]
+                            Increment iFound
+                        End
+                    End
+                Loop
+            End
+        Loop
+    End
+
+    /* Git rows, by what the pin IS (2026-09-25 - IsGitCommitPin in cLibraryInventory.pkg):
+         a commit      -> the branch head, as it always was;
+         a version tag -> the newest published tag a caret on the pin still accepts, so the offer
+                          is one the workspace's libraries take - never a new major;
+         anything else -> a range or a branch has no one pinned version to compare, so it is left
+                          out of both counts. Before this a branch pin ALWAYS read as behind its own
+                          head, and Update then wrote that commit over the branch name. */
+    Move (SizeOfArray(aObjDeps) - 1) to iMax
+    For i from 0 to iMax
+        Move (Trim(aObjDeps[i].sVersion)) to sPinned
+        Move "" to sNewer
+        If (IsGitCommitPin(sPinned) = True) Begin
+            Get GitRemoteHeadEx (Trim(aObjDeps[i].sSource)) iTimeoutSecs to sHead
+            If (sHead <> "") Begin
+                Increment iAns
+                If (Lowercase(sPinned) <> sHead) ;
+                    Move sHead to sNewer
+            End
+        End
+        Else If (IsVersionTagPin(sPinned) = True) Begin
+            Get GitRemoteTagsEx (Trim(aObjDeps[i].sSource)) iTimeoutSecs (&asTags) to bTags
+            If (bTags = True) Begin
+                Increment iAns
+                Move (NewestCompatibleVersionTag(sPinned, asTags)) to sNewer
+            End
+        End
+        If (sNewer <> "") Begin
+            Get SwsDependencyKey aObjDeps[i] to sName
+            If (sName <> "") Begin
+                Move sName  to asKeyOut[iFound]
+                Move sNewer to asLatestOut[iFound]
+                Increment iFound
+            End
+        End
+    Loop
+    Send Destroy of hoInv
+
+    Move asKeyOut    to asKey
+    Move asLatestOut to asLatest
+    Move iAns        to iAnswered
+    Function_Return iFound
+End_Function
+
+/*  Is the automatic check wanted? Default ON, and it is a plain switch rather than a "how often":
+    the scan already runs at most once per workspace per session and skips a workspace with no
+    remote-backed dependency at all, so there is nothing an interval would save that is worth a
+    second thing to explain. Anyone who wants it off is on a machine where it cannot answer.
+
+    Read every time rather than cached, because the cost is one settings read against a scan that
+    spawns processes - see the rule that a freshness check must be cheaper than what it guards. */
+Function PackageUpdateCheckEnabled Global Returns Boolean
+    Integer iVal
+    Get ReadInteger of ghoApplication CS_Settings CS_CheckPackageUpdates True to iVal
+    Function_Return (iVal <> 0)
+End_Function
+
+/*  THE BOARDS' ONE LINE: scan, and leave the verdict where the Libraries tile will find it.
+
+    On the QUICK bound, because this runs because a workspace was opened and not because anyone
+    asked. The answer is published even when nothing could be reached - bAnswered False - so the
+    board stops asking for this workspace and the tile stays silent rather than claiming anything.
+
+    Returns the number behind, which no caller needs but makes the function testable by hand. */
+Function PublishWorkspaceUpdateScan Global String sSwsFile Returns Integer
+    String[] asKey asLatest
+    Integer iFound iErr iAnswered
+
+    Move (Trim(sSwsFile)) to sSwsFile
+    If (sSwsFile = "") ;
+        Function_Return 0
+    Get WorkspaceUpdateScan sSwsFile CI_GitLsRemoteQuickSecs (&asKey) (&asLatest) (&iErr) (&iAnswered) to iFound
+    Send SetUpdateResult of ghoLibraryReport sSwsFile iFound (iAnswered > 0)
+    Function_Return iFound
+End_Function
+
+/*  Upgrade ONE package to the newest version its workspace allows.
+
+    `--yes` IS NOT OPTIONAL. Without it df-cli prompts for confirmation, and a bounded console-less
+    child that prompts is exactly the deadlock RDCRunProgramBounded exists to avoid - DFRefactor
+    would hang with no output until the timeout. The user has already confirmed in our own dialog.
+
+    Named package only. `upgrade` with no package upgrades EVERYTHING, and pins are interdependent
+    (measured: "Incompatible version for DataFlex-dev/Web UI: 1.0.51 does not satisfy 1.0.52"), so
+    a blanket upgrade can move packages the user never looked at. The caller passes one name. */
+Function DfCliPackageUpgrade Global String sSwsFile String sPackage String[] ByRef asOutput Returns Boolean
+    String[] asLines
+    String sArgs
+
+    Move (Trim(sPackage)) to sPackage
+    If (sSwsFile = "" or sPackage = "") ;
+        Function_Return False
+
+    Move ('package upgrade --yes "' + sSwsFile + '" "' + sPackage + '"') to sArgs
+    Get DfCliCapture sArgs to asLines
+    Move asLines to asOutput
+    // df-cli owns the verdict. There is no count to fall back on: an upgrade changes a version
+    // string in place, so the dependency COUNT is identical either way.
+    Function_Return (giLastDfCliExit = 0)
+End_Function
+/*  Make the INSTALLED set match the pins, for one named package.
+
+    This is `package update`, the command [[feedback_dfcli_package_update_is_not_a_check]] warns
+    must never be used as a CHECK - because whenever the pins differ from what is installed it
+    auto-installs, and on a drifted workspace it can end BROKEN at exit 15.
+
+    Here that behaviour is exactly the point and is invoked deliberately, immediately AFTER we have
+    rewritten a git dependency's pin: the pins are now what the user asked for, and this makes the
+    checkout agree with them. Never call it speculatively; never call it to find out whether
+    something is newer. */
+Function DfCliPackageReconcile Global String sSwsFile String sPackage String[] ByRef asOutput Returns Boolean
+    String[] asLines
+    String sArgs
+
+    Move (Trim(sPackage)) to sPackage
+    If (sSwsFile = "") ;
+        Function_Return False
+
+    If (sPackage = "") ;
+        Move ('package update "' + sSwsFile + '"') to sArgs
+    Else ;
+        Move ('package update "' + sSwsFile + '" "' + sPackage + '"') to sArgs
+    Get DfCliCapture sArgs to asLines
+    Move asLines to asOutput
+    Function_Return (giLastDfCliExit = 0)
+End_Function
+Define CI_HttpGetTimeoutSecs for 20   // one small document; a package list must not hang on it
+
+/*  Fetch one small text document over HTTPS, into a string array.
+
+    DFRefactor's FIRST http call, and deliberately the same shape as everything else that leaves the
+    process: curl.exe (shipped with Windows since 1803) run through RDCRunProgramBounded - no console,
+    a deadline, output redirected to a file we then read. No new dependency, no COM object, and the
+    same deadlock protection df-cli and ls-remote already rely on.
+
+    ONLY EVER ON DEMAND. This is why package details are a popup and not a card: a fetch per row
+    would put the network between the user and a list that must open instantly. The caller is a
+    click.
+
+    Read as UTF-8 without asking for a BOM - a downloaded document has none, and the package service
+    returns UTF-8 (see feedback_dfcli_package_update_is_not_a_check's sibling lesson: the same
+    mistake mangled an apostrophe in Browse Packages).
+
+    -sS = quiet but still report errors; -L follows a redirect; --max-time bounds it inside curl as
+    well as outside. Returns an empty array on any failure - the caller says so rather than showing
+    half a document. */
+Function rfHttpGetText Global String sUrl Returns String[]
+    String[] asOut asNone
+    String sLog sLaunch sLogFolder
+    tSwsFile OwnWS
+    Integer iRunExit
+
+    Move (Trim(sUrl)) to sUrl
+    If (sUrl = "") ;
+        Function_Return asNone
+    // http/https only, the same refusal RDCOpenUrl makes - this runs a program with the string in it.
+    If (Lowercase(Left(sUrl, 8)) <> "https://" and Lowercase(Left(sUrl, 7)) <> "http://") ;
+        Function_Return asNone
+
+    Get pOwnSws of ghoApplication to OwnWS
+    Get PrimaryPrograms of ghoApplication OwnWS to sLogFolder
+    If (sLogFolder = "") ;
+        Function_Return asNone
+    Move (vFolderFormat(sLogFolder) + "dfrefactor_http.txt") to sLog
+    If (vFilePathExists(sLog)) ;
+        Move (rfDeleteFile(sLog)) to sLaunch
+
+    Move ('/c " curl.exe -sS -L --max-time ' + String(CI_HttpGetTimeoutSecs) ;
+          + ' "' + sUrl + '" > "' + sLog + '" 2>&1 "') to sLaunch
+    Send Cursor_Wait of Cursor_Control
+    Get RDCRunProgramBounded "cmd.exe" sLaunch sLogFolder CI_HttpGetTimeoutSecs to iRunExit
+    Send Cursor_Ready of Cursor_Control
+
+    If (vFilePathExists(sLog) = 0) ;
+        Function_Return asNone
+    Move (rfReadEncodedFileAsStringArrayEx(sLog, True)) to asOut
+
+    /* DELETED ONCE READ, unlike the df-cli and ls-remote logs beside it. Those are diagnostics worth
+       keeping after a failed call; this is a response BODY, already in asOut and of no use on disk -
+       it can run to any size the server likes, and it lands in the USER'S Programs folder, where it
+       turned up as an untracked file in the repo (2026-08-21). Deleting on the way in only, as the
+       first cut did, always leaves the last one behind. */
+    If (vFilePathExists(sLog)) ;
+        Move (rfDeleteFile(sLog)) to sLaunch
+    Function_Return asOut
+End_Function

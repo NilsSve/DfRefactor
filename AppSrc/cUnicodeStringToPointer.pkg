@@ -57,34 +57,17 @@
 //****************************************************************************
 Use cApplication.pkg
 Use cRefactorFuncLib.pkg
+Use cPointerConverterBase.pkg   // the type test, the name sets and the signature walk the three pointer converters share
 Use RefactorStatusPanel.pkg
 
-Class cUnicodeStringToPointer is a cObject
+Class cUnicodeStringToPointer is a cPointerConverterBase
 
     Procedure Construct_Object
         Forward Send Construct_Object
+        // The source lines (0-based) the last ParseFile rewrote - the Deep Scan's dry run reads them
+        // (cDeepScanner._PointerMoveHits, 2026-10-20). The injected iRFVoid declaration is not one.
+        Property Integer[] paiChangedLines
     End_Procedure
-
-    // True when the datatype keyword is pointer-like. DataFlex treats Address the
-    // same as Pointer for this 4539, so both qualify as a valid destination.
-    Function IsPointerLikeType String sType Returns Boolean
-        Move (Lowercase(Trim(sType))) to sType
-        Function_Return (sType = "pointer" or sType = "address")
-    End_Function
-
-    // Case-insensitive membership test. asNames is expected to already hold
-    // lowercased names.
-    Function NameInArray String[] asNames String sName Returns Boolean
-        Integer iCount iMax
-        Move (Lowercase(Trim(sName))) to sName
-        Move (SizeOfArray(asNames)) to iMax
-        Decrement iMax
-        For iCount from 0 to iMax
-            If (asNames[iCount] = sName) ;
-                Function_Return True
-        Loop
-        Function_Return False
-    End_Function
 
     // Leading whitespace (spaces / tabs) of a line, so the rewritten statement and
     // the injected declaration keep the original indentation.
@@ -100,71 +83,38 @@ Class cUnicodeStringToPointer is a cObject
         Function_Return sLine
     End_Function
 
-    // Append a name (lowercased, non-blank) to a name set.
-    Procedure AddName String[] ByRef asNames String sName
-        Move (Lowercase(Trim(sName))) to sName
-        If (sName <> "") ;
-            Move sName to asNames[SizeOfArray(asNames)]
-    End_Procedure
-
-    // Parse a Procedure/Function signature (overstruck) and collect its String and
-    // Pointer/Address PARAMETER names into the per-method sets. Parameters take the
-    // form  <Type> [ByRef|ByVal] <name>  repeated; for a Function the list ends at
-    // "Returns". The walk only acts on String / Pointer / Address type keywords and
-    // skips everything else token-by-token, so decorators ("Global"), other types
-    // (Integer, UChar[], ...) and their names stay harmlessly ignored.
-    Procedure CollectParameters String sOverSignature String[] ByRef asStringVars String[] ByRef asPointerVars
-        String[] asTokens
-        Integer  iIdx iNum
-        String   sTok sName
-        
-        Move (StrSplitToArray(Trim(sOverSignature), CS_S)) to asTokens
-        Move (SizeOfArray(asTokens)) to iNum
-        Move 2 to iIdx                              // skip Procedure|Function + the method name
-        While (iIdx < iNum)
-            Move (Lowercase(asTokens[iIdx])) to sTok
-            If (sTok = "returns") ;
-                Procedure_Return                    // a Function's return type follows - done
-            If (sTok = "string" or sTok = "pointer" or sTok = "address") Begin
-                Increment iIdx
-                If (iIdx < iNum) Begin
-                    If (Lowercase(asTokens[iIdx]) = "byref" or Lowercase(asTokens[iIdx]) = "byval") ;
-                        Increment iIdx
-                End
-                If (iIdx < iNum) Begin
-                    Move asTokens[iIdx] to sName
-                    Increment iIdx
-                    If (sTok = "string") Begin
-                        Send AddName (&asStringVars) sName
-                    End
-                    Else Begin
-                        Send AddName (&asPointerVars) sName
-                    End
-                End
-            End
-            Else Begin
-                Increment iIdx
-            End
-        Loop
-    End_Procedure
-
     // Single forward pass. For each method it gathers the String and Pointer/Address
     // names (parameters first, then body declarations), then rewrites every bare
     // "Move <string> to <ptr>" into a MemCopy call, injecting one throwaway Integer
     // per method to receive MemCopy's return. Returns the number of rewrites.
     Function ParseFile String[] ByRef asCode Returns Integer
         Integer  iCount iMax iChanges iItems iIdx
+        Integer[] aiChanged
         String   sLine sOver sType sVars sName sId1 sId2 sNewLine sMoveIndent sThrowaway
         String[] asPointerVars asStringVars asVars asTokens asOut
-        Boolean  bInMethod bIsProcDecl bIsFuncDecl bPtr bStr bId1 bId2 bIgnore bThrowawayDeclared bEmitOriginal
+        Boolean  bInMethod bIsProcDecl bIsFuncDecl bPtr bStr bId1 bId2 bIgnore bThrowawayDeclared bEmitOriginal bGate
         tTokenizer TokenizerData
 
         Move "iRFVoid" to sThrowaway
         Move 0 to iChanges
+        Set paiChangedLines to aiChanged
         Move (SizeOfArray(asCode)) to iMax
         If (iMax = 0) ;
             Function_Return 0
         Decrement iMax
+
+        // GATE (Nils 2026-07-16 perf sweep - this class MISSED the 2026-07-04 profiler round's
+        // gate that its sibling cUnicodePointerToString got): the pass tokenizes EVERY line, but
+        // a "Move <str> to <ptr>" rewrite needs a Pointer or Address declaration somewhere - no
+        // "pointer" and no "address" text ANYWHERE (raw scan; a comment hit just runs the normal
+        // pass) = nothing to rewrite.
+        Get _FileContainsText of ghoFuncLib (&asCode) "pointer" to bGate
+        If (bGate = False) Begin
+            Get _FileContainsText of ghoFuncLib (&asCode) "address" to bGate
+        End
+        If (bGate = False) ;
+            Function_Return 0
+
         Move False to bThrowawayDeclared
 
         For iCount from 0 to iMax
@@ -202,7 +152,7 @@ Class cUnicodeStringToPointer is a cObject
                 Move (ResizeArray(asPointerVars, 0)) to asPointerVars
                 Move (ResizeArray(asStringVars, 0))  to asStringVars
                 Move False to bThrowawayDeclared
-                Send CollectParameters sOver (&asStringVars) (&asPointerVars)
+                Send CollectParameters sOver (&asPointerVars) (&asStringVars)
             End
 
             If (bInMethod = True) Begin
@@ -253,6 +203,7 @@ Class cUnicodeStringToPointer is a cObject
                                 Move (sMoveIndent + "Move (MemCopy(" + sId2 + ", AddressOf(" + sId1 + "), SizeOfString(" + sId1 + "))) to " + sThrowaway) to sNewLine
                                 Move sNewLine to asOut[SizeOfArray(asOut)]
                                 Increment iChanges
+                                Move iCount to aiChanged[SizeOfArray(aiChanged)]
                                 Move False to bEmitOriginal
                             End
                         End
@@ -271,6 +222,7 @@ Class cUnicodeStringToPointer is a cObject
         If (iChanges > 0) ;
             Move asOut to asCode
 
+        Set paiChangedLines to aiChanged
         Function_Return iChanges
     End_Function
 

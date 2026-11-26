@@ -39,14 +39,32 @@ Class cRefactorExpressionParser is a cRefactorLexer
     // Expression detection / position helpers
     // ====================================================================
 
+    /* The position of a Constrain-FAMILY command on a (masked) line - Constrain, or its by-number twin
+       VConstrain (DataFlex.lng: VConstrain {file#} {field#} {mode} {value}) - 0 when neither is
+       there. Whole-word on both, so 'sConstrain' the variable never matches. One answer for the four
+       places that treat the right-hand side of a Constrain as its own mini-language (mode + value):
+       VConstrain's EQ is a mode word too, and treating it as a comparison wrapped it into
+       'VConstrain iFile (iField = vValue)' = E 4345 "#$, ARGUMENT REQUIRED" (WinServ, Nils
+       2026-08-17). */
+    Function _ConstrainCommandPos String sLine Returns Integer
+        Integer iPos iPosV
+        Get _FindKeywordPos sLine CS_Constrain True 1 to iPos
+        Get _FindKeywordPos sLine "VConstrain" True 1 to iPosV
+        If (iPosV > 0 and (iPos = 0 or iPosV < iPos)) ;
+            Move iPosV to iPos
+        Function_Return iPos
+    End_Function
+
     // Helper function to check if line contains any expressions
     Function _HasExpression String sLine Returns Boolean
         Boolean bHasParenthesis bHasLegacyOperator
         Integer iPosOperator iPosConstrain iPosFunction iPosInsert
         String sWord
 
-        // First check if this is a Constrain command
-        Move (Pos(Lowercase(CS_Constrain + " "), Lowercase(sLine))) to iPosConstrain
+        // First check if this is a Constrain command - WHOLE-WORD (LegacyApp2 'If sConstrain eq "1"': a bare
+        // Pos("constrain ") matched the SUBSTRING inside the variable 'sConstrain', so _HasExpression wrongly
+        // returned False (no parens) -> the comparison was dropped and 'eq' never modernised).
+        Get _ConstrainCommandPos sLine to iPosConstrain
         If (iPosConstrain <> 0) Begin
             // For Constrain, only return true if there are parentheses
             Move (Pos("(", sLine) <> 0) to bHasParenthesis
@@ -528,7 +546,13 @@ Class cRefactorExpressionParser is a cRefactorLexer
                         Move (Pos(sToken, Trim(TokenizerData.sLine))) to iPosLine // bFound
                     End
                 End
-                If (TokenizerData.asStringConstant[iCount].iStartPos = iPosLine) Begin
+                // Only a literal that lies IN this expression. iPosLine can be a position in the indented
+                // sLine while iStartPos is one on the trimmed line; when the indent made the two agree, a
+                // literal from further along was written past the expression's end - '(not(Found))' came
+                // back '(not(Found)) "AB"' and the rebuilt line had the literal twice (2026-09-23).
+                If (TokenizerData.asStringConstant[iCount].iStartPos = iPosLine and ;
+                    TokenizerData.asStringConstant[iCount].iStartPos >= iPos and ;
+                    TokenizerData.asStringConstant[iCount].iStartPos < (iPos + Length(sExpressionOS))) Begin
                     Move (Overstrike(sToken, sExpressionWS, (TokenizerData.asStringConstant[iCount].iStartPos - iPos +1))) to sExpressionWS
                 End
             Loop
@@ -571,9 +595,86 @@ Class cRefactorExpressionParser is a cRefactorLexer
         Function_Return sExpression
     End_Function
 
+    // sCode = '<op> <operand...> [<more of the line>]'. Returns sCode cut just before the first word that is
+    // in pasCommandFunctions (Character, Trim, Left, Mid, Pos, Replace, Pad, Insert, Length, ...) and sits
+    // at paren depth 0 AFTER the operator - see the note in _ExpressionTail. Unchanged when there is none.
+    Function _CutBeforeCommandFunctionWord String sCode Returns String
+        String[] asWords asCmdFns
+        String sWord sLow
+        Integer i iMax iDepth iPos j
+
+        Get pasCommandFunctions to asCmdFns
+        If (SizeOfArray(asCmdFns) = 0) ;
+            Function_Return sCode
+        Move (StrSplitToArray(sCode, CS_S)) to asWords
+        Move (SizeOfArray(asWords) - 1) to iMax
+        Move 0 to iDepth
+        Move 1 to iPos                                     // running 1-based position of asWords[i] in sCode
+        For i from 0 to iMax
+            Move asWords[i] to sWord
+            Move (Lowercase(Trim(sWord))) to sLow
+            If (i > 0 and iDepth = 0 and sLow <> "") Begin
+                If (SearchArray(sLow, asCmdFns) <> -1) ;
+                    Function_Return (RTrim(Left(sCode, iPos - 1)))
+            End
+            For j from 1 to (Length(sWord))
+                If (Mid(sWord, 1, j) = "(") ;
+                    Increment iDepth
+                Else If (Mid(sWord, 1, j) = ")") ;
+                    Decrement iDepth
+            Loop
+            Move (iPos + Length(sWord) + 1) to iPos       // + the separating space
+        Loop
+        Function_Return sCode
+    End_Function
+
+    /* ONE OPERAND, THEN THE NEXT COMMAND (2026-10-31, _ExpressionTail). asArray is '<op> <operand> ...' split at
+       spaces. A legacy comparison takes ONE argument after its operator - a word, a string, or one parenthesised
+       group - so when that argument is a whole token, and what follows it does not open a parenthesis (a call
+       written 'MyFunc (x)'), the tail is sCode up to the operand's end - cut from sCode, never rebuilt, because the
+       caller finds the expression on the line by its text, spaces and all. "" when the shape is not that. */
+    Function _OperandOnlyTail String sCode String[] asArray Returns String
+        Integer i iLast iOperand iNext iPos iEnd
+        Boolean bOp
+
+        Move (SizeOfArray(asArray) - 1) to iLast
+        If (iLast < 1) ;
+            Function_Return ""
+        Get _IsOperator asArray[0] to bOp
+        If (bOp = False) ;
+            Get _IsLegacyOperatorWord asArray[0] to bOp
+        If (bOp = False) ;
+            Function_Return ""
+        Move -1 to iOperand
+        Move -1 to iNext
+        Move 0 to iEnd
+        Move (Length(asArray[0]) + 2) to iPos              // 1-based position of asArray[1] in sCode
+        For i from 1 to iLast
+            If (Trim(asArray[i]) <> "") Begin
+                If (iOperand = -1) Begin
+                    Move i to iOperand
+                    Move (iPos + Length(asArray[i]) - 1) to iEnd
+                End
+                Else If (iNext = -1) ;
+                    Move i to iNext
+            End
+            Move (iPos + Length(asArray[i]) + 1) to iPos    // + the separating space
+        Loop
+        If (iOperand = -1) ;
+            Function_Return ""
+        // An unclosed group goes on over the next tokens; the counting loop takes it.
+        If (Left(Trim(asArray[iOperand]), 1) = "(" and Right(Trim(asArray[iOperand]), 1) <> ")") ;
+            Function_Return ""
+        If (iNext > -1) Begin
+            If (Left(Trim(asArray[iNext]), 1) = "(") ;
+                Function_Return ""
+        End
+        Function_Return (RTrim(Left(sCode, iEnd)))
+    End_Function
+
     Function _ExpressionTail tTokenizer ByRef TokenizerData String sCode Returns String
         Boolean bFound bFirst bParanthesis
-        Integer iLength iCount iSpaceCount iLeftParanthesis iRightParanthesis iParenthesisCount iPos
+        Integer iLength iCount iSpaceCount iLeftParanthesis iRightParanthesis iParenthesisCount iPos iDepth
         String sChar sTail sKeyWord
         String[] asArray
         tToken TokenData
@@ -591,8 +692,26 @@ Class cRefactorExpressionParser is a cRefactorLexer
         Get _NumberOfParanthesis sCode (&iLeftParanthesis) to iRightParanthesis
         Move (iLeftParanthesis > 0 or iRightParanthesis > 0) to bParanthesis
         If (bParanthesis = True) Begin
+            /* A COMMAND-FUNCTION WORD AT PAREN DEPTH 0 ENDS THE TAIL (Nils 2026-08-18, WinServ, three
+               files: 'If sFalt_sep eq (_("Tab")) Character (9) to inter' came out as
+               'If (sFalt_sep = (_("Tab")) Character (9)) to inter' - Error 52 + 4298). The keyword cut
+               below relies on pasKeyWords, and Character / Trim / Left / Mid / ... - the words that are a
+               COMMAND as well as a function - are exactly the ones a keyword list can miss (they are
+               removed from pasCommands on purpose). After the operand, such a word at depth 0 can only
+               be the next COMMAND on the line, never part of the comparison: cut before it. Depth is
+               tracked so a Trim INSIDE the operand's parens - '( Trim (sX) )' - is left alone. */
+            Get _CutBeforeCommandFunctionWord sCode to sCode
             Move (StrSplitToArray(sCode, CS_S)) to asArray
+            /* ONE OPERAND FIRST (2026-10-31). The keyword cut below relies on pasKeyWords, and DataFlex 26's
+               language lists no Calc - an obsolete command - so in the app 'eq Tuesday   Calc (dDate -1) to
+               dStart' was cut at 'to', the shortcut below was skipped, and the counting loop took 'Calc
+               (dDate -1)' into the comparison: 'If (iDay = Tuesday Calc (dDate -1)) to dStart'.
+               _OperandOnlyTail needs no keyword list. The token array is handed back as the path below hands it
+               back - the caller reads it. */
             Move asArray to TokenizerData.asLineTokens
+            Get _OperandOnlyTail sCode asArray to sTail
+            If (sTail <> "") ;
+                Function_Return sTail
             Get _FirstKeyWordInArray TokenizerData.sOverstrikeLine asArray to TokenData
             If (TokenData.iStartPos <> 0) Begin
                 Move (Pos(TokenData.sCode, sCode) -1) to iLength
@@ -602,6 +721,15 @@ Class cRefactorExpressionParser is a cRefactorLexer
             End
             If (iLength = 0) Begin
                 Get _IsOperator asArray[0] to bFound
+                /* asArray[0] IS the legacy comparison word this tail was cut at (_HasLegacyOperatorPos),
+                   and the answer must not depend on the catalogue: DataFlex 26's DataFlex.lng lists no
+                   eq/ne/gt/ge/lt/le, so in the APP _IsOperator said False here, the shortcut never fired,
+                   and an unknown command with a parenthesised argument later on the line was swallowed
+                   into the comparison - 'If (Cust.Flag = "1" MyWritePos "*" 18.7 (FONT_DEFAULT))',
+                   Error 52 six times (a workspace, 2026-09-05, one report file). The test runner, seeded from the
+                   editor settings, HAD the words and passed - the runner is not the app. */
+                If (bFound = False) ;
+                    Get _IsLegacyOperatorWord asArray[0] to bFound
                 If (bFound = True) Begin
                     // Take the "operator + one-token" shortcut UNLESS asArray[1] is an INCOMPLETE
                     // parenthesised sub-expression ÔÇö i.e. it starts with '(' but does NOT end with ')'.
@@ -619,6 +747,7 @@ Class cRefactorExpressionParser is a cRefactorLexer
             End
         End
         Move 0 to iParenthesisCount
+        Move 0 to iDepth
 
         Move (Pos(" to ", Lowercase(sCode))) to iPos
         If (iPos = 0) Begin
@@ -653,9 +782,14 @@ Class cRefactorExpressionParser is a cRefactorLexer
                 End
             End
             Else Begin
+                // The operand ends where ITS parenthesis closes (2026-10-31) - counting to the last ')' of the
+                // line took a later command's argument along: 'eq (a + b) Calc (x - 1)'.
+                If (sChar = "(") ;
+                    Increment iDepth
                 If (sChar = ")") Begin
+                    Decrement iDepth
                     Increment iParenthesisCount
-                    If (iParenthesisCount = iRightParanthesis) Begin
+                    If (iDepth <= 0 or iParenthesisCount = iRightParanthesis) Begin
                         Move iLength to iCount
                     End
                 End
@@ -671,12 +805,15 @@ Class cRefactorExpressionParser is a cRefactorLexer
     //       You need to call it again if needed.
     Function _ExtractExpressionNoParenthesis tTokenizer ByRef TokenizerData String sOverstrikeLine Returns String
         String sText sExpression sChar sChar2 sNose sTail sKeyWord sOverstrikeLineNS // NS = "No concatenating Spaces"
-        Integer iCount iLength iStart iPos
+        Integer iCount iLength iStart iPos iPosFind iPosConstrain
         Boolean bStart bStop bSpace bFound bSpace2 bTwo
 
         Move "" to sExpression
-        If (Lowercase(sOverstrikeLine) contains (Lowercase(CS_Find) + CS_S) or ;
-            Lowercase(sOverstrikeLine) contains (Lowercase(CS_Constrain) + CS_S)) Begin
+        // WHOLE-WORD Find / Constrain (LegacyApp2 'If sConstrain eq "1"': a substring 'contains' matched inside
+        // the variable 'sConstrain' (likewise 'sFind') and bailed the extraction, leaving 'eq' unconverted).
+        Get _FindKeywordPos sOverstrikeLine CS_Find True 1 to iPosFind
+        Get _ConstrainCommandPos sOverstrikeLine to iPosConstrain
+        If (iPosFind > 0 or iPosConstrain > 0) Begin
             Function_Return sExpression
         End
         Move (Length(sOverstrikeLine)) to iLength
@@ -744,7 +881,11 @@ Class cRefactorExpressionParser is a cRefactorLexer
         // `If (iThis) Constrain X.Y Eq Z` correctly extract only `(iThis)` and leave the
         // Constrain clause as standalone tokens, which ChangeLegacyOperators' Constrain
         // guard (oRefactorFuncLib.pkg line 1087) then catches and bails out cleanly.
-        Move (Pos(Lowercase(CS_Constrain + CS_S), Lowercase(sOverStrikeLine))) to iPosConstrain
+        // Boundary-aware (Nils's LegacyApp2 PurchReg.VW 'If sConstrain eq "1"'): a bare Pos("constrain ") matched
+        // the SUBSTRING inside the variable 'sConstrain', truncating the line to 'If s' -> the comparison was
+        // lost and 'eq' never modernised. _FindKeywordPos requires WHOLE-WORD 'Constrain' (a non-identifier
+        // char on both sides), so 'sConstrain' / 'Constrained_Find' no longer false-match.
+        Get _ConstrainCommandPos sOverStrikeLine to iPosConstrain
         If (iPosConstrain > 0) Begin
             Move (Trim(Left(sOverStrikeLine, iPosConstrain - 1))) to sOverStrikeLine
         End
@@ -808,8 +949,8 @@ Class cRefactorExpressionParser is a cRefactorLexer
     Function _FindFirstExpression String sOverStrikeLine String sOrg tTokenizer ByRef TokenizerData Returns String
         String sExpression sWord sValue sTarget sPosition
         Boolean bHasParenthesis bHasLegacyOperators
-        Integer iPosOperator iPosFunction iStart iEnd iLength iPosIn iPosAt iPosInsert iItem iRightPos iPosExpression
-        String sLineLower sToken sOperator
+        Integer iPosOperator iPosFunction iStart iEnd iLength iPosIn iPosAt iPosInsert iItem iPosExpression iLeftP iRightP
+        String sLineLower sToken sOperator sRightSide
 
         // Has legacy operator?
         Get _HasLegacyOperatorPos sOverstrikeLine to iPosOperator
@@ -822,9 +963,24 @@ Class cRefactorExpressionParser is a cRefactorLexer
         End
         Else Begin
             Move (iPosOperator < iPosFunction) to bHasParenthesis
-            If (bHasParenthesis = False) Begin
-                Move (RightPos(")", sOverStrikeLine)) to iRightPos
-                Move (iRightPos > iPosOperator) to bHasParenthesis
+            If (bHasParenthesis = False and iPosFunction > 0) Begin
+                // The operator sits to the RIGHT of the first '('. Route to _ExtractParenthesisExpression
+                // (bHasParenthesis True) ONLY when a paren genuinely belongs to THIS comparison:
+                //   (a) the operator is ENCLOSED - a '(' opened before it is still unclosed at the operator
+                //       (the "(WindowIndex eq FieldIndex)" inside "If (Found) Move (...)", or
+                //       "((Current_Radio(Self)) eq 0)"), OR
+                //   (b) the RIGHT operand itself opens a paren ("(a) Gt (Number(Val(...)))").
+                // Otherwise the LEFT operand is parenthesised but the RIGHT is a BARE token
+                // ("((year#/4)*4) eq year#") and the comparison must be BUNDLED (line ~863). The old test -
+                // "is there ANY ')' after the operator" (RightPos) - also fired True on a ')' belonging to a
+                // LATER, unrelated sub-expression of a chained-If line (the next condition's parens, or the
+                // "If (Not(...))" a preceding Ifnot converter emitted); it then took the parenthesis path and
+                // _ExtractParenthesisExpression returned only the LEFT group, DROPPING the "eq <right>" tail -
+                // mangling "If a If ((x)*y) eq z If ((p)*q) eq r Begin". A legacy operator (gt/ge/lt/le/eq/ne)
+                // is 2 chars, so the right operand starts at iPosOperator + 2. (Nils 2026-07-12)
+                Get _NumberOfParanthesis (Left(sOverStrikeLine, iPosOperator - 1)) (&iLeftP) to iRightP
+                Move (Trim(Mid(sOverStrikeLine, Length(sOverStrikeLine), iPosOperator + 2))) to sRightSide
+                Move (iLeftP > iRightP or Left(sRightSide, 1) = "(") to bHasParenthesis
             End
         End
 
@@ -919,9 +1075,11 @@ Class cRefactorExpressionParser is a cRefactorLexer
 
         Move sLine to sText
         Move sLine to sOrg
-        // Do nothing if a Constrain command.
-        Get _HasCommand TokenizerData.sOverstrikeLine (CS_Constrain + CS_S) to bFound
-        If (bFound = True) Begin
+        // Do nothing if a REAL Constrain command - WHOLE-WORD (the shared _HasCommand uses a substring
+        // 'contains', which false-matched the variable 'sConstrain' and suppressed the paren-wrap so 'eq'
+        // stayed legacy; LegacyApp2 PurchReg.VW 'If sConstrain eq "1"').
+        Get _ConstrainCommandPos TokenizerData.sOverstrikeLine to iPos
+        If (iPos > 0) Begin
             Function_Return False
         End
 
@@ -973,36 +1131,55 @@ Class cRefactorExpressionParser is a cRefactorLexer
     // Legacy operator handling
     // ====================================================================
 
+    /* The position of the first " <sOp> " in sLow (lowercased) that is a COMPARISON, plus 1 - the operator's own
+       first letter; 0 when there is none. THE MODE WORD OF A FIND IS NONE (2026-10-31): in 'Find lt Invoice by
+       Index.3' the lt says which record to find, and read as a comparison it made the tokenizer bundle '[Found] Find
+       lt Invoice' into one token, '((Found) Find lt Invoice)' - SplitInlineIfElseLine then took 'by' for the
+       command and wrote 'If (Found) Find lt Invoice Begin' / 'by Index.3' / 'End'. Constrained_Find takes a mode
+       the same way. */
+    Function _LegacyOperatorWordPos String sLow String sOp Returns Integer
+        String sRest sPrev
+        Integer iPos iOffset iSp
+
+        Move 0 to iOffset
+        Move sLow to sRest
+        While (sRest contains (" " + sOp + " "))
+            Move (Pos((" " + sOp + " "), sRest)) to iPos
+            Move (RTrim(Left(sRest, iPos))) to sPrev
+            Move (RightPos(" ", sPrev)) to iSp
+            Move (Right(sPrev, (Length(sPrev) - iSp))) to sPrev
+            If (sPrev <> "find" and sPrev <> "constrained_find") ;
+                Function_Return (iOffset + iPos + 1)
+            Move (iOffset + iPos + Length(sOp)) to iOffset
+            Move (Mid(sLow, Length(sLow), (iOffset + 1))) to sRest
+        Loop
+        Function_Return 0
+    End_Function
+
     Function _HasLegacyOperatorPos String sOverstrikeLine Returns Integer
         Integer iPos iPosFirst
 
         Move (Lowercase(sOverstrikeLine)) to sOverstrikeLine
         Move 2048 to iPosFirst
 
-        If (sOverStrikeLine contains " gt ") Begin
-            Move (Pos(" gt ", sOverstrikeLine) + 1) to iPos
+        Get _LegacyOperatorWordPos sOverstrikeLine "gt" to iPos
+        If (iPos > 0) ;
             Move (iPos min iPosFirst) to iPosFirst
-        End
-        If (sOverStrikeLine contains " ge ") Begin
-            Move (Pos(" ge ", sOverstrikeLine) + 1) to iPos
+        Get _LegacyOperatorWordPos sOverstrikeLine "ge" to iPos
+        If (iPos > 0) ;
             Move (iPos min iPosFirst) to iPosFirst
-        End
-        If (sOverStrikeLine contains " lt ") Begin
-            Move (Pos(" lt ", sOverstrikeLine) + 1) to iPos
+        Get _LegacyOperatorWordPos sOverstrikeLine "lt" to iPos
+        If (iPos > 0) ;
             Move (iPos min iPosFirst) to iPosFirst
-        End
-        If (sOverStrikeLine contains " le ") Begin
-            Move (Pos(" le ", sOverstrikeLine) + 1) to iPos
+        Get _LegacyOperatorWordPos sOverstrikeLine "le" to iPos
+        If (iPos > 0) ;
             Move (iPos min iPosFirst) to iPosFirst
-        End
-        If (sOverStrikeLine contains " eq ") Begin
-            Move (Pos(" eq ", sOverstrikeLine) + 1) to iPos
+        Get _LegacyOperatorWordPos sOverstrikeLine "eq" to iPos
+        If (iPos > 0) ;
             Move (iPos min iPosFirst) to iPosFirst
-        End
-        If (sOverStrikeLine contains " ne ") Begin
-            Move (Pos(" ne ", sOverstrikeLine) + 1) to iPos
+        Get _LegacyOperatorWordPos sOverstrikeLine "ne" to iPos
+        If (iPos > 0) ;
             Move (iPos min iPosFirst) to iPosFirst
-        End
         If (iPosFirst = 2048) Begin
             Move 0 to iPosFirst
         End
@@ -1040,9 +1217,12 @@ Class cRefactorExpressionParser is a cRefactorLexer
             Move (Replaces(sFromOperator, sOverStrikeLine, sToOperator)) to sOverStrikeLine
         End
 
-        // Uppercase last character
-        Move (Uppercase(sCharRight)) to sCharNew
-        Move (Replace(sCharRight, sFromOperator, sCharNew)) to sFromOperator
+        // Uppercase the LAST character only -> ' lE ' (lowercase first, UPPERCASE second). Build it
+        // from the lowercased letters, NOT from the block above (which had already uppercased the
+        // FIRST char, so 'Replace(last-char)' produced ' LE ' - duplicating the "Uppercase all" block
+        // below and NEVER trying ' lE '. That is exactly why the lower-Upper forms 'lE'/'gE'/'nE'/'eQ'
+        // were left unconverted (Nils 2026-07-13; real find 'If not arbk.arb_indat lE w_at_datum ...').
+        Move (" " + Lowercase(sCharleft) + Uppercase(sCharRight) + " ") to sFromOperator
         Move (Pos(sFromOperator, sOverStrikeLine)) to iPos
         If (iPos > 0) Begin
             Move (Replaces(sFromOperator, sOverStrikeLine, sToOperator)) to sOverStrikeLine
@@ -1097,11 +1277,117 @@ Class cRefactorExpressionParser is a cRefactorLexer
     // Indicator / Boolean extraction
     // ====================================================================
 
+    // True when the '[' at iBracketPos in sLine INDEXES the identifier directly before it - legacy
+    // SPACED indexing, e.g. 'Move asNames [iCount ] to sTerm' - rather than opening an indicator
+    // group. An indicator bracket only ever follows the line START or one of the keywords that can
+    // legally precede it: the flow words (If / Ifnot / While / Until / and / or / not / Else) and
+    // the indicator-SET forms' own words (Move / to / as / Indicate - legacy 'Move [Not Select] to
+    // [Found]', see Tokenizer test 45). Any OTHER identifier immediately before the '[' (spaces
+    // allowed) means array/string indexing. Without this the indicator converters mangled the line
+    // above into 'Move (asNames)' - dropping the index AND the destination - and
+    // DeclareRefactoredIndicators then shimmed the INDEX VARIABLE as a global Boolean (LegacyApp,
+    // 2026-07-05). '.' counts as an identifier char so Table.Field indexing is covered too.
+    Function _IsIndexBracket String sLine Integer iBracketPos Returns Boolean
+        Integer i iEnd iAsc
+        String sCh sWord
+        Boolean bIn
+
+        Move (iBracketPos - 1) to i
+        // Walk back over the whitespace between a would-be identifier and the '['.
+        Move " " to sCh
+        While (i > 0 and (sCh = " " or sCh = Character(9)))
+            Move (Mid(sLine, 1, i)) to sCh
+            If (sCh = " " or sCh = Character(9)) ;
+                Decrement i
+        Loop
+        If (i <= 0) ;
+            Function_Return False
+        // The char before the bracket must END an identifier; ')' / ']' / operators keep the
+        // conservative default (treated as a possible indicator, exactly as before).
+        Move (Mid(sLine, 1, i)) to sCh
+        Move (Ascii(sCh)) to iAsc
+        If (not((iAsc >= 65 and iAsc <= 90) or (iAsc >= 97 and iAsc <= 122) or (iAsc >= 48 and iAsc <= 57) or sCh = "_")) ;
+            Function_Return False
+        // Collect the full word ending at position i, then test it against the flow keywords that
+        // CAN legally precede an indicator bracket.
+        Move i to iEnd
+        Move True to bIn
+        While (i > 0 and bIn = True)
+            Move (Mid(sLine, 1, i)) to sCh
+            Move (Ascii(sCh)) to iAsc
+            If ((iAsc >= 65 and iAsc <= 90) or (iAsc >= 97 and iAsc <= 122) or (iAsc >= 48 and iAsc <= 57) or sCh = "_" or sCh = ".") ;
+                Decrement i
+            Else ;
+                Move False to bIn
+        Loop
+        Move (Lowercase(Mid(sLine, (iEnd - i), (i + 1)))) to sWord
+        Function_Return (sWord <> "if" and sWord <> "ifnot" and sWord <> "while" and sWord <> "until" and sWord <> "and" and sWord <> "or" and sWord <> "not" and sWord <> "else" and sWord <> "move" and sWord <> "to" and sWord <> "as" and sWord <> "indicate")
+    End_Function
+
+    // True when sName is a DataFlex runtime indicator or boolean literal that the converters neither
+    // gb-prefix NOR declare: Found / FindErr / Err (find + error), SELECT (an FMAC #Replace macro),
+    // SeqEof (sequential EOF, set by Read/Readln), and the True/False literals. ONE canonical list so
+    // _IndicatorVarName (no gb-prefix) and _UndeclaredNamedIndicatorsIn (no Global_Variable declaration)
+    // can never drift - they did: SeqEof was missing from the declaration skip, so 'Indicate seqeof True'
+    // (e.g. vWin32fh.pkg) pulled in DeclareRefactoredIndicators AND would have spliced a bogus
+    // 'Global_Variable Boolean seqeof' that clashes with the runtime indicator (Nils, 2026-07-06).
+    Function _IsBuiltInIndicatorName String sName Returns Boolean
+        String sLC
+        Move (Lowercase(Trim(sName))) to sLC
+        Function_Return (sLC = "found" or sLC = "finderr" or sLC = "err" or sLC = "select" or sLC = "seqeof" or sLC = "true" or sLC = "false")
+    End_Function
+
+    // The MODERN variable name for a converted legacy indicator (Nils 2026-07-05): USER indicators
+    // get a 'gb' prefix - '[MyFlag]' -> '(gbMyFlag)' at every rewritten use and 'Global_Variable
+    // Boolean gbMyFlag' at the declaration - so the generated global can never collide with a local
+    // of the same name ('Global_Variable Boolean Done' vs a local 'Done' = symbol clash).
+    // Pass-through (returned UNCHANGED): the runtime's own indicators (Found/FindErr/Err/SeqEof),
+    // SELECT, the True/False literals, names already carrying a gb/gib prefix, and anything that is
+    // NOT a plain identifier (parenthesised/compound expressions, dotted or digit-leading tokens) -
+    // which makes the helper safe to apply at any emission site. EVERY emitter of a converted
+    // indicator name must funnel through here (ConvertBracketIndicatorsToExpression, the multi-Not
+    // group builder below, ChangeLegacyIndicators' fallback + exit post-process,
+    // ChangeIndicatorToBoolean, DeclareRefactoredIndicators) so names stay consistent across every
+    // file of a run.
+    Function _IndicatorVarName String sName Returns String
+        Integer i iLen iAsc
+        String sLC sCh
+
+        Move (Trim(sName)) to sName
+        If (sName = "") ;
+            Function_Return sName
+        Move (Lowercase(sName)) to sLC
+        If (_IsBuiltInIndicatorName(Self, sName)) ;
+            Function_Return sName
+        If (Left(sLC, 2) = "gb" or Left(sLC, 3) = "gib") ;
+            Function_Return sName
+        // A NAME as legacy DataFlex spells one: letter/underscore start; letter, digit, underscore,
+        // '$' or '#' in the body. Measured 2026-09-13 (Nils: 'Indicator is$done' pinned as
+        // odd): DF26 takes '$' in a Global_Variable Boolean name, an #IFNDEF, a Move and an If, so the
+        // gb name simply carries it - 'gbis$done' - and _ExtractIdentifiers keeps such a name
+        // in one piece, so every emitter sees the same word. Anything else ('.', '?', a digit first)
+        // passes through unchanged, which is what keeps this helper safe at any emission site.
+        Move (Length(sName)) to iLen
+        For i from 1 to iLen
+            Move (Mid(sName, 1, i)) to sCh
+            Move (Ascii(sCh)) to iAsc
+            If (i = 1) Begin
+                If (not((iAsc >= 65 and iAsc <= 90) or (iAsc >= 97 and iAsc <= 122) or sCh = "_")) ;
+                    Function_Return sName
+            End
+            Else Begin
+                If (not((iAsc >= 65 and iAsc <= 90) or (iAsc >= 97 and iAsc <= 122) or (iAsc >= 48 and iAsc <= 57) or sCh = "_" or sCh = "$" or sCh = "#")) ;
+                    Function_Return sName
+            End
+        Loop
+        Function_Return ("gb" + sName)
+    End_Function
+
     // Returns True if source line contains the "Indicate" keyword *or* a "[" and a "]", but not a "[]", which is an array declaration.
     Function _IsIndicatorStatement String sOverStrikeLine Returns Boolean
-        Boolean bFound bIndicatorWord
-        Integer iLeft iRight
-        String sChar sLeftBracket
+        Boolean bFound bIndicatorWord bNumeric bIndex
+        Integer iLeft iRight iBracket
+        String sChar sLeftBracket sBracketBody
 
         Get IsCommentLineOrBlank sOverStrikeLine to bFound
         If (bFound = True) Begin
@@ -1121,6 +1407,27 @@ Class cRefactorExpressionParser is a cRefactorLexer
             Move (Pos(sLeftBracket, sOverstrikeLine)) to iLeft
             Move (Pos("]", sOverstrikeLine)) to iRight
             Move ((iRight - iLeft) > 1) to bFound
+            // An array index such as "[0]" is NOT a boolean indicator (those are named/system
+            // booleans like [Found] or [~bActive]). Without this guard the bare, space-separated
+            // index in "Set Form_Datatype [0] to Mask_Window" was read as a leading indicator and
+            // mangled to "Set (Form_Datatype)". (An in-paren index like daPeriodDates[0] is already
+            // masked by | pipes downstream - this covers the index that reaches the line unmasked.)
+            If (bFound = True) Begin
+                Move (Pos("[", sOverstrikeLine)) to iBracket
+                Move (Trim(Mid(sOverstrikeLine, (iRight - iBracket - 1), (iBracket + 1)))) to sBracketBody
+                Get _IsNumeric sBracketBody to bNumeric
+                If (bNumeric = True) ;
+                    Move False to bFound
+                // Spaced ARRAY INDEXING - an identifier (plus optional spaces) directly before the
+                // '[' - is not an indicator either (see _IsIndexBracket). Covers 'Move asNames
+                // [iCount ] to sTerm', whose bracket body is an IDENTIFIER, so the numeric guard
+                // above cannot catch it (LegacyApp, 2026-07-05).
+                If (bFound = True) Begin
+                    Get _IsIndexBracket sOverstrikeLine iBracket to bIndex
+                    If (bIndex = True) ;
+                        Move False to bFound
+                End
+            End
         End
         Function_Return (bIndicatorWord or bFound)
     End_Function
@@ -1201,6 +1508,22 @@ Class cRefactorExpressionParser is a cRefactorLexer
         Function_Return BooleanIndicator
     End_Function
 
+    /* The flow words that OPEN an indicator group - 'If [Found]', 'Ifnot [SeqEof]', 'While [Not Found]',
+       'Until [Found]', 'Else [X]' - are never the boolean themselves, and _ExtractLegacyBooleanContent must
+       know that WITHOUT the keyword lists. Those lists are seeded from the target install's language
+       catalogue, and a modern catalogue has dropped the obsolete 'ifnot' (DataFlex 26 lists If, While, Until
+       and Else, and no Ifnot). So in the app _IsListedWord said "not a keyword", the command word became
+       FirstBoolean, the bracket SecondBoolean, and ConvertBracketIndicatorsToExpression - nothing to emit for
+       a bracket-less first, ' and ' before the second - wrote 'ifnot ( and seqeof) begin' (2026-09-07, Error 52
+       + 4328 in a file the compiler had accepted). The test runner, seeded from the editor settings, lists
+       Ifnot and never showed it: the Indicate trap below, in its second costume. Case-insensitive, trimmed. */
+    Function _IsIndicatorFlowWord String sToken Returns Boolean
+        String sLow
+
+        Move (Lowercase(Trim(sToken))) to sLow
+        Function_Return (sLow = "if" or sLow = "ifnot" or sLow = "while" or sLow = "until" or sLow = "else")
+    End_Function
+
     // Takes a tTokenizer struct as parameter and returns a tBooleanIndicator struct.
     // Works on strings containing e.g. "[not Seqeof] Begin"
     //                             and  "Indicate Found as bTrue"
@@ -1221,7 +1544,8 @@ Class cRefactorExpressionParser is a cRefactorLexer
     Function _ExtractLegacyBooleanContent tTokenizer TokenizerData Returns tBooleanIndicator
         Integer iItem iSize iCount iIdx
         String sToken sCurrentGroup sFullExpression
-        Boolean  bFound bIndicate bExpression bSystemBoolean bHasNot bTo bAs bIsListedWord bMove
+        Boolean  bFound bIndicate bExpression bSystemBoolean bHasNot bTo bAs bIsListedWord bMove bOpenBracketTilde
+        Boolean  bIsIndicateCmd bFlowWord
         Boolean bHasLeftBracket bHasRightBracket
         tBooleanIndicator BooleanIndicator
         tOperatorsInfo OperatorsInfo
@@ -1253,7 +1577,27 @@ Class cRefactorExpressionParser is a cRefactorLexer
             Get _IsSystemBoolean sToken to bSystemBoolean
             Get _IsTokenEqual sToken CS_To to bTo
             Get _IsTokenEqual sToken CS_As to bAs
-            If (bIsListedWord = False or bSystemBoolean = True or bTo = True or bAs = True) Begin
+            /* THE 'Indicate' COMMAND WORD IS NOT A BOOLEAN. _IsListedWord cannot know that: the
+               keyword lists come from the installed DataFlex language catalogue, and Indicate is
+               OBSOLETE - modern DF does not list it (290 keywords, no Indicate among them). So the
+               gate below let the command token itself through, and on a line that STARTS with it
+               ('Indicate USE_PO as sOne EQ Y') it was captured as FirstBoolean while the real
+               target landed in SecondBoolean. ChangeLegacyIndicators emits FirstBoolean as the Move
+               target, so every such line became "Move (<expr>) to Indicate" - including
+               'Indicate Found as True', the example in that function's own {Description}
+               (Nils 2026-08-04, eight of them in one TestBench run over LegacyCode.pkg).
+
+               Excluded HERE rather than added to the keyword lists: those lists are shared by the
+               lexer and every converter, and Indicate must stay un-listed for the detectors that
+               look for it as a command. bIndicate is still set at the foot of the loop, so the
+               SecondBoolean guard that keys off "the previous token was Indicate" is unaffected -
+               and a line where the bracket comes first is unchanged, because there FirstBoolean is
+               already filled by the time this token is reached. */
+            Get _IsTokenEqual sToken CS_Indicate to bIsIndicateCmd
+            // Nor is the flow word that opens the group - 'ifnot' above all (see _IsIndicatorFlowWord).
+            Get _IsIndicatorFlowWord sToken to bFlowWord
+            If (bIsIndicateCmd = False and bFlowWord = False and ;
+                (bIsListedWord = False or bSystemBoolean = True or bTo = True or bAs = True)) Begin
 
                 // Get next token?
                 If (bTo = True or bAs = True) Begin
@@ -1269,7 +1613,17 @@ Class cRefactorExpressionParser is a cRefactorLexer
                         Move TokenizerData.asLineTokens[iItem] to sToken
                     End
                     Else Begin
+                        // "[~ err]" (a space after the tilde) tokenizes as "[~" + "err]", so stripping the
+                        // tilde leaves just "[" - the indicator NAME is stranded in the NEXT token. Pull it
+                        // in, else FirstBoolean ends up nameless + unflagged and the "[~ name]" form is never
+                        // modernized (it recurs after every recompile). A glued "[~name" keeps its own name
+                        // (the bracket-tilde guard below only fires when nothing but "[" is left).
+                        Move (Left(Trim(sToken), 1) = "[") to bOpenBracketTilde
                         Move (Replace(CS_Tilde, sToken, "")) to sToken
+                        If (bOpenBracketTilde and (Trim(Replaces("[", sToken, "")) = "") and iItem < iSize) Begin
+                            Increment iItem
+                            Move ("[" + TokenizerData.asLineTokens[iItem]) to sToken
+                        End
                     End
                     Move True to bHasLeftBracket
                 End
@@ -1317,6 +1671,10 @@ Class cRefactorExpressionParser is a cRefactorLexer
                     Move bHasLeftBracket to BooleanIndicator.AsBoolean.bHasBracket
                     Move bHasNot         to BooleanIndicator.AsBoolean.bHasNot
                     If (iItem = iSize) Begin
+                        // The tokenizer can hand the WHOLE after-as expression as one (fabricated)
+                        // token - trim a typo'd trailing ")" here too (the legacy Indicate ignored
+                        // such junk; see the multi-token branch below).
+                        Get _TrimTrailingExcessParens sToken sToken to sToken
                         Move sToken      to BooleanIndicator.AsBoolean.sCode
                     End
                     // Do we have an expression after the "as"?
@@ -1325,44 +1683,55 @@ Class cRefactorExpressionParser is a cRefactorLexer
                             // Handle multi-Not-bracket groups: e.g. [Not A Not B] and [Not C Not D]
                             // sToken = first boolean name (already past the [Not prefix).
                             // Build (Not(A) and Not(B) ...) groups, joined with outer parens.
+                            // Every name here was BRACKETED (an indicator use), so each is funneled
+                            // through _IndicatorVarName (gb-prefix; system booleans pass through).
+                            Get _IndicatorVarName sToken to sToken
                             Move ("Not(" + sToken + ")") to sCurrentGroup
                             Move "" to sFullExpression
                             Move (iItem + 1) to iIdx
                             While (iIdx <= iSize)
                                 Move TokenizerData.asLineTokens[iIdx] to sToken
-                                If (Right(sToken, 1) = "]") Begin
-                                    // End of current bracket group ÔÇö strip ] and add last boolean
-                                    Move (Left(sToken, Length(sToken) - 1)) to sToken
-                                    If (sToken <> "") Begin
-                                        Append sCurrentGroup " and Not(" sToken ")"
-                                    End
-                                    // Close and accumulate this group
-                                    If (sFullExpression = "") Begin
-                                        Move ("(" + sCurrentGroup + ")") to sFullExpression
-                                    End
-                                    Else Begin
-                                        Move (sFullExpression + " and (" + sCurrentGroup + ")") to sFullExpression
-                                    End
-                                    Move "" to sCurrentGroup
-                                End
-                                Else If (Lowercase(sToken) = "not") Begin
-                                    // Within-group Not separator ÔÇö skip; next token is the boolean name
-                                End
-                                Else If (Lowercase(sToken) = "and") Begin
-                                    // Between-group separator ÔÇö skip
-                                End
-                                Else If (sToken = "[Not") Begin
-                                    // Start-of-new-bracket-group prefix ÔÇö skip
-                                End
-                                Else Begin
-                                    // Boolean variable name ÔÇö start new group or append to current
-                                    If (sCurrentGroup = "") Begin
-                                        Move ("Not(" + sToken + ")") to sCurrentGroup
-                                    End
-                                    Else Begin
-                                        Append sCurrentGroup " and Not(" sToken ")"
-                                    End
-                                End
+                                /* ONE SUBJECT - the token - so the chain reads as what it is: a five-way sort of the
+                                   tokens inside a bracketed indicator group. Three of the arms are deliberately empty:
+                                   "not", "and" and "[Not" are SEPARATORS, and skipping them is the whole action. As a
+                                   run of Else Ifs those three read as forgotten branches; as arms they read as a list
+                                   of what carries no value. */
+                                Case Begin
+                                    Case (Right(sToken, 1) = "]")
+                                        // End of current bracket group ÔÇö strip ] and add last boolean
+                                        Move (Left(sToken, Length(sToken) - 1)) to sToken
+                                        If (sToken <> "") Begin
+                                            Get _IndicatorVarName sToken to sToken
+                                            Append sCurrentGroup " and Not(" sToken ")"
+                                        End
+                                        // Close and accumulate this group
+                                        If (sFullExpression = "") Begin
+                                            Move ("(" + sCurrentGroup + ")") to sFullExpression
+                                        End
+                                        Else Begin
+                                            Move (sFullExpression + " and (" + sCurrentGroup + ")") to sFullExpression
+                                        End
+                                        Move "" to sCurrentGroup
+                                        Case Break
+                                    Case (Lowercase(sToken) = "not")
+                                        // Within-group Not separator ÔÇö skip; next token is the boolean name
+                                        Case Break
+                                    Case (Lowercase(sToken) = "and")
+                                        // Between-group separator ÔÇö skip
+                                        Case Break
+                                    Case (sToken = "[Not")
+                                        // Start-of-new-bracket-group prefix ÔÇö skip
+                                        Case Break
+                                    Case Else
+                                        // Boolean variable name ÔÇö start new group or append to current
+                                        Get _IndicatorVarName sToken to sToken
+                                        If (sCurrentGroup = "") Begin
+                                            Move ("Not(" + sToken + ")") to sCurrentGroup
+                                        End
+                                        Else Begin
+                                            Append sCurrentGroup " and Not(" sToken ")"
+                                        End
+                                Case End
                                 Increment iIdx
                             Loop
                             // Wrap in outer parens when result spans multiple groups
@@ -1384,7 +1753,19 @@ Class cRefactorExpressionParser is a cRefactorLexer
                                 Append sToken " " TokenizerData.asLineTokens[iCount]
                             Loop
                             Move (Trim(sToken)) to sToken
-                            Move (Pos("(", sToken) and Pos(")", sToken)) to bExpression
+                            // The legacy Indicate IGNORED junk after its arguments, so a typo'd
+                            // trailing ")" was legal source - fatal once this text lands inside a
+                            // Move expression (30 unbalanced Moves on the LegacyApp replay, Nils
+                            // 2026-07-24). Trim the excess before deciding on the wrap.
+                            Get _TrimTrailingExcessParens sToken sToken to sToken
+                            // Wrap unless the text already IS one balanced paren group. The old
+                            // contains-parens check read '(A) = (B)' as wrapped - the shape this
+                            // store receives when the plan's OPERATORS row has already modernised
+                            // the Eq in an earlier engine run (plan rows run in grid order, not
+                            // alphabetical), so no fabricated outer parens arrive with the token.
+                            // The unwrapped store then emitted the illegal 'Move (A) = (B) to X'
+                            // (LegacyApp GruppLeveransOrder replay, Nils 2026-07-24).
+                            Get _IsSingleParenGroup sToken to bExpression
                             If (bExpression = False) Begin
                                 Move ("(" + sToken + ")") to sToken
                             End
@@ -1405,10 +1786,6 @@ Class cRefactorExpressionParser is a cRefactorLexer
         Function_Return BooleanIndicator
     End_Function
 
-    // ToDo: BooleanIndicator.FirstBoolean & BooleanIndicator.SecondBoolean
-    //       is only used by ChangeLegacyIndicators!
-    // *** How about changing the struct into a boolean array of indicator variables? ***
-    //
     Function _ConstructDoubleBooleanExpression tTokenizer TokenizerData Returns String
         String sExpression sToken
         Boolean bNot
@@ -1427,10 +1804,14 @@ Class cRefactorExpressionParser is a cRefactorLexer
             Append sExpression " " sToken ")"
         End
         Else Begin
+            // A space before it (2026-11-01): '[A B] Begin' came out as 'If (A andB) Begin'.
             Get ReplaceParanthesis sToken to sToken
             Move TokenizerData.BooleanIndicator.SecondBoolean.bHasNot to bNot
             If (bNot = True) Begin
                 Append sExpression " " CS_Not "("
+            End
+            Else Begin
+                Append sExpression " "
             End
             Append sExpression sToken ")"
             If (bNot = True) Begin

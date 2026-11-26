@@ -1,0 +1,224 @@
+﻿//****************************************************************************
+// $Module type: Class
+// $Module name: cParsePathPairToFilePath
+// $Author     : Nils Svedmyr, RDC Tools International, <mailto:support@rdctools.com>
+// Web-site    : http://www.rdctools.com
+//
+// Description : Collapses the legacy three-part path split
+//
+//                   Get Parse_Path  <spec> to <sPath>
+//                   Get Parse_Drive <spec> to <sDrive>
+//                   ... (sDrive + sPath) ...
+//
+//               into the one modern call that returns the same thing
+//
+//                   Get ExtractFilePath <spec> to <sPath>
+//                   ... sPath ...
+//
+//               WHY IT IS A PAIR AND NOT TWO RENAMES. ExtractFilePath is not a
+//               drop-in for Parse_Path: Parse_Path strips the drive, trims the
+//               trailing separator, and probes the DISK (a "DIR:" channel) to
+//               decide whether the last segment is a folder. Only when the drive
+//               is put back - which is what the Parse_Drive line beside it is
+//               for - do the two agree. So the unit of conversion is the pair
+//               plus the place their results are rejoined.
+//
+//               THE ONE BEHAVIOUR CHANGE, and Nils accepted it explicitly
+//               (2026-07-29, "trailing backslash acceptable"): Parse_Drive +
+//               Parse_Path gives "c:\Ide\Test" while ExtractFilePath gives
+//               "c:\Ide\Test\". Four of his six call sites put that string on
+//               screen, so a trailing backslash becomes visible there. The
+//               alternative was generated code that strips it again, which is
+//               uglier than the thing it replaces.
+//
+//               Nothing is rewritten unless EVERY use of the drive variable can
+//               be accounted for - see ParseFile's guard list. A pair it cannot
+//               fully resolve is left exactly as it was.
+//
+// This code is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+// without even the implied warranty of MERCHANTABILITY or FITNESS for a PARTICULAR PURPOSE.
+// This is free software; you can redistribute it and/or modify it under the terms of the
+// GNU Lesser General Public License - see the "GNU Lesser General Public License.txt"
+// in the help folder for more details.
+//****************************************************************************
+
+Use cRefactorFuncLib.pkg
+
+Class cParsePathPairToFilePath is a cObject
+
+    Procedure Construct_Object
+        Forward Send Construct_Object
+    End_Procedure
+
+    // The executable half of a masked line: everything before a trailing "//".
+    // Safe on the OVERSTRIKE line only, where string literals are already masked -
+    // a "//" surviving there is a real comment, never text inside a quote.
+    Function _CodePart String sOver Returns String
+        Integer iPos
+        Move (Pos("//", sOver)) to iPos
+        If (iPos > 0) ;
+            Function_Return (Left(sOver, (iPos - 1)))
+        Function_Return sOver
+    End_Function
+
+    // True when sOver is exactly "Get <sFn> <arg> to <dest>", returning the two operands.
+    // Five tokens, no more: anything else is a shape this must not touch.
+    Function _IsGetCall String sOver String sFn String ByRef sArg String ByRef sDest Returns Boolean
+        String[] asTok
+        String   sCode
+
+        Move "" to sArg
+        Move "" to sDest
+        Get _CodePart sOver to sCode
+        Get _SplitWords of ghoFuncLib sCode to asTok
+        If ((SizeOfArray(asTok)) <> 5) ;
+            Function_Return False
+        If (Lowercase(Trim(asTok[0])) <> "get") ;
+            Function_Return False
+        If (Lowercase(Trim(asTok[1])) <> Lowercase(sFn)) ;
+            Function_Return False
+        If (Lowercase(Trim(asTok[3])) <> "to") ;
+            Function_Return False
+        Move (Trim(asTok[2])) to sArg
+        Move (Trim(asTok[4])) to sDest
+        Function_Return (sArg <> "" and sDest <> "")
+    End_Function
+
+    /* Rewrite "(sDrive + sPath)" / "(sDrive - sPath)" to just "sPath".
+       DataFlex uses both operators for this join ("-" trims the left operand's trailing
+       blanks first), and the real code in the wild spells them with and without spaces,
+       so all four shapes are handled. Case-insensitive, because DataFlex identifiers are.
+       The replacement removes the "(" it matched, so it can never re-match what it just
+       wrote - the loop is bounded anyway, since a scanner that only stops when it is told
+       to is one bad return away from hanging a refactoring run. */
+    Function _ReplaceConcat String sLine String sD String sP Returns String
+        String   sOut sLow sCand
+        String[] asCand
+        Integer  i iPos iLen iGuard
+
+        Move ("(" + sD + " + " + sP + ")") to asCand[0]
+        Move ("(" + sD + "+"   + sP + ")") to asCand[1]
+        Move ("(" + sD + " - " + sP + ")") to asCand[2]
+        Move ("(" + sD + "-"   + sP + ")") to asCand[3]
+        Move sLine to sOut
+        For i from 0 to 3
+            Move (Lowercase(asCand[i])) to sCand
+            Move (Length(asCand[i])) to iLen
+            Move 0 to iGuard
+            Move (Pos(sCand, Lowercase(sOut))) to iPos
+            While (iPos > 0 and iGuard < 50)
+                Increment iGuard
+                Move (Left(sOut, (iPos - 1)) + sP + Mid(sOut, ((Length(sOut)) - iPos - iLen + 1), (iPos + iLen))) to sOut
+                Move (Pos(sCand, Lowercase(sOut))) to iPos
+            Loop
+        Loop
+        Function_Return sOut
+    End_Function
+
+    /* One file. Returns the number of PAIRS collapsed (each removes one line).
+
+       GUARDS - nothing is rewritten unless all of them hold:
+         1. "Get Parse_Path <spec> to <P>" followed by the next CODE line
+            "Get Parse_Drive <spec> to <D>", both naming the SAME <spec>.
+         2. <D> and <P> are different names (a pair writing both halves into one
+            variable is doing something this does not model).
+         3. The Parse_Drive line carries no trailing comment - it is DELETED, and a
+            comment must never disappear with it. The Parse_Path line may carry one:
+            it is renamed in place, so the comment survives.
+         4. After rewriting every "(D +/- P)" join, <D> appears nowhere else but its
+            own declaration. Anything left means a use this cannot account for, and
+            the whole pair is abandoned - the two-pass structure below exists so that
+            "abandoned" means the file is untouched, not half-converted. */
+    Function ParseFile String[] ByRef asCode Returns Integer
+        Integer  iCount iMax iChanges iNext iUses iItems iIdx
+        String   sLine sOver sSpec sPath sSpec2 sDrive sIndent
+        String[] asTrial
+        Integer[] aiDelete
+        Boolean  bGate bOK bCancel
+        tTokenizer TokenizerData
+
+        Move 0 to iChanges
+        Move (SizeOfArray(asCode)) to iMax
+        If (iMax = 0) ;
+            Function_Return 0
+        Decrement iMax
+
+        // Cheap raw pre-gate, like every other whole-file scanner: no "parse_path"
+        // anywhere means there is nothing here for this pass to do.
+        Get _FileContainsText of ghoFuncLib (&asCode) "parse_path" to bGate
+        If (bGate = False) ;
+            Function_Return 0
+
+        Move False to bCancel
+        For iCount from 0 to iMax
+            If (bCancel = False) Begin
+                Move asCode[iCount] to sLine
+                If (Mod(iCount, 20) = 0 and Active_State(ghoStatusPanel) = True) Begin
+                    Send Update_StatusPanel of ghoStatusPanel ("Source line:" * String(iCount + 1) * "of:" * String(iMax + 1))
+                    Set piPosition of ghoProgressBar to (iCount + 1)
+                    Get pbUserCancelRequested of ghoEngine to bCancel
+                End
+
+                Get Tokenizer of ghoFuncLib sLine to TokenizerData
+                Move TokenizerData.sOverstrikeLine to sOver
+                Get _IsGetCall sOver "Parse_Path" (&sSpec) (&sPath) to bOK
+                If (bOK = True) Begin
+                    // The next line that is not blank.
+                    Move (iCount + 1) to iNext
+                    While (iNext <= iMax and Trim(asCode[iNext]) = "")
+                        Increment iNext
+                    Loop
+                    If (iNext <= iMax) Begin
+                        Get Tokenizer of ghoFuncLib asCode[iNext] to TokenizerData
+                        Get _IsGetCall (TokenizerData.sOverstrikeLine) "Parse_Drive" (&sSpec2) (&sDrive) to bOK
+                        // Guard 1 + 2 + 3.
+                        If (bOK = True and Lowercase(sSpec) = Lowercase(sSpec2) ;
+                            and Lowercase(sDrive) <> Lowercase(sPath) ;
+                            and Pos("//", asCode[iNext]) = 0) Begin
+                            /* Guard 4, on a TRIAL COPY. Rewriting the joins first and only then
+                               asking whether anything still names the drive is the only order that
+                               can answer honestly - and doing it on a copy means a pair that fails
+                               the question costs nothing. */
+                            Move asCode to asTrial
+                            Move ""     to asTrial[iNext]
+                            Move (SizeOfArray(asTrial) - 1) to iItems
+                            For iIdx from 0 to iItems
+                                If (iIdx <> iCount and iIdx <> iNext) Begin
+                                    Get _ReplaceConcat asTrial[iIdx] sDrive sPath to asTrial[iIdx]
+                                End
+                            Loop
+                            Get _WordUsesOutsidePair of ghoFuncLib (&asTrial) sDrive iCount iNext to iUses
+                            If (iUses <= 1) Begin       // its declaration, and nothing else
+                                Move asTrial to asCode
+                                Get _LineIndent of ghoFuncLib sLine to sIndent
+                                Move (sIndent + "Get ExtractFilePath " + sSpec + " to " + sPath) to asCode[iCount]
+                                Move (RTrim(sLine)) to sLine
+                                // The renamed line keeps its own trailing comment, if it had one.
+                                If (Pos("//", sLine) > 0) ;
+                                    Move (asCode[iCount] + "   " + Mid(sLine, ((Length(sLine)) - (Pos("//", sLine)) + 1), (Pos("//", sLine)))) to asCode[iCount]
+                                Move iNext to aiDelete[SizeOfArray(aiDelete)]
+                                Increment iChanges
+                            End
+                        End
+                    End
+                End
+            End
+        Loop
+
+        // The deletions in ONE rebuild after the walk (_RemoveLinesAt).
+        Send _RemoveLinesAt of ghoFuncLib (&asCode) aiDelete
+
+        If (Active_State(ghoStatusPanel) = True) ;
+            Set piPosition of ghoProgressBar to (iMax + 1)
+
+        Function_Return iChanges
+    End_Function
+
+    // Public entry. One source file as a String ByRef array.
+    Function ChangeParsePathPairToExtractFilePath String[] ByRef asCode Returns Integer
+        Integer iChanges
+        Get ParseFile (&asCode) to iChanges
+        Function_Return iChanges
+    End_Function
+
+End_Class
