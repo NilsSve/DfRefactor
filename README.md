@@ -74,7 +74,7 @@ The workspace contains these programs:
 
 ## Adding refactoring functions
 
-New functions go into the function library, `AppSrc\oRefactorFuncLib.pkg` (or `AppSrc\UserDefinedRefactorFunctions.pkg` for your own). A function is registered with the `{ Published = True }` meta-tag above it, and its `{ Description }` meta-tag says what kind of function it is and how it appears in the program:
+New functions go into the function library: `AppSrc\oRefactorFuncLib.pkg`, or the `AppSrc\*RefactorFunctions.inc` file of the function's family (or `AppSrc\UserDefinedRefactorFunctions.pkg` for your own). A function is registered with the `{ Published = True }` meta-tag above it, and its `{ Description }` meta-tag says what kind of function it is and how it appears in the program:
 
 ```
 { Published = True }
@@ -89,6 +89,15 @@ New functions go into the function library, `AppSrc\oRefactorFuncLib.pkg` (or `A
 The `MethodType` decides what the function receives: one source line at a time (`eStandardFunction`, `eRemoveFunction`), a whole file as a string array (`eEditorFunction`, `eOtherFunction`, `eReportFunction`), or all selected files at once (`eOtherFunctionAll`, `eReportFunctionAll`). A line-by-line function has the interface `String ByRef sLine` plus an optional `String sParameter`, and returns True when it changed the line.
 
 The help's **How It All Works** page describes all the meta-tags, and how to connect a function to the compiler message it fixes.
+
+### Working with an AI coding assistant
+
+[`AGENTS.md`](AGENTS.md) describes the project for AI coding assistants - and is a good read for anyone
+about to change the code: how to build and test, how the function library is organised, the rules for
+adding a refactoring function, and the few things that must never be done (such as writing a customer's
+name into the source). Codex, Cursor, GitHub Copilot and other tools that follow the `AGENTS.md`
+convention read it on their own; Claude Code reads it through [`CLAUDE.md`](CLAUDE.md). If your tool
+reads a different file name, point it at `AGENTS.md`.
 
 ---
 
