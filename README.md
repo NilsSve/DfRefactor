@@ -150,5 +150,6 @@ UnitTests64.exe -c -o "results.xml"
 
 * Bug reports and ideas: [Issues](https://github.com/NilsSve/DfRefactor/issues)
 * Questions and suggestions: [Discussions](https://github.com/NilsSve/DfRefactor/discussions)
+* Want to contribute? Read [CONTRIBUTING.md](CONTRIBUTING.md) — new refactoring functions, fixes, tests and legacy code samples are all welcome.
 
 Need a refactoring function that isn't in the library, or help with a full legacy-code migration? RDC Tools International can design, implement and unit-test one for your code base — see the **Feedback** page of the help.

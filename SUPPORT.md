@@ -7,7 +7,7 @@ DFRefactor is open source and MIT licensed. There are two paths for support, dep
 ## Community support (free)
 
 - **Bug reports and feature requests** — open an issue on the GitHub repository. Include the DataFlex version, a short code snippet that triggers the problem, and what you expected to happen.
-- **Pull requests** — welcome, especially for new refactoring functions. See [CLAUDE.md](CLAUDE.md) for the architecture overview and the meta-tag conventions a new refactoring function needs to follow.
+- **Pull requests** — welcome, especially for new refactoring functions. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute, and [AGENTS.md](AGENTS.md) for the architecture overview and the meta-tag conventions a new refactoring function needs to follow.
 - **Direct contact** — email [support@rdctools.com](mailto:support@rdctools.com).
 - **If DFRefactor saves you a week of manual refactoring**, the [Ko-fi link in `FUNDING.yml`](FUNDING.yml) keeps the maintainer caffeinated.
 
