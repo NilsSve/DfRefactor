@@ -223,6 +223,8 @@ construction.
 
 - `AppSrc/LegacyCode.pkg` — the TestBench's input; tracked as a public sample. Change it freely while testing, but don't commit those changes. **(maintainer only)** It is marked `skip-worktree` in the maintainer's checkout for that reason.
 - `AppSrc/RefactoredCode.pkg` — output of TestBench runs (gitignored).
+- `Data/ScintillaEdit.json` — the user's editor settings (gitignored). Until it exists, the tracked `Data/ScintillaEdit.default.json` is read instead: it holds the DF language row (keywords, operators, comment markers) that nothing else supplies.
+- **Database version**: `CN_DbVersionNeeded` (`RefactorConstants.h.pkg`) is the version of the newest `DUF_MultipleTablesX_X.pkg` that `DUFUpdateProgram.src` Uses — bump the two together. A program whose database is older runs `DUFUpdateProgram64.exe` at startup (`DoDatabaseUpdateStuff.pkg`; `UnitTests.src` has its own copy of the check). A fresh clone's database is always older.
 - `Data/` — the DataFlex database; tracked as the shipped starting data. Don't commit the changes a test run makes to it. **(maintainer only)** Marked `skip-worktree` in the maintainer's checkout.
 
 ### Batch / Command-line Mode
