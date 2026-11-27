@@ -8,25 +8,32 @@ DFRefactor is an automated code refactoring tool for DataFlex source code, devel
 
 ## Building
 
-This project is compiled using the DataFlex IDE (Studio). The project configuration file is `AppSrc/DFRefactor.cfg` (main app) and `AppSrc/TestBench.cfg` (test bench). There is no command-line build system — open the `.sws` workspace file in DataFlex Studio and compile from there. The target platform is x64 (`64BitSuffix=64`).
+DataFlex **26.0**, x64 (`64BitSuffix=64`, so a program builds as `<Name>64.exe`). The workspace is **`DFRefactorFlexTron.sws`** (JSON format) in the repo root: open it in DataFlex Studio and compile there. Its `libraries` block pins every library by version, and the Studio's package manager (or `df-cli config DFRefactorFlexTron.sws`) installs them; `Programs\Config.ws` is generated from it and stays tracked. Outside the Studio, `df-cli build-file` compiles one program; build into a scratch `--output-dir`, never into `Programs\`.
 
 ## Programs (Entry Points)
 
-There are four compiled programs in `AppSrc/`:
+The workspace's projects, all in `AppSrc/`:
 
 | Source file | Purpose |
 |---|---|
-| `DFRefactor.src` | Main production application |
+| `DFRefactorFT.src` | The main program — the FlexTron (web-control) user interface |
+| `DFRefactor.src` | The classic Windows user interface, same engine |
 | `TestBench.src` | Interactive test bench for developing/testing refactoring functions |
-| `UnitTests.src` | Automated unit test runner (uses DFUnit framework) |
-| `CompiledRefactoredCode.src` | Wrapper for the refactored output of LegacyCode.pkg to RefactoredCode.pkg |
+| `UnitTests.src` | The DFUnit test program |
+| `DUFUpdateProgram.src` | Database updater (DUF), run before the main program when the schema changes |
+| `MetaTagCheck.src` | Maintainer tool: checks multi-line meta-tag values against the DF26 compiler limits that crash a build silently |
+| `FunctionHelpGen.src` | Maintainer tool: writes the manual's function reference out of the meta-tags (markdown for HelpNDoc) |
+| `HarvestWin32Projection.src` | Maintainer tool: merges Win32 API rows into `Data\WinAPICatalog.json` / `WinAPIStructCatalog.json` |
+
+`CompiledRefactoredCode.src` (a wrapper that compiles the TestBench output) and `ScintillaControlProbe.src` are tracked but are not workspace projects — never build `CompiledRefactoredCode`.
 
 ## Running Tests
 
-- **Unit tests**: Run `UnitTests.exe` (compiled from `UnitTests.src`). Test fixtures are defined in `AppSrc/oUnit_Tests.pkg` and additional test packages under `AppSrc/Tests/`. Each test procedure must have the `{Published = True}` meta-tag to be discovered.
-- **Interactive testing**: Run `TestBench.exe`. It processes the code in `AppSrc/LegacyCode.pkg` (gitignored working file) through refactoring functions and shows results side-by-side, in `AppSrc/RefactoredCode.pkg`(gitignored working file).
+- **Unit tests**: build and run `UnitTests64.exe` (from `UnitTests.src`). Headless: `UnitTests64.exe -c -o results.xml` (`-c` console/CI mode, `-o` writes JUnit XML); `--list` lists the tests and `--filter <text>` runs only matching ones (no match = exit -1). The fixtures are the `AppSrc/o*-Tests.pkg` files, pulled in by `AppSrc/oUnit_Tests.pkg`; `AppSrc/Tests/` holds sample *input* files, not fixtures. Each test procedure needs `{ Published = True }`. Since DFUnit 0.1.2 an error raised inside a test **fails** that test.
+- `UnitTests.src` is a plain `cApplication`, so it carries stubs for what the code under test asks the real application object (`psTargetPkgFolder`, `SavedPlanJsonPath`, `WorkspaceSourceRoots`, …). A new `Get … of ghoApplication` in tested code may need a stub there.
+- **Interactive testing**: run `TestBench64.exe`. It runs the code in `AppSrc/LegacyCode.pkg` through refactoring functions and shows the result side-by-side, in `AppSrc/RefactoredCode.pkg` (gitignored).
 
-To run a single test fixture, the `TearDown` procedure calls `Send _InitializeFuncLib of ghoFuncLib` to reset state between tests.
+Between tests the fixture's `TearDown` sends `_InitializeFuncLib of ghoFuncLib` to reset the function library's state.
 
 ## Architecture
 
@@ -35,7 +42,7 @@ To run a single test fixture, the `TearDown` procedure calls `Send _InitializeFu
 ```
 cRefactorApplication  (AppSrc/cRefactorApplication.pkg)
     └── Application-wide settings, workspace management
-    └── Uses cRefactorFileIO.pkg for file I/O — DF26-compatible global
+    └── Uses RefactorFileIO.pkg for file I/O — DF26-compatible global
         functions that replaced the old cFilesystem submodule (removed,
         along with its ghoFileSystem handle) and absorbed DUF's channel-based
         file I/O (core code no longer routes file I/O through DUF)
@@ -78,15 +85,15 @@ cRefactorFuncLib      (AppSrc/cRefactorFuncLib.pkg)
     └── Adds RegisterInterface meta-tag parsing logic
     └── IsMetaTag global function for parsing {Description} compound tags
 
-oRefactorFuncLib      (AppSrc/oRefactorFuncLib.pkg + six *RefactorFunctions.inc files)
+oRefactorFuncLib      (AppSrc/oRefactorFuncLib.pkg + eight *RefactorFunctions.inc files)
     └── Instantiates cRefactorFuncLib
     └── Global handle: ghoFuncLib
     └── Holds ALL public refactoring functions, decorated with meta-tags — but
-        SPLIT ACROSS SEVEN FILES (2026-09-01), six of them #Include'd into the
-        object. Searching only the .pkg misses 65 of the 120 functions.
+        SPLIT ACROSS NINE FILES (2026-09-01, two more 2026-11-27), eight of them
+        #Include'd into the object. Searching only the .pkg misses most of them.
 ```
 
-**The function library is seven files.** `oRefactorFuncLib.pkg` plus one `.inc` per family, each `#Include`d inside the `Object … End_Object` block so they compile as if written there:
+**The function library is nine files.** `oRefactorFuncLib.pkg` plus one `.inc` per family, each `#Include`d inside the `Object … End_Object` block so they compile as if written there:
 
 | file | holds | rule |
 |---|---|---|
@@ -97,6 +104,8 @@ oRefactorFuncLib      (AppSrc/oRefactorFuncLib.pkg + six *RefactorFunctions.inc 
 | `CommandToFunctionRefactorFunctions.inc` | `<Cmd> <arg> to <dest>` → `Move (<Cmd>(<arg>)) to <dest>` | — |
 | `CodeJockRefactorFunctions.inc` | legacy controls → CodeJock | — |
 | `CommentOutRefactorFunctions.inc` | constructs retired by commenting out | — |
+| `ReportRefactorFunctions.inc` | workspace reports — change nothing, write a worksheet | — (some reports belong to the Cleanup and Unicode64 groups) |
+| `CollisionRefactorFunctions.inc` | DF 25/26 name collisions (4544, 4390, 4345, 4379): rename, align, guard, drop arguments | — |
 
 To find a function, search them all: `grep -n "^    Function " AppSrc/oRefactorFuncLib.pkg AppSrc/*.inc`.
 
@@ -141,11 +150,17 @@ Every refactoring function in the function library must declare its type via `{M
        """ }
    ```
 3. Optional: add `{EnumList}`, `{InitialValue}`, and `{ParamHelp}` meta-tags inside `{Description}` if the function takes an `sParameter` enum argument. `{InitialValue}` is the **first-use default / fallback only** — a user's chosen parameter persists across program restarts and is *not* reset to `{InitialValue}` on every launch (the startup meta-data sync applies it only when the stored value is blank or is no longer one of the `{EnumList}` values).
+
 4. Optional: add `{ Private = True }` inside `{Description}` for functions defined in `UserDefinedRefactorFunctions.pkg` that should *not* be included in the JSON Export/Import file. The export skips private functions and warns which ones were excluded.
+
 5. **Wire it into the Modernization Analyzer** (if the function fixes a compiler message): add a `{ ModRecipe = "<msg#> | <match-text> | [category]" }` sub-tag inside `{Description}`. `<match-text>` disambiguates functions that share a message number (omit it for single-function messages); it matches the message text as a **substring**, which the stem families rely on (`4298 | DFWRITE` covers DFWRITELN and DFWRITEEOL) — write it as `symbol: X` when X must match as a **whole symbol** only, the form the undefined-symbol errors need (`4328 | symbol: DATETIME` must not fire on DWHIGHDATETIME); `[category]` is `AutoFix` (default), `Suggest`, or `Explain`. The function name is implicit, and the analyzer's suggested-fix hint is the `{Description}` first line. Tag order inside `{Description}` no longer matters — `ParseHelpTopic` consumes only `{ParamHelp}`'s own lines (until 2026-07-05 it swallowed every remaining line, so tags after `{ParamHelp}` were silently lost and the startup sync then blanked `Functions.SummaryText`). Repeat the tag for a function that fixes more than one message. After adding or changing a `{ModRecipe}`, bump `CI_ModAnalyzerRecipeVersion` (top of `cModAnalyzer.pkg`) so the recipe table and `ModAnalyzerRecipes.json` reseed. (The `_AddMetaTagRecipes` loop in `cModAnalyzer.pkg` reads these tags off `ghoFuncLib`; Explain-only recipes that have no refactor function stay hardcoded in `BuildDefaultRecipes`.) **Mind the `{Description}` size limit** — for a large function, relocate example/limitation prose into a `/* … */` block comment above `{Published = True}` to make room for the tag. (The function library's function-header comments are `/* */` blocks, not `//` lines — match that style.)
+
 6. **JSON Export / Import knows about the split, but only one way.** Export reads the whole `#Include` set (`cExportImportFunctions.ReadCodeLibraryWithIncludes`), so every function's source round-trips out. Import can only write `oRefactorFuncLib.pkg` itself, so it **refuses** any function defined in an `.inc` and names the file — writing it into the `.pkg` would add a second definition. Apply those by hand.
+
 7. **Note**: Earlier versions of DataFlex Studio had Code Explorer and Code Completion issues with triple-quote strings in `{Description}`. This is resolved in DF 26.
+
 8. **Mid-loop cancel detection** (only relevant for `eOtherFunction` / `eOtherFunctionAll` types that iterate over many lines or files internally): if you want the user to be able to cancel quickly during your function's own inner loop, use `Get pbUserCancelRequested of ghoEngine to bCancel` and exit your local loop when it returns True. **Never call `Get Cancel_Check of ghoEngine`** — that's the engine's cancel pipeline (it deactivates the status panel and pops the YesNo) and calling it from inside a refactor function silently consumes the cancel signal, leaving the engine grinding through the rest of the workspace while the program appears locked up. See `cRefactorEngine.pkg`'s `pbUserCancelRequested` for the rationale, and `UserDefinedRefactorFunctions.pkg` for the canonical code pattern.
+
 9. **Per-file progress bar** (whole-file types — `eOtherFunction` / `eReportFunction` / `eEditorFunction` / `eOtherFunctionAll` / `eReportFunctionAll`): the engine only auto-advances the per-file progress bar for line-by-line (`eStandardFunction` / `eRemoveFunction`) functions, because a whole-file function is one call per file. **Your function must nudge the bar itself** inside its line loop — every ~20 lines, guarded so it is a no-op when no panel shows: `If (Mod(iCount, 20) = 0 and (Active_State(ghoStatusPanel) = True)) Begin` … `Send Update_StatusPanel of ghoStatusPanel (...)` + `Set piPosition of ghoProgressBar to (iCount + 1)` … `End`. See `cUnicodePointerToString.pkg` or `ChangeDfTimerTocTimer` for the pattern. (An engine-side "set the bar to full after the call" does NOT work — it flashes full then resets per file; the bar must fill *as you scan*.)
 
 ### Updating the Deep Scan Catalog (BuildDefaultDeepScanRules)
@@ -157,92 +172,36 @@ The Deep Scan rules seed lives in `AppSrc/cDeepScanner.pkg` (`BuildDefaultDeepSc
 - **Two version bumps, always**: `CI_DeepScanRulesVersion` (`RefactorConstants.h.pkg`) — without it the change never reaches an existing `DeepScanRules.json` (the file wins while versions match; the bump reseeds and merges the user's Enabled toggles by DS number) — and `CI_ModAnalyzerRecipeVersion` (`cModAnalyzer.pkg`) — the rules double as analyzer recipes and stay dormant in the grid/plan until the recipe table reseeds.
 - A new detection *shape* needs a new `eDS*` kind (`RefactorConstants.h.pkg`) plus a `_RuleMatchesLine` branch and a `ScanLines` pre-gate. Tests go in `oDeepScanner-Tests.pkg`: the legacy form hits, the modern look-alike does not.
 
-### Git Submodules (Libraries/)
+### Libraries (DataFlex packages)
 
-Five submodules, all DIRECT children of `Libraries/` (2026-07-23 restructure: `RDCToolsLib`, `DFAbout`
-and `vwin32fh` used to be nested submodules *inside* DUF; they were untangled and are now parallel to
-it, listed in the workspace `.sws` `[Libraries]` alongside the rest — DUF no longer carries nested
-submodules):
+Every library the build uses comes from a **package pin** in `DFRefactorFlexTron.sws` (by version), installed under the machine's `DfPkg` folder — those installed copies are read-only and are what compiles:
 
-| Submodule | Purpose |
-|---|---|
-| `Libraries/DFUnit` | Unit testing framework (provides `cTestFixture`) |
-| `Libraries/DUF` | DbUpdateFramework — database schema migrations |
-| `Libraries/RDCToolsLib` | Shared RDC Tools classes (`cRDCCJCommandBarSystem`, `cRDCAutoCreateNewID`, grid subclasses) |
-| `Libraries/DFAbout` | About-dialog package (`DfAbout.pkg`, `cAboutModalPanel`) |
-| `Libraries/vwin32fh` | Windows file-handling functions (`vWin32fh.pkg` — `vFilePathExists`, `vFolderFormat`, …) |
+| Library | Repository | Holds |
+|---|---|---|
+| DFUnit | `NilsSve/Library-DFUnit` | unit testing framework (`cTestFixture`) |
+| DUF | `NilsSve/Library-DUF` | DbUpdateFramework — database schema updates |
+| RDCToolsLib | `NilsSve/Library-RDCToolsLib` | shared RDC classes (`cRDCCJCommandBarSystem`, `cRDCModalPanel`, grid subclasses, …) |
+| DFAbout | `NilsSve/Library-DFAbout` | About dialog (`DfAbout.pkg`) |
+| vwin32fh | `NilsSve/Library-vwin32fh` | Windows file functions (`vWin32fh.pkg`) |
+| RDCFlexTron | `NilsSve/Library-RDCFlexTron` | the FlexTron toolkit (see below) |
 
-Submodule remotes/branches (see `.gitmodules`): `DFUnit` → `NilsSve/Library-DFUnit.git` branch `release` (a maintained fork); `vwin32fh` → `NilsSve/Library-vwin32fh.git` branch `master`; the other three → `NilsSve/Library-<name>.git` branch `main`. There is no `SciControlLib` submodule: it was retired and the Scintilla integration now lives directly in `AppSrc/` (`ScintillaApi.h.pkg`, `RefactorDllLoader.pkg`, …).
+Plus the Data Access packages `Web UI FlexTron` and `Web UI Material Theme` (`dependencies`).
 
-The superproject only records a pinned commit (gitlink) per submodule; it does not contain their files. **First-time setup after cloning: run `git submodule update --init --recursive` once**, then `git config submodule.recurse true` so future pulls keep the libraries in sync automatically. Re-run the update command if `Libraries\` looks empty/out of date or a submodule is added.
+To change a library: change it in its own clone, commit, tag a release and push there, then move the `version` pin in the `.sws`; the Studio (or `df-cli config DFRefactorFlexTron.sws`) installs it. A library that pins another library (RDCFlexTron pins RDCToolsLib) must name the same version as this workspace.
 
-**Pitfall:** GitHub Desktop pushes only the superproject, not new submodule commits. After committing inside a submodule, push it explicitly (e.g. `git -C Libraries/DFUnit push origin release`) before/with the superproject push, or collaborators' fetch fails with `not our ref <sha>`.
+`Libraries/` still holds four git submodules (DUF, RDCToolsLib, DFAbout, vwin32fh). The build does not read them; they are left over from before the package pins. Don't edit library code there expecting it to compile in.
 
-### Two repositories: `flextron` (private) and `origin` (public)
+### The repository is public
 
-Day-to-day work goes to **`flextron`** — the private remote. `origin` is the **PUBLIC**
-`NilsSve/DfRefactor` repo and lags well behind; it is brought forward by a curated,
-FlexTron-excluded catch-up, never by pushing a branch.
+`NilsSve/DfRefactor` is **public** (since 2026-11-26; the former private FlexTron repository is archived). Work on `master` and push `origin master`.
 
-**Never type `git push origin <anything>` casually.** A bare `git push` goes to the tracking
-remote, which is private. `git push origin master` is safely rejected non-fast-forward, but
-`git push origin HEAD` from a feature branch silently creates a new PUBLIC branch carrying full
-FlexTron history. **Read the push output — `[new branch]` on a branch you expected to be tracked
-is the tell.**
-
-**No FlexTron file goes into the public repo**, at least until the two workspaces are merged. The
-name says which files those are:
-
-- **classes**: `cFT<Component>.pkg`, the file named after the class (`cFTWebHtmlBox.pkg`,
-  `cFTModalPanel.pkg` ...; since 2026-09-21, replacing the old `<Framework>FT` suffix);
-- **every other package**: the `FT` prefix (`FTMarkupBuilders.pkg`, `FTDashIcons.pkg`,
-  `FTConstants.h.pkg` ...; since 2026-09-23, replacing the `xxxFT.pkg` suffix);
-- **views, dialogs and the program**: the `FT` suffix (`DashboardFT.vw`, `MessageBoxFT.dg`,
-  `DFRefactorFT.src`) - each is the twin of a non-FT original.
-
-A public push is prepared in a throwaway worktree off `origin/master`, and must pass THREE leak
-checks before it is pushed as `git push origin <tmp>:master`:
-
-```bash
-git diff --cached --name-status                       # 1. the staged change set
-git ls-files | grep -E "FT\.|/c?FT[A-Z]"              # 2. tree level - no FT-named file (suffix, FT* or cFT*)
-git ls-files -z '*.pkg' '*.src' '*.vw' '*.dg' '*.inc' '*.dd' \
-  | xargs -0 grep -lIE "(Use|#Include)[[:space:]]+([A-Za-z_0-9]*FT|c?FT[A-Z][A-Za-z_0-9.]*)\.(pkg|vw|dg|inc)"
-                                                      # 3. no NON-FT file that REFERENCES one
-```
-
-Check 2 is case-sensitive on purpose (with `-i`, `FT\.` also matches a name like `draft.md`), and
-check 3 runs `-z` / `-0` because a tracked file name with a space splits a plain `xargs`. Before
-2026-09-23 both patterns missed the `FT`-prefixed packages.
-
-Check 3 exists because checks 1 and 2 both look for FT *files* and neither catches a non-FT file
-that `Use`s one — which fails the public build on a missing include rather than on anything
-obviously FlexTron-related. On 2026-09-23 it lists 15 such files: nine `Use FTThemeColors.pkg`
-(`DFRefactor.src`, `TestBench.src`, `UnitTests.src`, `FunctionHelpGen.src`,
-`SelectWorkspace.dg`, `cCmdLinkButton.pkg`, `cCompilerOutputContextMenu.pkg`, `cWSTextBox.pkg`,
-`oCmdLnkButtonContextmenu.pkg` - it holds the programs' shared colour accessors, and itself Uses
-`FTConstants.h.pkg`), three `Use FTRefactorGridToolTip.pkg` (`cRefactorCJGrid.pkg`,
-`CompilerOutput.dg`, `oUnit_Tests.pkg`), `cDfCliPackages.pkg` Uses `cFTLibraryReport.pkg`, and
-**`ScintillaParameters.dg`** and **`DropSelfConfirm.dg`** `Use cFTModalPanel.pkg`. Where the shared
-colour accessors should live is still open. The two dialogs are simpler. `cFTModalPanel` is
-FlexTron-only (`cFTModalPanel.pkg`, from the Library-RDCFlexTron package - see below); the standard one is **`cRDCModalPanel.pkg`**, in
-`Libraries/RDCToolsLib/AppSrc/` and already used by `BackupFiles.dg`, `CompilerOutput.dg`,
-`EngineLogFile.dg` and others. So the catch-up swap for both dialogs is
-`cFTModalPanel.pkg` -> `cRDCModalPanel.pkg`. Left as-is on this line for now (Nils,
-2026-08-04) — it is a catch-up task, not a fix needed here. (Scope the glob to source
-extensions — unscoped, this very file matches its own rule.)
-
-Afterwards remove the worktree (`git worktree remove --force`) and delete the temp branch. Note
-that a worktree does NOT populate `Libraries/`, so the public tree cannot be compile-verified that
-way — validate on the line where the submodules and database exist.
+**Never write a customer's name into anything that gets committed** — source, tests, comments, commit messages: no workspace, file, class, table or column name taken from a customer's code. Test workspaces are referred to by neutral names (`LegacyApp1`, …).
 
 ### The FlexTron toolkit comes from the Library-RDCFlexTron package
 
-Since 2026-09-24 the FlexTron toolkit is not kept in this repository. `DFRefactorFlexTron.sws` pins the
-private package **Library-RDCFlexTron** (`github.com/NilsSve/Library-RDCFlexTron`) by commit, and the
-package manager puts:
+The FlexTron toolkit is not kept in this repository. The package manager puts:
 
-- its classes and packages in `DfPkg\NilsSve_RDC_FlexTron_Library_26.0-<commit>\AppSrc`: the hosts
+- its classes and packages in `DfPkg\NilsSve_RDC_FlexTron_Library_26.0-<version>\AppSrc`: the hosts
   (`cFTLocalWebControlHost`, `cFTDbLocalWebControlHost`, `cFTThemeHost_mixin`), the web controls
   (`cFTWeb*`), `cFTModalPanel`, `cFTDbModalPanel`, `cFTComboForm`, `cFTDockArea`, `FTConstants.h.pkg`,
   `FTThemeColors`, `FTMarkupBuilders`, `FTDashIcons` and `FTAllWebControlClasses`;
@@ -254,24 +213,15 @@ package manager puts:
 `cRefactorApplication`, shared with the light builds. That object sends `SeedFTTheme` at the end of its
 construction.
 
-Those copies are read-only. To change one of them, change it in a clone of Library-RDCFlexTron, commit
-and push there, then move the `version` pin in `DFRefactorFlexTron.sws`; the Studio (or
-`df-cli config DFRefactorFlexTron.sws`) installs the new commit. The library pins RDCToolsLib itself, so
-a pin bump there must match this workspace's RDCToolsLib pin - every route to a library must name the
-same commit.
+### Data & Configuration
 
-The package is private, so for the public catch-up it counts as FlexTron: the files in check 3's list
-still `Use` its packages (`FTThemeColors.pkg`, and through it `FTConstants.h.pkg`; `cFTModalPanel.pkg`).
-
-### Data & Configuration (gitignored)
-
-- `AppSrc/LegacyCode.pkg` — working file containing legacy DataFlex code snippets used as test input (gitignored)
-- `AppSrc/RefactoredCode.pkg` — output of refactoring runs (gitignored)
-- `Data/` — DataFlex database files (`.dat`, `.k*`, `.hdr`, etc.) — all gitignored
+- `AppSrc/LegacyCode.pkg` — the TestBench's input. Tracked (a public sample), but marked `skip-worktree` locally so the working copy can change freely: never commit it by accident.
+- `AppSrc/RefactoredCode.pkg` — output of TestBench runs (gitignored).
+- `Data/` — the DataFlex database; tracked as the shipped starting data and marked `skip-worktree` locally.
 
 ### Batch / Command-line Mode
 
-The engine supports headless operation via the `/bm` or `/batch_mode` flags (`CS_BatchModeShort` / `CS_BatchModeLong` in `RefactorConstants.h.pkg`), each taking the INI file to run. Don't confuse these with `CS_CmdConfigFile1..3` (`/c`, `-c`, `--console`) — DFRefactor's OWN superseded ini-file flags, still parsed (`DFRefactorFT.src:400`) so existing scripts keep running. `UnitTests` has an unrelated `-c`/`--console` meaning console/CI mode, taking no argument. INI files `DFRefactorCmdLineRF.ini`, `DFRefactorCmdLineSC.ini`, `DFRefactorCmdLineWS.ini` configure different batch-mode runs; the Export dialog writes one INI plus `<name>_RUN.ps1` and, after a run, `<name>_RESULT.txt`.
+The engine supports headless operation via the `/bm` or `/batch_mode` flags (`CS_BatchModeShort` / `CS_BatchModeLong` in `RefactorConstants.h.pkg`), each taking the INI file to run. Don't confuse these with `CS_CmdConfigFile1..3` (`/c`, `-c`, `--console`) — DFRefactor's OWN superseded ini-file flags, still parsed (`DFRefactorFT.src:400`) so existing scripts keep running. `UnitTests` has an unrelated `-c`/`--console` meaning console/CI mode, taking no argument. No batch INI files ship with the repository; the Export dialog writes one INI plus `<name>_RUN.ps1` and, after a run, `<name>_RESULT.txt`.
 
 **A batch run executes inside `OnStartup`, before `Start_UI`** — so no window exists yet unless something pages the main panel. That matters for anything that drives a windowed control: `eEditorFunction` refactorings talk to the live Scintilla control, and with no window handle every call is a silent no-op. `eEditorFunctions` in `cRefactorEngine.pkg` therefore activates the editor *before* writing to it, pages the main panel once as a retry, and records a per-function "SKIPPED" run note if the editor is still unavailable — never a silent 0-changes result.
 
