@@ -6,7 +6,7 @@
 
 DFRefactor is a free, open-source tool that modernizes **DataFlex** source code — a business application language dating to the 1980s, still in active commercial use today. It reads your existing source code, finds code that should be written differently in a newer DataFlex version, or that the newer version no longer accepts, and rewrites it. The changes are made automatically, in many files at a time, and they can be undone.
 
-The tool implements both **canonical refactorings from Fowler's book** (Remove Dead Code, Replace Class, the spirit of Decompose Conditional) and **DataFlex-specific transformations** for legacy syntax that no general-purpose IDE would know how to modernize — like the 1980s square-bracket `[Found]` indicators, which it rewrites into modern expressions.
+The tool implements both **canonical refactorings from Fowler's book** (Remove Dead Code, Change Function Declaration for the renames, and the spirit of Decompose Conditional) and **DataFlex-specific transformations** for legacy syntax that no general-purpose IDE would know how to modernize — like the 1980s square-bracket `[Found]` indicators, which it rewrites into modern expressions.
 
 DFRefactor is written entirely in DataFlex and is distributed under the MIT license.
 
